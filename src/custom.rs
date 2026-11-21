@@ -318,6 +318,17 @@ impl App {
         self
     }
 
+    // the files let go over a window, by its label, before its page hears of them through
+    // onFileDrop; an app that takes paths from the page can check them against these
+    pub fn on_file_drop(
+        mut self,
+        mut hook: impl FnMut(&AppHandle, &str, &[PathBuf]) + 'static,
+    ) -> Self {
+        let handle = self.handle.clone();
+        self.lifecycle.dropped = Some(Box::new(move |_, label, paths| hook(&handle, label, paths)));
+        self
+    }
+
     pub fn on_closed(mut self, mut hook: impl FnMut(&AppHandle, &str) + 'static) -> Self {
         let handle = self.handle.clone();
         self.lifecycle.closed = Some(Box::new(move |_, label| hook(&handle, label)));

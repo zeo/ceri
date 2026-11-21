@@ -93,6 +93,10 @@ export interface AppWindow {
   state(): Promise<WindowState>;
   isMaximized(): Promise<boolean>;
   onResized(handler: (size: WindowResized) => void): Promise<Unlisten>;
+  // files from the desktop are held over the window, or no longer are
+  onFileHover(handler: (over: boolean) => void): Promise<Unlisten>;
+  // the paths of the files let go over the window
+  onFileDrop(handler: (paths: readonly string[]) => void): Promise<Unlisten>;
 }
 
 export const appWindow: AppWindow;

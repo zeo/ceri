@@ -251,7 +251,7 @@ impl JsonParser<'_> {
 }
 
 // JSON.stringify's string quoting
-pub(super) fn quote(text: &str) -> String {
+pub(crate) fn quote(text: &str) -> String {
     let mut quoted = String::with_capacity(text.len() + 2);
     quoted.push('"');
     for character in text.chars() {

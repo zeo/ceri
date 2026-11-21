@@ -20,6 +20,7 @@ mod inspector;
 mod interfaces;
 mod intl;
 mod json;
+pub(crate) use json::quote as json_quote;
 mod lexer;
 mod media;
 mod modules;

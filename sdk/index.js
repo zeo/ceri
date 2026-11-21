@@ -142,6 +142,8 @@ export const appWindow = Object.freeze({
   state: command("window:state"),
   isMaximized: () => invoke("window:state").then((state) => state.maximized),
   onResized: (handler) => listen("window:resized", (event) => handler(event.payload)),
+  onFileHover: (handler) => listen("window:file-hover", (event) => handler(event.payload.over)),
+  onFileDrop: (handler) => listen("window:file-drop", (event) => handler(event.payload.paths)),
 });
 
 function asking(name) {

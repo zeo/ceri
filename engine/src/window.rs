@@ -455,6 +455,7 @@ pub struct WindowContext {
 pub type StartedHook = Box<dyn FnOnce(&WindowControl)>;
 pub type CloseHook = Box<dyn FnMut(&WindowControl, &str) -> bool>;
 pub type ClosedHook = Box<dyn FnMut(&WindowControl, &str)>;
+pub type DropHook = Box<dyn FnMut(&WindowControl, &str, &[PathBuf])>;
 
 // the app's part in the loop; every hook runs on the loop's thread
 #[derive(Default)]
@@ -466,6 +467,8 @@ pub struct Lifecycle {
     // whether a window its user or app asked to close may close
     pub close_requested: Option<CloseHook>,
     pub closed: Option<ClosedHook>,
+    // files let go over a window, before its page hears of them
+    pub dropped: Option<DropHook>,
     // after the last window has gone, before run returns
     pub exiting: Option<Box<dyn FnOnce()>>,
     // fills in what a window's config leaves to the app, for launch windows and later ones alike
@@ -555,6 +558,9 @@ struct AppWindow {
     normal: Option<WindowGeometry>,
     modifiers: ModifiersState,
     preferences: UserPreferences,
+    // files are being held over the window, and the ones let go since the page last heard
+    hovering: bool,
+    dropped: Vec<PathBuf>,
     published: Arc<Mutex<Published>>,
     closing: bool,
 }
@@ -638,6 +644,8 @@ where
             normal: None,
             modifiers: ModifiersState::empty(),
             preferences: UserPreferences::default(),
+            hovering: false,
+            dropped: Vec::new(),
             published: self.control.published.clone(),
             closing: false,
         };
@@ -1012,6 +1020,23 @@ impl AppWindow {
             WindowEvent::Moved(_) => {
                 self.follow_refresh_rate();
                 self.publish();
+            }
+            // one event comes for each file held or let go, so the page hears once of the hold
+            WindowEvent::HoveredFile(_) => {
+                if !self.hovering {
+                    self.hovering = true;
+                    self.deliver("window:file-hover", r#"{"over":true}"#);
+                }
+            }
+            WindowEvent::HoveredFileCancelled => {
+                if self.hovering {
+                    self.hovering = false;
+                    self.deliver("window:file-hover", r#"{"over":false}"#);
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                self.hovering = false;
+                self.dropped.push(path);
             }
             WindowEvent::Occluded(occluded) => {
                 self.show_page(!occluded);
@@ -1631,6 +1656,15 @@ where
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         for window in self.windows.values_mut() {
             window.poll_worker();
+            // the files of one drop arrive one by one, and are whole once the loop has no
+            // more events
+            if !window.dropped.is_empty() {
+                let paths = std::mem::take(&mut window.dropped);
+                if let Some(hook) = &mut self.lifecycle.dropped {
+                    hook(&self.control, &window.config.label, &paths);
+                }
+                window.deliver("window:file-drop", &drop_payload(&paths));
+            }
         }
         self.sweep(event_loop);
         // workers keep their own clocks and wake the loop when they have something to show
@@ -1745,6 +1779,14 @@ fn present_frame(
             *pixel = u32::from(rgba[0]) << 16 | u32::from(rgba[1]) << 8 | u32::from(rgba[2]);
         }
     }
+}
+
+fn drop_payload(paths: &[PathBuf]) -> String {
+    let quoted: Vec<_> = paths
+        .iter()
+        .map(|path| crate::script::json_quote(&path.to_string_lossy()))
+        .collect();
+    format!(r#"{{"paths":[{}]}}"#, quoted.join(","))
 }
 
 // the palette windows forces on applications while its high contrast setting is on, as
@@ -1966,6 +2008,18 @@ mod geometry_tests {
         assert!(
             !at(100, -40).visible_on(&monitors),
             "its title bar is above the screen"
+        );
+    }
+
+    #[test]
+    fn dropped_paths_reach_the_page_as_json() {
+        let paths = [
+            std::path::PathBuf::from(r#"C:\shots\a "b".png"#),
+            std::path::PathBuf::from("/tmp/c.png"),
+        ];
+        assert_eq!(
+            super::drop_payload(&paths),
+            r#"{"paths":["C:\\shots\\a \"b\".png","/tmp/c.png"]}"#
         );
     }
 }
