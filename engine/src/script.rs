@@ -348,6 +348,9 @@ enum Builtin {
     StructuredClone,
     Atob,
     Btoa,
+    CreateImageBitmap,
+    // an ImageBitmap's close, which carries its pixels until it is called
+    ImageBitmapClose(canvas::ImageBitmapHandle),
     SetTimeout,
     ClearTimeout,
     SetInterval,
@@ -1551,6 +1554,10 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("btoa".to_string(), Value::Builtin(Builtin::Btoa));
+            values.values.insert(
+                "createImageBitmap".to_string(),
+                Value::Builtin(Builtin::CreateImageBitmap),
+            );
             values
                 .values
                 .insert("WebAssembly".to_string(), Value::WebAssemblyNamespace);
@@ -3859,6 +3866,7 @@ impl ScriptRuntime {
                 "structuredClone" => Ok(Value::Builtin(Builtin::StructuredClone)),
                 "atob" => Ok(Value::Builtin(Builtin::Atob)),
                 "btoa" => Ok(Value::Builtin(Builtin::Btoa)),
+                "createImageBitmap" => Ok(Value::Builtin(Builtin::CreateImageBitmap)),
                 "AbortController" => Ok(Value::AbortControllerConstructor),
                 "Worker" => Ok(Value::WorkerConstructor),
                 "fetch" => Ok(Value::Builtin(Builtin::Fetch)),
@@ -8216,6 +8224,11 @@ impl ScriptRuntime {
                     .cloned()
                     .map(Value::File)
                     .unwrap_or(Value::Null))
+            }
+            Builtin::CreateImageBitmap => self.create_image_bitmap(&arguments),
+            Builtin::ImageBitmapClose(held) => {
+                held.borrow_mut().take();
+                Ok(Value::Undefined)
             }
             // a string of bytes, one to a character, to base64 and back
             Builtin::Btoa => {

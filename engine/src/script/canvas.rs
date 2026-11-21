@@ -367,6 +367,9 @@ fn arc_points(
     (place(start.cos(), start.sin()), cubics)
 }
 
+// the pixels of an ImageBitmap, gone once it is closed
+pub(crate) type ImageBitmapHandle = Rc<RefCell<Option<Bitmap>>>;
+
 pub(super) struct CanvasContextData {
     node: NodeId,
     state: DrawState,
@@ -2011,7 +2014,92 @@ impl ScriptRuntime {
 
     // the picture a drawImage source shows now and the size script measures it in, which for a
     // video with anamorphic pixels differs from the picture's; None while it has nothing
+    // a picture of an ImageData, a canvas, an image, a video or an encoded image blob, kept
+    // apart from what it was taken of
+    pub(super) fn create_image_bitmap(
+        &mut self,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let source = arguments
+            .first()
+            .cloned()
+            .unwrap_or(Value::Undefined)
+            .resolve();
+        let decoded = |bytes: &[u8], mime_type: &str| {
+            crate::image::decode_image(bytes, mime_type)
+                .ok()
+                .map(|image| Bitmap::from_image(&image))
+        };
+        let bitmap = match &source {
+            Value::Element(_) => self.canvas_source(&source)?.map(|(bitmap, _)| bitmap),
+            Value::Blob(blob) => decoded(&blob.bytes, &blob.mime_type),
+            Value::File(file) => decoded(&file.bytes, &file.mime_type),
+            data => {
+                let width = self.get_property(data, "width")?;
+                let width = self.coerce_uint32(width)?;
+                let height = self.get_property(data, "height")?;
+                let height = self.coerce_uint32(height)?;
+                let bytes = match self.get_property(data, "data")? {
+                    Value::TypedArray(array) => {
+                        let array = array.borrow();
+                        array
+                            .buffer
+                            .borrow()
+                            .get(array.start..array.end)
+                            .map(<[u8]>::to_vec)
+                    }
+                    _ => None,
+                };
+                bytes
+                    .filter(|bytes| {
+                        width > 0 && bytes.len() == width as usize * height as usize * 4
+                    })
+                    .map(|bytes| {
+                        let mut bitmap = Bitmap::new(width, height);
+                        let whole = (0.0, 0.0, width as f32, height as f32);
+                        bitmap.put_image_data(&bytes, (width, height), (0, 0), whole);
+                        bitmap
+                    })
+            }
+        };
+        Ok(Value::Promise(match bitmap {
+            Some(bitmap) => {
+                let held = Rc::new(RefCell::new(Some(bitmap)));
+                let (width, height) = held
+                    .borrow()
+                    .as_ref()
+                    .map_or((0, 0), |bitmap| (bitmap.width, bitmap.height));
+                self.fulfilled_promise(plain_object([
+                    ("width".to_string(), Value::Number(f64::from(width))),
+                    ("height".to_string(), Value::Number(f64::from(height))),
+                    (
+                        "close".to_string(),
+                        Value::Builtin(Builtin::ImageBitmapClose(held)),
+                    ),
+                ]))
+            }
+            None => self.rejected_promise_value(dom_exception(
+                "InvalidStateError",
+                "The source image could not be decoded.",
+            )),
+        }))
+    }
+
     fn canvas_source(&mut self, source: &Value) -> Result<Option<Measured>, ScriptError> {
+        // an ImageBitmap is known by the close that carries its pixels
+        if !matches!(source, Value::Element(_))
+            && let Ok(Value::Builtin(Builtin::ImageBitmapClose(held))) =
+                self.get_property(source, "close")
+        {
+            let Some(bitmap) = held.borrow().clone() else {
+                return Err(self.throw_value(dom_exception(
+                    "InvalidStateError",
+                    "Failed to execute 'drawImage' on 'CanvasRenderingContext2D': The image source is detached.",
+                )));
+            };
+            let size = (bitmap.width as f32, bitmap.height as f32);
+            return Ok(Some((bitmap, size)));
+        }
         let node = match source {
             Value::Element(handle) => Some(handle.id),
             _ => None,
@@ -2452,6 +2540,42 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("true|66|TypeError|6x4|gone")
+        );
+    }
+
+    #[test]
+    fn an_image_bitmap_draws_until_it_is_closed() {
+        let document = crate::dom::Document::parse(
+            r#"<html><body><canvas id="c" width="8" height="8"></canvas><p id="status"></p></body></html>"#,
+        )
+        .expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const c = document.getElementById("c").getContext("2d");
+                const status = document.getElementById("status");
+                const data = new ImageData(new Uint8ClampedArray([255, 0, 0, 255, 0, 0, 255, 128]), 2, 1);
+                createImageBitmap(data).then((bitmap) => {
+                    const seen = [bitmap.width + "x" + bitmap.height];
+                    c.drawImage(bitmap, 3, 3);
+                    seen.push([...c.getImageData(3, 3, 2, 1).data].join(","));
+                    bitmap.close();
+                    try { c.drawImage(bitmap, 0, 0); } catch (error) { seen.push(error.name); }
+                    return createImageBitmap(document.getElementById("c")).then((copy) => {
+                        seen.push(copy.width);
+                        return createImageBitmap({}).catch((error) => seen.push(error.name));
+                    }).then(() => (status.textContent = seen.join("|")));
+                });
+                "##,
+            )
+            .expect("script should run");
+        runtime.advance_time(1).expect("promises should settle");
+        let status = document.borrow().find_element_by_id("status").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("2x1|255,0,0,255,0,0,255,128|InvalidStateError|8|InvalidStateError")
         );
     }
 
