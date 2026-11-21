@@ -192,16 +192,20 @@ impl Canvas {
     }
 
     fn device(width: u32, height: u32, scale: f32, background: Color) -> Self {
+        // a clear background leaves the surface see-through, as a transparent window shows it
+        let opaque = background.alpha > 0;
         let mut pixels = vec![0; width as usize * height as usize * 4];
-        for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
-            pixel.copy_from_slice(&[background.red, background.green, background.blue, 255]);
+        if opaque {
+            for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
+                pixel.copy_from_slice(&[background.red, background.green, background.blue, 255]);
+            }
         }
         Self {
             width,
             height,
             scale,
             background,
-            opaque: true,
+            opaque,
             pixels,
             shift: (0.0, 0.0),
             nudge: (0.0, 0.0),
@@ -2578,6 +2582,18 @@ pub(crate) fn paint_with_canvases(
     scale: f32,
     planes: bool,
 ) -> Canvas {
+    paint_frame(document, canvases, scale, planes, BASE)
+}
+
+// the whole frame over a base of its own: the white a page shows through where it paints
+// nothing, or nothing at all for a window the desktop shows through
+pub(crate) fn paint_frame(
+    document: &LayoutDocument,
+    canvases: &[ImageLayer],
+    scale: f32,
+    planes: bool,
+    base: Color,
+) -> Canvas {
     let _profile = crate::profile::scope("paint: whole frame");
     let layers;
     let images = if canvases.is_empty() {
@@ -2595,7 +2611,7 @@ pub(crate) fn paint_with_canvases(
         document.viewport.width,
         document.viewport.height,
         scale,
-        BASE,
+        base,
     );
     if planes && !has_backdrop(&document.root) {
         canvas.planes = Some(Vec::new());
@@ -2604,7 +2620,7 @@ pub(crate) fn paint_with_canvases(
     canvas
 }
 
-const BASE: Color = Color::opaque(245, 248, 250);
+pub(crate) const BASE: Color = Color::WHITE;
 
 // what a frame has to paint again over the one before it
 #[derive(Debug, PartialEq)]
@@ -2819,7 +2835,17 @@ pub(crate) fn repaint(
     if let Some(planes) = &mut canvas.planes {
         planes.retain(|plane| !overlaps(plane.bounds, kept_box));
     }
-    canvas.fill_rect(painted.x, painted.y, painted.width, painted.height, BASE);
+    let base = canvas.background;
+    if base.alpha > 0 {
+        canvas.fill_rect(painted.x, painted.y, painted.width, painted.height, base);
+    } else {
+        let columns = kept.left.saturating_sub(MARGIN) as usize * 4
+            ..(kept.right + MARGIN).min(canvas.width) as usize * 4;
+        for row in kept.top.saturating_sub(MARGIN)..(kept.bottom + MARGIN).min(canvas.height) {
+            let start = row as usize * stride;
+            canvas.pixels[start + columns.start..start + columns.end].fill(0);
+        }
+    }
     let layers = document
         .images
         .iter()
@@ -2843,7 +2869,7 @@ pub(crate) fn repaint(
         match settled_planes(&before, canvas.planes.take().unwrap_or_default(), kept_box) {
             Some(planes) => canvas.planes = Some(planes),
             None => {
-                *canvas = paint_with_canvases(document, canvases, scale, true);
+                *canvas = paint_frame(document, canvases, scale, true, base);
                 return;
             }
         }

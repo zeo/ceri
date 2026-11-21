@@ -997,6 +997,8 @@ pub struct Browser {
     locale: Option<String>,
     // the policy the app sets on its own documents, over whatever they declare themselves
     content_security_policy: Option<String>,
+    // the window shows the desktop wherever the page paints nothing
+    see_through: bool,
     last_navigation_failure: Option<NavigationFailure>,
     page: Option<Page>,
     current_url: Option<AppUrl>,
@@ -1174,6 +1176,7 @@ impl Browser {
             time_zone: None,
             locale: None,
             content_security_policy: None,
+            see_through: false,
             last_navigation_failure: None,
             page: None,
             current_url: None,
@@ -1260,6 +1263,11 @@ impl Browser {
 
     // inline scripts and styles written into the app's own documents run under it, as the
     // app's bundled code
+    // paints frames over nothing instead of white, for a transparent window
+    pub fn set_see_through(&mut self, on: bool) {
+        self.see_through = on;
+    }
+
     pub fn with_content_security_policy(mut self, policy: impl Into<String>) -> Self {
         self.content_security_policy = Some(policy.into());
         self
@@ -3013,6 +3021,8 @@ impl Browser {
                             && Arc::ptr_eq(&before.image, &after.image)
                     })
             })
+            // moved pixels are filled in behind over a flat colour, which a clear frame lacks
+            .filter(|_| !self.see_through)
             .and_then(|last| crate::paint::scroll_repaint(&last.canvas, &last.layout, &layout));
         let damage = match painted.as_ref() {
             _ if scrolled.is_some() => crate::paint::Damage::Nothing,
@@ -3022,6 +3032,11 @@ impl Browser {
                 last.canvas.planes(),
             ),
             _ => crate::paint::Damage::Everything,
+        };
+        let base = if self.see_through {
+            crate::css::Color::transparent()
+        } else {
+            crate::paint::BASE
         };
         let (mut canvas, mut spare, behind) = match (damage, painted.take()) {
             (crate::paint::Damage::Nothing, Some(mut last)) => match scrolled {
@@ -3059,11 +3074,12 @@ impl Browser {
                 }
             }
             _ => (
-                Arc::new(crate::paint::paint_with_canvases(
+                Arc::new(crate::paint::paint_frame(
                     &layout,
                     &canvases,
                     device_pixel_ratio,
                     planes,
+                    base,
                 )),
                 None,
                 Vec::new(),
@@ -3083,11 +3099,12 @@ impl Browser {
                     layer.image = image;
                 }
             }
-            canvas = Arc::new(crate::paint::paint_with_canvases(
+            canvas = Arc::new(crate::paint::paint_frame(
                 &layout,
                 &canvases,
                 device_pixel_ratio,
                 planes,
+                base,
             ));
             spare = None;
         }
@@ -8009,6 +8026,36 @@ mod tests {
             boxes.iter().collect::<Vec<_>>(),
             [[0, 0, 10, 10], [200, 150, 210, 160]]
         );
+    }
+
+    #[test]
+    fn a_see_through_frame_is_clear_where_the_page_paints_nothing() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>html, body { margin: 0; background: transparent; }
+            div { position: absolute; left: 20px; top: 20px; width: 40px; height: 40px; background: red; }</style>
+            <div id="box"></div>"##,
+        ));
+        browser.set_see_through(true);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 120.0,
+            height: 90.0,
+        };
+        let first = browser.paint(viewport).unwrap();
+        assert_eq!(pixel_at(&first, 5, 5), [0, 0, 0, 0]);
+        assert_eq!(pixel_at(&first, 30, 30), [255, 0, 0, 255]);
+        // the box moves, and what it leaves behind is clear again
+        let document = browser.document().unwrap();
+        let node = document.borrow().find_element_by_id("box").unwrap();
+        document
+            .borrow_mut()
+            .set_style_property(node, "left", "70px".to_string());
+        let second = browser.paint(viewport).unwrap();
+        assert!(second.revision().changed.is_some(), "painted over the last");
+        assert_eq!(pixel_at(&second, 30, 30), [0, 0, 0, 0]);
+        assert_eq!(pixel_at(&second, 80, 30), [255, 0, 0, 255]);
     }
 
     // a few hundred seeded writes, pointer moves and scrolls, each followed by a frame painted

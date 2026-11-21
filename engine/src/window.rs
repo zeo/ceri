@@ -177,6 +177,9 @@ pub struct WindowConfig {
     pub always_on_top: bool,
     // only Windows has a taskbar a window can leave
     pub skip_taskbar: bool,
+    // the desktop shows wherever the page paints nothing, once the page clears the
+    // backgrounds of its html and body
+    pub transparent: bool,
     // the drop shadow Windows gives a window without decorations
     pub shadow: bool,
     // whether the window takes the keyboard when it opens
@@ -212,6 +215,7 @@ impl Default for WindowConfig {
             fullscreen: false,
             always_on_top: false,
             skip_taskbar: false,
+            transparent: false,
             shadow: true,
             focused: true,
             click_through: false,
@@ -578,6 +582,7 @@ where
         };
         let factory = self.factory.clone();
         let label = config.label.clone();
+        let see_through = config.transparent;
         let control = self.control.clone();
         let notify = control.waker();
         let spawn: Spawn = Rc::new(move |viewport, recovery: Option<String>| {
@@ -590,6 +595,7 @@ where
                 viewport,
                 move || {
                     let mut browser = factory(&context)?;
+                    browser.set_see_through(see_through);
                     if let Some(reason) = recovery {
                         browser.show_recovery(500, &reason);
                     }
@@ -739,6 +745,7 @@ impl AppWindow {
             .with_resizable(config.resizable)
             .with_visible(config.visible)
             .with_active(config.focused)
+            .with_transparent(config.transparent)
             .with_maximized(config.maximized || remembered.is_some_and(|known| known.maximized))
             .with_content_protected(config.content_protected);
         if let Some((width, height)) = config.maximum_size {
@@ -755,7 +762,10 @@ impl AppWindow {
             use winit::platform::windows::WindowAttributesExtWindows;
             attributes = attributes
                 .with_skip_taskbar(config.skip_taskbar)
-                .with_undecorated_shadow(config.shadow);
+                .with_undecorated_shadow(config.shadow)
+                // with no surface of its own behind the composition, the window is clear
+                // where the frame is
+                .with_no_redirection_bitmap(config.transparent);
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         if let Some(id) = &config.app_id {
@@ -807,8 +817,9 @@ impl AppWindow {
             }
         };
         let size = window.inner_size();
-        if let (Some(width), Some(height)) =
-            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+        if !self.config.transparent
+            && let (Some(width), Some(height)) =
+                (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
             && let Err(error) = output.fill(self.config.background, width, height)
         {
             eprintln!("ceri: {error}");
