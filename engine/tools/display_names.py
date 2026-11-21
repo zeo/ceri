@@ -61,6 +61,8 @@ def display(names, function, tag):
 
 
 def quote(text):
+    # a range in a name is written with an en dash
+    text = text.replace("\u2014", "\u2013")
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 

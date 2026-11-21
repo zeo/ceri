@@ -1204,7 +1204,7 @@ pub(super) const CURRENCY_NAMES: &[(&str, &str)] = &[
     ("SGD", "Singapore Dollar"),
     ("SHP", "St. Helena Pound"),
     ("SLE", "Sierra Leonean Leone"),
-    ("SLL", "Sierra Leonean Leone (1964—2022)"),
+    ("SLL", "Sierra Leonean Leone (1964–2022)"),
     ("SOS", "Somali Shilling"),
     ("SRD", "Surinamese Dollar"),
     ("SSP", "South Sudanese Pound"),
