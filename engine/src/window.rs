@@ -554,6 +554,8 @@ struct AppWindow {
     scale: f32,
     // the display's refresh rate in millihertz, once the engine was told
     refresh_rate: Option<u32>,
+    // the last display the page was told of
+    display: Option<InputEvent>,
     page_shown: bool,
     zoom: f32,
     window: Option<Rc<Window>>,
@@ -642,6 +644,7 @@ where
             viewport,
             scale: 1.0,
             refresh_rate: None,
+            display: None,
             page_shown: true,
             zoom: 1.0,
             window: None,
@@ -1522,16 +1525,38 @@ impl AppWindow {
         }
     }
 
-    // tells the engine how often the display the window is on refreshes, when that changes
+    // tells the engine how often the display the window is on refreshes, and how big it is,
+    // when either changes
     fn follow_refresh_rate(&mut self) {
-        let rate = self
+        let monitor = self
             .window
             .as_ref()
-            .and_then(|window| window.current_monitor())
+            .and_then(|window| window.current_monitor());
+        let rate = monitor
+            .as_ref()
             .and_then(|monitor| monitor.refresh_rate_millihertz());
         if let Some(rate) = rate.filter(|rate| self.refresh_rate != Some(*rate)) {
             self.refresh_rate = Some(rate);
             self.submit(InputEvent::RefreshRate(rate));
+        }
+        if let Some(monitor) = monitor {
+            let known = monitor_of(&monitor);
+            // css pixels count from the display's own corner at its own scale
+            let scale = (known.scale as f32).max(0.1);
+            let ((left, top), (width, height)) = known.work_area;
+            let display = InputEvent::Display {
+                size: (known.size.0 as f32 / scale, known.size.1 as f32 / scale),
+                available: [
+                    (left - known.position.0) as f32 / scale,
+                    (top - known.position.1) as f32 / scale,
+                    width as f32 / scale,
+                    height as f32 / scale,
+                ],
+            };
+            if self.display.as_ref() != Some(&display) {
+                self.display = Some(display.clone());
+                self.submit(display);
+            }
         }
     }
 

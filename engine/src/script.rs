@@ -516,6 +516,13 @@ pub(crate) struct ViewportMetrics {
     pub(crate) device_pixel_ratio: f32,
 }
 
+// the display a page's window is on, in CSS pixels; with none known the viewport stands in
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Display {
+    size: (f32, f32),
+    available: [f32; 4],
+}
+
 impl Default for ViewportMetrics {
     fn default() -> Self {
         Self {
@@ -622,6 +629,8 @@ pub struct ScriptRuntime {
     file_lists: RefCell<HashMap<NodeId, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
     clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
+    display: Option<Display>,
+    screen_object: RefCell<Option<Value>>,
     scroll_offsets: BTreeMap<NodeId, (f32, f32)>,
     viewport: ViewportMetrics,
     canvas_contexts: HashMap<NodeId, CanvasContextHandle>,
@@ -1722,6 +1731,8 @@ impl ScriptRuntime {
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
             clipboard_provider: None,
+            display: None,
+            screen_object: RefCell::new(None),
             bridge: None,
             scroll_offsets: BTreeMap::new(),
             canvas_contexts: HashMap::new(),
@@ -3255,7 +3266,61 @@ impl ScriptRuntime {
         self.frame_interval = milliseconds;
     }
 
+    pub(crate) fn set_display(&mut self, size: (f32, f32), available: [f32; 4]) {
+        let display = Display { size, available };
+        if self.display != Some(display) {
+            self.display = Some(display);
+            self.screen_object.replace(None);
+        }
+    }
+
+    // one object while the display stays the same, so screen === screen
+    fn screen(&self) -> Value {
+        if let Some(screen) = self.screen_object.borrow().as_ref() {
+            return screen.clone();
+        }
+        let viewport = (self.viewport.width, self.viewport.height);
+        let Display { size, available } = self.display.unwrap_or(Display {
+            size: viewport,
+            available: [0.0, 0.0, viewport.0, viewport.1],
+        });
+        let number = |value: f32| Value::Number(f64::from(value.round()));
+        let landscape = size.0 >= size.1;
+        let orientation = plain_object([
+            (
+                "type".to_string(),
+                Value::String(
+                    if landscape {
+                        "landscape-primary"
+                    } else {
+                        "portrait-primary"
+                    }
+                    .into(),
+                ),
+            ),
+            ("angle".to_string(), Value::Number(0.0)),
+        ]);
+        let screen = plain_object([
+            ("width".to_string(), number(size.0)),
+            ("height".to_string(), number(size.1)),
+            ("availLeft".to_string(), number(available[0])),
+            ("availTop".to_string(), number(available[1])),
+            ("availWidth".to_string(), number(available[2])),
+            ("availHeight".to_string(), number(available[3])),
+            ("colorDepth".to_string(), Value::Number(24.0)),
+            ("pixelDepth".to_string(), Value::Number(24.0)),
+            ("isExtended".to_string(), Value::Bool(false)),
+            ("orientation".to_string(), orientation),
+        ]);
+        self.screen_object.replace(Some(screen.clone()));
+        screen
+    }
+
     pub(crate) fn set_viewport_metrics(&mut self, viewport: ViewportMetrics) {
+        // the viewport stands in for an unknown display, so its screen follows it
+        if self.display.is_none() {
+            self.screen_object.replace(None);
+        }
         // a layout rounds at the device scale, so one measured at another scale is stale
         if viewport.device_pixel_ratio != self.viewport.device_pixel_ratio {
             *self.measured.borrow_mut() = None;
@@ -3827,6 +3892,7 @@ impl ScriptRuntime {
                     .borrow()
                     .get("location")
                     .ok_or_else(|| runtime_error("window location is unavailable")),
+                "screen" => Ok(self.screen()),
                 "innerWidth" => Ok(Value::Number(self.viewport.width as f64)),
                 "innerHeight" => Ok(Value::Number(self.viewport.height as f64)),
                 "performance" => Ok(self.performance.clone()),

@@ -38,6 +38,12 @@ pub enum InputEvent {
     Resize(Size),
     // how often the window's display refreshes, in millihertz
     RefreshRate(u32),
+    // the display the window is on in CSS pixels: its whole size, and the part a taskbar or
+    // dock leaves free as left, top, width and height
+    Display {
+        size: (f32, f32),
+        available: [f32; 4],
+    },
     // the window was shown, or hidden or minimised
     Visible(bool),
     PointerMove {
@@ -878,6 +884,10 @@ impl EngineHost {
             }
             InputEvent::RefreshRate(millihertz) => {
                 self.browser.set_refresh_rate(millihertz);
+                InputResult::default()
+            }
+            InputEvent::Display { size, available } => {
+                self.browser.set_display(size, available);
                 InputResult::default()
             }
             InputEvent::Visible(visible) => {

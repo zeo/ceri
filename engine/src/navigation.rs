@@ -1002,6 +1002,8 @@ pub struct Browser {
     locale: Option<String>,
     // the policy the app sets on its own documents, over whatever they declare themselves
     content_security_policy: Option<String>,
+    // the display the window is on, for screen, once the window has said
+    display: Option<((f32, f32), [f32; 4])>,
     // the window shows the desktop wherever the page paints nothing
     see_through: bool,
     last_navigation_failure: Option<NavigationFailure>,
@@ -1181,6 +1183,7 @@ impl Browser {
             time_zone: None,
             locale: None,
             content_security_policy: None,
+            display: None,
             see_through: false,
             last_navigation_failure: None,
             page: None,
@@ -1346,6 +1349,13 @@ impl Browser {
     }
 
     // paces animation frames and the frames of anything in motion by the display's refresh
+    pub fn set_display(&mut self, size: (f32, f32), available: [f32; 4]) {
+        self.display = Some((size, available));
+        if let Some(page) = self.page.as_mut() {
+            page.runtime.set_display(size, available);
+        }
+    }
+
     pub fn set_refresh_rate(&mut self, millihertz: u32) {
         self.frame_interval = frame_interval(millihertz);
         if let Some(page) = self.page.as_mut() {
@@ -6239,6 +6249,48 @@ mod tests {
         );
         assert_eq!(writes.borrow().as_slice(), ["copied"]);
         assert_eq!(text.borrow().as_str(), "copied");
+    }
+
+    #[test]
+    fn screen_reports_the_display_or_the_viewport_until_one_is_known() {
+        let mut browser = Browser::new(bundle(
+            r#"<button id="go">read</button><p id="status">idle</p><script>
+                window.read = () => {
+                    const s = screen;
+                    document.getElementById("status").textContent = [
+                        s.width, s.height, s.availLeft, s.availTop, s.availWidth, s.availHeight,
+                        s.colorDepth, s.orientation.type, s === screen, window.screen === s,
+                    ].join("|");
+                };
+                read();
+                document.getElementById("go").addEventListener("click", read);
+            </script>"#,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 400.0,
+                height: 300.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        browser
+            .click_id("go")
+            .expect("the button should take the click");
+        assert_eq!(
+            element_text(&browser, "status"),
+            "400|300|0|0|400|300|24|landscape-primary|true|true"
+        );
+        browser.set_display((1080.0, 1920.0), [0.0, 0.0, 1080.0, 1872.0]);
+        browser
+            .click_id("go")
+            .expect("the button should take the click");
+        assert_eq!(
+            element_text(&browser, "status"),
+            "1080|1920|0|0|1080|1872|24|portrait-primary|true|true"
+        );
     }
 
     #[test]
