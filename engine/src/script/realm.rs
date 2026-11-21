@@ -162,6 +162,7 @@ pub(super) enum Native {
     Anim(super::animations::AnimMember),
     AnimConstructor,
     ClipboardItemConstructor,
+    DomExceptionConstructor,
     // an animation of the given generation reaches its end
     AnimFinish(u32, u64),
     Shape(super::geometry_values::ShapeMember),
@@ -224,6 +225,7 @@ impl Native {
                 | Native::ReaderConstructor
                 | Native::AnimConstructor
                 | Native::ClipboardItemConstructor
+                | Native::DomExceptionConstructor
                 | Native::Helper(super::iterator_helpers::HelperMember::Constructor)
                 | Native::Markup(
                     super::markup::MarkupMember::Parser | super::markup::MarkupMember::Serializer
@@ -274,6 +276,7 @@ pub(super) struct Intrinsics {
     pub(super) eval_error_prototype: ObjectHandle,
     pub(super) uri_error_prototype: ObjectHandle,
     pub(super) aggregate_error_prototype: ObjectHandle,
+    pub(super) dom_exception_prototype: ObjectHandle,
     pub(super) promise_prototype: ObjectHandle,
     pub(super) promise_constructor: ObjectHandle,
     pub(super) regexp_prototype: ObjectHandle,
@@ -328,6 +331,39 @@ fn fixed(value: Value) -> Property {
         configurable: false,
     }
 }
+
+// the legacy constants of DOMException: the name with that code, its constant, and the code
+pub(super) const DOM_EXCEPTION_CODES: &[(&str, &str, u16)] = &[
+    ("IndexSizeError", "INDEX_SIZE_ERR", 1),
+    ("", "DOMSTRING_SIZE_ERR", 2),
+    ("HierarchyRequestError", "HIERARCHY_REQUEST_ERR", 3),
+    ("WrongDocumentError", "WRONG_DOCUMENT_ERR", 4),
+    ("InvalidCharacterError", "INVALID_CHARACTER_ERR", 5),
+    ("", "NO_DATA_ALLOWED_ERR", 6),
+    (
+        "NoModificationAllowedError",
+        "NO_MODIFICATION_ALLOWED_ERR",
+        7,
+    ),
+    ("NotFoundError", "NOT_FOUND_ERR", 8),
+    ("NotSupportedError", "NOT_SUPPORTED_ERR", 9),
+    ("InUseAttributeError", "INUSE_ATTRIBUTE_ERR", 10),
+    ("InvalidStateError", "INVALID_STATE_ERR", 11),
+    ("SyntaxError", "SYNTAX_ERR", 12),
+    ("InvalidModificationError", "INVALID_MODIFICATION_ERR", 13),
+    ("NamespaceError", "NAMESPACE_ERR", 14),
+    ("InvalidAccessError", "INVALID_ACCESS_ERR", 15),
+    ("", "VALIDATION_ERR", 16),
+    ("TypeMismatchError", "TYPE_MISMATCH_ERR", 17),
+    ("SecurityError", "SECURITY_ERR", 18),
+    ("NetworkError", "NETWORK_ERR", 19),
+    ("AbortError", "ABORT_ERR", 20),
+    ("URLMismatchError", "URL_MISMATCH_ERR", 21),
+    ("QuotaExceededError", "QUOTA_EXCEEDED_ERR", 22),
+    ("TimeoutError", "TIMEOUT_ERR", 23),
+    ("InvalidNodeTypeError", "INVALID_NODE_TYPE_ERR", 24),
+    ("DataCloneError", "DATA_CLONE_ERR", 25),
+];
 
 pub(super) struct Builder {
     function_prototype: ObjectHandle,
@@ -627,6 +663,27 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     ]: [ObjectHandle; 7] = error_prototypes
         .try_into()
         .unwrap_or_else(|_| unreachable!("seven error kinds"));
+
+    let dom_exception_prototype = plain(&error_prototype);
+    let dom_exception = build.constructor(
+        Native::DomExceptionConstructor,
+        "DOMException",
+        0,
+        &dom_exception_prototype,
+    );
+    for (_, constant, code) in DOM_EXCEPTION_CODES {
+        for target in [&dom_exception, &dom_exception_prototype] {
+            target
+                .borrow_mut()
+                .define(constant.to_string(), fixed(Value::Number(f64::from(*code))));
+        }
+    }
+    build.value(
+        &dom_exception_prototype,
+        "@@toStringTag",
+        Value::String("DOMException".into()),
+    );
+    globals.push(("DOMException", Value::Object(dom_exception)));
 
     let boolean_prototype = new_object(JsObject::with_prototype(
         Some(object_prototype.clone()),
@@ -1426,6 +1483,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         eval_error_prototype,
         uri_error_prototype,
         aggregate_error_prototype,
+        dom_exception_prototype,
         promise_prototype,
         promise_constructor,
         regexp_prototype,
@@ -2924,6 +2982,9 @@ impl ScriptRuntime {
             Native::ClipboardItemConstructor => Err(self.type_error(
                 "Failed to construct 'ClipboardItem': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
+            Native::DomExceptionConstructor => Err(self.type_error(
+                "Failed to construct 'DOMException': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
+            )),
             Native::RectConstructor(_) | Native::PointConstructor(_) => Err(self.type_error(
                 "Failed to construct: Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
@@ -3258,6 +3319,17 @@ impl ScriptRuntime {
             Native::ReaderConstructor => self.construct_reader(new_target),
             Native::MessageChannelConstructor => self.construct_message_channel(new_target),
             Native::AnimConstructor => Err(self.type_error("Illegal constructor")),
+            Native::DomExceptionConstructor => {
+                let message = match argument(&arguments, 0) {
+                    Value::Undefined => String::new(),
+                    value => self.coerce_string(value)?,
+                };
+                let name = match argument(&arguments, 1) {
+                    Value::Undefined => "Error".to_string(),
+                    value => self.coerce_string(value)?,
+                };
+                Ok(super::dom_exception(&name, &message))
+            }
             Native::Helper(_) => self.construct_iterator(new_target),
             Native::Markup(_) => self.construct_markup(new_target),
             Native::Promise(function)

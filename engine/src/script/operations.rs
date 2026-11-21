@@ -933,6 +933,9 @@ impl ScriptRuntime {
             Value::Symbol(_) => intrinsics.symbol_prototype.clone(),
             Value::BigInt(_) => intrinsics.bigint_prototype.clone(),
             Value::Array(_) => intrinsics.array_prototype.clone(),
+            Value::Error(error) if error.class_name == "DOMException" => {
+                intrinsics.dom_exception_prototype.clone()
+            }
             Value::Error(error) => self.error_prototype(&error.name),
             Value::Iterator(_) => intrinsics.iterator_prototype.clone(),
             Value::TypedArray(array) if array.borrow().object.is_some() => {

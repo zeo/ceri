@@ -4719,6 +4719,13 @@ impl ScriptRuntime {
             Value::Error(error) => match property {
                 "name" => Ok(Value::String(error.name.clone().into())),
                 "message" => Ok(Value::String(error.message.clone().into())),
+                // a DOMException's code is the legacy number its name has, or 0
+                "code" if error.class_name == "DOMException" => Ok(Value::Number(
+                    realm::DOM_EXCEPTION_CODES
+                        .iter()
+                        .find(|(name, _, _)| *name == error.name)
+                        .map_or(0.0, |(_, _, code)| f64::from(*code)),
+                )),
                 "code" => Ok(error
                     .code
                     .clone()
@@ -11532,12 +11539,7 @@ fn new_abort_signal() -> AbortSignalHandle {
 }
 
 fn abort_error_value() -> Value {
-    Value::Error(Rc::new(ErrorData {
-        name: "AbortError".to_string(),
-        message: "The operation was aborted".to_string(),
-        code: None,
-        class_name: "Error".to_string(),
-    }))
+    dom_exception("AbortError", "signal is aborted without reason")
 }
 
 fn subtle_error_value(name: &str, message: impl Into<String>) -> Value {
@@ -19256,6 +19258,34 @@ mod tests {
         );
     }
     #[test]
+    fn dom_exceptions_construct_and_match_what_the_engine_throws() {
+        let document = document(r#"<main><p id="status">idle</p></main>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const made = new DOMException("gone", "NotFoundError");
+                const controller = new AbortController();
+                controller.abort();
+                const seen = [
+                    made instanceof DOMException, made instanceof Error, made.name, made.message, made.code,
+                    String(made), DOMException.ABORT_ERR, new DOMException().name,
+                    controller.signal.reason instanceof DOMException, controller.signal.reason.code,
+                    Object.prototype.toString.call(made),
+                ];
+                try { DOMException("x"); } catch (error) { seen.push(error.name); }
+                document.getElementById("status").textContent = seen.join("|");
+                "#,
+            )
+            .expect("script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "true|true|NotFoundError|gone|8|NotFoundError: gone|20|Error|true|20|[object DOMException]|TypeError"
+            )
+        );
+    }
+    #[test]
     fn promise_try_wraps_what_a_function_returns_or_throws() {
         let document = document(r#"<main><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());
@@ -22159,7 +22189,7 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some(
-                "abort|true|AbortError|The operation was aborted|AbortError|The operation was aborted|AbortError|The operation was aborted"
+                "abort|true|AbortError|signal is aborted without reason|AbortError|signal is aborted without reason|AbortError|signal is aborted without reason"
             )
         );
     }
