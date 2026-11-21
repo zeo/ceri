@@ -8,6 +8,11 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
     CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::UI::Controls::{
+    TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TD_ERROR_ICON, TD_INFORMATION_ICON, TD_WARNING_ICON,
+    TDF_ALLOW_DIALOG_CANCELLATION, TDF_POSITION_RELATIVE_TO_WINDOW,
+};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
     FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT,
@@ -15,8 +20,8 @@ use windows::Win32::UI::Shell::{
     IFileOpenDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_YESNO,
-    MessageBoxW,
+    IDCANCEL, IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL,
+    MB_YESNO, MessageBoxW,
 };
 use windows::core::{HSTRING, Interface, PCWSTR};
 
@@ -160,7 +165,86 @@ pub(super) fn pick(dialog: &FileDialog, pick: Pick) -> Result<Option<Vec<PathBuf
     })
 }
 
+type TaskDialogIndirect = unsafe extern "system" fn(
+    *const TASKDIALOGCONFIG,
+    *mut i32,
+    *mut i32,
+    *mut windows::core::BOOL,
+) -> windows::core::HRESULT;
+
+// buttons with words of their own; the task dialog only exists in common controls 6, which an
+// app has when its manifest asks for it, so it is found at run time and none falls back
+fn labelled(dialog: &MessageDialog) -> Option<Result<bool, String>> {
+    if dialog.ok_label.is_none() && dialog.cancel_label.is_none() {
+        return None;
+    }
+    // SAFETY: comctl32 is a system library that stays loaded, and the name is terminated
+    let show: TaskDialogIndirect = unsafe {
+        let library = LoadLibraryW(windows::core::w!("comctl32.dll")).ok()?;
+        std::mem::transmute(GetProcAddress(
+            library,
+            windows::core::s!("TaskDialogIndirect"),
+        )?)
+    };
+    let (yes, no) = match dialog.buttons {
+        MessageButtons::YesNo => ("Yes", "No"),
+        _ => ("OK", "Cancel"),
+    };
+    let accept = HSTRING::from(dialog.ok_label.as_deref().unwrap_or(yes));
+    let refuse = HSTRING::from(dialog.cancel_label.as_deref().unwrap_or(no));
+    let mut buttons = vec![TASKDIALOG_BUTTON {
+        nButtonID: IDOK.0,
+        pszButtonText: PCWSTR(accept.as_ptr()),
+    }];
+    if dialog.buttons != MessageButtons::Ok {
+        buttons.push(TASKDIALOG_BUTTON {
+            nButtonID: IDCANCEL.0,
+            pszButtonText: PCWSTR(refuse.as_ptr()),
+        });
+    }
+    let (title, text) = (
+        HSTRING::from(dialog.title.as_str()),
+        HSTRING::from(dialog.text.as_str()),
+    );
+    let mut config = TASKDIALOGCONFIG {
+        cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: owner(dialog.owner).unwrap_or_default(),
+        // escape and the close box answer as the cancel button would
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
+        pszWindowTitle: PCWSTR(title.as_ptr()),
+        pszContent: PCWSTR(text.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: IDOK.0,
+        ..Default::default()
+    };
+    config.Anonymous1.pszMainIcon = match dialog.level {
+        MessageLevel::Info => TD_INFORMATION_ICON,
+        MessageLevel::Warning => TD_WARNING_ICON,
+        MessageLevel::Error => TD_ERROR_ICON,
+    };
+    let mut chosen = 0;
+    // SAFETY: the configuration, its strings and buttons outlive the call
+    let result = unsafe {
+        show(
+            &config,
+            &mut chosen,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    Some(
+        result
+            .ok()
+            .map(|()| chosen == IDOK.0)
+            .map_err(|error| error.message()),
+    )
+}
+
 pub(super) fn message(dialog: &MessageDialog) -> Result<bool, String> {
+    if let Some(answer) = labelled(dialog) {
+        return answer;
+    }
     let buttons = match dialog.buttons {
         MessageButtons::Ok => MB_OK,
         MessageButtons::OkCancel => MB_OKCANCEL,

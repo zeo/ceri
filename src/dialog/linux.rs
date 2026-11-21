@@ -320,14 +320,28 @@ pub(super) fn message(dialog: &MessageDialog) -> Result<bool, String> {
         format!("--text={}", dialog.text).into(),
     ];
     let mut kdialog: Vec<OsString> = vec!["--title".into(), (&dialog.title).into()];
-    if dialog.buttons == MessageButtons::OkCancel {
-        zenity.extend(["--ok-label=OK".into(), "--cancel-label=Cancel".into()]);
+    let (yes, no) = match dialog.buttons {
+        MessageButtons::YesNo => ("Yes", "No"),
+        _ => ("OK", "Cancel"),
+    };
+    let accept = dialog.ok_label.as_deref().unwrap_or(yes);
+    let refuse = dialog.cancel_label.as_deref().unwrap_or(no);
+    let custom = dialog.ok_label.is_some() || dialog.cancel_label.is_some();
+    if dialog.buttons == MessageButtons::OkCancel
+        || (custom && dialog.buttons != MessageButtons::Ok)
+    {
+        zenity.extend([
+            format!("--ok-label={accept}").into(),
+            format!("--cancel-label={refuse}").into(),
+        ]);
         kdialog.extend([
             "--yes-label".into(),
-            "OK".into(),
+            accept.into(),
             "--no-label".into(),
-            "Cancel".into(),
+            refuse.into(),
         ]);
+    } else if custom {
+        zenity.push(format!("--ok-label={accept}").into());
     }
     kdialog.extend([kdialog_kind.into(), (&dialog.text).into()]);
     Ok(run(vec![("zenity", zenity), ("kdialog", kdialog)])?.is_some())

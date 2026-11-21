@@ -156,6 +156,9 @@ export interface SaveDialogOptions {
 export interface MessageDialogOptions {
   readonly title?: string;
   readonly kind?: "info" | "warning" | "error";
+  // words for the buttons in place of OK and Cancel, or Yes and No
+  readonly okLabel?: string;
+  readonly cancelLabel?: string;
 }
 
 export interface Dialog {

@@ -92,6 +92,9 @@ pub struct MessageDialog {
     pub level: MessageLevel,
     pub buttons: MessageButtons,
     pub owner: Option<NativeHandle>,
+    // words for the buttons in place of OK and Cancel, or Yes and No
+    pub ok_label: Option<String>,
+    pub cancel_label: Option<String>,
 }
 
 impl MessageDialog {

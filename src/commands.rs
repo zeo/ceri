@@ -275,12 +275,17 @@ struct PickRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MessageRequest {
     message: String,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     kind: MessageLevel,
+    #[serde(default)]
+    ok_label: Option<String>,
+    #[serde(default)]
+    cancel_label: Option<String>,
 }
 
 // a dialog waits on the user, so it answers from a thread of its own; paths go back as strings,
@@ -321,6 +326,8 @@ fn dialog(call: &CommandCall, owner: Option<NativeHandle>) -> Result<String, Com
         level: request.kind,
         buttons,
         owner,
+        ok_label: request.ok_label,
+        cancel_label: request.cancel_label,
     }
     .show()
     .map_err(CommandError::failed)?;
