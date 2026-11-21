@@ -205,6 +205,7 @@ pub(super) enum Native {
     UrlPattern(super::urlpattern::PatternMember),
     XPath(super::xpath::XPathMember),
     StyleOm(super::typed_om::StyleMember),
+    Temporal(super::temporal::TemporalMember),
     PerfObserver(super::perf_observers::ObserverMember),
     PerfDeliver(Rc<super::perf_observers::PerfObserver>),
     DataTransferConstructor,
@@ -292,6 +293,7 @@ impl Native {
                 | Native::UrlPattern(super::urlpattern::PatternMember::Constructor)
                 | Native::XPath(super::xpath::XPathMember::Constructor)
                 | Native::StyleOm(super::typed_om::StyleMember::Construct(_))
+                | Native::Temporal(super::temporal::TemporalMember::Construct(_))
                 | Native::PerfObserver(
                     super::perf_observers::ObserverMember::Constructor
                         | super::perf_observers::ObserverMember::ReportingConstructor
@@ -411,6 +413,7 @@ pub(super) struct Intrinsics {
     pub(super) url_patterns: super::urlpattern::PatternInterfaces,
     pub(super) xpath: super::xpath::XPathInterfaces,
     pub(super) typed_om: super::typed_om::StyleOmInterfaces,
+    pub(super) temporal: super::temporal::TemporalInterfaces,
     pub(super) disposables: super::disposables::DisposableInterfaces,
     pub(super) cssom: super::cssom::CssomInterfaces,
     pub(super) font_faces: super::fontfaces::FontInterfaces,
@@ -1295,6 +1298,8 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     );
     build.method(&date, "UTC", Native::Date(super::dates::DateMethod::Utc), 7);
     globals.push(("Date", Value::Object(date)));
+    let temporal =
+        super::temporal::create(&build, &object_prototype, &date_prototype, &mut globals);
 
     use super::typed::{ELEMENT_KINDS, TYPED_METHODS, TypedMethod as T, VIEW_ACCESSORS};
     let typed_prototype = plain(&object_prototype);
@@ -1784,6 +1789,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         url_patterns,
         xpath,
         typed_om,
+        temporal,
         hosts,
         perf_observers,
         disposables,
@@ -3283,6 +3289,7 @@ impl ScriptRuntime {
             Native::UrlPattern(member) => self.call_url_pattern(member, this, arguments),
             Native::XPath(member) => self.call_xpath(member, this, arguments),
             Native::StyleOm(member) => self.call_style_om(member, this, arguments),
+            Native::Temporal(member) => self.call_temporal(member, this, arguments),
             Native::PerfObserver(member) => self.call_perf_observer(member, this, arguments),
             Native::PerfDeliver(observer) => self.deliver_perf_entries(&observer),
             Native::ViewTransition(transition, which) => {
@@ -3761,6 +3768,9 @@ impl ScriptRuntime {
             Native::Offscreen(_) => self.construct_offscreen(arguments, new_target),
             Native::UrlPattern(_) => self.construct_url_pattern(arguments, new_target),
             Native::XPath(_) => self.construct_xpath_evaluator(new_target),
+            Native::Temporal(super::temporal::TemporalMember::Construct(kind)) => {
+                self.construct_temporal(kind, arguments, new_target)
+            }
             Native::StyleOm(super::typed_om::StyleMember::Construct(name)) => {
                 self.construct_style_om(name, arguments, new_target)
             }

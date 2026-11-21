@@ -711,14 +711,6 @@ test/built-ins/Date/proto-from-ctor-realm-two.js
 test/built-ins/Date/proto-from-ctor-realm-zero.js
 test/built-ins/Date/prototype/toDateString/negative-year.js
 test/built-ins/Date/prototype/toString/negative-year.js
-test/built-ins/Date/prototype/toTemporalInstant/length.js
-test/built-ins/Date/prototype/toTemporalInstant/name.js
-test/built-ins/Date/prototype/toTemporalInstant/not-a-constructor.js
-test/built-ins/Date/prototype/toTemporalInstant/prop-desc.js
-test/built-ins/Date/prototype/toTemporalInstant/this-value-invalid-date.js
-test/built-ins/Date/prototype/toTemporalInstant/this-value-non-date.js
-test/built-ins/Date/prototype/toTemporalInstant/this-value-non-object.js
-test/built-ins/Date/prototype/toTemporalInstant/this-value-valid-date.js
 test/built-ins/Date/prototype/toUTCString/negative-year.js
 test/built-ins/Date/subclassing.js
 test/built-ins/Error/isError/errors-other-realm.js

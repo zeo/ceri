@@ -344,6 +344,14 @@ impl Rule {
         };
         if in_daylight { daylight } else { self.standard }
     }
+
+    fn transitions_near(&self, seconds: i64) -> Vec<i64> {
+        let year = year_of(seconds);
+        (year - 1..=year + 1)
+            .filter_map(|year| self.changes(year))
+            .flat_map(|(start, end)| [start, end])
+            .collect()
+    }
 }
 
 impl Zone {
@@ -359,6 +367,68 @@ impl Zone {
             return rule.offset(seconds);
         }
         self.types[usize::from(self.indices[after - 1])].0
+    }
+
+    // the instants whose wall clock reads a local time: one, two in a fold, none in a gap
+    pub(super) fn possible(&self, local: i64) -> Vec<i64> {
+        let mut found: Vec<i64> = [self.offset(local - DAY), self.offset(local + DAY)]
+            .into_iter()
+            .map(|offset| local - i64::from(offset))
+            .filter(|&instant| i64::from(self.offset(instant)) == local - instant)
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
+    // the nearest instant after, or with next false before, where the offset changes
+    pub(super) fn transition(&self, seconds: i64, next: bool) -> Option<i64> {
+        let changes = |time: i64| self.offset(time - 1) != self.offset(time);
+        if next {
+            let start = self.times.partition_point(|&time| time <= seconds);
+            if let Some(&time) = self.times[start..].iter().find(|&&time| changes(time)) {
+                return Some(time);
+            }
+            let rule = self.rule.as_ref()?;
+            let floor = self.times.last().copied().unwrap_or(i64::MIN).max(seconds);
+            let mut year_from = floor;
+            // a zone's rule repeats every year, so a few years ahead always finds one
+            for _ in 0..4 {
+                let mut candidates: Vec<i64> = rule
+                    .transitions_near(year_from)
+                    .into_iter()
+                    .filter(|&time| time > floor && changes(time))
+                    .collect();
+                candidates.sort_unstable();
+                if let Some(&time) = candidates.first() {
+                    return Some(time);
+                }
+                year_from += 365 * DAY;
+            }
+            None
+        } else {
+            let last_table = self.times.last().copied();
+            if let Some(rule) = &self.rule
+                && last_table.is_none_or(|last| seconds > last)
+            {
+                let mut candidates: Vec<i64> = rule
+                    .transitions_near(seconds)
+                    .into_iter()
+                    .filter(|&time| time < seconds && last_table.is_none_or(|last| time > last))
+                    .filter(|&time| changes(time))
+                    .collect();
+                candidates.sort_unstable();
+                if let Some(&time) = candidates.last() {
+                    return Some(time);
+                }
+            }
+            let end = self.times.partition_point(|&time| time < seconds);
+            self.times[..end]
+                .iter()
+                .rev()
+                .copied()
+                .find(|&time| changes(time))
+        }
     }
 }
 
@@ -379,6 +449,21 @@ mod tests {
         // the rule past the table: summer of 2300 is still daylight time
         assert_eq!(york.offset(seconds(2300, 7, 1, 0)), -4 * 3600);
         assert_eq!(york.offset(seconds(2300, 12, 1, 0)), -5 * 3600);
+        // 2024-03-10 02:30 does not exist and 2024-11-03 01:30 happens twice
+        assert!(york.possible(seconds(2024, 3, 10, 2) + 1800).is_empty());
+        assert_eq!(york.possible(seconds(2024, 11, 3, 1) + 1800).len(), 2);
+        assert_eq!(
+            york.transition(seconds(2024, 1, 1, 0), true),
+            Some(seconds(2024, 3, 10, 7))
+        );
+        assert_eq!(
+            york.transition(seconds(2024, 3, 10, 7), false),
+            Some(seconds(2023, 11, 5, 6))
+        );
+        assert_eq!(
+            york.transition(seconds(2400, 1, 1, 0), true),
+            Some(seconds(2400, 3, 12, 7))
+        );
         let (_, sydney) = lookup("Australia/Sydney").expect("Sydney");
         assert_eq!(sydney.offset(seconds(2300, 1, 1, 0)), 11 * 3600);
         assert_eq!(sydney.offset(seconds(2300, 7, 1, 0)), 10 * 3600);
@@ -387,6 +472,7 @@ mod tests {
         assert_eq!(primary("us/eastern"), Some("America/New_York"));
         let (_, utc) = lookup("UTC").expect("UTC");
         assert_eq!(utc.offset(0), 0);
+        assert_eq!(utc.transition(0, true), None);
         assert!(lookup("Mars/Olympus").is_none());
     }
 }

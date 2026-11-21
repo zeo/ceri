@@ -498,6 +498,36 @@ impl BigInt {
         u64::from(*limbs.first().unwrap_or(&0)) | (u64::from(*limbs.get(1).unwrap_or(&0)) << 32)
     }
 
+    // the value as an i128, when it fits one
+    pub(super) fn to_i128(&self) -> Option<i128> {
+        if self.limbs.len() > 4 {
+            return None;
+        }
+        let magnitude = self
+            .limbs
+            .iter()
+            .rev()
+            .fold(0_u128, |total, &limb| (total << 32) | u128::from(limb));
+        if self.negative {
+            0_i128.checked_sub_unsigned(magnitude)
+        } else {
+            i128::try_from(magnitude).ok()
+        }
+    }
+
+    pub(super) fn from_i128(value: i128) -> Self {
+        let mut magnitude = value.unsigned_abs();
+        let mut limbs = Vec::new();
+        while magnitude > 0 {
+            limbs.push(magnitude as u32);
+            magnitude >>= 32;
+        }
+        Self {
+            negative: value < 0,
+            limbs,
+        }
+    }
+
     pub(super) fn from_u64(value: u64) -> Self {
         Self::from_parts(false, vec![value as u32, (value >> 32) as u32])
     }

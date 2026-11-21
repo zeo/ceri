@@ -69,6 +69,7 @@ mod segmenter;
 mod sockets;
 mod streams;
 mod strings;
+mod temporal;
 mod typed;
 mod typed_om;
 mod tz;
