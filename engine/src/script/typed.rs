@@ -223,6 +223,8 @@ pub(super) enum TypedMethod {
     ViewByteOffset,
     ViewGet(ElementKind),
     ViewSet(ElementKind),
+    // the base64 and hex methods only Uint8Array has
+    Text(super::base64::TextMethod),
 }
 
 pub(super) const TYPED_METHODS: &[(&str, TypedMethod, u32)] = &[
@@ -397,6 +399,7 @@ impl ScriptRuntime {
         use TypedMethod as M;
         let first = argument(&arguments, 0);
         match method {
+            M::Text(method) => self.call_uint8_text(method, this, arguments),
             M::Constructor(kind) => {
                 if new_target.is_none() {
                     return Err(

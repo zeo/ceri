@@ -1060,6 +1060,19 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
             "BYTES_PER_ELEMENT".to_string(),
             fixed(Value::Number(kind.size() as f64)),
         );
+        if *kind == super::typed::ElementKind::Uint8 {
+            use super::base64::TextMethod as X;
+            for (target, key, method, length) in [
+                (&prototype, "toBase64", X::ToBase64, 0),
+                (&prototype, "toHex", X::ToHex, 0),
+                (&prototype, "setFromBase64", X::SetFromBase64, 1),
+                (&prototype, "setFromHex", X::SetFromHex, 1),
+                (&constructor, "fromBase64", X::FromBase64, 1),
+                (&constructor, "fromHex", X::FromHex, 1),
+            ] {
+                build.method(target, key, Native::Typed(T::Text(method)), length);
+            }
+        }
         globals.push((name, Value::Object(constructor)));
         typed_prototypes.push(prototype);
     }

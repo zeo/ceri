@@ -2,6 +2,7 @@ mod animations;
 mod arrays;
 mod ast;
 mod audio;
+mod base64;
 mod bigint;
 mod bridge;
 mod broadcast;
