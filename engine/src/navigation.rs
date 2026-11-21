@@ -4852,6 +4852,52 @@ mod tests {
     }
 
     #[test]
+    fn view_transitions_run_the_update_and_settle_in_order() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id='status'>idle</p><script>
+              const seen = [];
+              const status = document.getElementById("status");
+              const first = document.startViewTransition(async () => { seen.push("update"); status.dataset.step = "1"; });
+              seen.push(first instanceof ViewTransition, document.activeViewTransition === first, "started");
+              first.updateCallbackDone.then(() => seen.push("done"));
+              first.ready.then(() => seen.push("ready"));
+              first.finished.then(() => {
+                seen.push("finished", document.activeViewTransition);
+                const skipped = document.startViewTransition(() => seen.push("second update"));
+                skipped.skipTransition();
+                skipped.ready.catch((error) => seen.push(error.name));
+                skipped.finished.then(() => {
+                  const failing = document.startViewTransition({ update() { throw new RangeError("no"); } });
+                  failing.ready.catch(() => {});
+                  failing.finished.catch(() => {});
+                  failing.updateCallbackDone.catch((error) => {
+                    seen.push(error.name);
+                    status.textContent = seen.join("|");
+                  });
+                });
+              });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/index.html")
+            .expect("packaged document should load");
+        for _ in 0..4 {
+            browser.advance_time(16).expect("rendering step");
+        }
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "true|true|started|update|done|ready|finished||AbortError|second update|RangeError"
+            )
+        );
+    }
+
+    #[test]
     fn browser_pumps_a_packaged_worker_without_a_loopback_server() {
         let mut resources = bundle(
             r#"<p id='status'>idle</p><script>

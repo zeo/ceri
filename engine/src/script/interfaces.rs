@@ -364,6 +364,8 @@ static INTERFACES: &[Interface] = &[
             ("importNode", Method(1)),
             ("adoptNode", Method(1)),
             ("createEvent", Method(1)),
+            ("startViewTransition", Method(0)),
+            ("activeViewTransition", ReadOnly),
             ("createRange", Method(0)),
             ("createTreeWalker", Method(1)),
             ("getAnimations", Method(0)),
@@ -1877,6 +1879,8 @@ impl ScriptRuntime {
                 self.replace_children_quietly(target, Some(fragment));
                 Value::Undefined
             }
+            ("startViewTransition", Access::Call) => self.start_view_transition(first)?,
+            ("activeViewTransition", Access::Get) => self.active_view_transition(),
             ("createEvent", Access::Call) => {
                 let interface = self.coerce_string(first)?;
                 self.create_legacy_event(&interface)?

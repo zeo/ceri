@@ -170,6 +170,10 @@ pub(super) enum Native {
     Segmenter(super::segmenter::SegmenterMember),
     Disposable(super::disposables::DisposableMember, bool),
     Atomics(super::atomics::AtomicsOp),
+    ViewTransition(
+        Rc<super::viewtransitions::ViewTransition>,
+        super::viewtransitions::TransitionStep,
+    ),
     Cssom(super::cssom::CssomMember),
     Font(super::fontfaces::FontMember),
     // DOMMatrixReadOnly when true, DOMMatrix otherwise
@@ -306,6 +310,7 @@ const HOST_INTERFACES: &[&str] = &[
     "CanvasRenderingContext2D",
     "ImageBitmap",
     "VisualViewport",
+    "ViewTransition",
 ];
 
 pub(super) struct Intrinsics {
@@ -3145,6 +3150,9 @@ impl ScriptRuntime {
                 self.call_disposable(member, asynchronous, this, arguments)
             }
             Native::Atomics(op) => self.call_atomics(op, arguments),
+            Native::ViewTransition(transition, which) => {
+                self.step_view_transition(&transition, which, first)
+            }
             Native::Cssom(member) => self.call_cssom(member, this, arguments),
             Native::Font(member) => self.call_font(member, this, arguments),
             Native::MatrixConstructor(_) => Err(self.type_error(

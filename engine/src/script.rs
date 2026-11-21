@@ -62,6 +62,7 @@ mod streams;
 mod strings;
 mod typed;
 mod urls;
+mod viewtransitions;
 mod vm;
 mod websocket;
 mod xhr;
@@ -647,6 +648,8 @@ pub struct ScriptRuntime {
     performance: Value,
     // window.visualViewport, which hears resize with the window
     visual_viewport: Option<ObjectHandle>,
+    // the view transition under way and the object script holds for it
+    view_transition: Option<(Value, Rc<viewtransitions::ViewTransition>)>,
     // the viewport size the last resize steps saw, so a change fires resize
     reported_viewport: Option<(f32, f32)>,
     performance_entries: Vec<geometry::PerformanceEntry>,
@@ -1825,6 +1828,7 @@ impl ScriptRuntime {
             media_list_prototype: None,
             performance: Value::Undefined,
             visual_viewport: None,
+            view_transition: None,
             reported_viewport: None,
             performance_entries: Vec::new(),
             event_targets: HashMap::new(),
