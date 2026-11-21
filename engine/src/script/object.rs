@@ -114,6 +114,8 @@ pub(super) enum ObjectClass {
     UrlSearchParams(Rc<RefCell<super::urls::ParamsState>>),
     // a TreeWalker or NodeIterator
     Walk(Rc<RefCell<super::traversal::WalkState>>),
+    // what an iterator helper such as map or take hands back
+    IteratorHelper(Rc<RefCell<super::iterator_helpers::HelperState>>),
 }
 
 #[derive(Clone)]

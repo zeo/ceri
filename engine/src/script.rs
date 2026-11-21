@@ -24,6 +24,7 @@ mod import_map;
 mod inspector;
 mod interfaces;
 mod intl;
+mod iterator_helpers;
 mod json;
 mod messaging;
 mod traversal;

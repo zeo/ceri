@@ -157,6 +157,7 @@ pub(super) enum Native {
     ReaderDeliver(u32, u64),
     Port(super::messaging::PortMember),
     Walk(super::traversal::WalkMember),
+    Helper(super::iterator_helpers::HelperMember),
     Anim(super::animations::AnimMember),
     AnimConstructor,
     ClipboardItemConstructor,
@@ -222,6 +223,7 @@ impl Native {
                 | Native::ReaderConstructor
                 | Native::AnimConstructor
                 | Native::ClipboardItemConstructor
+                | Native::Helper(super::iterator_helpers::HelperMember::Constructor)
                 | Native::RectConstructor(_)
                 | Native::PointConstructor(_)
                 | Native::PortConstructor
@@ -297,6 +299,7 @@ pub(super) struct Intrinsics {
     pub(super) readers: super::filereader::ReaderInterfaces,
     pub(super) ports: super::messaging::PortInterfaces,
     pub(super) traversal: super::traversal::TraversalInterfaces,
+    pub(super) helpers: super::iterator_helpers::HelperInterfaces,
     pub(super) animations: super::animations::AnimInterfaces,
     pub(super) shapes: super::geometry_values::ShapeInterfaces,
     pub(super) urls: super::urls::UrlInterfaces,
@@ -1304,6 +1307,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let channels = super::broadcast::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let readers = super::filereader::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let traversal = super::traversal::create(&build, &object_prototype, &mut globals);
+    let helpers = super::iterator_helpers::create(&build, &iterator_prototype, &mut globals);
     let animations = super::animations::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let clipboard_item = build.constructor(
         Native::ClipboardItemConstructor,
@@ -1377,6 +1381,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         readers,
         ports,
         traversal,
+        helpers,
         animations,
         shapes,
         urls,
@@ -2730,6 +2735,7 @@ impl ScriptRuntime {
             Native::ReaderDeliver(id, generation) => self.deliver_reader(id, generation),
             Native::Port(member) => self.call_port(member, this, arguments),
             Native::Walk(member) => self.call_walk(member, this, arguments),
+            Native::Helper(member) => self.call_iterator_helper(member, this, arguments),
             Native::Anim(member) => self.call_animation(member, this, arguments),
             Native::AnimFinish(id, generation) => self.deliver_animation_finish(id, generation),
             Native::Shape(member) => self.call_shape(member, this, arguments),
@@ -3095,6 +3101,7 @@ impl ScriptRuntime {
             Native::ReaderConstructor => self.construct_reader(new_target),
             Native::MessageChannelConstructor => self.construct_message_channel(new_target),
             Native::AnimConstructor => Err(self.type_error("Illegal constructor")),
+            Native::Helper(_) => self.construct_iterator(new_target),
             Native::ClipboardItemConstructor => {
                 self.call_clipboard_member(super::Builtin::ClipboardItemConstructor, arguments)
             }
