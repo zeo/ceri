@@ -66,6 +66,8 @@ struct Context {
     in_async: bool,
     in_generator: bool,
     in_class_field: bool,
+    // a class static block reserves await up to the next function, arrow parameters included
+    in_static_block: bool,
     allow_super_call: bool,
     allow_super_member: bool,
     strict: bool,
@@ -194,6 +196,82 @@ pub(super) fn number_key(value: f64) -> Name {
     }
 }
 
+// the hidden bindings a block with using declarations disposes through, names no script can write
+const USING_SCOPE: &str = "%using";
+const USING_ERROR: &str = "%usingerror";
+const USING_VALUE: &str = "%usingvalue";
+
+// whether a statement list declares with using, and whether any of it is await using
+fn using_kind(body: &[Stmt]) -> Option<bool> {
+    let mut found = None;
+    for statement in body {
+        if let Stmt::Declaration { declarators, .. } = statement {
+            for declarator in declarators {
+                if let Some(Expr::Disposal(Disposal::Use { asynchronous }, _)) = &declarator.init {
+                    found = Some(found.unwrap_or(false) || *asynchronous);
+                }
+            }
+        }
+    }
+    found
+}
+
+fn using_declarators(declarators: Vec<Declarator>, asynchronous: bool) -> Vec<Declarator> {
+    declarators
+        .into_iter()
+        .map(|Declarator { target, init }| Declarator {
+            target,
+            init: init.map(|init| {
+                Expr::Disposal(
+                    Disposal::Use { asynchronous },
+                    vec![Expr::Identifier(USING_SCOPE.into()), init],
+                )
+            }),
+        })
+        .collect()
+}
+
+// a list holding using declarations runs inside a try whose catch disposes with the error and
+// whose finally disposes on every other way out
+fn wrap_using(body: Vec<Stmt>, asynchronous: bool) -> Vec<Stmt> {
+    let end = |error: bool| {
+        let mut arguments = vec![Expr::Identifier(USING_SCOPE.into())];
+        if error {
+            arguments.push(Expr::Identifier(USING_ERROR.into()));
+        }
+        let end = Expr::Disposal(Disposal::End { error }, arguments);
+        Stmt::Expression(if asynchronous {
+            Expr::Await(Box::new(end))
+        } else {
+            end
+        })
+    };
+    vec![
+        Stmt::Declaration {
+            kind: DeclarationKind::Const,
+            declarators: vec![Declarator {
+                target: Pattern::Identifier(USING_SCOPE.into()),
+                init: Some(Expr::Disposal(Disposal::Scope { asynchronous }, Vec::new())),
+            }],
+        },
+        Stmt::Try {
+            block: body,
+            handler: Some(CatchClause {
+                param: Some(Pattern::Identifier(USING_ERROR.into())),
+                body: vec![end(true)],
+            }),
+            finalizer: Some(vec![end(false)]),
+        },
+    ]
+}
+
+fn with_using(body: Vec<Stmt>) -> Vec<Stmt> {
+    match using_kind(&body) {
+        Some(asynchronous) => wrap_using(body, asynchronous),
+        None => body,
+    }
+}
+
 impl<'a> Parser<'a> {
     pub(super) fn new(source: &'a str) -> Self {
         Self {
@@ -210,6 +288,9 @@ impl<'a> Parser<'a> {
         let (body, strict) = self.parse_body_with_directives(true)?;
         self.expect_eof()?;
         self.check_declarations(&[body.as_slice()], None, true, false)?;
+        if using_kind(&body).is_some() {
+            return Err(self.error_here("using declarations belong in a block, function or module"));
+        }
         Ok(Script { body, strict })
     }
 
@@ -228,7 +309,13 @@ impl<'a> Parser<'a> {
                 items.extend(self.parse_export()?);
             } else {
                 items.push(ModuleItem::Statement(Stmt::Position(self.offset()?)));
-                items.push(ModuleItem::Statement(self.parse_statement_list_item()?));
+                let statement = self.parse_statement_list_item()?;
+                if using_kind(std::slice::from_ref(&statement)).is_some() {
+                    return Err(self.error_here(
+                        "using declarations at the top level of a module are not supported",
+                    ));
+                }
+                items.push(ModuleItem::Statement(statement));
             }
         }
         Ok(Module { items })
@@ -399,7 +486,8 @@ impl<'a> Parser<'a> {
         RESERVED.contains(&name)
             && !(name == "yield" && !self.context.in_generator && !self.context.strict)
             || self.context.strict && STRICT_RESERVED.contains(&name)
-            || name == "await" && (self.context.in_async || self.context.module)
+            || name == "await"
+                && (self.context.in_async || self.context.module || self.context.in_static_block)
     }
 
     fn is_binding_identifier(&mut self) -> Result<bool, ScriptError> {
@@ -629,6 +717,24 @@ impl<'a> Parser<'a> {
             let class = self.parse_class(true)?;
             return Ok(Stmt::Class(class));
         }
+        if let Some(asynchronous) = self.using_declaration(false)? {
+            if asynchronous {
+                self.advance()?;
+            }
+            self.advance()?;
+            let declarators = self.parse_declarators(DeclarationKind::Const, true)?;
+            if declarators
+                .iter()
+                .any(|declarator| !matches!(declarator.target, Pattern::Identifier(_)))
+            {
+                return Err(self.error_here("a using declaration binds names, not patterns"));
+            }
+            self.consume_semicolon()?;
+            return Ok(Stmt::Declaration {
+                kind: DeclarationKind::Const,
+                declarators: using_declarators(declarators, asynchronous),
+            });
+        }
         if self.is_word("const")? || self.is_let_declaration()? {
             let kind = if self.eat_word("const")? {
                 DeclarationKind::Const
@@ -641,6 +747,35 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::Declaration { kind, declarators });
         }
         self.parse_statement()
+    }
+
+    // Some(true) at "await using" and Some(false) at "using" when a name follows on the same
+    // line; a for head does not read "using of" as a declaration
+    fn using_declaration(&mut self, for_head: bool) -> Result<Option<bool>, ScriptError> {
+        let (asynchronous, at) = if self.is_word("using")? {
+            (false, 1)
+        } else if self.is_word("await")?
+            && (self.context.in_async || self.context.module)
+            && self.is_word_at(1, "using")?
+            && !self.peek_at(1)?.newline_before
+        {
+            (true, 2)
+        } else {
+            return Ok(None);
+        };
+        let next = self.peek_at(at)?;
+        let binding = !next.newline_before
+            && match &next.kind {
+                TokenKind::Identifier(name) => {
+                    (!RESERVED.contains(&name.as_str())
+                        || matches!(name.as_str(), "yield" | "await"))
+                        && name != "let"
+                        && !(for_head && name == "of")
+                }
+                TokenKind::EscapedIdentifier(_) => true,
+                _ => false,
+            };
+        Ok(binding.then_some(asynchronous))
     }
 
     // "let" starts a declaration when a binding follows it, otherwise it is a name
@@ -858,7 +993,7 @@ impl<'a> Parser<'a> {
         }
         self.advance()?;
         self.check_declarations(&[body.as_slice()], None, false, false)?;
-        Ok(body)
+        Ok(with_using(body))
     }
 
     fn parse_if(&mut self) -> Result<Stmt, ScriptError> {
@@ -888,8 +1023,65 @@ impl<'a> Parser<'a> {
             false
         };
         self.expect_punct("(")?;
+        let mut using = None;
         let init = if self.is_punct(";")? {
             None
+        } else if let Some(asynchronous) = self.using_declaration(true)? {
+            if asynchronous {
+                self.advance()?;
+            }
+            self.advance()?;
+            let target = self.parse_binding_target()?;
+            if !matches!(target, Pattern::Identifier(_)) {
+                return Err(self.error_here("a using declaration binds names, not patterns"));
+            }
+            if self.eat_word("of")? {
+                let right = self.parse_assignment(true)?;
+                self.expect_punct(")")?;
+                let body = self.parse_statement()?;
+                let declaration = Stmt::Declaration {
+                    kind: DeclarationKind::Const,
+                    declarators: using_declarators(
+                        vec![Declarator {
+                            target,
+                            init: Some(Expr::Identifier(USING_VALUE.into())),
+                        }],
+                        asynchronous,
+                    ),
+                };
+                let statements = vec![declaration, body];
+                self.check_declarations(&[statements.as_slice()], None, false, false)?;
+                return Ok(Stmt::ForOf {
+                    left: ForHead::Declaration {
+                        kind: DeclarationKind::Const,
+                        target: Pattern::Identifier(USING_VALUE.into()),
+                    },
+                    right,
+                    body: Box::new(Stmt::Block(wrap_using(statements, asynchronous))),
+                    is_await,
+                });
+            }
+            if self.is_word("in")? {
+                return Err(self.error_here("a for-in head cannot declare with using"));
+            }
+            self.expect_punct("=")?;
+            let mut declarators = vec![Declarator {
+                target,
+                init: Some(self.parse_assignment(false)?),
+            }];
+            if self.eat_punct(",")? {
+                declarators.extend(self.parse_declarators(DeclarationKind::Const, false)?);
+            }
+            if declarators.iter().any(|declarator| {
+                declarator.init.is_none() || !matches!(declarator.target, Pattern::Identifier(_))
+            }) {
+                return Err(self.error_here("a using declaration needs a name and an initializer"));
+            }
+            using = Some(asynchronous);
+            Some(ForInit::Declaration {
+                kind: DeclarationKind::Const,
+                declarators: using_declarators(declarators, asynchronous),
+            })
         } else if self.is_word("var")? || self.is_word("const")? || self.is_let_declaration()? {
             let kind = match self.advance()?.kind {
                 TokenKind::Identifier(word) if word == "var" => DeclarationKind::Var,
@@ -936,11 +1128,15 @@ impl<'a> Parser<'a> {
         };
         self.expect_punct(")")?;
         let body = Box::new(self.parse_statement()?);
-        Ok(Stmt::For {
+        let statement = Stmt::For {
             init,
             test,
             update,
             body,
+        };
+        Ok(match using {
+            Some(asynchronous) => Stmt::Block(wrap_using(vec![statement], asynchronous)),
+            None => statement,
         })
     }
 
@@ -998,6 +1194,9 @@ impl<'a> Parser<'a> {
         // collide across the cases as one list
         let bodies: Vec<&[Stmt]> = cases.iter().map(|case| case.body.as_slice()).collect();
         self.check_declarations(&bodies, None, false, false)?;
+        if bodies.iter().any(|body| using_kind(body).is_some()) {
+            return Err(self.error_here("a case clause cannot declare with using"));
+        }
         Ok(Stmt::Switch {
             discriminant,
             cases,
@@ -1376,6 +1575,7 @@ impl<'a> Parser<'a> {
     ) -> Result<Expr, ScriptError> {
         let saved = self.context;
         self.context.in_async = is_async;
+        self.context.in_static_block = false;
         self.context.in_generator = false;
         self.context.in_function = true;
         let body = if self.eat_punct("{")? {
@@ -1388,7 +1588,7 @@ impl<'a> Parser<'a> {
                 false,
             )?;
             self.context.strict = strict;
-            body
+            with_using(body)
         } else {
             vec![
                 Stmt::Position(self.offset()?),
@@ -2140,6 +2340,7 @@ impl<'a> Parser<'a> {
         let saved = self.context;
         let outer_eval = self.eval_context.take();
         self.context.in_async = is_async;
+        self.context.in_static_block = false;
         self.context.in_generator = is_generator;
         self.context.in_function = true;
         self.context.allow_new_target = true;
@@ -2161,6 +2362,7 @@ impl<'a> Parser<'a> {
             true,
             false,
         )?;
+        let body = with_using(body);
         self.context = saved;
         let eval_context = std::mem::replace(&mut self.eval_context, outer_eval);
         Ok(Rc::new(FunctionNode {
@@ -2207,6 +2409,7 @@ impl<'a> Parser<'a> {
             let saved = self.context;
             self.context.in_generator = is_generator;
             self.context.in_async = is_async;
+            self.context.in_static_block = false;
             let name = self.parse_declared_identifier();
             self.context = saved;
             Some(name?)
@@ -2350,6 +2553,7 @@ impl<'a> Parser<'a> {
                 self.context.allow_super_member = true;
                 self.context.allow_super_call = false;
                 self.context.in_async = false;
+                self.context.in_static_block = false;
                 self.context.in_generator = false;
                 let value_start = self.offset()?;
                 let value = self.parse_assignment(true)?;
@@ -2402,6 +2606,7 @@ impl<'a> Parser<'a> {
         self.context.allow_super_member = true;
         self.context.allow_super_call = false;
         self.context.in_class_field = true;
+        self.context.in_static_block = true;
         self.expect_punct("{")?;
         let body = self.parse_block_body()?;
         self.context = saved;

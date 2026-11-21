@@ -34,6 +34,8 @@ struct Resource {
     value: Value,
     method: Value,
     call: Call,
+    // added as await using or to an async stack, so its result is awaited
+    asynchronous: bool,
 }
 
 pub(super) struct DisposableStack {
@@ -43,7 +45,7 @@ pub(super) struct DisposableStack {
 }
 
 // an async disposal under way: what is left, the error so far, and whether anything was awaited
-pub(super) struct Disposal {
+pub(super) struct AsyncDisposal {
     result: PromiseHandle,
     resources: RefCell<Vec<Resource>>,
     error: RefCell<Option<Value>>,
@@ -168,6 +170,7 @@ impl ScriptRuntime {
                 value: Value::Undefined,
                 method: Value::Undefined,
                 call: Call::Method,
+                asynchronous,
             }));
         }
         if is_primitive(&value) {
@@ -192,12 +195,13 @@ impl ScriptRuntime {
             }));
         }
         if !is_callable(&method) {
-            return Err(self.type_error("Disposal method is not a function"));
+            return Err(self.type_error("AsyncDisposal method is not a function"));
         }
         Ok(Some(Resource {
             value,
             method,
             call,
+            asynchronous,
         }))
     }
 
@@ -234,8 +238,11 @@ impl ScriptRuntime {
         });
     }
 
-    fn dispose_resources(&mut self, resources: Vec<Resource>) -> Option<Value> {
-        let mut error = None;
+    fn dispose_resources(
+        &mut self,
+        resources: Vec<Resource>,
+        mut error: Option<Value>,
+    ) -> Option<Value> {
         for resource in resources.into_iter().rev() {
             if let Err(thrown) = self.call_resource(&resource) {
                 let thrown = self.take_thrown(thrown);
@@ -245,11 +252,15 @@ impl ScriptRuntime {
         error
     }
 
-    fn dispose_resources_async(&mut self, resources: Vec<Resource>) -> PromiseHandle {
-        let disposal = Rc::new(Disposal {
+    fn dispose_resources_async(
+        &mut self,
+        resources: Vec<Resource>,
+        error: Option<Value>,
+    ) -> PromiseHandle {
+        let disposal = Rc::new(AsyncDisposal {
             result: Self::pending_promise(),
             resources: RefCell::new(resources),
-            error: RefCell::new(None),
+            error: RefCell::new(error),
             awaited: Cell::new(false),
             needs_await: Cell::new(false),
         });
@@ -257,7 +268,7 @@ impl ScriptRuntime {
         disposal.result.clone()
     }
 
-    fn continue_disposal(&mut self, disposal: &Rc<Disposal>) {
+    fn continue_disposal(&mut self, disposal: &Rc<AsyncDisposal>) {
         loop {
             let next = disposal.resources.borrow_mut().pop();
             let Some(resource) = next else {
@@ -275,6 +286,20 @@ impl ScriptRuntime {
             };
             if is_nullish(&resource.method) {
                 disposal.needs_await.set(true);
+                continue;
+            }
+            if !resource.asynchronous {
+                // a plain using in an async scope still waits once for any await using of null
+                // before it, but its own result is not awaited
+                if disposal.needs_await.replace(false) && !disposal.awaited.get() {
+                    disposal.resources.borrow_mut().push(resource);
+                    self.await_disposal(disposal, Value::Undefined);
+                    return;
+                }
+                if let Err(thrown) = self.call_resource(&resource) {
+                    let thrown = self.take_thrown(thrown);
+                    self.suppress(&mut disposal.error.borrow_mut(), thrown);
+                }
                 continue;
             }
             match self.call_resource(&resource) {
@@ -298,7 +323,7 @@ impl ScriptRuntime {
         }
     }
 
-    fn await_disposal(&mut self, disposal: &Rc<Disposal>, value: Value) {
+    fn await_disposal(&mut self, disposal: &Rc<AsyncDisposal>, value: Value) {
         let step = |rejected| {
             Value::Builtin(Builtin::Native(Native::Promise(Rc::new(
                 PromiseFunction::DisposalStep(disposal.clone(), rejected),
@@ -316,7 +341,7 @@ impl ScriptRuntime {
 
     pub(super) fn step_disposal(
         &mut self,
-        disposal: &Rc<Disposal>,
+        disposal: &Rc<AsyncDisposal>,
         rejected: bool,
         settled: Value,
     ) -> Result<Value, ScriptError> {
@@ -325,6 +350,61 @@ impl ScriptRuntime {
         }
         self.continue_disposal(disposal);
         Ok(Value::Undefined)
+    }
+
+    // a block's using declarations keep their resources in a stack no script can reach
+    pub(super) fn using_scope(&self, asynchronous: bool) -> Value {
+        Value::Object(new_object(JsObject::with_prototype(
+            None,
+            ObjectClass::DisposableStack(Rc::new(DisposableStack {
+                asynchronous,
+                disposed: Cell::new(false),
+                resources: RefCell::new(Vec::new()),
+            })),
+        )))
+    }
+
+    fn using_stack(scope: &Value) -> Rc<DisposableStack> {
+        Self::disposable_stack(scope, true)
+            .or_else(|| Self::disposable_stack(scope, false))
+            .expect("a using scope holds a stack")
+    }
+
+    pub(super) fn using_add(
+        &mut self,
+        scope: &Value,
+        value: Value,
+        asynchronous: bool,
+    ) -> Result<Value, ScriptError> {
+        let stack = Self::using_stack(scope);
+        if let Some(resource) = self.disposable_resource(value.clone(), asynchronous)? {
+            stack.resources.borrow_mut().push(resource);
+        }
+        Ok(value)
+    }
+
+    // disposes once, from the catch with the error or from the finally; an async scope hands
+    // back the promise its block awaits
+    pub(super) fn using_end(
+        &mut self,
+        scope: &Value,
+        thrown: Option<Value>,
+    ) -> Result<Value, ScriptError> {
+        let stack = Self::using_stack(scope);
+        let resources = if stack.disposed.replace(true) {
+            Vec::new()
+        } else {
+            std::mem::take(&mut *stack.resources.borrow_mut())
+        };
+        if stack.asynchronous {
+            return Ok(Value::Promise(
+                self.dispose_resources_async(resources, thrown),
+            ));
+        }
+        match self.dispose_resources(resources, thrown) {
+            Some(error) => Err(self.throw_value(error)),
+            None => Ok(Value::Undefined),
+        }
     }
 
     pub(super) fn call_disposable(
@@ -370,9 +450,11 @@ impl ScriptRuntime {
                     std::mem::take(&mut *stack.resources.borrow_mut())
                 };
                 if asynchronous {
-                    return Ok(Value::Promise(self.dispose_resources_async(resources)));
+                    return Ok(Value::Promise(
+                        self.dispose_resources_async(resources, None),
+                    ));
                 }
-                return match self.dispose_resources(resources) {
+                return match self.dispose_resources(resources, None) {
                     Some(error) => Err(self.throw_value(error)),
                     None => Ok(Value::Undefined),
                 };
@@ -399,6 +481,7 @@ impl ScriptRuntime {
                     value: value.clone(),
                     method: on_dispose,
                     call: Call::Adopted,
+                    asynchronous,
                 });
                 Ok(value)
             }
@@ -411,6 +494,7 @@ impl ScriptRuntime {
                     value: Value::Undefined,
                     method: on_dispose,
                     call: Call::Method,
+                    asynchronous,
                 });
                 Ok(Value::Undefined)
             }
@@ -438,6 +522,65 @@ impl ScriptRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn using_declarations_dispose_when_their_block_ends() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [];
+                const out = document.getElementById("out");
+                const resource = (name, fail) => ({
+                    [Symbol.dispose]() { seen.push("-" + name); if (fail) throw new Error(name); },
+                });
+                function early() {
+                    using a = resource("a"), b = resource("b");
+                    seen.push("body");
+                    return "returned";
+                }
+                seen.push(early());
+                for (let i = 0; i < 3; i++) {
+                    using c = resource("c" + i);
+                    if (i === 1) break;
+                }
+                for (using d of [resource("d0"), resource("d1")]) seen.push("of");
+                try {
+                    using e = resource("e", true);
+                    throw new Error("body");
+                } catch (error) {
+                    seen.push(error.name, error.error.message, error.suppressed.message);
+                }
+                try { using f = 1; } catch (error) { seen.push(error.name); }
+                { using g = null; using h = resource("h"); }
+                const named = (() => { using fn = class { static [Symbol.dispose]() {} }; return fn.name; })();
+                seen.push(named);
+                for (const source of ["using x = resource('top');", "switch (1) { case 1: using y = null; }"]) {
+                    try { eval(source); } catch (error) { seen.push(error.name); }
+                }
+                (async () => {
+                    {
+                        await using later = { async [Symbol.asyncDispose]() { await null; seen.push("-async"); } };
+                        using now = resource("sync");
+                    }
+                    seen.push("after");
+                    out.textContent = seen.join("|");
+                })();
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some(
+                "body|-b|-a|returned|-c0|-c1|of|-d0|of|-d1|-e|SuppressedError|e|body|TypeError|\
+                 -h|fn|SyntaxError|SyntaxError|-sync|-async|after"
+            )
+        );
+    }
 
     #[test]
     fn stacks_dispose_last_first_and_chain_suppressed_errors() {

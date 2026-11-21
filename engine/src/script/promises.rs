@@ -72,7 +72,7 @@ pub(super) enum PromiseFunction {
     FromAsync,
     // a step of Array.fromAsync once what it awaited settled
     FromAsyncStep(Rc<super::from_async::FromAsync>, super::from_async::Phase),
-    DisposalStep(Rc<super::disposables::Disposal>, bool),
+    DisposalStep(Rc<super::disposables::AsyncDisposal>, bool),
 }
 
 fn argument(arguments: &[Value], index: usize) -> Value {

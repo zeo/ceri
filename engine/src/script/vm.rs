@@ -2203,6 +2203,22 @@ impl ScriptRuntime {
                 self.iterable_callsite = None;
                 frames.last_mut().expect("frame").stack.push(iterator?);
             }
+            Op::Disposal(step) => {
+                let value = match step {
+                    super::ast::Disposal::Scope { asynchronous } => self.using_scope(asynchronous),
+                    super::ast::Disposal::Use { asynchronous } => {
+                        let value = Self::pop(frame);
+                        let scope = Self::pop(frame);
+                        self.using_add(&scope, value, asynchronous)?
+                    }
+                    super::ast::Disposal::End { error } => {
+                        let thrown = error.then(|| Self::pop(frame));
+                        let scope = Self::pop(frame);
+                        self.using_end(&scope, thrown)?
+                    }
+                };
+                frames.last_mut().expect("frame").stack.push(value);
+            }
             Op::ArgumentsIterator => {
                 let Value::Array(array) = Self::pop(frame) else {
                     unreachable!("arguments arrive as an array")

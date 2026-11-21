@@ -205,6 +205,7 @@ pub(super) enum Op {
     JumpIfNullishChain(u32),
     ChainEnd,
     GetIterator(Option<u32>),
+    Disposal(Disposal),
     // an iterator over the argument list, which no replaced array iterator can reach
     ArgumentsIterator,
     GetAsyncIterator,
@@ -2674,6 +2675,15 @@ impl Compiler {
                 Expr::Class(class) if class.name.is_none() => {
                     return self.compile_class(class, Some(name));
                 }
+                // a using declaration names its initializer as a const would
+                Expr::Disposal(step @ Disposal::Use { .. }, arguments) => {
+                    if let [scope, init] = arguments.as_slice() {
+                        self.compile_expression(scope)?;
+                        self.compile_named_expression(init, target)?;
+                        self.emit(Op::Disposal(*step));
+                        return Ok(());
+                    }
+                }
                 _ => {}
             }
         }
@@ -3307,6 +3317,12 @@ impl Compiler {
             Expr::Await(argument) => {
                 self.compile_expression(argument)?;
                 self.emit(Op::Await);
+            }
+            Expr::Disposal(step, arguments) => {
+                for argument in arguments {
+                    self.compile_expression(argument)?;
+                }
+                self.emit(Op::Disposal(*step));
             }
             Expr::DynamicImport { specifier, options } => {
                 self.compile_expression(specifier)?;
@@ -4239,7 +4255,9 @@ fn walk_expression(expression: &Expr, visit: &mut dyn FnMut(&Expr)) {
         }
         Expr::SuperMember(PropertyKey::Computed(key)) => children.push(key),
         Expr::OptionalChain(inner) => children.push(inner),
-        Expr::Sequence(expressions) => children.extend(expressions),
+        Expr::Sequence(expressions) | Expr::Disposal(_, expressions) => {
+            children.extend(expressions)
+        }
         Expr::Yield {
             argument: Some(argument),
             ..

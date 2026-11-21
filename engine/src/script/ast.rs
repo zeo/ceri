@@ -12,6 +12,15 @@ pub(super) enum DeclarationKind {
     Const,
 }
 
+// the steps a using declaration runs: open a block's dispose scope, add a resource to it, and
+// dispose what it holds when the block ends, after an error when one was thrown
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Disposal {
+    Scope { asynchronous: bool },
+    Use { asynchronous: bool },
+    End { error: bool },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Declarator {
     pub(super) target: Pattern,
@@ -321,6 +330,7 @@ pub(super) enum Expr {
         delegate: bool,
     },
     Await(Box<Expr>),
+    Disposal(Disposal, Vec<Expr>),
     DynamicImport {
         specifier: Box<Expr>,
         options: Option<Box<Expr>>,
