@@ -339,6 +339,7 @@ static INTERFACES: &[Interface] = &[
             ("hidden", ReadOnly),
             ("styleSheets", ReadOnly),
             ("adoptedStyleSheets", ReadWrite),
+            ("fonts", ReadOnly),
             ("children", ReadOnly),
             ("firstElementChild", ReadOnly),
             ("lastElementChild", ReadOnly),
@@ -1271,6 +1272,7 @@ impl ScriptRuntime {
                 }
             }
             ("sheet", Access::Get) => self.style_sheet_of(node),
+            ("fonts", Access::Get) if on_document => self.font_set(),
             ("styleSheets", Access::Get) => self.style_sheets_of(node),
             ("adoptedStyleSheets", Access::Get) => self.adopted_sheets_value(node),
             ("adoptedStyleSheets", Access::Set) => {

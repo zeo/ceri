@@ -24,6 +24,8 @@ pub(crate) struct LayoutInputs {
     // what rebuilding the sheet dropped or failed to load, for the page's log
     pub(crate) notes: Vec<String>,
     pub(crate) fonts: Rc<FontSet>,
+    // which change of the document's script fonts the font set holds
+    pub(crate) fonts_stamp: u64,
     // hover, preferences, running transitions and animations, and decoded image sizes
     pub(crate) extras: StyleState,
 }

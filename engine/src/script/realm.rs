@@ -167,6 +167,7 @@ pub(super) enum Native {
     Matrix(super::matrices::MatrixMember),
     Segmenter(super::segmenter::SegmenterMember),
     Cssom(super::cssom::CssomMember),
+    Font(super::fontfaces::FontMember),
     // DOMMatrixReadOnly when true, DOMMatrix otherwise
     MatrixConstructor(bool),
     Stream(Rc<super::streams::StreamFunction>),
@@ -249,6 +250,8 @@ impl Native {
                 | Native::Segmenter(super::segmenter::SegmenterMember::Constructor)
                 | Native::Cssom(super::cssom::CssomMember::SheetConstructor)
                 | Native::Cssom(super::cssom::CssomMember::RuleConstructor)
+                | Native::Font(super::fontfaces::FontMember::FaceConstructor)
+                | Native::Font(super::fontfaces::FontMember::SetConstructor)
                 | Native::Helper(super::iterator_helpers::HelperMember::Constructor)
                 | Native::Markup(
                     super::markup::MarkupMember::Parser | super::markup::MarkupMember::Serializer
@@ -341,6 +344,7 @@ pub(super) struct Intrinsics {
     pub(super) matrices: super::matrices::MatrixInterfaces,
     pub(super) segmenters: super::segmenter::SegmenterInterfaces,
     pub(super) cssom: super::cssom::CssomInterfaces,
+    pub(super) font_faces: super::fontfaces::FontInterfaces,
     pub(super) helpers: super::iterator_helpers::HelperInterfaces,
     pub(super) animations: super::animations::AnimInterfaces,
     pub(super) shapes: super::geometry_values::ShapeInterfaces,
@@ -1507,6 +1511,12 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     super::markup::create(&build, &object_prototype, &mut globals);
     let paths = super::path2d::create(&build, &object_prototype, &mut globals);
     let cssom = super::cssom::create(&build, &object_prototype, &mut globals);
+    let font_faces = super::fontfaces::create(
+        &build,
+        &object_prototype,
+        &dom.prototype("EventTarget"),
+        &mut globals,
+    );
     let navigator_apis = super::navigator_apis::create(
         &build,
         &object_prototype,
@@ -1608,6 +1618,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         matrices,
         segmenters,
         cssom,
+        font_faces,
         helpers,
         animations,
         shapes,
@@ -3031,6 +3042,7 @@ impl ScriptRuntime {
             Native::Matrix(member) => self.call_matrix(member, this, arguments),
             Native::Segmenter(member) => self.call_segmenter(member, this, arguments),
             Native::Cssom(member) => self.call_cssom(member, this, arguments),
+            Native::Font(member) => self.call_font(member, this, arguments),
             Native::MatrixConstructor(_) => Err(self.type_error(
                 "Failed to construct 'DOMMatrix': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
@@ -3452,6 +3464,10 @@ impl ScriptRuntime {
                 self.construct_sheet(arguments, new_target)
             }
             Native::Cssom(_) => Err(self.type_error("Illegal constructor")),
+            Native::Font(super::fontfaces::FontMember::FaceConstructor) => {
+                self.construct_font_face(arguments, new_target)
+            }
+            Native::Font(_) => Err(self.type_error("Illegal constructor")),
             Native::MatrixConstructor(read_only) => {
                 self.construct_matrix(read_only, arguments, new_target)
             }

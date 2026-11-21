@@ -120,6 +120,7 @@ pub(super) enum ObjectClass {
     // a Path2D and the calls that made it
     Path(super::path2d::PathHandle),
     Matrix(Rc<RefCell<super::matrices::MatrixState>>),
+    FontFace(Rc<super::fontfaces::FaceState>),
     // a CSSStyleSheet, and a rule it lists
     Sheet(Rc<super::cssom::SheetState>),
     CssRule(Rc<super::cssom::RuleState>),

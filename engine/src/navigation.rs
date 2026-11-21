@@ -1464,6 +1464,7 @@ impl Browser {
             sheets_version: document.version(),
             notes: Vec::new(),
             fonts: self.fonts.clone(),
+            fonts_stamp: 0,
             extras: StyleState {
                 color_scheme: self.preferences.color_scheme,
                 reduced_motion: self.preferences.reduced_motion,
@@ -3874,6 +3875,21 @@ fn load_web_fonts(
     }
 }
 
+// the faces script loaded through FontFace and added to document.fonts, beside the sheet's own
+fn add_script_fonts(document: &Document, inputs: &mut LayoutInputs) {
+    let (fonts, stamp) = document.script_fonts();
+    for font in fonts {
+        inputs.fonts.add_web_face(
+            &font.family,
+            font.weights,
+            font.italic,
+            Vec::new(),
+            font.face.clone(),
+        );
+    }
+    inputs.fonts_stamp = stamp;
+}
+
 // rebuilds the sheet once script added, removed or rewrote a style element or stylesheet link;
 // a sheet still in place keeps the text it loaded with, and one that fails to load stays empty
 pub(crate) fn refresh_stylesheet(
@@ -3888,6 +3904,7 @@ pub(crate) fn refresh_stylesheet(
     let sources = sheet_sources(document);
     let mut inputs = inputs.borrow_mut();
     inputs.sheets_version = document.version();
+    let fonts_changed = document.script_fonts().1 != inputs.fonts_stamp;
     if inputs.sheets.len() == sources.len()
         && inputs
             .sheets
@@ -3895,6 +3912,12 @@ pub(crate) fn refresh_stylesheet(
             .zip(&sources)
             .all(|((old, _), source)| old == source)
     {
+        if fonts_changed {
+            let policies = document.content_security_policy().clone();
+            let stylesheet = inputs.stylesheet.clone();
+            load_web_fonts(load, &inputs.fonts, base, &stylesheet, &policies);
+            add_script_fonts(document, &mut inputs);
+        }
         return;
     }
     let policies = document.content_security_policy().clone();
@@ -3919,8 +3942,9 @@ pub(crate) fn refresh_stylesheet(
             .into_iter()
             .map(|rule| format!("dropped CSS rule: {rule}")),
     );
-    if stylesheet.font_faces() != inputs.stylesheet.font_faces() {
+    if stylesheet.font_faces() != inputs.stylesheet.font_faces() || fonts_changed {
         load_web_fonts(load, &inputs.fonts, base, &stylesheet, &policies);
+        add_script_fonts(document, &mut inputs);
     }
     inputs.stylesheet = Rc::new(stylesheet);
     inputs.sheets = sheets;
@@ -9231,6 +9255,49 @@ mod tests {
         assert_eq!(
             document.element_text_content(status).as_deref(),
             Some("30,36")
+        );
+    }
+
+    #[test]
+    fn font_faces_added_from_script_style_text() {
+        let mut resources = bundle(
+            r##"<html><body style="margin: 0; font: 20px/30px monospace"><span id="before" style="font-family: 'Script Face', monospace">ABAB</span><br><span id="after" style="font-family: 'Script Face', monospace">ABAB</span><p id="status">idle</p><script>
+                const width = (id) => Math.round(document.getElementById(id).getBoundingClientRect().width);
+                const fallback = width("before");
+                const face = new FontFace("Script Face", "url(/fonts/ceri-test.woff2) format('woff2')");
+                const seen = [face.status, document.fonts.has(face), document.fonts.check("20px 'Script Face'")];
+                face.load().then((loaded) => {
+                    document.fonts.add(loaded);
+                    seen.push(loaded === face, face.status, document.fonts.size, document.fonts.has(face), document.fonts.check("20px 'Script Face'"));
+                    seen.push(width("after") !== fallback);
+                    const broken = new FontFace("Broken", new Uint8Array([1, 2, 3]));
+                    seen.push(broken.status);
+                    return document.fonts.ready;
+                }).then((set) => {
+                    seen.push(set === document.fonts, document.fonts.status);
+                    document.getElementById("status").textContent = seen.join(",");
+                });
+            </script></body></html>"##,
+        );
+        let font = std::fs::read(format!(
+            "{}/tests/fixtures/fonts/ceri-test.woff2",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("fixture font should exist");
+        resources
+            .insert("/fonts/ceri-test.woff2", "font/woff2", font)
+            .expect("font should be accepted");
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        browser.advance_time(1).expect("tasks should run");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("unloaded,false,true,true,loaded,1,true,true,true,error,true,loaded")
         );
     }
 

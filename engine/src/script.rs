@@ -20,6 +20,7 @@ mod encoding;
 mod events;
 mod eventsource;
 mod filereader;
+mod fontfaces;
 mod from_async;
 mod geometry;
 mod geometry_values;
@@ -682,6 +683,9 @@ pub struct ScriptRuntime {
     event_sources: HashMap<u32, eventsource::SourceState>,
     // when the user last pressed or typed into the page, for navigator.userActivation
     activated_at: Option<u64>,
+    // document.fonts and the faces it holds
+    font_set: RefCell<Option<object::ObjectHandle>>,
+    font_set_faces: RefCell<Vec<object::ObjectHandle>>,
     // the sheet object of each style element, and the constructed sheets each root adopted
     sheet_objects: RefCell<HashMap<NodeId, object::ObjectHandle>>,
     adopted_sheets: RefCell<HashMap<NodeId, Vec<object::ObjectHandle>>>,
@@ -1835,6 +1839,8 @@ impl ScriptRuntime {
             fetches: RefCell::new(Vec::new()),
             event_sources: HashMap::new(),
             activated_at: None,
+            font_set: RefCell::new(None),
+            font_set_faces: RefCell::new(Vec::new()),
             sheet_objects: RefCell::new(HashMap::new()),
             adopted_sheets: RefCell::new(HashMap::new()),
             lock_queue: RefCell::new(Vec::new()),

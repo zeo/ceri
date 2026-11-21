@@ -287,6 +287,27 @@ pub struct Document {
     adopted_sheets: HashMap<NodeId, Vec<String>>,
     // style elements whose sheet script disabled
     disabled_sheets: HashSet<NodeId>,
+    // faces script added through document.fonts, and a count of the changes to them
+    script_fonts: Vec<ScriptFont>,
+    script_fonts_stamp: u64,
+}
+
+// a face a FontFace object loaded and document.fonts holds
+#[derive(Clone)]
+pub(crate) struct ScriptFont {
+    pub(crate) family: String,
+    pub(crate) weights: Option<(u16, u16)>,
+    pub(crate) italic: bool,
+    pub(crate) face: Rc<crate::font::FontFace>,
+}
+
+impl fmt::Debug for ScriptFont {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScriptFont")
+            .field("family", &self.family)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -412,6 +433,8 @@ impl Document {
             sheet_rules: HashMap::new(),
             adopted_sheets: HashMap::new(),
             disabled_sheets: HashSet::new(),
+            script_fonts: Vec::new(),
+            script_fonts_stamp: 0,
         };
         document.root = document.allocate(NodeKind::Document);
         document.orphans.clear();
@@ -1315,6 +1338,17 @@ impl Document {
             self.version += 1;
             self.selector_version = next_stamp();
         }
+    }
+
+    pub(crate) fn script_fonts(&self) -> (&[ScriptFont], u64) {
+        (&self.script_fonts, self.script_fonts_stamp)
+    }
+
+    // the faces document.fonts holds now, which the next layout's font set takes up
+    pub(crate) fn set_script_fonts(&mut self, fonts: Vec<ScriptFont>) {
+        self.script_fonts = fonts;
+        self.script_fonts_stamp += 1;
+        self.version += 1;
     }
 
     pub(crate) fn sheet_disabled(&self, node: NodeId) -> bool {
