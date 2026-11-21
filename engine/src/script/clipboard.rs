@@ -6,6 +6,7 @@ use super::*;
 // clipboard for a paste and written by the handlers of a copy or cut
 pub(super) struct Transfer {
     data: Vec<(String, String)>,
+    files: Vec<FileHandle>,
     // only a copy or a cut lets its handlers change the data
     writable: bool,
 }
@@ -77,10 +78,11 @@ impl ScriptRuntime {
         }
         let transfer = Rc::new(RefCell::new(Transfer {
             data,
+            files,
             writable: name != "paste",
         }));
         let fields = events::HostEventFields {
-            value: Some(transfer_object(&transfer, &files)),
+            value: Some(self.transfer_object(&transfer)),
             ..events::HostEventFields::default()
         };
         let outcome = self.fire(events::ListenerTarget::Node(target), name, fields)?;
@@ -149,6 +151,8 @@ impl ScriptRuntime {
                 Value::Undefined
             }
             Builtin::ClipboardItemFile(file) => file.map_or(Value::Null, Value::File),
+            Builtin::ClipboardTypes(transfer) => Self::new_array(transfer_items(&transfer).0),
+            Builtin::ClipboardItems(transfer) => Self::new_array(transfer_items(&transfer).1),
             Builtin::ClipboardItemConstructor => {
                 let mut entries = Vec::new();
                 if let source @ Value::Object(_) = first.resolve() {
@@ -344,9 +348,9 @@ fn clipboard_item(entries: ItemHandle) -> Value {
     ])
 }
 
-// the DataTransfer a clipboard event hands its listeners; types, items and files show what
-// the transfer held when the event began
-fn transfer_object(handle: &TransferHandle, files: &[FileHandle]) -> Value {
+// a DataTransfer over a transfer's data: types and items read what it holds now, so data set
+// by a handler or on one script made shows at once
+pub(super) fn transfer_items(handle: &TransferHandle) -> (Vec<Value>, Vec<Value>) {
     let text = |value: &str| Value::String(value.to_string().into());
     let item = |kind: &str, mime: &str, string: Option<&str>, file: Option<&FileHandle>| {
         plain_object([
@@ -369,35 +373,107 @@ fn transfer_object(handle: &TransferHandle, files: &[FileHandle]) -> Value {
         .iter()
         .map(|(kind, held)| item("string", kind, Some(held), None))
         .collect();
-    if !files.is_empty() {
+    if !transfer.files.is_empty() {
         types.push(text("Files"));
     }
     items.extend(
-        files
+        transfer
+            .files
             .iter()
             .map(|file| item("file", &file.mime_type, None, Some(file))),
     );
-    let method = |builtin: Builtin| Value::Builtin(builtin);
-    plain_object([
-        ("types".to_string(), ScriptRuntime::new_array(types)),
-        ("items".to_string(), ScriptRuntime::new_array(items)),
-        (
-            "files".to_string(),
-            ScriptRuntime::new_array(files.iter().cloned().map(Value::File).collect()),
-        ),
-        ("dropEffect".to_string(), text("none")),
-        ("effectAllowed".to_string(), text("uninitialized")),
-        (
-            "getData".to_string(),
-            method(Builtin::ClipboardGetData(handle.clone())),
-        ),
-        (
-            "setData".to_string(),
-            method(Builtin::ClipboardSetData(handle.clone())),
-        ),
-        (
-            "clearData".to_string(),
-            method(Builtin::ClipboardClearData(handle.clone())),
-        ),
-    ])
+    (types, items)
+}
+
+impl ScriptRuntime {
+    pub(super) fn transfer_object(&self, handle: &TransferHandle) -> Value {
+        let text = |value: &str| Value::String(value.to_string().into());
+        let method = |builtin: Builtin| Value::Builtin(builtin);
+        let files = handle.borrow().files.clone();
+        let transfer = plain_object([
+            (
+                "files".to_string(),
+                ScriptRuntime::new_array(files.into_iter().map(Value::File).collect()),
+            ),
+            ("dropEffect".to_string(), text("none")),
+            ("effectAllowed".to_string(), text("uninitialized")),
+            (
+                "getData".to_string(),
+                method(Builtin::ClipboardGetData(handle.clone())),
+            ),
+            (
+                "setData".to_string(),
+                method(Builtin::ClipboardSetData(handle.clone())),
+            ),
+            (
+                "clearData".to_string(),
+                method(Builtin::ClipboardClearData(handle.clone())),
+            ),
+        ]);
+        if let Value::Object(object) = &transfer {
+            let mut object = object.borrow_mut();
+            for (name, getter) in [
+                ("types", Builtin::ClipboardTypes(handle.clone())),
+                ("items", Builtin::ClipboardItems(handle.clone())),
+            ] {
+                object.define(
+                    name.to_string(),
+                    object::Property {
+                        slot: object::Slot::Accessor {
+                            get: Some(Value::Builtin(getter)),
+                            set: None,
+                        },
+                        enumerable: true,
+                        writable: false,
+                        configurable: true,
+                    },
+                );
+            }
+        }
+        self.host_object(transfer, "DataTransfer")
+    }
+
+    // new DataTransfer(): an empty transfer that script may write
+    pub(super) fn new_data_transfer(&self) -> Value {
+        self.transfer_object(&Rc::new(RefCell::new(Transfer {
+            data: Vec::new(),
+            files: Vec::new(),
+            writable: true,
+        })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_data_transfer_script_makes_holds_what_it_sets() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const transfer = new DataTransfer();
+                const seen = [transfer instanceof DataTransfer, transfer.types.length];
+                transfer.setData("text", "plain words");
+                transfer.setData("text/html", "<b>bold</b>");
+                seen.push(transfer.types.join(), transfer.getData("text/plain"), transfer.items.length);
+                transfer.clearData("text/html");
+                seen.push(transfer.types.join(), Object.prototype.toString.call(transfer));
+                try { DataTransfer(); } catch (error) { seen.push(error.name); }
+                document.getElementById("out").textContent = seen.join("|");
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some(
+                "true|0|text/plain,text/html|plain words|2|text/plain|[object DataTransfer]|TypeError"
+            )
+        );
+    }
 }

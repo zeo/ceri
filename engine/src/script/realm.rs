@@ -197,6 +197,7 @@ pub(super) enum Native {
     PortConstructor,
     // an interface whose objects only the engine makes
     IllegalConstructor,
+    DataTransferConstructor,
     MessageChannelConstructor,
     // the messages posted to ports and the window since the last task arrive
     PortDeliver,
@@ -271,6 +272,7 @@ impl Native {
                 | Native::PointConstructor(_)
                 | Native::PortConstructor
                 | Native::IllegalConstructor
+                | Native::DataTransferConstructor
                 | Native::MessageChannelConstructor
                 | Native::UrlConstructor
                 | Native::UrlSearchParamsConstructor
@@ -1550,6 +1552,20 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         globals.push((name, Value::Object(constructor)));
         hosts.insert(*name, prototype);
     }
+    let transfer = plain(&object_prototype);
+    build.value(
+        &transfer,
+        "@@toStringTag",
+        Value::String("DataTransfer".into()),
+    );
+    let constructor = build.constructor(
+        Native::DataTransferConstructor,
+        "DataTransfer",
+        0,
+        &transfer,
+    );
+    globals.push(("DataTransfer", Value::Object(constructor)));
+    hosts.insert("DataTransfer", transfer);
     for name in [
         "offsetLeft",
         "offsetTop",
@@ -3203,6 +3219,9 @@ impl ScriptRuntime {
             Native::MessageChannelConstructor => Err(self.type_error(
                 "Failed to construct 'MessageChannel': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
+            Native::DataTransferConstructor => {
+                Err(self.type_error("Constructor DataTransfer requires 'new'"))
+            }
             Native::PortConstructor | Native::IllegalConstructor => {
                 Err(self.type_error("Illegal constructor"))
             }
@@ -3608,6 +3627,7 @@ impl ScriptRuntime {
             Native::PointConstructor(read_only) => {
                 self.construct_point(read_only, arguments, new_target)
             }
+            Native::DataTransferConstructor => Ok(self.new_data_transfer()),
             Native::PortConstructor | Native::IllegalConstructor => {
                 Err(self.type_error("Illegal constructor"))
             }

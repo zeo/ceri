@@ -500,6 +500,8 @@ enum Builtin {
     ClipboardGetData(clipboard::TransferHandle),
     ClipboardSetData(clipboard::TransferHandle),
     ClipboardClearData(clipboard::TransferHandle),
+    ClipboardTypes(clipboard::TransferHandle),
+    ClipboardItems(clipboard::TransferHandle),
     // an item's text for its callback, and its file; none where the item is of the other kind
     ClipboardItemString(Option<Rc<str>>),
     ClipboardItemFile(Option<FileHandle>),
@@ -8996,6 +8998,8 @@ impl ScriptRuntime {
             builtin @ (Builtin::ClipboardGetData(_)
             | Builtin::ClipboardSetData(_)
             | Builtin::ClipboardClearData(_)
+            | Builtin::ClipboardTypes(_)
+            | Builtin::ClipboardItems(_)
             | Builtin::ClipboardItemString(_)
             | Builtin::ClipboardItemFile(_)
             | Builtin::ClipboardItemConstructor
