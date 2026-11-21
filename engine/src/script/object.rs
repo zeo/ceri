@@ -79,6 +79,7 @@ pub(super) enum ObjectClass {
     Arguments,
     // what JSON.rawJSON makes, which JSON.stringify writes out as its text
     RawJson,
+    Locale(Rc<super::locale::LocaleTag>),
     PerfObserver(Rc<super::perf_observers::PerfObserver>),
     // the entries a PerformanceObserver callback is handed
     PerfEntries(Rc<Vec<super::geometry::PerformanceEntry>>),

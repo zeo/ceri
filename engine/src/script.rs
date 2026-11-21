@@ -41,6 +41,8 @@ pub(crate) use json::quote as json_quote;
 mod atomics;
 mod disposables;
 mod lexer;
+mod locale;
+mod locale_data;
 mod media;
 mod modules;
 mod notifications;
