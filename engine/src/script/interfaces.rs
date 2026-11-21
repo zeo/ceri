@@ -200,6 +200,7 @@ static INTERFACES: &[Interface] = &[
             ("compareDocumentPosition", Method(1)),
             ("isSameNode", Method(1)),
             ("isEqualNode", Method(1)),
+            ("lookupNamespaceURI", Method(1)),
         ],
     },
     Interface {
@@ -375,6 +376,9 @@ static INTERFACES: &[Interface] = &[
             ("createTreeWalker", Method(1)),
             ("getAnimations", Method(0)),
             ("createNodeIterator", Method(1)),
+            ("evaluate", Method(2)),
+            ("createExpression", Method(1)),
+            ("createNSResolver", Method(1)),
             ("getSelection", Method(0)),
             ("elementFromPoint", Method(2)),
             ("elementsFromPoint", Method(2)),
@@ -1619,6 +1623,24 @@ impl ScriptRuntime {
                 None => Value::Bool(false),
             },
             ("isSameNode", Access::Call) => Value::Bool(self.node_object_id(&first) == Some(node)),
+            ("lookupNamespaceURI", Access::Call) => {
+                let prefix = match first {
+                    Value::Undefined | Value::Null => None,
+                    value => Some(self.coerce_string(value)?).filter(|prefix| !prefix.is_empty()),
+                };
+                self.lookup_namespace(node, prefix.as_deref())
+            }
+            ("evaluate", Access::Call) if on_document => self.call_xpath_evaluator(
+                super::xpath::XPathMember::Evaluate,
+                arguments,
+                "Document",
+            )?,
+            ("createExpression", Access::Call) if on_document => self.call_xpath_evaluator(
+                super::xpath::XPathMember::CreateExpression,
+                arguments,
+                "Document",
+            )?,
+            ("createNSResolver", Access::Call) if on_document => first,
             ("isEqualNode", Access::Call) => match self.node_object_id(&first) {
                 Some(other) => Value::Bool(equal_nodes(&self.document.borrow(), node, other)),
                 None => Value::Bool(false),

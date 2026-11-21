@@ -85,6 +85,8 @@ pub(super) enum ObjectClass {
     // an OffscreenCanvas and the canvas element it keeps alive
     Offscreen(super::ElementHandle),
     UrlPattern(Rc<super::urlpattern::UrlPattern>),
+    // an XPathResult, XPathExpression or XPathEvaluator
+    XPath(Rc<super::xpath::XPathObject>),
     PerfObserver(Rc<super::perf_observers::PerfObserver>),
     // the entries a PerformanceObserver callback is handed
     PerfEntries(Rc<Vec<super::geometry::PerformanceEntry>>),

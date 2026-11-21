@@ -203,6 +203,7 @@ pub(super) enum Native {
     DurationFormat(super::durationformat::DurationMember),
     Offscreen(super::offscreen::OffscreenMember),
     UrlPattern(super::urlpattern::PatternMember),
+    XPath(super::xpath::XPathMember),
     PerfObserver(super::perf_observers::ObserverMember),
     PerfDeliver(Rc<super::perf_observers::PerfObserver>),
     DataTransferConstructor,
@@ -286,6 +287,7 @@ impl Native {
                 | Native::DurationFormat(super::durationformat::DurationMember::Constructor)
                 | Native::Offscreen(super::offscreen::OffscreenMember::Constructor)
                 | Native::UrlPattern(super::urlpattern::PatternMember::Constructor)
+                | Native::XPath(super::xpath::XPathMember::Constructor)
                 | Native::PerfObserver(
                     super::perf_observers::ObserverMember::Constructor
                         | super::perf_observers::ObserverMember::ReportingConstructor
@@ -403,6 +405,7 @@ pub(super) struct Intrinsics {
     pub(super) duration_formats: super::durationformat::DurationInterfaces,
     pub(super) offscreen: super::offscreen::OffscreenInterfaces,
     pub(super) url_patterns: super::urlpattern::PatternInterfaces,
+    pub(super) xpath: super::xpath::XPathInterfaces,
     pub(super) disposables: super::disposables::DisposableInterfaces,
     pub(super) cssom: super::cssom::CssomInterfaces,
     pub(super) font_faces: super::fontfaces::FontInterfaces,
@@ -1615,6 +1618,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let duration_formats = super::durationformat::create(&build, &object_prototype, &intl);
     let offscreen = super::offscreen::create(&build, &object_prototype, &mut globals);
     let url_patterns = super::urlpattern::create(&build, &object_prototype, &mut globals);
+    let xpath = super::xpath::create(&build, &object_prototype, &mut globals);
     let (disposables, disposable_globals) = super::disposables::create(&build, &object_prototype);
     globals.extend(disposable_globals);
     globals.push(("Intl", Value::Object(intl)));
@@ -1772,6 +1776,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         duration_formats,
         offscreen,
         url_patterns,
+        xpath,
         hosts,
         perf_observers,
         disposables,
@@ -3269,6 +3274,7 @@ impl ScriptRuntime {
             Native::DurationFormat(member) => self.call_duration_format(member, this, arguments),
             Native::Offscreen(member) => self.call_offscreen(member, this, arguments),
             Native::UrlPattern(member) => self.call_url_pattern(member, this, arguments),
+            Native::XPath(member) => self.call_xpath(member, this, arguments),
             Native::PerfObserver(member) => self.call_perf_observer(member, this, arguments),
             Native::PerfDeliver(observer) => self.deliver_perf_entries(&observer),
             Native::ViewTransition(transition, which) => {
@@ -3745,6 +3751,7 @@ impl ScriptRuntime {
             Native::DurationFormat(_) => self.construct_duration_format(arguments, new_target),
             Native::Offscreen(_) => self.construct_offscreen(arguments, new_target),
             Native::UrlPattern(_) => self.construct_url_pattern(arguments, new_target),
+            Native::XPath(_) => self.construct_xpath_evaluator(new_target),
             Native::PerfObserver(member) => {
                 self.construct_perf_observer(member, arguments, new_target)
             }

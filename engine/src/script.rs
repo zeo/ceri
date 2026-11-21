@@ -75,6 +75,7 @@ mod viewtransitions;
 mod vm;
 mod websocket;
 mod xhr;
+mod xpath;
 
 use events::{HostEventFields, ListenerTarget};
 use object::{JsObject, ObjectClass, ObjectHandle, new_object};
