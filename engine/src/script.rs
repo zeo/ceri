@@ -138,7 +138,40 @@ type TypedArrayHandle = Rc<RefCell<TypedArrayData>>;
 type CanvasContextHandle = Rc<RefCell<canvas::CanvasContextData>>;
 type AbortSignalHandle = Rc<RefCell<AbortSignalData>>;
 type AbortControllerHandle = Rc<RefCell<AbortControllerData>>;
-type BytesHandle = Rc<RefCell<Vec<u8>>>;
+type BytesHandle = Rc<RefCell<ByteBuffer>>;
+
+// an ArrayBuffer's bytes, with the most it may grow to when resizable and whether a transfer
+// took its contents
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ByteBuffer {
+    bytes: Vec<u8>,
+    max: Option<usize>,
+    detached: bool,
+}
+
+impl From<Vec<u8>> for ByteBuffer {
+    fn from(bytes: Vec<u8>) -> Self {
+        ByteBuffer {
+            bytes,
+            max: None,
+            detached: false,
+        }
+    }
+}
+
+impl std::ops::Deref for ByteBuffer {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.bytes
+    }
+}
+
+impl std::ops::DerefMut for ByteBuffer {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.bytes
+    }
+}
 type WorkerHandle = Rc<RefCell<WorkerData>>;
 type WasmFunctionHandle = Rc<WasmFunctionData>;
 
@@ -1208,6 +1241,8 @@ struct TypedArrayData {
     buffer: BytesHandle,
     start: usize,
     end: usize,
+    // a view made over a resizable buffer without a length follows the buffer's length
+    tracking: bool,
     kind: typed::ElementKind,
     // the object for its named properties and a subclass prototype, made when first needed
     object: Option<object::ObjectHandle>,
@@ -7504,7 +7539,7 @@ impl ScriptRuntime {
             }
             Builtin::WebAssemblyInstantiate => {
                 let bytes = match arguments.first().map(Value::resolve) {
-                    Some(Value::Bytes(bytes)) => bytes.borrow().clone(),
+                    Some(Value::Bytes(bytes)) => bytes.borrow().to_vec(),
                     Some(Value::TypedArray(array)) => uint8_array_bytes(&array.borrow()),
                     Some(_) => {
                         return Err(runtime_error(
@@ -7673,13 +7708,7 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::WorkerPostMessage(worker) => {
-                if arguments.len() > 1
-                    && !matches!(arguments.get(1).map(Value::resolve), Some(Value::Undefined))
-                {
-                    return Err(runtime_error(
-                        "Worker transfer lists are not supported in this slice",
-                    ));
-                }
+                let transferred = self.transfer_buffers(arguments.get(1), false)?;
                 let message = clone_payload(
                     arguments.first().unwrap_or(&Value::Undefined),
                     MAX_CLONE_BYTES,
@@ -7695,6 +7724,7 @@ impl ScriptRuntime {
                         TrySendError::Full(_) => runtime_error("Worker message queue is full"),
                         TrySendError::Disconnected(_) => runtime_error("Worker is unavailable"),
                     })?;
+                detach_buffers(transferred);
                 Ok(Value::Undefined)
             }
             Builtin::WorkerTerminate(worker) => {
@@ -7707,13 +7737,7 @@ impl ScriptRuntime {
                 Ok(Value::Undefined)
             }
             Builtin::WorkerGlobalPostMessage(sender) => {
-                if arguments.len() > 1
-                    && !matches!(arguments.get(1).map(Value::resolve), Some(Value::Undefined))
-                {
-                    return Err(runtime_error(
-                        "Worker transfer lists are not supported in this slice",
-                    ));
-                }
+                let transferred = self.transfer_buffers(arguments.get(1), false)?;
                 let message = clone_payload(
                     arguments.first().unwrap_or(&Value::Undefined),
                     MAX_CLONE_BYTES,
@@ -7724,6 +7748,7 @@ impl ScriptRuntime {
                         TrySendError::Full(_) => runtime_error("Worker message queue is full"),
                         TrySendError::Disconnected(_) => runtime_error("Worker is unavailable"),
                     })?;
+                detach_buffers(transferred);
                 Ok(Value::Undefined)
             }
             Builtin::WindowScrollTo => {
@@ -8285,7 +8310,7 @@ impl ScriptRuntime {
                 String::from_utf8_lossy(&blob.bytes).into_owned().into(),
             )))),
             Builtin::BlobBytes(blob) => Ok(Value::Promise(
-                self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(blob.bytes.clone())))),
+                self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(blob.bytes.clone().into())))),
             )),
             Builtin::FileSlice(file) => {
                 let (start, end) = blob_slice_range(&arguments, file.bytes.len() as i64)?;
@@ -8306,7 +8331,7 @@ impl ScriptRuntime {
                 String::from_utf8_lossy(&file.bytes).into_owned().into(),
             )))),
             Builtin::FileBytes(file) => Ok(Value::Promise(
-                self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(file.bytes.clone())))),
+                self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(file.bytes.clone().into())))),
             )),
             Builtin::NodeListItem(nodes) => {
                 let index = arguments
@@ -8426,15 +8451,11 @@ impl ScriptRuntime {
                 }
             }
             Builtin::StructuredClone => {
-                if arguments.len() > 1
-                    && !matches!(arguments.get(1).map(Value::resolve), Some(Value::Undefined))
-                {
-                    return Err(runtime_error(
-                        "structuredClone transfer lists are not supported in this slice",
-                    ));
-                }
+                let transferred = self.transfer_buffers(arguments.get(1), true)?;
                 let value = arguments.first().unwrap_or(&Value::Undefined);
-                clone_payload(value, MAX_CLONE_BYTES).and_then(CloneValue::into_value)
+                let copy = clone_payload(value, MAX_CLONE_BYTES).and_then(CloneValue::into_value)?;
+                detach_buffers(transferred);
+                Ok(copy)
             }
             Builtin::ClipboardReadText => {
                 let Some(provider) = self.clipboard_provider.as_ref() else {
@@ -8486,7 +8507,8 @@ impl ScriptRuntime {
                 };
                 let (buffer, start, end, kind) = {
                     let array = array.borrow();
-                    (array.buffer.clone(), array.start, array.end, array.kind)
+                    let range = typed::byte_range(&array);
+                    (array.buffer.clone(), range.start, range.end, array.kind)
                 };
                 if matches!(
                     kind,
@@ -8530,7 +8552,7 @@ impl ScriptRuntime {
                     }
                 };
                 let bytes = match arguments.get(1).map(Value::resolve) {
-                    Some(Value::Bytes(bytes)) => bytes.borrow().clone(),
+                    Some(Value::Bytes(bytes)) => bytes.borrow().to_vec(),
                     Some(Value::TypedArray(array)) => uint8_array_bytes(&array.borrow()),
                     _ => {
                         return Ok(Value::Promise(self.rejected_promise_value(
@@ -8543,7 +8565,7 @@ impl ScriptRuntime {
                 };
                 match subtle_digest(&algorithm, &bytes) {
                     Ok(digest) => Ok(Value::Promise(
-                        self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(digest)))),
+                        self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(digest.into())))),
                     )),
                     Err(error) => Ok(Value::Promise(
                         self.rejected_promise_value(subtle_error_value("NotSupportedError", error)),
@@ -8559,7 +8581,7 @@ impl ScriptRuntime {
             },
             Builtin::RequestBytes(request) => match self.consume_request_body(&request) {
                 Ok(body) => Ok(Value::Promise(
-                    self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(body)))),
+                    self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(body.into())))),
                 )),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
@@ -8816,7 +8838,7 @@ impl ScriptRuntime {
             }
             Builtin::ResponseBytes(response) => match self.consume_response_body(&response) {
                 Ok(body) => Ok(Value::Promise(
-                    self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(body)))),
+                    self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(body.into())))),
                 )),
                 Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
             },
@@ -11226,6 +11248,58 @@ fn data_clone_error(message: impl Into<String>) -> ScriptError {
     runtime_error(format!("DataCloneError: {}", message.into()))
 }
 
+// a transfer hands a buffer's bytes to the copy, which leaves the original detached
+fn detach_buffers(buffers: Vec<BytesHandle>) {
+    for buffer in buffers {
+        let mut buffer = buffer.borrow_mut();
+        buffer.bytes = Vec::new();
+        buffer.detached = true;
+    }
+}
+
+impl ScriptRuntime {
+    // the ArrayBuffers a postMessage transfer list or a { transfer } options bag hands over;
+    // structuredClone takes only the options bag
+    fn transfer_buffers(
+        &mut self,
+        argument: Option<&Value>,
+        options_only: bool,
+    ) -> Result<Vec<BytesHandle>, ScriptError> {
+        let argument = argument.map(Value::resolve).unwrap_or(Value::Undefined);
+        let list = match &argument {
+            Value::Undefined | Value::Null => return Ok(Vec::new()),
+            Value::Array(_) if !options_only => argument.clone(),
+            value if operations::is_primitive(value) => {
+                return Err(self.type_error("The transfer option must be an object"));
+            }
+            _ => match self.get_property(&argument, "transfer")? {
+                Value::Undefined => return Ok(Vec::new()),
+                transfer => transfer,
+            },
+        };
+        let mut buffers: Vec<BytesHandle> = Vec::new();
+        for (index, item) in self.iterate_to_vec(list)?.into_iter().enumerate() {
+            let Value::Bytes(buffer) = item.resolve() else {
+                return Err(data_clone_error(format!(
+                    "Value at index {index} does not have a transferable type"
+                )));
+            };
+            if buffer.borrow().detached {
+                return Err(data_clone_error(format!(
+                    "ArrayBuffer at index {index} is already detached"
+                )));
+            }
+            if buffers.iter().any(|seen| Rc::ptr_eq(seen, &buffer)) {
+                return Err(data_clone_error(format!(
+                    "ArrayBuffer at index {index} is a duplicate of an earlier ArrayBuffer"
+                )));
+            }
+            buffers.push(buffer);
+        }
+        Ok(buffers)
+    }
+}
+
 fn clone_payload(value: &Value, max_bytes: usize) -> Result<CloneValue, ScriptError> {
     let mut context = CloneContext::new(max_bytes);
     clone_value(value, &mut context, 0)
@@ -11348,9 +11422,14 @@ fn clone_value(
             result.map(CloneValue::Array)
         }
         Value::Bytes(bytes) => {
+            if bytes.borrow().detached {
+                return Err(data_clone_error(
+                    "An ArrayBuffer is detached and could not be cloned",
+                ));
+            }
             let pointer = Rc::as_ptr(bytes) as usize;
             context.enter(pointer)?;
-            let bytes = bytes.borrow().clone();
+            let bytes = bytes.borrow().to_vec();
             let result = context
                 .account_bytes(bytes.len())
                 .map(|_| CloneValue::Bytes(bytes));
@@ -11365,7 +11444,7 @@ fn clone_value(
             let bytes = array
                 .buffer
                 .borrow()
-                .get(array.start..array.end)
+                .get(typed::byte_range(&array))
                 .ok_or_else(|| data_clone_error("typed array view is out of bounds"))?
                 .to_vec();
             let result = context
@@ -11468,14 +11547,14 @@ impl CloneValue {
             Self::Date(time) => {
                 Value::Object(new_object(JsObject::with_class(ObjectClass::Date(time))))
             }
-            Self::Bytes(bytes) => Value::Bytes(Rc::new(RefCell::new(bytes))),
+            Self::Bytes(bytes) => Value::Bytes(Rc::new(RefCell::new(bytes.into()))),
             Self::BigInt(digits) => Value::BigInt(Rc::new(
                 bigint::BigInt::parse(&digits)
                     .ok_or_else(|| data_clone_error("BigInt digits are invalid"))?,
             )),
             Self::TypedArray(kind, bytes) => {
                 let end = bytes.len();
-                typed::new_typed(kind, Rc::new(RefCell::new(bytes)), 0, end)
+                typed::new_typed(kind, Rc::new(RefCell::new(bytes.into())), 0, end)
             }
             Self::Blob { bytes, mime_type } => Value::Blob(Rc::new(BlobData { bytes, mime_type })),
             Self::File {
@@ -12945,7 +13024,7 @@ fn body_init_bytes(value: Value) -> Result<(Vec<u8>, Option<String>), ScriptErro
             body.as_bytes().to_vec(),
             Some("text/plain;charset=UTF-8".to_string()),
         )),
-        Value::Bytes(bytes) => Ok((bytes.borrow().clone(), None)),
+        Value::Bytes(bytes) => Ok((bytes.borrow().to_vec(), None)),
         Value::TypedArray(array) => Ok((uint8_array_bytes(&array.borrow()), None)),
         Value::Blob(blob) => Ok((
             blob.bytes.clone(),
@@ -13100,11 +13179,11 @@ fn uint8_array_property_index(property: &str) -> Option<usize> {
 }
 
 fn uint8_array_view_len(array: &TypedArrayData) -> usize {
-    array.end - array.start
+    typed::byte_range(array).len()
 }
 
 fn uint8_array_bytes(array: &TypedArrayData) -> Vec<u8> {
-    array.buffer.borrow()[array.start..array.end].to_vec()
+    array.buffer.borrow()[typed::byte_range(array)].to_vec()
 }
 
 fn uint8_array_byte(array: &TypedArrayData, index: usize) -> Option<u8> {
@@ -13117,7 +13196,8 @@ fn uint8_array_byte(array: &TypedArrayData, index: usize) -> Option<u8> {
 fn set_uint8_array_byte(array: &TypedArrayHandle, index: usize, byte: u8) {
     let (start, end, buffer) = {
         let array = array.borrow();
-        (array.start, array.end, array.buffer.clone())
+        let range = typed::byte_range(&array);
+        (range.start, range.end, array.buffer.clone())
     };
     if index < end - start {
         buffer.borrow_mut()[start + index] = byte;
@@ -23007,7 +23087,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_clone_rejects_cycles_functions_and_transfer_lists() {
+    fn structured_clone_rejects_cycles_and_functions_and_transfers_buffers() {
         let document = document("<p id='status'>idle</p>");
         let mut runtime = ScriptRuntime::new(document.clone());
         let cyclic = Rc::new(RefCell::new(object::JsObject::new()));
@@ -23030,13 +23110,24 @@ mod tests {
                 } catch (error) {
                   functionValue = error.message;
                 }
-                let transfer = "unexpected";
+                const buffer = new Uint8Array([1, 2, 3]).buffer;
+                const moved = structuredClone({ buffer }, { transfer: [buffer] });
+                const kept = new ArrayBuffer(1);
+                structuredClone(kept, [kept]);
+                let detached = "unexpected";
                 try {
-                  structuredClone({ value: 1 }, [new ArrayBuffer(1)]);
+                  structuredClone(buffer);
                 } catch (error) {
-                  transfer = error.message;
+                  detached = error.message;
                 }
-                status.textContent = functionValue + "|" + transfer;
+                let twice = "unexpected";
+                try {
+                  structuredClone(kept, { transfer: [kept, kept] });
+                } catch (error) {
+                  twice = error.message;
+                }
+                status.textContent = [functionValue, buffer.detached, buffer.byteLength,
+                  new Uint8Array(moved.buffer).join(), kept.detached, detached, twice].join("|");
                 "#,
             )
             .expect("structured clone errors should be catchable");
@@ -23047,7 +23138,9 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some(
-                "DataCloneError: value is not cloneable|structuredClone transfer lists are not supported in this slice",
+                "DataCloneError: value is not cloneable|true|0|1,2,3|false|\
+                 DataCloneError: An ArrayBuffer is detached and could not be cloned|\
+                 DataCloneError: ArrayBuffer at index 1 is a duplicate of an earlier ArrayBuffer",
             )
         );
     }

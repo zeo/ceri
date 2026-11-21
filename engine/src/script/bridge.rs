@@ -136,7 +136,7 @@ impl ScriptRuntime {
     // invoke(command, arguments, { headers }) as Tauri's invoke takes them
     fn invoke_request(&mut self, arguments: &[Value]) -> Result<Request, ScriptError> {
         let body = match arguments.get(1).map(Value::resolve) {
-            Some(Value::Bytes(bytes)) => Some(bytes.borrow().clone()),
+            Some(Value::Bytes(bytes)) => Some(bytes.borrow().to_vec()),
             Some(Value::TypedArray(array)) => Some(uint8_array_bytes(&array.borrow())),
             _ => None,
         };

@@ -297,7 +297,7 @@ impl ScriptRuntime {
                 };
                 Value::String(format!("data:{mime_type};base64,{}", canvas::base64(&bytes)).into())
             }
-            Format::ArrayBuffer => Value::Bytes(Rc::new(RefCell::new(bytes))),
+            Format::ArrayBuffer => Value::Bytes(Rc::new(RefCell::new(bytes.into()))),
         };
         if let Some(state) = self.readers.states.get_mut(&id)
             && state.generation == generation

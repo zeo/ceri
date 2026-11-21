@@ -107,6 +107,7 @@ pub(super) enum ObjectClass {
         buffer: super::BytesHandle,
         start: usize,
         end: usize,
+        tracking: bool,
     },
     TextDecoder(Rc<RefCell<super::encoding::DecoderState>>),
     Intl(Rc<super::intl::IntlState>),

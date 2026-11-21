@@ -2302,7 +2302,7 @@ impl ScriptRuntime {
                         array
                             .buffer
                             .borrow()
-                            .get(array.start..array.end)
+                            .get(super::typed::byte_range(&array))
                             .map(<[u8]>::to_vec)
                     }
                     _ => None,
@@ -2554,7 +2554,7 @@ impl ScriptRuntime {
         };
         let length = {
             let array = array.borrow();
-            array.end - array.start
+            super::typed::byte_range(&array).len()
         };
         let width = arguments.get(1).cloned().unwrap_or(Value::Undefined);
         let width = self.coerce_uint32(width)? as usize;
@@ -2628,7 +2628,7 @@ impl ScriptRuntime {
                 array
                     .buffer
                     .borrow()
-                    .get(array.start..array.end)
+                    .get(super::typed::byte_range(&array))
                     .map(<[u8]>::to_vec)
             }
             _ => None,
@@ -2674,7 +2674,7 @@ fn image_data_object(width: u32, height: u32, data: Vec<u8>) -> Value {
             "data".to_string(),
             new_typed(
                 ElementKind::Uint8Clamped,
-                Rc::new(RefCell::new(data)),
+                Rc::new(RefCell::new(data.into())),
                 0,
                 length,
             ),

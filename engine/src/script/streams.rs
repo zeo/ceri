@@ -607,7 +607,7 @@ impl ScriptRuntime {
         let length = bytes.len();
         let chunk = typed::new_typed(
             typed::ElementKind::Uint8,
-            Rc::new(RefCell::new(bytes)),
+            Rc::new(RefCell::new(bytes.into())),
             0,
             length,
         );
@@ -702,7 +702,7 @@ impl ScriptRuntime {
                 String::from_utf8_lossy(&bytes).into_owned().into(),
             )),
             BodyKind::Json => self.parse_json(&String::from_utf8_lossy(&bytes)),
-            BodyKind::Bytes => Ok(Value::Bytes(Rc::new(RefCell::new(bytes)))),
+            BodyKind::Bytes => Ok(Value::Bytes(Rc::new(RefCell::new(bytes.into())))),
             BodyKind::Blob => Ok(Value::Blob(Rc::new(BlobData {
                 bytes,
                 mime_type: collect.mime_type.clone(),
@@ -949,7 +949,7 @@ impl ScriptRuntime {
                         let length = chunk.len();
                         let bytes = typed::new_typed(
                             typed::ElementKind::Uint8,
-                            Rc::new(RefCell::new(chunk)),
+                            Rc::new(RefCell::new(chunk.into())),
                             0,
                             length,
                         );
@@ -2464,7 +2464,7 @@ impl ScriptRuntime {
                 let length = bytes.len();
                 let array = typed::new_typed(
                     typed::ElementKind::Uint8,
-                    Rc::new(RefCell::new(bytes)),
+                    Rc::new(RefCell::new(bytes.into())),
                     0,
                     length,
                 );
@@ -2551,7 +2551,7 @@ impl ScriptRuntime {
                             let length = bytes.len();
                             let array = typed::new_typed(
                                 typed::ElementKind::Uint8,
-                                Rc::new(RefCell::new(bytes)),
+                                Rc::new(RefCell::new(bytes.into())),
                                 0,
                                 length,
                             );

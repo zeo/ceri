@@ -454,7 +454,7 @@ impl ScriptRuntime {
                 }
                 SocketEvent::Binary(bytes) => {
                     let data = if socket.binary_as_buffer {
-                        Value::Bytes(Rc::new(RefCell::new(bytes)))
+                        Value::Bytes(Rc::new(RefCell::new(bytes.into())))
                     } else {
                         Value::Blob(Rc::new(BlobData {
                             bytes,

@@ -185,14 +185,21 @@ impl ScriptRuntime {
     pub(super) fn buffer_source_bytes(&mut self, value: &Value) -> Result<Vec<u8>, ScriptError> {
         match value {
             Value::Undefined => Ok(Vec::new()),
-            Value::Bytes(bytes) => Ok(bytes.borrow().clone()),
+            Value::Bytes(bytes) => Ok(bytes.borrow().to_vec()),
             Value::TypedArray(array) => {
                 let array = array.borrow();
-                Ok(array.buffer.borrow()[array.start..array.end].to_vec())
+                Ok(array.buffer.borrow()[super::typed::byte_range(&array)].to_vec())
             }
             Value::Object(object) => match &object.borrow().class {
-                ObjectClass::DataView { buffer, start, end } => {
-                    Ok(buffer.borrow()[*start..*end].to_vec())
+                ObjectClass::DataView {
+                    buffer,
+                    start,
+                    end,
+                    tracking,
+                } => {
+                    let buffer = buffer.borrow();
+                    let range = super::typed::view_range(&buffer, *start, *end, *tracking, 1);
+                    Ok(range.map_or(Vec::new(), |(start, end)| buffer[start..end].to_vec()))
                 }
                 _ => Err(runtime_error(
                     "The provided value is not of type '(ArrayBuffer or ArrayBufferView)'",
@@ -244,7 +251,7 @@ impl ScriptRuntime {
                 let length = bytes.len();
                 Ok(new_typed(
                     ElementKind::Uint8,
-                    Rc::new(RefCell::new(bytes)),
+                    Rc::new(RefCell::new(bytes.into())),
                     0,
                     length,
                 ))

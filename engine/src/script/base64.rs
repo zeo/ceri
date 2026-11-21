@@ -249,7 +249,9 @@ impl ScriptRuntime {
                 };
                 let array = array.borrow();
                 let buffer = array.buffer.borrow();
-                let bytes = buffer.get(array.start..array.end).unwrap_or_default();
+                let bytes = buffer
+                    .get(super::typed::byte_range(&array))
+                    .unwrap_or_default();
                 Ok(Value::String(
                     match method {
                         M::ToBase64 => to_base64(bytes, url, omit_padding),
@@ -276,7 +278,7 @@ impl ScriptRuntime {
                 }
                 Ok(new_typed(
                     ElementKind::Uint8,
-                    Rc::new(RefCell::new(decoded.bytes)),
+                    Rc::new(RefCell::new(decoded.bytes.into())),
                     0,
                     length,
                 ))
@@ -290,7 +292,10 @@ impl ScriptRuntime {
                 };
                 let (start, room) = {
                     let array = array.borrow();
-                    (array.start, array.end - array.start)
+                    {
+                        let range = super::typed::byte_range(&array);
+                        (range.start, range.len())
+                    }
                 };
                 let decoded = match decoding {
                     Some((url, last, _)) => from_base64(text.as_bytes(), url, last, room),

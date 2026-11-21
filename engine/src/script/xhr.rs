@@ -549,7 +549,7 @@ impl ScriptRuntime {
                     }
                     "arraybuffer" => match &xhr.response {
                         Some(response) => {
-                            Value::Bytes(Rc::new(RefCell::new(response.body.clone())))
+                            Value::Bytes(Rc::new(RefCell::new(response.body.clone().into())))
                         }
                         None => Value::Null,
                     },

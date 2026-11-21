@@ -1290,6 +1290,20 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         Native::Typed(T::BufferSlice),
         2,
     );
+    for (key, member) in [
+        ("maxByteLength", T::BufferMaxByteLength),
+        ("resizable", T::BufferResizable),
+        ("detached", T::BufferDetached),
+    ] {
+        build.getter(&array_buffer_prototype, key, Native::Typed(member), None);
+    }
+    for (key, member) in [
+        ("resize", T::BufferResize),
+        ("transfer", T::BufferTransfer(true)),
+        ("transferToFixedLength", T::BufferTransfer(false)),
+    ] {
+        build.method(&array_buffer_prototype, key, Native::Typed(member), 1);
+    }
     build.value(
         &array_buffer_prototype,
         "@@toStringTag",

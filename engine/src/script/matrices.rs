@@ -725,7 +725,7 @@ impl ScriptRuntime {
                     .flat_map(|&value| kind.encode(value))
                     .collect::<Vec<u8>>();
                 let length = bytes.len();
-                typed::new_typed(kind, Rc::new(RefCell::new(bytes)), 0, length)
+                typed::new_typed(kind, Rc::new(RefCell::new(bytes.into())), 0, length)
             }
             M::ToJson => {
                 let mut entries: Vec<(String, Value)> = SHORT

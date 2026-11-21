@@ -323,9 +323,13 @@ impl ScriptRuntime {
     }
 
     // an element read during iteration: arrays may shrink while a callback runs
+    // a typed array is read live, so an index its shrunk buffer no longer holds reads as absent
     fn element(this: &Value, values: &[Value], index: usize) -> Option<Value> {
         match this {
             Value::Array(array) => array.borrow().get(index).cloned(),
+            Value::TypedArray(array) if index < values.len() => Some(
+                super::typed::read_element(&array.borrow(), index).unwrap_or(Value::Uninitialized),
+            ),
             _ => values.get(index).cloned(),
         }
     }
@@ -333,6 +337,9 @@ impl ScriptRuntime {
     fn element_count(this: &Value, values: &[Value]) -> usize {
         match this {
             Value::Array(array) => array.borrow().len(),
+            Value::TypedArray(array) => values
+                .len()
+                .min(super::typed::element_count(&array.borrow())),
             _ => values.len(),
         }
     }

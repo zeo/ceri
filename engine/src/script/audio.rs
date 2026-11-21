@@ -452,7 +452,7 @@ impl BufferState {
         };
         let view = view.borrow();
         let bytes = view.buffer.borrow();
-        let Some(bytes) = bytes.get(view.start..view.end) else {
+        let Some(bytes) = bytes.get(super::typed::byte_range(&view)) else {
             return;
         };
         let samples = &self.channels[channel];
@@ -476,9 +476,12 @@ impl BufferState {
             .flat_map(|sample| sample.to_le_bytes())
             .collect();
         let end = bytes.len();
-        let Value::TypedArray(view) =
-            typed::new_typed(ElementKind::Float32, Rc::new(RefCell::new(bytes)), 0, end)
-        else {
+        let Value::TypedArray(view) = typed::new_typed(
+            ElementKind::Float32,
+            Rc::new(RefCell::new(bytes.into())),
+            0,
+            end,
+        ) else {
             unreachable!("new_typed makes typed arrays")
         };
         self.views[channel] = Some(view.clone());
@@ -1454,7 +1457,7 @@ impl ScriptRuntime {
                 let samples = buffer.channels[channel].clone();
                 let target = target.borrow();
                 let mut bytes = target.buffer.borrow_mut();
-                if let Some(window) = bytes.get_mut(target.start..target.end) {
+                if let Some(window) = bytes.get_mut(super::typed::byte_range(&target)) {
                     write_floats(window, &samples[start..]);
                 }
                 Ok(Value::Undefined)
@@ -1466,7 +1469,11 @@ impl ScriptRuntime {
                 let samples: Vec<f32> = {
                     let source = source.borrow();
                     let bytes = source.buffer.borrow();
-                    read_floats(bytes.get(source.start..source.end).unwrap_or_default())
+                    read_floats(
+                        bytes
+                            .get(super::typed::byte_range(&source))
+                            .unwrap_or_default(),
+                    )
                 };
                 let buffer = self.audio.buffer(id);
                 buffer.sync(channel);
@@ -1477,7 +1484,7 @@ impl ScriptRuntime {
                 if let Some(view) = &buffer.views[channel] {
                     let view = view.borrow();
                     let mut bytes = view.buffer.borrow_mut();
-                    if let Some(window) = bytes.get_mut(view.start..view.end) {
+                    if let Some(window) = bytes.get_mut(super::typed::byte_range(&view)) {
                         write_floats(window, &data);
                     }
                 }

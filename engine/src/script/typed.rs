@@ -207,8 +207,42 @@ pub(super) fn valid_index(array: &TypedArrayData, number: f64) -> Option<usize> 
     (whole && number >= 0.0 && number < element_count(array) as f64).then_some(number as usize)
 }
 
+// the bytes a view covers now: a tracking view follows its buffer's length, and a view whose
+// buffer was detached or shrank past it is out of bounds
+pub(super) fn view_range(
+    buffer: &ByteBuffer,
+    start: usize,
+    end: usize,
+    tracking: bool,
+    size: usize,
+) -> Option<(usize, usize)> {
+    if buffer.detached {
+        return None;
+    }
+    let length = buffer.len();
+    if tracking {
+        (start <= length).then(|| (start, start + (length - start) / size * size))
+    } else {
+        (end <= length).then_some((start, end))
+    }
+}
+
+pub(super) fn typed_range(array: &TypedArrayData) -> Option<(usize, usize)> {
+    view_range(
+        &array.buffer.borrow(),
+        array.start,
+        array.end,
+        array.tracking,
+        array.kind.size(),
+    )
+}
+
+pub(super) fn byte_range(array: &TypedArrayData) -> std::ops::Range<usize> {
+    typed_range(array).map_or(0..0, |(start, end)| start..end)
+}
+
 pub(super) fn element_count(array: &TypedArrayData) -> usize {
-    (array.end - array.start) / array.kind.size()
+    byte_range(array).len() / array.kind.size()
 }
 
 pub(super) fn read_element(array: &TypedArrayData, index: usize) -> Option<Value> {
@@ -246,6 +280,7 @@ pub(super) fn new_typed(kind: ElementKind, buffer: BytesHandle, start: usize, en
         buffer,
         start,
         end,
+        tracking: false,
         kind,
         object: None,
     })))
@@ -276,6 +311,12 @@ pub(super) enum TypedMethod {
     BufferConstructor,
     BufferIsView,
     BufferByteLength,
+    BufferMaxByteLength,
+    BufferResizable,
+    BufferDetached,
+    BufferResize,
+    // transfer when true keeps the buffer resizable, transferToFixedLength when false
+    BufferTransfer(bool),
     BufferSlice,
     ViewConstructor,
     ViewBuffer,
@@ -380,6 +421,24 @@ impl ScriptRuntime {
         }
     }
 
+    // ValidateTypedArray: a typed array whose buffer is detached or too short throws
+    fn valid_typed(&mut self, value: &Value) -> Result<TypedArrayHandle, ScriptError> {
+        let array = self.this_typed(value)?;
+        if typed_range(&array.borrow()).is_none() {
+            return Err(self.type_error(
+                "Cannot perform this operation on a typed array whose buffer is detached or out of bounds",
+            ));
+        }
+        Ok(array)
+    }
+
+    fn this_buffer(&mut self, this: &Value) -> Result<BytesHandle, ScriptError> {
+        match this {
+            Value::Bytes(buffer) => Ok(buffer.clone()),
+            _ => Err(self.type_error("this is not an ArrayBuffer")),
+        }
+    }
+
     fn index_argument(&mut self, value: Value, label: &str) -> Result<usize, ScriptError> {
         let number = match value {
             Value::Undefined => 0.0,
@@ -396,7 +455,7 @@ impl ScriptRuntime {
         if bytes > MAX_TYPED_ARRAY_BYTES {
             return Err(self.range_error("Array buffer allocation failed"));
         }
-        Ok(Rc::new(RefCell::new(vec![0; bytes])))
+        Ok(Rc::new(RefCell::new(vec![0; bytes].into())))
     }
 
     // a typed array of a kind filled from a list of numbers
@@ -411,6 +470,7 @@ impl ScriptRuntime {
             buffer,
             start: 0,
             end: length,
+            tracking: false,
             kind,
             object: None,
         };
@@ -470,7 +530,6 @@ impl ScriptRuntime {
                 }
                 match &first {
                     Value::Bytes(buffer) => {
-                        let buffer_length = buffer.borrow().len();
                         let offset =
                             self.index_argument(argument(&arguments, 1), "typed array offset")?;
                         if offset % kind.size() != 0 {
@@ -480,8 +539,30 @@ impl ScriptRuntime {
                                 kind.size()
                             )));
                         }
-                        let end = match argument(&arguments, 2) {
-                            Value::Undefined => {
+                        let length = match argument(&arguments, 2) {
+                            Value::Undefined => None,
+                            length => Some(self.index_argument(length, "typed array length")?),
+                        };
+                        if buffer.borrow().detached {
+                            return Err(self.type_error(
+                                "Cannot construct a typed array on a detached ArrayBuffer",
+                            ));
+                        }
+                        let buffer_length = buffer.borrow().len();
+                        if length.is_none() && buffer.borrow().max.is_some() {
+                            if offset > buffer_length {
+                                return Err(self.range_error(format!(
+                                    "Start offset {offset} is outside the bounds of the buffer"
+                                )));
+                            }
+                            let array = new_typed(kind, buffer.clone(), offset, buffer_length);
+                            if let Value::TypedArray(array) = &array {
+                                array.borrow_mut().tracking = true;
+                            }
+                            return Ok(array);
+                        }
+                        let end = match length {
+                            None => {
                                 if (buffer_length - offset.min(buffer_length)) % kind.size() != 0 {
                                     return Err(self.range_error(format!(
                                         "byte length of {} should be a multiple of {}",
@@ -491,18 +572,15 @@ impl ScriptRuntime {
                                 }
                                 buffer_length
                             }
-                            length => {
-                                offset
-                                    + self.index_argument(length, "typed array length")?
-                                        * kind.size()
-                            }
+                            Some(length) => offset + length * kind.size(),
                         };
                         if offset > buffer_length || end > buffer_length {
                             return Err(self.range_error("Invalid typed array length"));
                         }
                         Ok(new_typed(kind, buffer.clone(), offset, end))
                     }
-                    Value::TypedArray(source) => {
+                    Value::TypedArray(_) => {
+                        let source = self.valid_typed(&first)?;
                         let values = elements(&source.borrow());
                         self.typed_from_values(kind, values)
                     }
@@ -556,10 +634,15 @@ impl ScriptRuntime {
             )),
             M::ByteLength => {
                 let array = self.this_typed(&this)?;
-                let array = array.borrow();
-                Ok(Value::Number((array.end - array.start) as f64))
+                Ok(Value::Number(byte_range(&array.borrow()).len() as f64))
             }
-            M::ByteOffset => Ok(Value::Number(self.this_typed(&this)?.borrow().start as f64)),
+            M::ByteOffset => {
+                let array = self.this_typed(&this)?;
+                let array = array.borrow();
+                Ok(Value::Number(
+                    typed_range(&array).map_or(0, |_| array.start) as f64,
+                ))
+            }
             M::Length => Ok(Value::Number(
                 element_count(&self.this_typed(&this)?.borrow()) as f64,
             )),
@@ -568,10 +651,10 @@ impl ScriptRuntime {
                 _ => Value::Undefined,
             }),
             M::Set => {
-                let array = self.this_typed(&this)?;
+                let array = self.valid_typed(&this)?;
                 let offset = self.index_argument(argument(&arguments, 1), "offset")?;
                 let values = match &first {
-                    Value::TypedArray(source) => elements(&source.borrow()),
+                    Value::TypedArray(_) => elements(&self.valid_typed(&first)?.borrow()),
                     other => self.array_like_list(other)?,
                 };
                 let count = element_count(&array.borrow());
@@ -585,15 +668,17 @@ impl ScriptRuntime {
             }
             M::Subarray => {
                 let array = self.this_typed(&this)?;
-                let (kind, buffer, start, count) = {
+                let (kind, buffer, start, count, tracking) = {
                     let array = array.borrow();
                     (
                         array.kind,
                         array.buffer.clone(),
                         array.start,
                         element_count(&array),
+                        array.tracking,
                     )
                 };
+                let follows = tracking && matches!(argument(&arguments, 1), Value::Undefined);
                 let begin = match first {
                     Value::Undefined => 0.0,
                     value => self.coerce_number(value)?.trunc(),
@@ -604,15 +689,24 @@ impl ScriptRuntime {
                 };
                 let begin = relative(if begin.is_nan() { 0.0 } else { begin }, count);
                 let end = relative(if end.is_nan() { 0.0 } else { end }, count).max(begin);
-                Ok(new_typed(
-                    kind,
-                    buffer,
-                    start + begin * kind.size(),
-                    start + end * kind.size(),
-                ))
+                let start = start + begin * kind.size();
+                if follows {
+                    if start > buffer.borrow().len() {
+                        return Err(
+                            self.range_error("Start offset is outside the bounds of the buffer")
+                        );
+                    }
+                } else if start + (end - begin) * kind.size() > buffer.borrow().len() {
+                    return Err(self.range_error("Invalid typed array length"));
+                }
+                let view = new_typed(kind, buffer, start, start + (end - begin) * kind.size());
+                if let (true, Value::TypedArray(view)) = (follows, &view) {
+                    view.borrow_mut().tracking = true;
+                }
+                Ok(view)
             }
             M::Values | M::Keys | M::Entries => {
-                self.this_typed(&this)?;
+                self.valid_typed(&this)?;
                 let kind = match method {
                     M::Values => ArrayIterationKind::Values,
                     M::Keys => ArrayIterationKind::Keys,
@@ -630,12 +724,12 @@ impl ScriptRuntime {
                 ))))
             }
             M::Read(array_method) => {
-                let array = self.this_typed(&this)?;
+                let array = self.valid_typed(&this)?;
                 let copy = Self::new_array(elements(&array.borrow()));
                 self.call_array_method(array_method, copy, arguments)
             }
             M::Derive(array_method) => {
-                let array = self.this_typed(&this)?;
+                let array = self.valid_typed(&this)?;
                 let kind = array.borrow().kind;
                 let copy = Self::new_array(elements(&array.borrow()));
                 // numbers sort numerically in typed arrays
@@ -654,16 +748,32 @@ impl ScriptRuntime {
                 self.typed_from_values(kind, values)
             }
             M::Mutate(array_method) => {
-                let array = self.this_typed(&this)?;
+                let array = self.valid_typed(&this)?;
                 let copy = Self::new_array(elements(&array.borrow()));
-                let arguments = if matches!(array_method, ArrayMethod::Sort)
+                let mut arguments = if matches!(array_method, ArrayMethod::Sort)
                     && matches!(first, Value::Undefined)
                 {
                     vec![self.numeric_comparator()]
                 } else {
                     arguments
                 };
+                if matches!(array_method, ArrayMethod::Fill) {
+                    let kind = array.borrow().kind;
+                    let value = self.typed_element_value(kind, first)?;
+                    match arguments.first_mut() {
+                        Some(slot) => *slot = value,
+                        None => arguments.push(value),
+                    }
+                }
                 self.call_array_method(array_method, copy.clone(), arguments)?;
+                // fill coerces its arguments first, which may have shrunk the buffer
+                if matches!(array_method, ArrayMethod::Fill)
+                    && typed_range(&array.borrow()).is_none()
+                {
+                    return Err(self.type_error(
+                        "Cannot perform %TypedArray%.prototype.fill on a typed array whose buffer is detached or out of bounds",
+                    ));
+                }
                 if let Value::Array(values) = copy {
                     let values = values.borrow().clone();
                     for (index, value) in values.into_iter().enumerate() {
@@ -677,7 +787,86 @@ impl ScriptRuntime {
                     return Err(self.type_error("Constructor ArrayBuffer requires 'new'"));
                 }
                 let length = self.index_argument(first, "array buffer length")?;
-                Ok(Value::Bytes(self.allocate(length)?))
+                let options = argument(&arguments, 1);
+                let max = match &options {
+                    Value::Object(_) => match self.get_property(&options, "maxByteLength")? {
+                        Value::Undefined => None,
+                        max => Some(self.index_argument(max, "array buffer max length")?),
+                    },
+                    _ => None,
+                };
+                if max.is_some_and(|max| length > max) {
+                    return Err(self.range_error(
+                        "Invalid array buffer length: larger than its maxByteLength",
+                    ));
+                }
+                if max.is_some_and(|max| max > MAX_TYPED_ARRAY_BYTES) {
+                    return Err(self.range_error("Invalid array buffer max length"));
+                }
+                let buffer = self.allocate(length)?;
+                buffer.borrow_mut().max = max;
+                Ok(Value::Bytes(buffer))
+            }
+            M::BufferMaxByteLength => {
+                let buffer = self.this_buffer(&this)?;
+                let buffer = buffer.borrow();
+                Ok(Value::Number(if buffer.detached {
+                    0.0
+                } else {
+                    buffer.max.unwrap_or(buffer.len()) as f64
+                }))
+            }
+            M::BufferResizable => Ok(Value::Bool(self.this_buffer(&this)?.borrow().max.is_some())),
+            M::BufferDetached => Ok(Value::Bool(self.this_buffer(&this)?.borrow().detached)),
+            M::BufferResize => {
+                let buffer = self.this_buffer(&this)?;
+                let Some(max) = buffer.borrow().max else {
+                    return Err(self.type_error(
+                        "Method ArrayBuffer.prototype.resize called on a fixed-length buffer",
+                    ));
+                };
+                let length = self.index_argument(first, "array buffer length")?;
+                if buffer.borrow().detached {
+                    return Err(self.type_error("Cannot resize a detached ArrayBuffer"));
+                }
+                if length > max {
+                    return Err(
+                        self.range_error("ArrayBuffer.prototype.resize: Invalid length parameter")
+                    );
+                }
+                buffer.borrow_mut().resize(length, 0);
+                Ok(Value::Undefined)
+            }
+            M::BufferTransfer(keep_resizable) => {
+                let buffer = self.this_buffer(&this)?;
+                let length = match first {
+                    Value::Undefined => buffer.borrow().len(),
+                    value => self.index_argument(value, "array buffer length")?,
+                };
+                if buffer.borrow().detached {
+                    return Err(self.type_error("Cannot transfer a detached ArrayBuffer"));
+                }
+                let max = if keep_resizable {
+                    buffer.borrow().max
+                } else {
+                    None
+                };
+                if max.is_some_and(|max| length > max) {
+                    return Err(self.range_error(
+                        "Invalid array buffer length: larger than its maxByteLength",
+                    ));
+                }
+                if length > MAX_TYPED_ARRAY_BYTES {
+                    return Err(self.range_error("Array buffer allocation failed"));
+                }
+                let mut bytes = std::mem::take(&mut buffer.borrow_mut().bytes);
+                buffer.borrow_mut().detached = true;
+                bytes.resize(length, 0);
+                Ok(Value::Bytes(Rc::new(RefCell::new(ByteBuffer {
+                    bytes,
+                    max,
+                    detached: false,
+                }))))
             }
             M::BufferIsView => Ok(Value::Bool(
                 matches!(first, Value::TypedArray(_))
@@ -691,6 +880,9 @@ impl ScriptRuntime {
                 let Value::Bytes(bytes) = &this else {
                     return Err(self.type_error("this is not an ArrayBuffer"));
                 };
+                if bytes.borrow().detached {
+                    return Err(self.type_error("Cannot slice a detached ArrayBuffer"));
+                }
                 let length = bytes.borrow().len();
                 let start = match first {
                     Value::Undefined => 0.0,
@@ -702,9 +894,9 @@ impl ScriptRuntime {
                 };
                 let start = relative(if start.is_nan() { 0.0 } else { start }, length);
                 let end = relative(if end.is_nan() { 0.0 } else { end }, length).max(start);
-                Ok(Value::Bytes(Rc::new(RefCell::new(
-                    bytes.borrow()[start..end].to_vec(),
-                ))))
+                let end = end.min(bytes.borrow().len());
+                let copy = bytes.borrow().get(start..end).unwrap_or_default().to_vec();
+                Ok(Value::Bytes(Rc::new(RefCell::new(copy.into()))))
             }
             M::ViewConstructor => {
                 if new_target.is_none() {
@@ -715,12 +907,19 @@ impl ScriptRuntime {
                         "First argument to DataView constructor must be an ArrayBuffer",
                     ));
                 };
-                let length = buffer.borrow().len();
                 let offset = self.index_argument(argument(&arguments, 1), "DataView offset")?;
-                let end = match argument(&arguments, 2) {
-                    Value::Undefined => length,
-                    value => offset + self.index_argument(value, "DataView length")?,
+                let view_length = match argument(&arguments, 2) {
+                    Value::Undefined => None,
+                    value => Some(self.index_argument(value, "DataView length")?),
                 };
+                if buffer.borrow().detached {
+                    return Err(
+                        self.type_error("Cannot construct a DataView on a detached ArrayBuffer")
+                    );
+                }
+                let length = buffer.borrow().len();
+                let tracking = view_length.is_none() && buffer.borrow().max.is_some();
+                let end = view_length.map_or(length, |view_length| offset + view_length);
                 if offset > length || end > length {
                     return Err(self.range_error("Invalid DataView length"));
                 }
@@ -731,6 +930,7 @@ impl ScriptRuntime {
                         buffer: buffer.clone(),
                         start: offset,
                         end,
+                        tracking,
                     },
                 ))))
             }
@@ -741,23 +941,46 @@ impl ScriptRuntime {
             | M::ViewSet(_) => {
                 let view = match &this {
                     Value::Object(object) => match &object.borrow().class {
-                        ObjectClass::DataView { buffer, start, end } => {
-                            Some((buffer.clone(), *start, *end))
-                        }
+                        ObjectClass::DataView {
+                            buffer,
+                            start,
+                            end,
+                            tracking,
+                        } => Some((buffer.clone(), *start, *end, *tracking)),
                         _ => None,
                     },
                     _ => None,
                 };
-                let Some((buffer, start, end)) = view else {
+                let Some((buffer, start, end, tracking)) = view else {
                     return Err(self.type_error("this is not a DataView"));
                 };
+                let range = || view_range(&buffer.borrow(), start, end, tracking, 1);
+                let out_of_bounds =
+                    "Cannot read a DataView whose buffer is detached or out of bounds";
                 match method {
                     M::ViewBuffer => Ok(Value::Bytes(buffer)),
-                    M::ViewByteLength => Ok(Value::Number((end - start) as f64)),
-                    M::ViewByteOffset => Ok(Value::Number(start as f64)),
+                    M::ViewByteLength | M::ViewByteOffset => match range() {
+                        Some((start, end)) => {
+                            Ok(Value::Number(if matches!(method, M::ViewByteLength) {
+                                end - start
+                            } else {
+                                start
+                            } as f64))
+                        }
+                        None => Err(self.type_error(out_of_bounds)),
+                    },
                     M::ViewGet(kind) | M::ViewSet(kind) => {
                         let offset = self.index_argument(first, "offset")?;
                         let size = kind.size();
+                        let converted = match method {
+                            M::ViewSet(_) => {
+                                Some(self.typed_element_value(kind, argument(&arguments, 1))?)
+                            }
+                            _ => None,
+                        };
+                        let Some((start, end)) = range() else {
+                            return Err(self.type_error(out_of_bounds));
+                        };
                         if start + offset + size > end {
                             return Err(
                                 self.range_error("Offset is outside the bounds of the DataView")
@@ -780,8 +1003,7 @@ impl ScriptRuntime {
                             }
                             Ok(kind.read_value(&bytes))
                         } else {
-                            let converted =
-                                self.typed_element_value(kind, argument(&arguments, 1))?;
+                            let converted = converted.expect("converted above");
                             let mut bytes = kind.encode_value(&converted);
                             if !little {
                                 bytes.reverse();
@@ -816,6 +1038,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn buffers_resize_transfer_and_leave_views_out_of_bounds() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [];
+                const buffer = new ArrayBuffer(4, { maxByteLength: 16 });
+                const follows = new Uint16Array(buffer);
+                const fixed = new Uint8Array(buffer, 0, 4);
+                const view = new DataView(buffer);
+                seen.push(buffer.resizable, buffer.maxByteLength, follows.length);
+                buffer.resize(10);
+                follows[4] = 513;
+                seen.push(follows.length, view.byteLength, view.getUint16(8, true), fixed.length);
+                buffer.resize(2);
+                seen.push(follows.length, fixed.length, fixed.byteOffset, fixed[0]);
+                try { fixed.fill(1); } catch (error) { seen.push(error.name); }
+                try { buffer.resize(17); } catch (error) { seen.push(error.name); }
+                try { new ArrayBuffer(2).resize(1); } catch (error) { seen.push(error.name); }
+                const moved = buffer.transfer(6);
+                seen.push(buffer.detached, buffer.byteLength, buffer.maxByteLength, moved.byteLength, moved.resizable);
+                seen.push(follows.length, follows[0], view.buffer === buffer);
+                try { view.getUint8(0); } catch (error) { seen.push(error.name); }
+                try { buffer.slice(0); } catch (error) { seen.push(error.name); }
+                const fixedCopy = moved.transferToFixedLength();
+                seen.push(fixedCopy.resizable, fixedCopy.byteLength, new Float16Array([1.5])[0]);
+                document.getElementById("out").textContent = seen.join("|");
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some(
+                "true|16|2|5|10|513|4|1|0|0||TypeError|RangeError|TypeError|true|0|0|6|true|\
+                 0||true|TypeError|TypeError|false|6|1.5"
+            )
+        );
+    }
+
+    #[test]
     fn elements_convert_like_the_spec() {
         assert_eq!(ElementKind::Int8.encode(200.0), vec![200u8]);
         assert_eq!(ElementKind::Int8.read(&[200]), -56.0);
@@ -827,7 +1093,10 @@ mod tests {
         assert_eq!(ElementKind::Float16.encode(-0.0), vec![0x00, 0x80]);
         assert_eq!(ElementKind::Float16.encode(65504.0), vec![0xff, 0x7b]);
         assert_eq!(ElementKind::Float16.encode(1e6), vec![0x00, 0x7c]);
-        assert_eq!(ElementKind::Float16.encode(2f64.powi(-24)), vec![0x01, 0x00]);
+        assert_eq!(
+            ElementKind::Float16.encode(2f64.powi(-24)),
+            vec![0x01, 0x00]
+        );
         assert_eq!(ElementKind::Float16.read(&[0x00, 0x3c]), 1.0);
         assert_eq!(ElementKind::Float16.read(&[0x01, 0x00]), 2f64.powi(-24));
         assert!(ElementKind::Float16.read(&[0x01, 0x7c]).is_nan());
