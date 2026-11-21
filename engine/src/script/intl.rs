@@ -196,8 +196,6 @@ pub(super) struct DateOptions {
     hour_cycle: Option<String>,
     time_zone_name: Option<String>,
     fractional: Option<u8>,
-    // the time fields came from toLocaleString's defaults rather than the caller
-    default_time: bool,
     // the zone asked for, as an IANA identifier or a +hh:mm offset; none for the host's own
     zone: Option<String>,
 }
@@ -227,9 +225,8 @@ impl DateOptions {
         }
         if time {
             self.hour = Some("numeric".to_string());
-            self.minute = Some("2-digit".to_string());
-            self.second = Some("2-digit".to_string());
-            self.default_time = true;
+            self.minute = Some("numeric".to_string());
+            self.second = Some("numeric".to_string());
         }
     }
 }

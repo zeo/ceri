@@ -25,8 +25,7 @@ const ZONE_STYLES: [&str; 7] = [
 const TIMES: usize = DATE_SKELETONS;
 const GLUE: usize = TIMES + TIME_SKELETONS;
 const DEFAULT_HOUR: usize = GLUE + 4;
-const DEFAULT_TIMES: usize = DEFAULT_HOUR + 1;
-const DATE_STYLES: usize = DEFAULT_TIMES + 3;
+const DATE_STYLES: usize = DEFAULT_HOUR + 1;
 const TIME_STYLES: usize = DATE_STYLES + 4;
 const MONTHS: usize = TIME_STYLES + 4;
 const WEEKDAYS: usize = MONTHS + 6 * 12;
@@ -91,28 +90,47 @@ fn position<const N: usize>(styles: [&str; N], value: Option<&str>) -> usize {
         .unwrap_or(0)
 }
 
-// the hour letter a request makes: hour12 picks h or H, hourCycle any of the four, and
-// otherwise the locale's own from its j pattern
-fn hour_letter(options: &DateOptions, locale: &Locale) -> char {
-    let default = locale
+fn default_letter(locale: &Locale) -> char {
+    locale
         .text(DEFAULT_HOUR)
         .chars()
         .find(|c| matches!(c, 'h' | 'H' | 'K' | 'k'))
-        .unwrap_or('h');
+        .unwrap_or('h')
+}
+
+// whether a request's hours are on a twelve-hour clock: hour12 decides, then hourCycle, then
+// the locale
+fn twelve_hour(options: &DateOptions, locale: &Locale) -> bool {
     match (options.hour12, options.hour_cycle.as_deref()) {
-        (Some(true), _) => {
-            if default == 'K' {
-                'K'
-            } else {
-                'h'
-            }
-        }
-        (Some(false), _) => 'H',
-        (None, Some("h11")) => 'K',
-        (None, Some("h12")) => 'h',
-        (None, Some("h23")) => 'H',
-        (None, Some("h24")) => 'k',
-        _ => default,
+        (Some(twelve), _) => twelve,
+        (None, Some(cycle)) => matches!(cycle, "h11" | "h12"),
+        (None, None) => matches!(default_letter(locale), 'h' | 'K'),
+    }
+}
+
+// the hour letter an explicit hourCycle asks for, which replaces the pattern's own
+fn cycle_letter(options: &DateOptions) -> Option<char> {
+    if options.hour12.is_some() {
+        return None;
+    }
+    match options.hour_cycle.as_deref() {
+        Some("h11") => Some('K'),
+        Some("h12") => Some('h'),
+        Some("h23") => Some('H'),
+        Some("h24") => Some('k'),
+        _ => None,
+    }
+}
+
+fn hour_letter(options: &DateOptions, locale: &Locale) -> char {
+    if let Some(letter) = cycle_letter(options) {
+        return letter;
+    }
+    let default = default_letter(locale);
+    match (twelve_hour(options, locale), default) {
+        (true, 'h' | 'K') | (false, 'H' | 'k') => default,
+        (true, _) => 'h',
+        (false, _) => 'H',
     }
 }
 
@@ -126,7 +144,10 @@ pub(super) fn hour_cycle(options: &DateOptions) -> &'static str {
     }
 }
 
-fn swap_hours(pattern: &str, letter: char) -> String {
+fn swap_hours(pattern: &str, letter: Option<char>) -> String {
+    let Some(letter) = letter else {
+        return pattern.to_string();
+    };
     let mut quoted = false;
     pattern
         .chars()
@@ -145,7 +166,8 @@ fn swap_hours(pattern: &str, letter: char) -> String {
 
 // the pattern for a request, as V8 and ICU would pick it
 fn pattern(options: &DateOptions, locale: &Locale) -> String {
-    let letter = hour_letter(options, locale);
+    let swap =
+        cycle_letter(options).or_else(|| options.hour12.map(|_| hour_letter(options, locale)));
     let style_index = |style: Option<&str>| -> Option<usize> {
         style.map(|style| match style {
             "full" => 0,
@@ -158,7 +180,7 @@ fn pattern(options: &DateOptions, locale: &Locale) -> String {
         let date = style_index(options.date_style.as_deref())
             .map(|index| locale.text(DATE_STYLES + index));
         let time = style_index(options.time_style.as_deref())
-            .map(|index| swap_hours(locale.text(TIME_STYLES + index), letter));
+            .map(|index| swap_hours(locale.text(TIME_STYLES + index), swap));
         return match (date, time) {
             (Some(date), Some(time)) => {
                 let glue =
@@ -179,7 +201,7 @@ fn pattern(options: &DateOptions, locale: &Locale) -> String {
         None => 0,
         Some(style) => {
             let double = usize::from(style == "2-digit");
-            if matches!(letter, 'h' | 'K') {
+            if twelve_hour(options, locale) {
                 1 + double
             } else {
                 3 + double
@@ -196,16 +218,7 @@ fn pattern(options: &DateOptions, locale: &Locale) -> String {
     let zone = position(ZONE_STYLES, options.time_zone_name.as_deref());
     let time_index = ((hour * 3 + minute) * 3 + second) * 7 + zone;
     let date = locale.text(date_index);
-    let mut time = if options.default_time && options.time_zone_name.is_none() {
-        let default = match (options.hour12, options.hour_cycle.as_deref()) {
-            (None, None) => 0,
-            _ if matches!(letter, 'H' | 'k') => 1,
-            _ => 2,
-        };
-        swap_hours(locale.text(DEFAULT_TIMES + default), letter)
-    } else {
-        swap_hours(locale.text(TIMES + time_index), letter)
-    };
+    let mut time = swap_hours(locale.text(TIMES + time_index), cycle_letter(options));
     if let Some(digits) = options.fractional.filter(|digits| *digits > 0) {
         time = insert_fraction(&time, digits, super::decimal_separator(&options.locale));
     }

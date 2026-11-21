@@ -1,0 +1,167 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- read by tools/date_patterns.py in a headless Edge: for each locale it formats sample times
+     to parts and writes back the CLDR pattern, names and zone names that produced them, so
+     ceri's tables match the CLDR the browser carries -->
+<pre id="out"></pre>
+<script>
+const LOCALES = JSON.parse(decodeURIComponent(location.hash.slice(1)));
+const ZONES = [
+  "America/New_York", "America/Chicago", "America/Denver", "America/Phoenix",
+  "America/Los_Angeles", "America/Anchorage", "Pacific/Honolulu", "America/Toronto",
+  "America/Vancouver", "America/Mexico_City", "America/Sao_Paulo", "America/Halifax",
+  "America/St_Johns", "Europe/London", "Europe/Dublin", "Europe/Lisbon", "Europe/Paris",
+  "Europe/Berlin", "Europe/Madrid", "Europe/Rome", "Europe/Amsterdam", "Europe/Warsaw",
+  "Europe/Kyiv", "Europe/Athens", "Europe/Istanbul", "Europe/Moscow", "Asia/Dubai",
+  "Asia/Kolkata", "Asia/Shanghai", "Asia/Hong_Kong", "Asia/Tokyo", "Asia/Seoul",
+  "Asia/Singapore", "Asia/Jakarta", "Australia/Sydney", "Australia/Perth",
+  "Australia/Adelaide", "Pacific/Auckland", "Africa/Johannesburg", "Africa/Cairo", "UTC",
+];
+const WEEKDAYS = ["", "narrow", "short", "long"];
+const YEARS = ["", "2-digit", "numeric"];
+const MONTHS = ["", "2-digit", "numeric", "narrow", "short", "long"];
+const DAYS = ["", "2-digit", "numeric"];
+const HOURS = [["", undefined], ["numeric", true], ["2-digit", true], ["numeric", false], ["2-digit", false]];
+const TWO = ["", "numeric", "2-digit"];
+const ZONE_NAMES = ["", "short", "long", "shortOffset", "longOffset", "shortGeneric", "longGeneric"];
+const ZONE_LETTERS = { short: "z", long: "zzzz", shortOffset: "O", longOffset: "OOOO", shortGeneric: "v", longGeneric: "vvvv" };
+// 2024-07-04 is a Thursday: one-digit month, day, hour, minute and second
+const SAMPLE = Date.UTC(2024, 6, 4, 9, 5, 7, 123);
+const AFTERNOON = Date.UTC(2024, 6, 4, 15, 5, 7, 123);
+const MIDNIGHT = Date.UTC(2024, 6, 4, 0, 5, 7, 123);
+
+const quote = (text) => /[A-Za-z']/.test(text) ? "'" + text.replace(/'/g, "''") + "'" : text;
+
+function names(locale) {
+  const format = (options, time) => new Intl.DateTimeFormat(locale, { ...options, timeZone: "UTC" }).formatToParts(time);
+  const take = (parts, type) => (parts.find((part) => part.type === type) || { value: "" }).value;
+  const monthsOf = (width, standalone) => Array.from({ length: 12 }, (_, month) => {
+    const time = Date.UTC(2024, month, 4);
+    return take(format(standalone ? { month: width } : { month: width, day: "numeric" }, time), "month");
+  });
+  const weekdaysOf = (width, standalone) => Array.from({ length: 7 }, (_, day) => take(format(standalone ? { weekday: width } : { weekday: width, year: "numeric", month: "numeric", day: "numeric" }, Date.UTC(2024, 6, 7 + day)), "weekday"));
+  const months = [monthsOf("long", false), monthsOf("short", false), monthsOf("narrow", false), monthsOf("long", true), monthsOf("short", true), monthsOf("narrow", true)];
+  // Intl has no short weekday width apart from abbreviated, so short repeats it
+  const weekdays = [weekdaysOf("long", false), weekdaysOf("short", false), weekdaysOf("short", false), weekdaysOf("narrow", false), weekdaysOf("long", true), weekdaysOf("short", true), weekdaysOf("short", true), weekdaysOf("narrow", true)];
+  const periods = [take(format({ hour: "numeric", hour12: true }, SAMPLE), "dayPeriod"), take(format({ hour: "numeric", hour12: true }, AFTERNOON), "dayPeriod")];
+  const eraOf = (width, time) => take(format({ era: width, year: "numeric" }, time), "era");
+  const bc = Date.UTC(-100, 0, 1);
+  const eras = [eraOf("short", bc), eraOf("short", SAMPLE), eraOf("long", bc), eraOf("long", SAMPLE)];
+  const digits = new Intl.NumberFormat(locale, { useGrouping: false }).format(1234567890);
+  const digitTable = digits[9] + digits.slice(0, 9);
+  return { months, weekdays, periods, eras, digits: digitTable };
+}
+
+function pattern(locale, options, table) {
+  const make = (time) => new Intl.DateTimeFormat(locale, { ...options, timeZone: options.timeZone || "UTC" }).formatToParts(time);
+  const morning = make(SAMPLE);
+  const afternoon = make(AFTERNOON);
+  const midnight = make(MIDNIGHT);
+  const fromNative = (value) => value.replace(/./g, (c) => { const index = table.digits.indexOf(c); return index < 0 ? c : String(index); });
+  let out = "";
+  morning.forEach((part, index) => {
+    const value = part.value;
+    switch (part.type) {
+      case "literal": out += quote(value); break;
+      case "year": out += fromNative(value).length === 2 ? "yy" : "y"; break;
+      case "month": {
+        if (/^\d+$/.test(fromNative(value))) { out += fromNative(value).length === 2 ? "MM" : "M"; break; }
+        const forms = ["MMMM", "MMM", "MMMMM", "LLLL", "LLL", "LLLLL"];
+        const found = table.months.findIndex((list) => list[6] === value);
+        out += forms[found < 0 ? 0 : found];
+        break;
+      }
+      case "day": out += fromNative(value).length === 2 ? "dd" : "d"; break;
+      case "weekday": {
+        const forms = ["EEEE", "EEE", "EEEEEE", "EEEEE", "cccc", "ccc", "cccccc", "ccccc"];
+        const found = table.weekdays.findIndex((list) => list[4] === value);
+        out += forms[found < 0 ? 1 : found];
+        break;
+      }
+      case "dayPeriod": out += value === table.periods[0] || value === table.periods[1] ? "a" : "B"; break;
+      case "hour": {
+        const width = fromNative(value).length;
+        const later = fromNative(afternoon[index].value);
+        const zero = fromNative(midnight[index].value);
+        const letter = later === "15" ? (zero === "24" ? "k" : "H") : (zero === "0" || zero === "00" ? "K" : "h");
+        out += letter.repeat(width);
+        break;
+      }
+      case "minute": out += fromNative(value).length === 2 ? "mm" : "m"; break;
+      case "second": out += fromNative(value).length === 2 ? "ss" : "s"; break;
+      case "fractionalSecond": out += "S".repeat(value.length); break;
+      case "timeZoneName": out += ZONE_LETTERS[options.timeZoneName] || "z"; break;
+      case "era": out += "G"; break;
+      default: out += quote(value);
+    }
+  });
+  return out;
+}
+
+function zoneParts(locale, table) {
+  // the localized GMT format, read off the short and long offset names
+  const parts = [];
+  for (const style of ["shortOffset", "longOffset"]) {
+    const name = (zone) => new Intl.DateTimeFormat(locale, { timeZoneName: style, timeZone: zone }).formatToParts(Date.UTC(2024, 0, 1, 12)).find((part) => part.type === "timeZoneName").value;
+    const minus = name("Etc/GMT+4");
+    const plus = name("Asia/Kolkata");
+    const zero = name("UTC");
+    const isDigit = (c) => /\d/.test(c) || table.digits.includes(c);
+    const first = [...minus].findIndex(isDigit);
+    let end = minus.length;
+    while (end > first && !isDigit(minus[end - 1])) end -= 1;
+    const prefix = minus.slice(0, first - 1);
+    parts.push(zero, prefix, minus.slice(end), minus[first - 1], plus[prefix.length]);
+  }
+  return parts;
+}
+
+function zoneNames(locale) {
+  const values = [];
+  for (const zone of ZONES) {
+    for (const style of ["short", "long", "shortGeneric", "longGeneric"]) {
+      for (const time of [Date.UTC(2024, 0, 1, 12), Date.UTC(2024, 6, 4, 12)]) {
+        values.push(new Intl.DateTimeFormat(locale, { timeZoneName: style, timeZone: zone }).formatToParts(time).find((part) => part.type === "timeZoneName").value);
+      }
+    }
+  }
+  return values;
+}
+
+const result = {};
+for (const locale of LOCALES) {
+  const table = names(locale);
+  const values = [];
+  for (const weekday of WEEKDAYS) for (const year of YEARS) for (const month of MONTHS) for (const day of DAYS) {
+    const options = {};
+    if (weekday) options.weekday = weekday;
+    if (year) options.year = year;
+    if (month) options.month = month;
+    if (day) options.day = day;
+    values.push(Object.keys(options).length ? pattern(locale, options, table) : "");
+  }
+  for (const [hour, twelve] of HOURS) for (const minute of TWO) for (const second of TWO) for (const zone of ZONE_NAMES) {
+    const options = {};
+    if (hour) { options.hour = hour; options.hour12 = twelve; }
+    if (minute) options.minute = minute;
+    if (second) options.second = second;
+    if (zone) options.timeZoneName = zone;
+    values.push(Object.keys(options).length ? pattern(locale, options, table).trim() : "");
+  }
+  // the date-time glue of each date style, read off combined patterns
+  const time = pattern(locale, { hour: "numeric", minute: "2-digit" }, table);
+  for (const date of [{ weekday: "long", year: "numeric", month: "long", day: "numeric" }, { year: "numeric", month: "long", day: "numeric" }, { year: "numeric", month: "short", day: "numeric" }, { year: "numeric", month: "numeric", day: "numeric" }]) {
+    const datePattern = pattern(locale, date, table);
+    const combined = pattern(locale, { ...date, hour: "numeric", minute: "2-digit" }, table);
+    values.push(combined.includes(datePattern) && combined.includes(time) ? combined.replace(datePattern, "{1}").replace(time, "{0}") : "{1}, {0}");
+  }
+  values.push(pattern(locale, { hour: "numeric" }, table));
+  for (const style of ["full", "long", "medium", "short"]) values.push(pattern(locale, { dateStyle: style }, table));
+  for (const style of ["full", "long", "medium", "short"]) values.push(pattern(locale, { timeStyle: style }, table));
+  for (const list of table.months) values.push(...list);
+  for (const list of table.weekdays) values.push(...list);
+  values.push(...table.periods, ...table.eras, table.digits, ...zoneParts(locale, table), ...zoneNames(locale));
+  result[locale] = values;
+}
+document.getElementById("out").textContent = JSON.stringify(result);
+</script>
