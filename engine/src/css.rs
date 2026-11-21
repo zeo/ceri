@@ -4959,33 +4959,59 @@ fn parse_relative_list(source: &str) -> Result<Vec<RelativeSelector>, String> {
 }
 
 fn parse_attribute_value(source: &str, cursor: &mut usize) -> Result<String, String> {
-    if *cursor >= source.len() {
+    let Some(&first) = source.as_bytes().get(*cursor) else {
         return Err(format!("attribute selector has no value: {source}"));
+    };
+    let quote = matches!(first, b'\'' | b'"').then_some(first as char);
+    if quote.is_some() {
+        *cursor += 1;
     }
-    let quote = source.as_bytes()[*cursor];
-    if quote == b'\'' || quote == b'"' {
-        *cursor += 1;
-        let start = *cursor;
-        while *cursor < source.len() && source.as_bytes()[*cursor] != quote {
-            *cursor += 1;
+    let mut value = String::new();
+    while let Some(character) = source[*cursor..].chars().next() {
+        match (character, quote) {
+            (found, Some(quote)) if found == quote => {
+                *cursor += 1;
+                return Ok(value);
+            }
+            (found, None) if found.is_ascii_whitespace() || found == ']' => break,
+            ('\\', _) => {
+                *cursor += 1;
+                let hex = source[*cursor..]
+                    .chars()
+                    .take_while(char::is_ascii_hexdigit)
+                    .take(6)
+                    .collect::<String>();
+                if !hex.is_empty() {
+                    *cursor += hex.len();
+                    let code = u32::from_str_radix(&hex, 16).unwrap_or(0xfffd);
+                    value.push(
+                        char::from_u32(code)
+                            .filter(|_| code != 0)
+                            .unwrap_or('\u{fffd}'),
+                    );
+                    if let Some(space) = source[*cursor..].chars().next()
+                        && space.is_ascii_whitespace()
+                    {
+                        *cursor += space.len_utf8();
+                    }
+                } else if let Some(escaped) = source[*cursor..].chars().next() {
+                    *cursor += escaped.len_utf8();
+                    // an escaped newline inside a string continues it
+                    if escaped != '\n' {
+                        value.push(escaped);
+                    }
+                }
+            }
+            (other, _) => {
+                value.push(other);
+                *cursor += other.len_utf8();
+            }
         }
-        if *cursor >= source.len() {
-            return Err(format!("unterminated attribute value: {source}"));
-        }
-        let value = source[start..*cursor].to_string();
-        *cursor += 1;
-        Ok(value)
-    } else {
-        let start = *cursor;
-        while *cursor < source.len()
-            && !source.as_bytes()[*cursor].is_ascii_whitespace()
-            && source.as_bytes()[*cursor] != b']'
-        {
-            *cursor += 1;
-        }
-        (start != *cursor)
-            .then(|| source[start..*cursor].to_string())
-            .ok_or_else(|| format!("attribute selector has no value: {source}"))
+    }
+    match quote {
+        Some(_) => Err(format!("unterminated attribute value: {source}")),
+        None if value.is_empty() => Err(format!("attribute selector has no value: {source}")),
+        None => Ok(value),
     }
 }
 

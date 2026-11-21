@@ -19232,6 +19232,30 @@ mod tests {
         );
     }
     #[test]
+    fn escaped_attribute_selectors_find_windows_paths_and_focus_them() {
+        let document = document(
+            r#"<main class="view"><ul><li class="clip" tabindex="-1" data-path="C:\Users\me\Videos\a b.mp4">a</li></ul></main><p id="status">idle</p>"#,
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const path = "C:\\Users\\me\\Videos\\a b.mp4";
+                const escaped = CSS.escape(path);
+                const found = document.querySelector(`.view [data-path="${escaped}"]`);
+                const seen = [escaped, found ? found.tagName : "none"];
+                found?.focus();
+                seen.push(document.activeElement ? document.activeElement.tagName : "null", found === document.activeElement);
+                document.getElementById("status").textContent = seen.join("|");
+                "#,
+            )
+            .expect("script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some("C\\:\\\\Users\\\\me\\\\Videos\\\\a\\ b\\.mp4|LI|LI|true")
+        );
+    }
+    #[test]
     fn promise_try_wraps_what_a_function_returns_or_throws() {
         let document = document(r#"<main><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());

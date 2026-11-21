@@ -165,9 +165,7 @@ mod tests {
                 .borrow()
                 .element(out)
                 .and_then(|element| element.attr("data-seen")),
-            Some(
-                "true|Notes|2|one|2|HTML|TITLE|true|true|svg|2|<title>Notes</title>|TypeError"
-            )
+            Some("true|Notes|2|one|2|HTML|TITLE|true|true|svg|2|<title>Notes</title>|TypeError")
         );
         assert_eq!(
             document.borrow().element_text_content(out).as_deref(),
