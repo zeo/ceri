@@ -157,7 +157,7 @@ See [docs/architecture.md](docs/architecture.md) for the process model and secur
 
 ## The engine
 
-[engine/](engine/README.md) holds the engine: HTML parsing and a live DOM, a CSS cascade with the selector, length and media-query surface listed there, block, flex, grid and table layout, positioning, scrolling and clipping, a software paint pass with an sfnt parser and antialiased glyph rasterizer, SVG, a 2D canvas, audio and video through the system's decoders on Windows, its own ES2022 JavaScript engine (parser, bytecode compiler and VM with generators, async functions and an object model with prototypes and descriptors) with modules, promises, workers, fetch, storage, IndexedDB, structured clone and Web Crypto digests, an accessibility tree, and a platform-neutral frame and input boundary that the shared `winit` and `softbuffer` window host drives.
+[engine/](engine/README.md) holds the engine: HTML parsing and a live DOM, a CSS cascade with the selector, length and media-query surface listed there, block, flex, grid and table layout, positioning, scrolling and clipping, a software paint pass with an sfnt parser and antialiased glyph rasterizer, SVG, a 2D canvas, WebGL 1 and 2 drawn on the CPU with a GLSL ES 1.00 and 3.00 compiler of its own, audio and video through the system's decoders on Windows, its own ES2022 JavaScript engine (parser, bytecode compiler and VM with generators, async functions and an object model with prototypes and descriptors) with modules, promises, workers, fetch, storage, IndexedDB, structured clone and Web Crypto digests, an accessibility tree, and a platform-neutral frame and input boundary that the shared `winit` and `softbuffer` window host drives.
 
 Host-owned seams keep platform work outside the renderer: `ResourceProvider` for assets and networking, `FilePicker` for file input, `ClipboardProvider` for clipboard text and pasted pictures, `FontSource` for installed faces, and typed `HostRuntimeInfo` for the runtime identity query. The renderer never receives a filesystem path, a native clipboard handle or a socket. On Windows the runtime backs the clipboard and file input with the platform clipboard and file dialog.
 
@@ -185,7 +185,7 @@ The window takes its caption from `document.title`, its icon from the packaged f
 
 JavaScript conformance is checked against a test262 subset in CI, with the tests the engine does not yet pass listed in `conformance/test262/expected-failures.txt`.
 
-Not covered yet: WebGL, WebGPU and WebCodecs, video on Linux, `DOMParser`, depth-sorted `preserve-3d` scenes, full WebAssembly, printing, platform accessibility adapters, and multi-process renderer isolation with a sandbox. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.
+Not covered yet: WebGPU (`navigator.gpu` finds no adapter) and WebCodecs, multisampled WebGL (a context asked for `antialias` draws without it and reports `false`), video on Linux, depth-sorted `preserve-3d` scenes, full WebAssembly, printing, platform accessibility adapters, and multi-process renderer isolation with a sandbox. Those are the gates in [docs/engine-research.md](docs/engine-research.md), which also carries the candidate comparison and the replacement criteria.
 
 ## License
 

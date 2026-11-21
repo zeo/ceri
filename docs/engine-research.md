@@ -12,7 +12,7 @@ The Rust-native engine is now the only engine. The runtime serves the packaged a
 
 CEF was removed on 2026-10-16 instead of being kept as a fallback. Two engines meant two security surfaces, two bundling paths and a bridge written twice, and the fallback hid every gap in the native engine instead of forcing it closed. An app that needs one of the gates below now waits for that gate:
 
-- media playback, WebGL and other GPU APIs
+- WebGPU and WebCodecs; media plays on Windows through the system decoders, and WebGL draws on the CPU
 - cross-origin policy beyond an operator allowlist, so there is no CORS preflight, no cookie jar and no credential mode
 - `transform-style: preserve-3d`, so intersecting 3D planes are not depth sorted and each transformed element flattens on its own
 - transitions between shorthand and longhand declarations, so a `margin` change does not drive a `margin-top` transition, and between `box-shadow` lists of different lengths
