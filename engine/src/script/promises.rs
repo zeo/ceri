@@ -26,6 +26,8 @@ pub(super) enum PromiseFunction {
     Race,
     Any,
     WithResolvers,
+    // calls a function now and hands back a promise of what it returns or throws
+    Try,
     Finally(PromiseHandle),
     // a per-element reaction of a combinator
     Element {
@@ -201,6 +203,22 @@ impl ScriptRuntime {
                 state.remaining.set(state.remaining.get().saturating_sub(1));
                 self.settle_aggregate(&state);
                 Ok(Value::Undefined)
+            }
+            PromiseFunction::Try => {
+                let callback = argument(&arguments, 0);
+                if !is_callable(&callback) {
+                    return Err(self.type_error("Promise.try requires a function"));
+                }
+                let rest = arguments.into_iter().skip(1).collect();
+                Ok(Value::Promise(
+                    match self.call_function(callback, Value::Undefined, rest) {
+                        Ok(value) => self.promise_resolve(value)?,
+                        Err(error) => {
+                            let thrown = self.take_thrown(error);
+                            self.rejected_promise_value(thrown)
+                        }
+                    },
+                ))
             }
             PromiseFunction::WithResolvers => {
                 let promise = Self::pending_promise();

@@ -4704,6 +4704,7 @@ impl ScriptRuntime {
                 "withResolvers" => Ok(Self::promise_native(
                     promises::PromiseFunction::WithResolvers,
                 )),
+                "try" => Ok(Self::promise_native(promises::PromiseFunction::Try)),
                 _ => Err(runtime_error(format!("Promise has no property {property}"))),
             },
             Value::Object(object) => Ok(object
@@ -19290,6 +19291,29 @@ mod tests {
             Some(
                 "a, b, and c|a and b|a, b, or c|a, b, & c|a, b, c|a, b, c|a b c|a, b und c|a, b \u{456} c|a||[{\"type\":\"element\",\"value\":\"x\"},{\"type\":\"literal\",\"value\":\" and \"},{\"type\":\"element\",\"value\":\"y\"}]|disjunction|RangeError"
             )
+        );
+    }
+    #[test]
+    fn promise_try_wraps_what_a_function_returns_or_throws() {
+        let document = document(r#"<main><p id="status">idle</p></main>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [];
+                Promise.try(() => 5).then((value) => seen.push(value));
+                Promise.try(() => { throw new Error("thrown"); }).catch((error) => seen.push(error.message));
+                Promise.try((a, b) => a + b, 2, 3).then((value) => seen.push(value));
+                Promise.try(() => Promise.resolve(7)).then((value) => seen.push(value));
+                try { Promise.try(1); } catch (error) { seen.push(error.name); }
+                setTimeout(() => (document.getElementById("status").textContent = seen.join("|")), 0);
+                "#,
+            )
+            .expect("script should run");
+        runtime.advance_time(1).expect("the timer should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some("TypeError|5|thrown|5|7")
         );
     }
     #[test]
