@@ -52,6 +52,7 @@ mod notifications;
 mod numbers;
 mod object;
 mod observers;
+mod offscreen;
 mod operations;
 mod parser;
 mod path2d;
@@ -708,6 +709,8 @@ pub struct ScriptRuntime {
     scroll_offsets: BTreeMap<NodeId, (f32, f32)>,
     viewport: ViewportMetrics,
     canvas_contexts: HashMap<NodeId, CanvasContextHandle>,
+    // the OffscreenCanvas objects standing in front of canvas elements no document holds
+    offscreen_canvases: HashMap<NodeId, std::rc::Weak<RefCell<object::JsObject>>>,
     logs: Vec<String>,
     clock: u64,
     next_task_id: u64,
@@ -1882,6 +1885,7 @@ impl ScriptRuntime {
             bridge: None,
             scroll_offsets: BTreeMap::new(),
             canvas_contexts: HashMap::new(),
+            offscreen_canvases: HashMap::new(),
             logs: Vec::new(),
             clock: 0,
             next_task_id: 1,

@@ -1629,7 +1629,11 @@ impl ScriptRuntime {
             return Ok(Value::Builtin(Builtin::CanvasMethod(context.clone(), name)));
         }
         Ok(match property {
-            "canvas" => self.node_value(context.borrow().node),
+            "canvas" => {
+                let node = context.borrow().node;
+                self.offscreen_object(node)
+                    .unwrap_or_else(|| self.node_value(node))
+            }
             "fillStyle" | "strokeStyle" => {
                 let context = context.borrow();
                 let paint = match property {
@@ -2290,6 +2294,9 @@ impl ScriptRuntime {
         };
         let bitmap = match &source {
             Value::Element(_) => self.canvas_source(&source)?.map(|(bitmap, _)| bitmap),
+            offscreen if Self::offscreen_element(offscreen).is_some() => {
+                self.canvas_source(&source)?.map(|(bitmap, _)| bitmap)
+            }
             Value::Blob(blob) => decoded(&blob.bytes, &blob.mime_type),
             Value::File(file) => decoded(&file.bytes, &file.mime_type),
             data => {
@@ -2321,22 +2328,7 @@ impl ScriptRuntime {
             }
         };
         Ok(Value::Promise(match bitmap {
-            Some(bitmap) => {
-                let held = Rc::new(RefCell::new(Some(bitmap)));
-                let (width, height) = held
-                    .borrow()
-                    .as_ref()
-                    .map_or((0, 0), |bitmap| (bitmap.width, bitmap.height));
-                let bitmap = plain_object([
-                    ("width".to_string(), Value::Number(f64::from(width))),
-                    ("height".to_string(), Value::Number(f64::from(height))),
-                    (
-                        "close".to_string(),
-                        Value::Builtin(Builtin::ImageBitmapClose(held)),
-                    ),
-                ]);
-                self.fulfilled_promise(self.host_object(bitmap, "ImageBitmap"))
-            }
+            Some(bitmap) => self.fulfilled_promise(self.image_bitmap_object(bitmap)),
             None => self.rejected_promise_value(dom_exception(
                 "InvalidStateError",
                 "The source image could not be decoded.",
@@ -2344,7 +2336,85 @@ impl ScriptRuntime {
         }))
     }
 
+    // the pixels a canvas holds, when anything has drawn on it
+    pub(super) fn canvas_bitmap(&self, node: NodeId) -> Option<Bitmap> {
+        self.canvas_contexts
+            .get(&node)
+            .map(|context| context.borrow().bitmap.clone())
+    }
+
+    // an ImageBitmap holding pixels until it is closed
+    pub(super) fn image_bitmap_object(&self, bitmap: Bitmap) -> Value {
+        let (width, height) = (bitmap.width, bitmap.height);
+        let held = Rc::new(RefCell::new(Some(bitmap)));
+        let bitmap = plain_object([
+            ("width".to_string(), Value::Number(f64::from(width))),
+            ("height".to_string(), Value::Number(f64::from(height))),
+            (
+                "close".to_string(),
+                Value::Builtin(Builtin::ImageBitmapClose(held)),
+            ),
+        ]);
+        self.host_object(bitmap, "ImageBitmap")
+    }
+
+    // a canvas's pixels as a PNG or JPEG blob, for OffscreenCanvas.convertToBlob
+    pub(super) fn canvas_blob(
+        &mut self,
+        node: NodeId,
+        kind: Value,
+        quality: Value,
+    ) -> Result<Value, ScriptError> {
+        let mime = match kind {
+            Value::Undefined => "image/png",
+            value
+                if self
+                    .coerce_string(value.clone())?
+                    .eq_ignore_ascii_case("image/jpeg") =>
+            {
+                "image/jpeg"
+            }
+            _ => "image/png",
+        };
+        let quality = match quality {
+            Value::Number(quality) if (0.0..=1.0).contains(&quality) => {
+                (quality * 100.0 + 0.5) as u8
+            }
+            _ => 92,
+        };
+        if self
+            .canvas_contexts
+            .get(&node)
+            .is_some_and(|context| context.borrow().tainted)
+        {
+            return Ok(Value::Promise(self.rejected_promise_value(dom_exception(
+                "SecurityError",
+                "Failed to execute 'convertToBlob' on 'OffscreenCanvas': Tainted OffscreenCanvas may not be exported.",
+            ))));
+        }
+        let encoded = match self.canvas_contexts.get(&node) {
+            Some(context) => context.borrow().bitmap.encode(mime, quality),
+            None => {
+                let (width, height) = canvas_size(&self.document.borrow(), node);
+                Bitmap::new(width, height).encode(mime, quality)
+            }
+        };
+        Ok(Value::Promise(match encoded {
+            Some(bytes) => self.fulfilled_promise(Value::Blob(Rc::new(BlobData {
+                bytes,
+                mime_type: mime.to_string(),
+            }))),
+            None => self.rejected_promise_value(dom_exception(
+                "EncodingError",
+                "Failed to execute 'convertToBlob' on 'OffscreenCanvas': Encoding of the canvas failed.",
+            )),
+        }))
+    }
+
     fn canvas_source(&mut self, source: &Value) -> Result<Option<Measured>, ScriptError> {
+        // an OffscreenCanvas draws as the canvas element behind it
+        let behind = Self::offscreen_element(source).map(Value::Element);
+        let source = behind.as_ref().unwrap_or(source);
         // an ImageBitmap is known by the close that carries its pixels
         if !matches!(source, Value::Element(_))
             && let Ok(Value::Builtin(Builtin::ImageBitmapClose(held))) =
