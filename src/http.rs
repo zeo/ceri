@@ -1,7 +1,46 @@
-use ceri_engine::{ExternalRequest, NavigationError, ResourceResponse};
+use ceri_engine::{
+    ExternalEvent, ExternalReport, ExternalRequest, NavigationError, ResourceResponse,
+};
+use std::collections::BTreeMap;
 
 pub fn request(request: &ExternalRequest) -> Result<ResourceResponse, NavigationError> {
     platform::request(request)
+}
+
+// runs the request on a thread of its own and reports the head and each read of the body as
+// they arrive, so a page reads a slow or endless answer as it comes
+pub fn spawn(request: ExternalRequest, report: ExternalReport) {
+    std::thread::spawn(move || {
+        let outcome = platform::exchange(
+            &request,
+            true,
+            |status, headers| {
+                report(ExternalEvent::Head {
+                    status,
+                    mime_type: mime_type_of(&headers),
+                    headers,
+                })
+            },
+            |chunk| {
+                report(ExternalEvent::Chunk(chunk.to_vec()));
+                true
+            },
+        );
+        report(match outcome {
+            Ok(()) => ExternalEvent::Done,
+            Err(error) => ExternalEvent::Failed(error.to_string()),
+        });
+    });
+}
+
+fn mime_type_of(headers: &BTreeMap<String, String>) -> String {
+    headers
+        .get("content-type")
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "application/octet-stream".to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -41,8 +80,30 @@ mod platform {
         NavigationError::ResourceProvider(detail.into())
     }
 
-    // the request travels over the platform TLS stack, so certificate policy stays with the OS
     pub(super) fn request(request: &ExternalRequest) -> Result<ResourceResponse, NavigationError> {
+        let mut head = (0, BTreeMap::new());
+        let mut body = Vec::new();
+        exchange(
+            request,
+            false,
+            |status, headers| head = (status, headers),
+            |chunk| {
+                body.extend_from_slice(chunk);
+                body.len() <= MAX_RESPONSE_BYTES
+            },
+        )?;
+        let (status, headers) = head;
+        ResourceResponse::new(status, super::mime_type_of(&headers), headers, body)
+    }
+
+    // the request travels over the platform TLS stack, so certificate policy stays with the OS;
+    // a streamed exchange waits as long as the server takes between reads, as browsers do
+    pub(super) fn exchange(
+        request: &ExternalRequest,
+        streamed: bool,
+        mut on_head: impl FnMut(u16, BTreeMap<String, String>),
+        mut on_chunk: impl FnMut(&[u8]) -> bool,
+    ) -> Result<(), NavigationError> {
         let (host, port, target) = split_target(request.url())?;
         let agent = wide(concat!("Ceri/", env!("CARGO_PKG_VERSION")));
         // SAFETY: every pointer below refers to a live null terminated buffer
@@ -65,7 +126,7 @@ mod platform {
                 TIMEOUT_MILLISECONDS,
                 TIMEOUT_MILLISECONDS,
                 TIMEOUT_MILLISECONDS,
-                TIMEOUT_MILLISECONDS,
+                if streamed { 0 } else { TIMEOUT_MILLISECONDS },
             )
         };
         let host_wide = wide(&host);
@@ -149,8 +210,7 @@ mod platform {
         {
             return Err(failure("the response had no status code"));
         }
-        let headers = read_raw_headers(call.0);
-        let mut body = Vec::new();
+        on_head(status as u16, read_raw_headers(call.0));
         let mut chunk = vec![0_u8; READ_CHUNK];
         loop {
             let mut read = 0_u32;
@@ -169,24 +229,15 @@ mod platform {
                 )));
             }
             if read == 0 {
-                break;
+                return Ok(());
             }
-            body.extend_from_slice(&chunk[..read as usize]);
-            if body.len() > MAX_RESPONSE_BYTES {
+            if !on_chunk(&chunk[..read as usize]) {
                 return Err(failure(format!(
                     "the response from {host} is larger than {} MiB",
                     MAX_RESPONSE_BYTES / (1024 * 1024)
                 )));
             }
         }
-        let mime_type = headers
-            .get("content-type")
-            .and_then(|value| value.split(';').next())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| "application/octet-stream".to_string());
-        ResourceResponse::new(status as u16, mime_type, headers, body)
     }
 
     fn read_raw_headers(call: *mut c_void) -> BTreeMap<String, String> {
@@ -301,8 +352,22 @@ mod platform {
 #[cfg(not(target_os = "windows"))]
 mod platform {
     use ceri_engine::{ExternalRequest, NavigationError, ResourceResponse};
+    use std::collections::BTreeMap;
 
     pub(super) fn request(request: &ExternalRequest) -> Result<ResourceResponse, NavigationError> {
         ceri_engine::request_external(request)
+    }
+
+    // the request answers whole here, so the body is reported as one piece
+    pub(super) fn exchange(
+        request: &ExternalRequest,
+        _streamed: bool,
+        mut on_head: impl FnMut(u16, BTreeMap<String, String>),
+        mut on_chunk: impl FnMut(&[u8]) -> bool,
+    ) -> Result<(), NavigationError> {
+        let response = ceri_engine::request_external(request)?;
+        on_head(response.status(), response.headers().clone());
+        on_chunk(response.body());
+        Ok(())
     }
 }

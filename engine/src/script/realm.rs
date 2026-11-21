@@ -166,6 +166,8 @@ pub(super) enum Native {
     DomExceptionConstructor,
     // reports a value as an uncaught exception would be, without throwing
     ReportError,
+    // the signal of the outside fetch with this id was aborted
+    FetchAbort(u32),
     // an animation of the given generation reaches its end
     AnimFinish(u32, u64),
     Shape(super::geometry_values::ShapeMember),
@@ -3027,6 +3029,7 @@ impl ScriptRuntime {
             Native::ClipboardItemConstructor => Err(self.type_error(
                 "Failed to construct 'ClipboardItem': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
+            Native::FetchAbort(id) => self.abort_fetch(id),
             Native::ReportError => {
                 let error = self.throw_value(first);
                 self.report_exception(error);

@@ -30,6 +30,7 @@ mod iterator_helpers;
 mod json;
 mod markup;
 mod messaging;
+mod netfetch;
 mod traversal;
 pub(crate) use json::quote as json_quote;
 mod lexer;
@@ -670,6 +671,9 @@ pub struct ScriptRuntime {
     array_expando_prune_at: usize,
     // the FinalizationRegistry objects whose targets are watched after each turn
     registries: Vec<std::rc::Weak<RefCell<collections::Registry>>>,
+    // outside fetches the host runs off this thread, and the id the next one takes
+    fetches: RefCell<Vec<netfetch::PendingFetch>>,
+    next_fetch_id: std::cell::Cell<u32>,
     pattern_cache: HashMap<(String, String), Rc<pattern::Regex>>,
     random_state: u64,
     console_depth: usize,
@@ -1802,6 +1806,8 @@ impl ScriptRuntime {
             array_expandos: HashMap::new(),
             array_expando_prune_at: 64,
             registries: Vec::new(),
+            fetches: RefCell::new(Vec::new()),
+            next_fetch_id: std::cell::Cell::new(0),
             pattern_cache: HashMap::new(),
             random_state: numbers::random_seed(),
             console_depth: 0,
@@ -5283,6 +5289,7 @@ impl ScriptRuntime {
             + self.settle_command_replies()?
             + self.pump_audio()?
             + self.pump_sockets()?
+            + self.pump_fetches()?
             + self.pump_notices()?
             + self.pump_media();
         self.drain_microtasks()?;
@@ -9662,7 +9669,7 @@ impl ScriptRuntime {
             Err(error) => return self.rejected_promise(error.to_string()),
         };
         if let Some(target) = external {
-            return self.fetch_external(target, &request, kind);
+            return self.fetch_external(target, &request, kind, options.signal.clone());
         }
         if self.resources.is_none() && self.resource_provider.is_none() {
             return self.rejected_promise("fetch is unavailable without a resource bundle");
@@ -9721,6 +9728,7 @@ impl ScriptRuntime {
         target: String,
         request: &ResourceRequest,
         kind: &'static str,
+        signal: Option<AbortSignalHandle>,
     ) -> PromiseHandle {
         let Some(provider) = self.resource_provider.as_deref() else {
             return self
@@ -9735,6 +9743,9 @@ impl ScriptRuntime {
             Ok(external) => external,
             Err(error) => return self.rejected_promise(error.to_string()),
         };
+        if let Some(promise) = self.spawn_fetch(provider, target.clone(), &external, signal) {
+            return promise;
+        }
         let sent = crate::netlog::send();
         let provided = provider.provide_external(&external);
         crate::netlog::record_to(

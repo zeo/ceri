@@ -16,9 +16,10 @@ use crate::tray::{Tray, TrayConfig, TrayEvent};
 use crate::video::DesktopVideo;
 use ceri_engine::{
     APP_ORIGIN, AppUrl, Browser, Capabilities, CommandCall, CommandError, EngineHost,
-    ExternalRequest, FontSet, Grant, HostBridge, HostRuntimeInfo, Lifecycle, MediaBytes,
-    MediaSource, NavigationError, Resource, ResourceBundle, ResourceProvider, ResourceResponse,
-    Size, SocketConnector, WindowConfig, WindowControl, mime_type_for, run_window_with,
+    ExternalReport, ExternalRequest, FontSet, Grant, HostBridge, HostRuntimeInfo, Lifecycle,
+    MediaBytes, MediaSource, NavigationError, Resource, ResourceBundle, ResourceProvider,
+    ResourceResponse, Size, SocketConnector, WindowConfig, WindowControl, mime_type_for,
+    run_window_with,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -995,6 +996,18 @@ impl ResourceProvider for PackagedAssets {
             return Ok(None);
         }
         crate::http::request(request).map(Some)
+    }
+
+    fn spawn_external(&self, request: &ExternalRequest, report: ExternalReport) -> bool {
+        if !self
+            .allowed_origins
+            .iter()
+            .any(|origin| origin.eq_ignore_ascii_case(request.origin()))
+        {
+            return false;
+        }
+        crate::http::spawn(request.clone(), report);
+        true
     }
 
     // packaged media is read where it is, on disk or in the program, so a long video is never

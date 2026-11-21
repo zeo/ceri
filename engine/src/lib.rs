@@ -85,10 +85,11 @@ pub use layout::{LayoutDocument, Rect, Size, ThumbDrag, layout};
 #[cfg(feature = "native-http")]
 pub use native_http::{NativeHttpProvider, request_external};
 pub use navigation::{
-    APP_ORIGIN, AppUrl, Browser, ClipboardProvider, ExternalRequest, FILES_ORIGIN, FilePicker,
-    FilePickerRequest, FileSelection, NavigationError, NavigationFailure, NavigationStatus,
-    Resource, ResourceBundle, ResourceCacheMode, ResourceProvider, ResourceRequest,
-    ResourceResponse, SocketConnector, SocketStream, UserPreferences, external_url, mime_type_for,
+    APP_ORIGIN, AppUrl, Browser, ClipboardProvider, ExternalEvent, ExternalReport, ExternalRequest,
+    FILES_ORIGIN, FilePicker, FilePickerRequest, FileSelection, NavigationError, NavigationFailure,
+    NavigationStatus, Resource, ResourceBundle, ResourceCacheMode, ResourceProvider,
+    ResourceRequest, ResourceResponse, SocketConnector, SocketStream, UserPreferences,
+    external_url, mime_type_for,
 };
 pub use paint::Canvas;
 pub use script::{

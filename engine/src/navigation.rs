@@ -382,6 +382,22 @@ impl ResourceRequest {
 
 // a fetch outside the app origin, which the host allows or refuses on its own policy
 #[derive(Clone, Debug, PartialEq, Eq)]
+// what an outside request started with spawn_external reports, in this order: the head,
+// any number of chunks of the body, then done, or a failure at any point
+pub enum ExternalEvent {
+    Head {
+        status: u16,
+        mime_type: String,
+        headers: BTreeMap<String, String>,
+    },
+    Chunk(Vec<u8>),
+    Done,
+    Failed(String),
+}
+
+pub type ExternalReport = Box<dyn Fn(ExternalEvent) + Send>;
+
+#[derive(Clone)]
 pub struct ExternalRequest {
     url: String,
     method: String,
@@ -473,6 +489,12 @@ pub trait ResourceProvider {
         _request: &ExternalRequest,
     ) -> Result<Option<ResourceResponse>, NavigationError> {
         Ok(None)
+    }
+
+    // starts an outside request off the page's thread, reporting the answer as it arrives;
+    // false leaves the request to provide_external, answered in place
+    fn spawn_external(&self, _request: &ExternalRequest, _report: ExternalReport) -> bool {
+        false
     }
 
     fn provide_request(

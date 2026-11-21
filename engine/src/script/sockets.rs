@@ -151,6 +151,10 @@ fn is_token(text: &str) -> bool {
 }
 
 impl ScriptRuntime {
+    pub(super) fn socket_waker(&self) -> Option<crate::bridge::Waker> {
+        self.sockets.waker.clone()
+    }
+
     pub(crate) fn set_socket_waker(&mut self, waker: Option<crate::bridge::Waker>) {
         self.sockets.waker = waker;
     }

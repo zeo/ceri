@@ -181,6 +181,8 @@ enum Source {
     Tee(Rc<TeeState>, usize),
     // the readable side of a transform
     Transform(Rc<TransformState>),
+    // a body arriving from the network, which the fetch pump feeds; the flag says it was canceled
+    Network(Rc<Cell<bool>>),
 }
 
 pub(super) struct Readable {
@@ -585,6 +587,43 @@ impl ScriptRuntime {
         value
     }
 
+    // a stream the network feeds as a response body arrives, and the flag its cancel sets
+    pub(super) fn network_stream(&self) -> (Value, Rc<RefCell<Readable>>, Rc<Cell<bool>>) {
+        let canceled = Rc::new(Cell::new(false));
+        let state = readable_state(Source::Network(canceled.clone()), 0.0, None);
+        let (value, stream) = self.new_readable(state, None);
+        stream.borrow_mut().started = true;
+        (value, stream, canceled)
+    }
+
+    pub(super) fn network_chunk(
+        &mut self,
+        stream: &Rc<RefCell<Readable>>,
+        bytes: Vec<u8>,
+    ) -> Result<(), ScriptError> {
+        if !matches!(stream.borrow().state, State::Readable) || stream.borrow().close_requested {
+            return Ok(());
+        }
+        let length = bytes.len();
+        let chunk = typed::new_typed(
+            typed::ElementKind::Uint8,
+            Rc::new(RefCell::new(bytes)),
+            0,
+            length,
+        );
+        self.enqueue_readable(stream, chunk)
+    }
+
+    pub(super) fn network_done(&mut self, stream: &Rc<RefCell<Readable>>) {
+        if matches!(stream.borrow().state, State::Readable) && !stream.borrow().close_requested {
+            self.close_requested(stream);
+        }
+    }
+
+    pub(super) fn network_failed(&mut self, stream: &Rc<RefCell<Readable>>, reason: Value) {
+        self.error_readable(stream, reason);
+    }
+
     // the stream a body was made from when script gave one, rather than bytes
     pub(super) fn script_body(holder: &ReadableStreamHandle) -> Option<Rc<RefCell<Readable>>> {
         let object = holder.borrow().object.clone()?;
@@ -885,6 +924,7 @@ impl ScriptRuntime {
             Source::Iterator { iterator, next } => Pull::Iterator(iterator.clone(), next.clone()),
             Source::Tee(tee, _) => Pull::Tee(tee.clone()),
             Source::Transform(transform) => Pull::Transform(transform.clone()),
+            Source::Network(_) => Pull::Nothing,
         };
         match pull {
             Pull::Nothing => Ok(None),
@@ -1092,6 +1132,10 @@ impl ScriptRuntime {
             Source::Iterator { iterator, .. } => Cancel::Iterator(iterator.clone()),
             Source::Tee(tee, index) => Cancel::Tee(tee.clone(), *index),
             Source::Transform(transform) => Cancel::Transform(transform.clone()),
+            Source::Network(canceled) => {
+                canceled.set(true);
+                Cancel::Nothing
+            }
             Source::Body(body) => {
                 let mut body = body.borrow_mut();
                 body.cursor = body.bytes.len();
