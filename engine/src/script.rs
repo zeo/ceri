@@ -2669,6 +2669,72 @@ impl ScriptRuntime {
         Ok(true)
     }
 
+    // document.execCommand for what text controls and the document selection answer: copy
+    // and cut through the host clipboard while the page is transiently active, and in a
+    // focused text control insertText, delete, forwardDelete and selectAll; anything else is
+    // a command that is not enabled here and reports false
+    pub(super) fn exec_command(&mut self, command: &str, value: &str) -> Result<bool, ScriptError> {
+        let command = command.to_ascii_lowercase();
+        let control = self
+            .focused_element
+            .filter(|&node| self.is_text_control(node));
+        match (command.as_str(), control) {
+            ("copy" | "cut", _) if !self.transiently_active() => Ok(false),
+            ("copy", Some(node)) => self.run_editing_shortcut(node, "c"),
+            ("cut", Some(node)) => self.run_editing_shortcut(node, "x"),
+            ("copy", None) => {
+                let Some(range) = self.selection.range() else {
+                    return Ok(false);
+                };
+                let text = self.range_text(range.get());
+                let Some(clipboard) = self.clipboard_provider.clone() else {
+                    return Ok(false);
+                };
+                if text.is_empty() {
+                    return Ok(false);
+                }
+                clipboard
+                    .write_text(&text)
+                    .map_err(|error| runtime_error(format!("clipboard write failed: {error}")))?;
+                Ok(true)
+            }
+            ("selectall", Some(node)) => self.run_editing_shortcut(node, "a"),
+            ("inserttext", Some(_)) => self.insert_text(value),
+            ("delete" | "forwarddelete", Some(node)) if !self.is_readonly(node) => {
+                let text = self.control_value(node).unwrap_or_default();
+                let units = text.encode_utf16().collect::<Vec<_>>();
+                let selection = self.selection_for(node, &text);
+                let (start, end) = if selection.start != selection.end {
+                    (selection.start, selection.end)
+                } else if command == "delete" && selection.start > 0 {
+                    (
+                        previous_utf16_boundary(&units, selection.start),
+                        selection.start,
+                    )
+                } else if command == "forwarddelete" && selection.start < units.len() {
+                    (
+                        selection.start,
+                        next_utf16_boundary(&units, selection.start),
+                    )
+                } else {
+                    return Ok(false);
+                };
+                self.mark_user_edit(node);
+                self.set_range_text(
+                    node,
+                    &[
+                        Value::String(String::new().into()),
+                        Value::Number(start as f64),
+                        Value::Number(end as f64),
+                        Value::String("start".to_string().into()),
+                    ],
+                )?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub(crate) fn insert_text(&mut self, text: &str) -> Result<bool, ScriptError> {
         if self.composition.is_some() {
             return self.composition_commit(text);

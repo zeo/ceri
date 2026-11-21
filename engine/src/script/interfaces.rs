@@ -365,6 +365,11 @@ static INTERFACES: &[Interface] = &[
             ("adoptNode", Method(1)),
             ("createEvent", Method(1)),
             ("startViewTransition", Method(0)),
+            ("execCommand", Method(1)),
+            ("queryCommandSupported", Method(1)),
+            ("queryCommandEnabled", Method(1)),
+            ("queryCommandState", Method(1)),
+            ("queryCommandValue", Method(1)),
             ("activeViewTransition", ReadOnly),
             ("createRange", Method(0)),
             ("createTreeWalker", Method(1)),
@@ -1880,6 +1885,30 @@ impl ScriptRuntime {
                 Value::Undefined
             }
             ("startViewTransition", Access::Call) => self.start_view_transition(first)?,
+            ("execCommand", Access::Call) => {
+                let command = self.coerce_string(first)?;
+                let value = match arguments.get(2).cloned() {
+                    None | Some(Value::Undefined) => String::new(),
+                    Some(value) => self.coerce_string(value)?,
+                };
+                Value::Bool(self.exec_command(&command, &value)?)
+            }
+            ("queryCommandSupported", Access::Call) | ("queryCommandEnabled", Access::Call) => {
+                let command = self.coerce_string(first)?.to_ascii_lowercase();
+                let known = matches!(
+                    command.as_str(),
+                    "copy" | "cut" | "selectall" | "inserttext" | "delete" | "forwarddelete"
+                );
+                let enabled = match command.as_str() {
+                    "copy" | "cut" => self.transiently_active(),
+                    _ => self
+                        .focused_element
+                        .is_some_and(|node| self.is_text_control(node)),
+                };
+                Value::Bool(known && (member.name() == "queryCommandSupported" || enabled))
+            }
+            ("queryCommandState", Access::Call) => Value::Bool(false),
+            ("queryCommandValue", Access::Call) => Value::String("".into()),
             ("activeViewTransition", Access::Get) => self.active_view_transition(),
             ("createEvent", Access::Call) => {
                 let interface = self.coerce_string(first)?;

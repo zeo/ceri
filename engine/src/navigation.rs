@@ -3259,6 +3259,8 @@ impl Browser {
     fn activate_node(&mut self, node: NodeId) -> Result<bool, NavigationError> {
         let handled = {
             let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            // a click the host makes for its user activates the page as a press would
+            page.runtime.note_activation();
             page.runtime
                 .click_node(node)
                 .map_err(|error| NavigationError::Script(error.to_string()))?
@@ -6448,6 +6450,54 @@ mod tests {
             )
         );
         assert!(body.contains("Content-Type: text/plain\r\n\r\nfile payload\r\n"));
+    }
+
+    #[test]
+    fn exec_command_edits_text_controls_and_copies_after_a_press() {
+        let text = Rc::new(RefCell::new(String::new()));
+        let writes = Rc::new(RefCell::new(Vec::new()));
+        let provider = Rc::new(MemoryClipboard {
+            text: text.clone(),
+            writes: writes.clone(),
+        });
+        let mut browser = Browser::new(bundle(
+            r#"<input id="field" value="abc"><button id="copy">copy</button><p id="status">idle</p><script>
+                const field = document.getElementById("field");
+                const seen = [];
+                field.addEventListener("input", () => seen.push("input:" + field.value));
+                field.focus();
+                field.setSelectionRange(3, 3);
+                seen.push(document.execCommand("insertText", false, "de"));
+                seen.push(document.execCommand("delete"), field.value);
+                field.setSelectionRange(0, 0);
+                seen.push(document.execCommand("forwardDelete"), field.value);
+                seen.push(document.queryCommandSupported("copy"), document.queryCommandEnabled("copy"));
+                seen.push(document.execCommand("copy"), document.execCommand("bold"));
+                document.getElementById("copy").addEventListener("click", () => {
+                    field.focus();
+                    document.execCommand("selectAll");
+                    seen.push(document.execCommand("copy"));
+                    document.getElementById("status").textContent = seen.join("|");
+                });
+            </script>"#,
+        ))
+        .with_clipboard_provider(provider);
+        browser
+            .navigate("https://app.ceri.invalid/index.html")
+            .expect("packaged document should load");
+        browser.click_id("copy").expect("click should run");
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "input:abcde|true|input:abcd|true|abcd|input:bcd|true|bcd|true|false|false|false|true"
+            )
+        );
+        assert_eq!(writes.borrow().as_slice(), ["bcd"]);
     }
 
     #[test]
