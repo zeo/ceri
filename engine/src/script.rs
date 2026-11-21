@@ -28,6 +28,7 @@ mod interfaces;
 mod intl;
 mod iterator_helpers;
 mod json;
+mod markup;
 mod messaging;
 mod traversal;
 pub(crate) use json::quote as json_quote;

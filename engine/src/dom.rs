@@ -322,6 +322,17 @@ impl Document {
         Ok(document)
     }
 
+    // parses a whole document under a new document node beside this one, as DOMParser
+    // does; markup that is not html is built as written, with no implied html, head or body
+    pub fn parse_document(&mut self, source: &str, html: bool) -> Result<NodeId, ParseError> {
+        let root = self.allocate(NodeKind::Document);
+        if let Err(error) = self.parse_into(root, source, html) {
+            self.free_tree(root);
+            return Err(error);
+        }
+        Ok(root)
+    }
+
     // parses markup into a new fragment of this document
     pub fn parse_fragment(&mut self, source: &str) -> Result<NodeId, ParseError> {
         let fragment = self.create_fragment();
@@ -1195,11 +1206,16 @@ impl Document {
     }
 
     pub fn document_element(&self) -> Option<NodeId> {
-        self.element_children(self.root).next()
+        self.document_element_of(self.root)
     }
 
-    fn document_child_named(&self, name: &str) -> Option<NodeId> {
-        let html = self.document_element()?;
+    // the same parts of any document node, such as one DOMParser made
+    pub fn document_element_of(&self, document: NodeId) -> Option<NodeId> {
+        self.element_children(document).next()
+    }
+
+    fn document_child_named(&self, document: NodeId, name: &str) -> Option<NodeId> {
+        let html = self.document_element_of(document)?;
         self.element_children(html).find(|&child| {
             self.element(child)
                 .is_some_and(|element| element.name == name)
@@ -1207,15 +1223,27 @@ impl Document {
     }
 
     pub fn body(&self) -> Option<NodeId> {
-        self.document_child_named("body")
+        self.body_of(self.root)
+    }
+
+    pub fn body_of(&self, document: NodeId) -> Option<NodeId> {
+        self.document_child_named(document, "body")
     }
 
     pub fn head(&self) -> Option<NodeId> {
-        self.document_child_named("head")
+        self.head_of(self.root)
+    }
+
+    pub fn head_of(&self, document: NodeId) -> Option<NodeId> {
+        self.document_child_named(document, "head")
     }
 
     pub fn title(&self) -> Option<String> {
-        let title = self.descendants(self.root).find(|&id| {
+        self.title_of(self.root)
+    }
+
+    pub fn title_of(&self, document: NodeId) -> Option<String> {
+        let title = self.descendants(document).find(|&id| {
             self.element(id)
                 .is_some_and(|element| element.name == "title")
         })?;

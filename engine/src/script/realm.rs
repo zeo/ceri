@@ -158,6 +158,7 @@ pub(super) enum Native {
     Port(super::messaging::PortMember),
     Walk(super::traversal::WalkMember),
     Helper(super::iterator_helpers::HelperMember),
+    Markup(super::markup::MarkupMember),
     Anim(super::animations::AnimMember),
     AnimConstructor,
     ClipboardItemConstructor,
@@ -224,6 +225,9 @@ impl Native {
                 | Native::AnimConstructor
                 | Native::ClipboardItemConstructor
                 | Native::Helper(super::iterator_helpers::HelperMember::Constructor)
+                | Native::Markup(
+                    super::markup::MarkupMember::Parser | super::markup::MarkupMember::Serializer
+                )
                 | Native::RectConstructor(_)
                 | Native::PointConstructor(_)
                 | Native::PortConstructor
@@ -1378,6 +1382,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let readers = super::filereader::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let traversal = super::traversal::create(&build, &object_prototype, &mut globals);
     let helpers = super::iterator_helpers::create(&build, &iterator_prototype, &mut globals);
+    super::markup::create(&build, &object_prototype, &mut globals);
     let animations = super::animations::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let clipboard_item = build.constructor(
         Native::ClipboardItemConstructor,
@@ -2870,6 +2875,7 @@ impl ScriptRuntime {
             Native::Port(member) => self.call_port(member, this, arguments),
             Native::Walk(member) => self.call_walk(member, this, arguments),
             Native::Helper(member) => self.call_iterator_helper(member, this, arguments),
+            Native::Markup(member) => self.call_markup(member, this, arguments),
             Native::Anim(member) => self.call_animation(member, this, arguments),
             Native::AnimFinish(id, generation) => self.deliver_animation_finish(id, generation),
             Native::Shape(member) => self.call_shape(member, this, arguments),
@@ -3253,6 +3259,7 @@ impl ScriptRuntime {
             Native::MessageChannelConstructor => self.construct_message_channel(new_target),
             Native::AnimConstructor => Err(self.type_error("Illegal constructor")),
             Native::Helper(_) => self.construct_iterator(new_target),
+            Native::Markup(_) => self.construct_markup(new_target),
             Native::Promise(function)
                 if matches!(*function, super::promises::PromiseFunction::Constructor) =>
             {

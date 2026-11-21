@@ -1101,6 +1101,11 @@ impl ScriptRuntime {
             return Ok(result);
         }
         // the remaining members are implemented on the host values themselves
+        let parsed_document = !matches!(this, Value::Document)
+            && matches!(
+                self.document.borrow().kind(handle.id),
+                Some(NodeKind::Document)
+            );
         let target = match (&this, member.name()) {
             (
                 Value::Document,
@@ -1109,6 +1114,13 @@ impl ScriptRuntime {
                 | "activeElement" | "importNode" | "adoptNode" | "createTreeWalker"
                 | "createNodeIterator" | "getAnimations",
             ) => Value::Document,
+            // a parsed document makes its nodes in the same tree store as the page's
+            (
+                _,
+                "createElement" | "createTextNode" | "createRange" | "getSelection"
+                | "activeElement" | "importNode" | "adoptNode" | "createTreeWalker"
+                | "createNodeIterator" | "getAnimations",
+            ) if parsed_document => Value::Document,
             _ => Value::Element(handle),
         };
         match member.access {
@@ -1203,7 +1215,10 @@ impl ScriptRuntime {
         let node = handle.id;
         let first = arguments.first().cloned().unwrap_or(Value::Undefined);
         let second = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-        let on_document = matches!(this, Value::Document);
+        // the page's document, or one DOMParser made
+        let on_document = matches!(this, Value::Document)
+            || matches!(self.document.borrow().kind(node), Some(NodeKind::Document));
+        let parsed_document = on_document && !matches!(this, Value::Document);
         if member.access != Access::Set
             && let Some(measured) = self.element_geometry(node, member.name())?
         {
@@ -1237,8 +1252,35 @@ impl ScriptRuntime {
                 if on_document {
                     Value::Null
                 } else {
-                    Value::Document
+                    let top = {
+                        let document = self.document.borrow();
+                        let mut top = node;
+                        while let Some(parent) = document.parent(top) {
+                            top = parent;
+                        }
+                        matches!(document.kind(top), Some(NodeKind::Document)).then_some(top)
+                    };
+                    match top {
+                        Some(top) if top != self.document_node() => self.node_value(top),
+                        _ => Value::Document,
+                    }
                 }
+            }
+            ("documentElement", Access::Get) if parsed_document => {
+                let element = self.document.borrow().document_element_of(node);
+                self.optional_node(element)
+            }
+            ("getElementById", Access::Call) if parsed_document => {
+                let id = self.coerce_string(first)?;
+                let found = {
+                    let document = self.document.borrow();
+                    document.descendants(node).find(|&candidate| {
+                        document
+                            .element(candidate)
+                            .is_some_and(|element| element.attr("id") == Some(id.as_str()))
+                    })
+                };
+                self.optional_node(found)
             }
             ("textContent", Access::Get) if on_document => Value::Null,
             ("nodeValue", Access::Get) if self.document.borrow().character_data(node).is_none() => {
@@ -1310,21 +1352,25 @@ impl ScriptRuntime {
                 self.optional_node(content)
             }
             ("body", Access::Get) => {
-                let body = self.document.borrow().body();
+                let body = self.document.borrow().body_of(node);
                 self.optional_node(body)
             }
             ("head", Access::Get) => {
-                let head = self.document.borrow().head();
+                let head = self.document.borrow().head_of(node);
                 self.optional_node(head)
             }
-            ("title", Access::Get) if on_document => {
-                Value::String(self.document.borrow().title().unwrap_or_default().into())
-            }
+            ("title", Access::Get) if on_document => Value::String(
+                self.document
+                    .borrow()
+                    .title_of(node)
+                    .unwrap_or_default()
+                    .into(),
+            ),
             ("title", Access::Set) if on_document => {
                 let title = self.coerce_string(first)?;
                 let existing = {
                     let document = self.document.borrow();
-                    document.descendants(document.root()).find(|&candidate| {
+                    document.descendants(node).find(|&candidate| {
                         document
                             .element(candidate)
                             .is_some_and(|element| element.name == "title")
@@ -1334,10 +1380,10 @@ impl ScriptRuntime {
                     Some(element) => element,
                     None => {
                         let created = self.document.borrow_mut().create_element("title");
-                        let head = self.document.borrow().head();
+                        let head = self.document.borrow().head_of(node);
                         let parent = head
-                            .or_else(|| self.document.borrow().document_element())
-                            .unwrap_or_else(|| self.document_node());
+                            .or_else(|| self.document.borrow().document_element_of(node))
+                            .unwrap_or(node);
                         self.insert_node(parent, created, None)?;
                         created
                     }
