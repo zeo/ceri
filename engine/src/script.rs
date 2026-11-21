@@ -39,6 +39,8 @@ mod netfetch;
 mod traversal;
 pub(crate) use json::quote as json_quote;
 mod atomics;
+mod display_names_data;
+mod displaynames;
 mod disposables;
 mod lexer;
 mod locale;

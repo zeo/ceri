@@ -1,0 +1,140 @@
+# generates engine/src/script/display_names_data.rs, the English names Intl.DisplayNames gives,
+# from the CLDR data in the ICU that Windows 10 and later ship as icu.dll
+#
+#     python -I engine/tools/display_names.py <output .rs file>
+
+import ctypes
+import sys
+
+icu = ctypes.CDLL("icu.dll")
+icu.uloc_getAvailable.restype = ctypes.c_char_p
+icu.uloc_getISOLanguages.restype = ctypes.POINTER(ctypes.c_char_p)
+icu.uloc_getISOCountries.restype = ctypes.POINTER(ctypes.c_char_p)
+icu.uldn_open.restype = ctypes.c_void_p
+icu.uscript_getShortName.restype = ctypes.c_char_p
+icu.ucurr_getName.restype = ctypes.c_wchar_p
+icu.ucurr_openISOCurrencies.restype = ctypes.c_void_p
+icu.uenum_next.restype = ctypes.c_void_p
+
+# CLDR's English names for whole tags, which Windows ICU leaves out of its data
+DIALECTS = {
+    "ar-001": "Modern Standard Arabic",
+    "de-AT": "Austrian German",
+    "de-CH": "Swiss High German",
+    "en-AU": "Australian English",
+    "en-CA": "Canadian English",
+    "en-GB": "British English",
+    "en-US": "American English",
+    "es-419": "Latin American Spanish",
+    "es-ES": "European Spanish",
+    "es-MX": "Mexican Spanish",
+    "fa-AF": "Dari",
+    "fr-CA": "Canadian French",
+    "fr-CH": "Swiss French",
+    "nds-NL": "Low Saxon",
+    "nl-BE": "Flemish",
+    "pt-BR": "Brazilian Portuguese",
+    "pt-PT": "European Portuguese",
+    "ro-MD": "Moldavian",
+    "sw-CD": "Congo Swahili",
+    "zh-Hans": "Simplified Chinese",
+    "zh-Hant": "Traditional Chinese",
+}
+
+
+def strings(pointer):
+    values = []
+    index = 0
+    while pointer[index]:
+        values.append(pointer[index].decode())
+        index += 1
+    return values
+
+
+def display(names, function, tag):
+    out = ctypes.create_unicode_buffer(256)
+    error = ctypes.c_int(0)
+    length = function(ctypes.c_void_p(names), tag.encode(), out, 256, ctypes.byref(error))
+    if error.value > 0 or length <= 0:
+        return None
+    return out.value[:length]
+
+
+def quote(text):
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def table(name, comment, rows):
+    lines = [f"// {comment}", f"pub(super) const {name}: &[(&str, &str)] = &["]
+    lines += [f'    ("{key}", "{quote(value)}"),' for key, value in sorted(rows.items())]
+    return lines + ["];", ""]
+
+
+def main(output):
+    error = ctypes.c_int(0)
+    standard = icu.uldn_open(b"en", 0, ctypes.byref(error))
+    languages = {}
+    for code in strings(icu.uloc_getISOLanguages()):
+        name = display(standard, icu.uldn_languageDisplayName, code)
+        if name and name != code:
+            languages[code] = name
+    regions = {}
+    for code in strings(icu.uloc_getISOCountries()) + ["001", "002", "019", "142", "150", "419", "EU", "UN"]:
+        name = display(standard, icu.uldn_regionDisplayName, code)
+        if name and name != code:
+            regions[code] = name
+    scripts = {}
+    for number in range(250):
+        code = icu.uscript_getShortName(number)
+        if not code:
+            continue
+        code = code.decode()
+        name = display(standard, icu.uldn_scriptDisplayName, code)
+        if len(code) == 4 and name and name != code:
+            scripts[code] = name
+    currencies = {}
+    handle = icu.ucurr_openISOCurrencies(1 | 8, ctypes.byref(error))
+    while handle:
+        length = ctypes.c_int(0)
+        step = ctypes.c_int(0)
+        pointer = icu.uenum_next(ctypes.c_void_p(handle), ctypes.byref(length), ctypes.byref(step))
+        if not pointer or step.value > 0:
+            break
+        code = ctypes.string_at(pointer, length.value).decode()
+        choice = ctypes.c_int(0)
+        size = ctypes.c_int(0)
+        failed = ctypes.c_int(0)
+        name = icu.ucurr_getName(code, b"en", 1, ctypes.byref(choice), ctypes.byref(size), ctypes.byref(failed))
+        if failed.value <= 0 and name and name[: size.value] != code:
+            currencies[code] = name[: size.value]
+    icu.uenum_close(ctypes.c_void_p(handle))
+    calendars = {}
+    for bcp, keyword in [
+        ("buddhist", "buddhist"), ("chinese", "chinese"), ("coptic", "coptic"), ("dangi", "dangi"),
+        ("ethioaa", "ethiopic-amete-alem"), ("ethiopic", "ethiopic"), ("gregory", "gregorian"),
+        ("hebrew", "hebrew"), ("indian", "indian"), ("islamic", "islamic"), ("islamic-civil", "islamic-civil"),
+        ("islamic-rgsa", "islamic-rgsa"), ("islamic-tbla", "islamic-tbla"), ("islamic-umalqura", "islamic-umalqura"),
+        ("iso8601", "iso8601"), ("japanese", "japanese"), ("persian", "persian"), ("roc", "roc"),
+    ]:
+        out = ctypes.create_unicode_buffer(128)
+        failed = ctypes.c_int(0)
+        length = icu.uldn_keyValueDisplayName(ctypes.c_void_p(standard), b"calendar", keyword.encode(), out, 128, ctypes.byref(failed))
+        if failed.value <= 0 and length > 0:
+            calendars[bcp] = out.value[:length]
+    lines = [
+        "// the English names Intl.DisplayNames gives, from the CLDR that Windows ICU carries;",
+        "// generated by engine/tools/display_names.py, regenerate instead of editing",
+        "",
+    ]
+    lines += table("LANGUAGE_NAMES", "language subtags", languages)
+    lines += table("DIALECT_NAMES", "whole tags with a name of their own, for languageDisplay dialect", DIALECTS)
+    lines += table("REGION_NAMES", "regions", regions)
+    lines += table("SCRIPT_NAMES", "scripts", scripts)
+    lines += table("CURRENCY_NAMES", "currencies in common use", currencies)
+    lines += table("CALENDAR_NAMES", "calendars by their BCP 47 name", calendars)
+    with open(output, "w", encoding="utf-8", newline="\n") as file:
+        file.write("\n".join(lines))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])
