@@ -674,6 +674,8 @@ pub struct ScriptRuntime {
     template_cache: HashMap<(usize, usize), (Rc<compiler::Code>, Value)>,
     array_expandos: ArrayExpandos,
     array_expando_prune_at: usize,
+    // the FinalizationRegistry objects whose targets are watched after each turn
+    registries: Vec<std::rc::Weak<RefCell<collections::Registry>>>,
     pattern_cache: HashMap<(String, String), Rc<pattern::Regex>>,
     random_state: u64,
     console_depth: usize,
@@ -1809,6 +1811,7 @@ impl ScriptRuntime {
             template_cache: HashMap::new(),
             array_expandos: HashMap::new(),
             array_expando_prune_at: 64,
+            registries: Vec::new(),
             pattern_cache: HashMap::new(),
             random_state: numbers::random_seed(),
             console_depth: 0,
@@ -9683,6 +9686,7 @@ impl ScriptRuntime {
         self.sync_selection_change()?;
         self.prune_event_targets();
         self.collect_detached_nodes();
+        self.sweep_registries();
         Ok(())
     }
 
@@ -19283,6 +19287,34 @@ mod tests {
             Some(
                 "true|true|NotFoundError|gone|8|NotFoundError: gone|20|Error|true|20|[object DOMException]|TypeError"
             )
+        );
+    }
+    #[test]
+    fn finalization_registries_and_report_error_behave_as_browsers_do() {
+        let document = document(r#"<main><p id="status">idle</p></main>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [];
+                const registry = new FinalizationRegistry((held) => seen.push("cleaned " + held));
+                const token = {};
+                (() => { registry.register({}, "gone"); })();
+                const kept = {};
+                registry.register(kept, "kept", token);
+                seen.push(registry.unregister(token), registry.unregister(token), Object.prototype.toString.call(registry));
+                try { registry.register(kept, kept); } catch (error) { seen.push(error.name); }
+                window.addEventListener("error", (event) => { seen.push("reported " + event.error.message); event.preventDefault(); });
+                reportError(new Error("late"));
+                setTimeout(() => setTimeout(() => { document.getElementById("status").textContent = seen.join("|"); }, 0), 0);
+                "#,
+            )
+            .expect("script should run");
+        runtime.advance_time(1).expect("the timer should run");
+        runtime.advance_time(1).expect("the timer should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some("true|false|[object FinalizationRegistry]|TypeError|reported late|cleaned gone")
         );
     }
     #[test]

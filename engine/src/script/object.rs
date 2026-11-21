@@ -116,6 +116,7 @@ pub(super) enum ObjectClass {
     Walk(Rc<RefCell<super::traversal::WalkState>>),
     // the object of a promise value, which keeps its expandos and its prototype
     Promise,
+    Registry(Rc<RefCell<super::collections::Registry>>),
     // the object of a typed array of this kind, for its named properties and prototype
     TypedArray(super::typed::ElementKind),
     // what an iterator helper such as map or take hands back

@@ -1796,7 +1796,6 @@ test/built-ins/Object/seal/object-seal-o-is-an-array-object.js
 test/built-ins/Object/seal/object-seal-p-is-own-property-of-an-array-object-that-uses-object-s-get-own-property.js
 test/built-ins/Object/seal/proxy-no-ownkeys-returned-keys-order.js
 test/built-ins/Object/seal/proxy-with-defineProperty-handler.js
-test/built-ins/Object/seal/seal-finalizationregistry.js
 test/built-ins/Object/seal/seal-sharedarraybuffer.js
 test/built-ins/Object/seal/throws-when-false.js
 test/built-ins/Object/values/getter-making-future-key-nonenumerable.js

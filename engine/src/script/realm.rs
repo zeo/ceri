@@ -163,6 +163,8 @@ pub(super) enum Native {
     AnimConstructor,
     ClipboardItemConstructor,
     DomExceptionConstructor,
+    // reports a value as an uncaught exception would be, without throwing
+    ReportError,
     // an animation of the given generation reaches its end
     AnimFinish(u32, u64),
     Shape(super::geometry_values::ShapeMember),
@@ -208,6 +210,7 @@ impl Native {
                 | Native::Reflect(super::reflect::ReflectMethod::ProxyConstructor)
                 | Native::Collection(super::collections::CollectionMethod::Constructor(_))
                 | Native::Collection(super::collections::CollectionMethod::WeakRefConstructor)
+                | Native::Collection(super::collections::CollectionMethod::RegistryConstructor)
                 | Native::Date(super::dates::DateMethod::Constructor)
                 | Native::Typed(super::typed::TypedMethod::Constructor(_))
                 | Native::Typed(super::typed::TypedMethod::BufferConstructor)
@@ -288,6 +291,7 @@ pub(super) struct Intrinsics {
     pub(super) weak_map_prototype: ObjectHandle,
     pub(super) weak_set_prototype: ObjectHandle,
     pub(super) weak_ref_prototype: ObjectHandle,
+    pub(super) registry_prototype: ObjectHandle,
     pub(super) collection_iterator_prototype: ObjectHandle,
     pub(super) date_prototype: ObjectHandle,
     pub(super) typed_prototypes: Vec<ObjectHandle>,
@@ -1105,6 +1109,35 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         &weak_ref_prototype,
     );
     globals.push(("WeakRef", Value::Object(weak_ref)));
+    let registry_prototype = plain(&object_prototype);
+    build.method(
+        &registry_prototype,
+        "register",
+        Native::Collection(C::Register),
+        2,
+    );
+    build.method(
+        &registry_prototype,
+        "unregister",
+        Native::Collection(C::Unregister),
+        1,
+    );
+    build.value(
+        &registry_prototype,
+        "@@toStringTag",
+        Value::String("FinalizationRegistry".into()),
+    );
+    let registry = build.constructor(
+        Native::Collection(C::RegistryConstructor),
+        "FinalizationRegistry",
+        1,
+        &registry_prototype,
+    );
+    globals.push(("FinalizationRegistry", Value::Object(registry)));
+    globals.push((
+        "reportError",
+        Value::Object(build.function(Native::ReportError, "reportError", 1)),
+    ));
 
     let date_prototype = plain(&object_prototype);
     for (key, method, length) in super::dates::DATE_METHODS {
@@ -1495,6 +1528,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         weak_map_prototype,
         weak_set_prototype,
         weak_ref_prototype,
+        registry_prototype,
         collection_iterator_prototype,
         date_prototype,
         typed_prototypes,
@@ -2982,6 +3016,11 @@ impl ScriptRuntime {
             Native::ClipboardItemConstructor => Err(self.type_error(
                 "Failed to construct 'ClipboardItem': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
+            Native::ReportError => {
+                let error = self.throw_value(first);
+                self.report_exception(error);
+                Ok(Value::Undefined)
+            }
             Native::DomExceptionConstructor => Err(self.type_error(
                 "Failed to construct 'DOMException': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),

@@ -310,7 +310,7 @@ impl Drop for Cursor {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CollectionMethod {
     Constructor(CollectionKind),
     Get,
@@ -333,6 +333,21 @@ pub(super) enum CollectionMethod {
     IsDisjointFrom,
     WeakRefConstructor,
     WeakRefDeref,
+    RegistryConstructor,
+    Register,
+    Unregister,
+}
+
+// a FinalizationRegistry: the callback, and the cells whose targets it watches
+pub(super) struct Registry {
+    cleanup: Value,
+    cells: Vec<RegistryCell>,
+}
+
+struct RegistryCell {
+    target: Weak<RefCell<JsObject>>,
+    held: Value,
+    token: Option<Weak<RefCell<JsObject>>>,
 }
 
 fn argument(arguments: &[Value], index: usize) -> Value {
@@ -733,6 +748,75 @@ impl ScriptRuntime {
                     ObjectClass::WeakRef(Rc::downgrade(target)),
                 ))))
             }
+            M::RegistryConstructor => {
+                if new_target.is_none() {
+                    return Err(self.type_error("Constructor FinalizationRegistry requires 'new'"));
+                }
+                if !is_callable(&first) {
+                    return Err(self.type_error("FinalizationRegistry: cleanup must be callable"));
+                }
+                let registry = Rc::new(RefCell::new(Registry {
+                    cleanup: first,
+                    cells: Vec::new(),
+                }));
+                self.registries.push(Rc::downgrade(&registry));
+                let prototype = match &new_target {
+                    Some(target @ Value::Object(_)) => self.prototype_from_constructor(target)?,
+                    _ => self.intrinsics.registry_prototype.clone(),
+                };
+                Ok(Value::Object(new_object(JsObject::with_prototype(
+                    Some(prototype),
+                    ObjectClass::Registry(registry),
+                ))))
+            }
+            M::Register | M::Unregister => {
+                let registry = match &this {
+                    Value::Object(object) => match &object.borrow().class {
+                        ObjectClass::Registry(registry) => Some(registry.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(registry) = registry else {
+                    return Err(self.type_error(
+                        "FinalizationRegistry method called on incompatible receiver",
+                    ));
+                };
+                let token = argument(&arguments, if method == M::Register { 2 } else { 0 });
+                let token = match token {
+                    Value::Object(token) => Some(token),
+                    Value::Undefined if method == M::Register => None,
+                    _ => return Err(self.type_error("Invalid unregisterToken")),
+                };
+                if method == M::Unregister {
+                    let token = token.expect("an object token");
+                    let mut registry = registry.borrow_mut();
+                    let before = registry.cells.len();
+                    registry.cells.retain(|cell| {
+                        cell.token
+                            .as_ref()
+                            .is_none_or(|held| held.as_ptr() != Rc::as_ptr(&token))
+                    });
+                    return Ok(Value::Bool(registry.cells.len() != before));
+                }
+                let Value::Object(target) = &first else {
+                    return Err(
+                        self.type_error("FinalizationRegistry.prototype.register: invalid target")
+                    );
+                };
+                let held = argument(&arguments, 1);
+                if matches!(&held, Value::Object(held) if Rc::ptr_eq(held, target)) {
+                    return Err(self.type_error(
+                        "FinalizationRegistry.prototype.register: target and holdings must not be same",
+                    ));
+                }
+                registry.borrow_mut().cells.push(RegistryCell {
+                    target: Rc::downgrade(target),
+                    held,
+                    token: token.as_ref().map(Rc::downgrade),
+                });
+                Ok(Value::Undefined)
+            }
             M::WeakRefDeref => match &this {
                 Value::Object(object) => match &object.borrow().class {
                     ObjectClass::WeakRef(target) => Ok(target
@@ -748,6 +832,32 @@ impl ScriptRuntime {
                 )),
             }
             .map_err(|error| self.type_error(error.message)),
+        }
+    }
+}
+
+impl ScriptRuntime {
+    // queues the cleanup callback for each registered target that is gone
+    pub(super) fn sweep_registries(&mut self) {
+        if self.registries.is_empty() {
+            return;
+        }
+        self.registries
+            .retain(|registry| registry.strong_count() > 0);
+        let mut due = Vec::new();
+        for registry in self.registries.iter().filter_map(Weak::upgrade) {
+            let mut registry = registry.borrow_mut();
+            let cleanup = registry.cleanup.clone();
+            registry.cells.retain(|cell| {
+                let alive = cell.target.strong_count() > 0;
+                if !alive {
+                    due.push((cleanup.clone(), cell.held.clone()));
+                }
+                alive
+            });
+        }
+        for (cleanup, held) in due {
+            self.schedule_callback(cleanup, vec![held]);
         }
     }
 }
