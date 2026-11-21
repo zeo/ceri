@@ -231,11 +231,7 @@ impl ScriptRuntime {
         match self.run(frame)? {
             RunResult::Return(value) => Ok(value),
             RunResult::Await(value, frame) => {
-                let promise = Rc::new(RefCell::new(PromiseData {
-                    outcome: PromiseOutcome::Pending,
-                    reactions: Vec::new(),
-                    handled: false,
-                }));
+                let promise = new_promise(PromiseOutcome::Pending);
                 let state = Rc::new(RefCell::new(AsyncFunctionData {
                     frame: Some(frame),
                     promise: promise.clone(),
@@ -2697,11 +2693,7 @@ impl ScriptRuntime {
     // ---- async functions ----
 
     fn start_async(&mut self, frame: Frame) -> Result<Value, ScriptError> {
-        let promise = Rc::new(RefCell::new(PromiseData {
-            outcome: PromiseOutcome::Pending,
-            reactions: Vec::new(),
-            handled: false,
-        }));
+        let promise = new_promise(PromiseOutcome::Pending);
         let state = Rc::new(RefCell::new(AsyncFunctionData {
             frame: Some(Box::new(frame)),
             promise: promise.clone(),
@@ -2773,11 +2765,7 @@ impl ScriptRuntime {
         mode: ResumeMode,
         value: Value,
     ) -> Result<Value, ScriptError> {
-        let promise = Rc::new(RefCell::new(PromiseData {
-            outcome: PromiseOutcome::Pending,
-            reactions: Vec::new(),
-            handled: false,
-        }));
+        let promise = new_promise(PromiseOutcome::Pending);
         data.borrow_mut().queue.push_back(AsyncGeneratorRequest {
             mode,
             value,
@@ -2892,11 +2880,7 @@ impl ScriptRuntime {
                     data.borrow_mut().queue.push_front(request);
                 }
                 data.borrow_mut().awaiting = true;
-                let promise = Rc::new(RefCell::new(PromiseData {
-                    outcome: PromiseOutcome::Pending,
-                    reactions: Vec::new(),
-                    handled: false,
-                }));
+                let promise = new_promise(PromiseOutcome::Pending);
                 let state = Rc::new(RefCell::new(AsyncFunctionData {
                     frame: Some(frame),
                     promise,

@@ -238,6 +238,8 @@ impl Native {
                 | super::intl::IntlMethod::PluralRulesConstructor
                 | super::intl::IntlMethod::RelativeTimeFormatConstructor
                 | super::intl::IntlMethod::ListFormatConstructor))
+            || matches!(self, Native::Promise(function)
+                if matches!(**function, super::promises::PromiseFunction::Constructor))
     }
 }
 
@@ -269,6 +271,7 @@ pub(super) struct Intrinsics {
     pub(super) uri_error_prototype: ObjectHandle,
     pub(super) aggregate_error_prototype: ObjectHandle,
     pub(super) promise_prototype: ObjectHandle,
+    pub(super) promise_constructor: ObjectHandle,
     pub(super) regexp_prototype: ObjectHandle,
     pub(super) array_values: Value,
     pub(super) iterator_prototype: ObjectHandle,
@@ -361,13 +364,23 @@ impl Builder {
     }
 
     fn value(&self, target: &ObjectHandle, key: &str, value: Value) {
-        target
-            .borrow_mut()
-            .define(key.to_string(), Property::hidden(value));
+        // a toStringTag is configurable but not writable
+        let writable = key != "@@toStringTag";
+        target.borrow_mut().define(
+            key.to_string(),
+            Property {
+                writable,
+                ..Property::hidden(value)
+            },
+        );
     }
 
     fn getter(&self, target: &ObjectHandle, key: &str, getter: Native, setter: Option<Native>) {
-        let get = Value::Object(self.function(getter, &format!("get {key}"), 0));
+        let name = match symbol_description(key) {
+            Some(description) if is_symbol_key(key) => format!("[{description}]"),
+            _ => key.to_string(),
+        };
+        let get = Value::Object(self.function(getter, &format!("get {name}"), 0));
         let set =
             setter.map(|setter| Value::Object(self.function(setter, &format!("set {key}"), 1)));
         target.borrow_mut().define(
@@ -811,6 +824,44 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         "@@toStringTag",
         Value::String("Promise".to_string().into()),
     );
+    use super::promises::PromiseFunction as P;
+    let promise_native = |function| Native::Promise(Rc::new(function));
+    for (key, function, length) in [
+        ("then", P::Then, 2),
+        ("catch", P::Catch, 1),
+        ("finally", P::Finally, 1),
+    ] {
+        build.method(&promise_prototype, key, promise_native(function), length);
+    }
+    let promise_constructor = build.constructor(
+        promise_native(P::Constructor),
+        "Promise",
+        1,
+        &promise_prototype,
+    );
+    for (key, function, length) in [
+        ("resolve", P::Resolve, 1),
+        ("reject", P::Reject, 1),
+        ("all", P::Combinator(super::promises::Combinator::All), 1),
+        (
+            "allSettled",
+            P::Combinator(super::promises::Combinator::AllSettled),
+            1,
+        ),
+        ("any", P::Combinator(super::promises::Combinator::Any), 1),
+        ("race", P::Combinator(super::promises::Combinator::Race), 1),
+        ("withResolvers", P::WithResolvers, 0),
+        ("try", P::Try, 1),
+    ] {
+        build.method(&promise_constructor, key, promise_native(function), length);
+    }
+    build.getter(
+        &promise_constructor,
+        "@@species",
+        promise_native(P::Species),
+        None,
+    );
+    globals.push(("Promise", Value::Object(promise_constructor.clone())));
     let regexp_prototype = plain(&object_prototype);
     for (key, method, length) in super::regexp::REGEXP_METHODS {
         build.method(&regexp_prototype, key, Native::RegExp(*method), *length);
@@ -1371,6 +1422,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         uri_error_prototype,
         aggregate_error_prototype,
         promise_prototype,
+        promise_constructor,
         regexp_prototype,
         array_values,
         iterator_prototype,
@@ -3121,6 +3173,11 @@ impl ScriptRuntime {
             Native::MessageChannelConstructor => self.construct_message_channel(new_target),
             Native::AnimConstructor => Err(self.type_error("Illegal constructor")),
             Native::Helper(_) => self.construct_iterator(new_target),
+            Native::Promise(function)
+                if matches!(*function, super::promises::PromiseFunction::Constructor) =>
+            {
+                self.construct_promise_object(arguments, new_target)
+            }
             Native::ClipboardItemConstructor => {
                 self.call_clipboard_member(super::Builtin::ClipboardItemConstructor, arguments)
             }

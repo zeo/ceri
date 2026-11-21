@@ -114,6 +114,8 @@ pub(super) enum ObjectClass {
     UrlSearchParams(Rc<RefCell<super::urls::ParamsState>>),
     // a TreeWalker or NodeIterator
     Walk(Rc<RefCell<super::traversal::WalkState>>),
+    // the object of a promise value, which keeps its expandos and its prototype
+    Promise,
     // what an iterator helper such as map or take hands back
     IteratorHelper(Rc<RefCell<super::iterator_helpers::HelperState>>),
 }
@@ -191,6 +193,7 @@ impl JsObject {
                 ObjectClass::Map(_) => intrinsics.map_prototype.clone(),
                 ObjectClass::Set(_) => intrinsics.set_prototype.clone(),
                 ObjectClass::Date(_) => intrinsics.date_prototype.clone(),
+                ObjectClass::Promise => intrinsics.promise_prototype.clone(),
                 _ => intrinsics.object_prototype.clone(),
             }),
             None => None,

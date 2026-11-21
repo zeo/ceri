@@ -1,7 +1,9 @@
-// the Promise combinators (all, allSettled, race, any), withResolvers and finally, built on
-// the runtime's reaction queue with small native callbacks that carry their shared state
+// the Promise constructor, its prototype methods and statics (resolve, reject, all,
+// allSettled, race, any, withResolvers and try), built on the runtime's reaction queue with
+// small native functions that carry their shared state; a constructor other than Promise,
+// such as a subclass, is reached through NewPromiseCapability as the standard says
 
-use super::operations::is_callable;
+use super::operations::{is_callable, is_primitive, same_value};
 use super::*;
 use std::cell::Cell;
 
@@ -10,34 +12,56 @@ pub(super) enum Combinator {
     All,
     AllSettled,
     Any,
+    Race,
+}
+
+#[derive(Default)]
+pub(super) struct Capability {
+    resolve: RefCell<Option<Value>>,
+    reject: RefCell<Option<Value>>,
 }
 
 pub(super) struct Aggregate {
     values: RefCell<Vec<Value>>,
     remaining: Cell<usize>,
-    promise: PromiseHandle,
+    resolve: Value,
+    reject: Value,
     combinator: Combinator,
 }
 
 #[derive(Clone)]
 pub(super) enum PromiseFunction {
-    All,
-    AllSettled,
-    Race,
-    Any,
+    Combinator(Combinator),
     WithResolvers,
     // calls a function now and hands back a promise of what it returns or throws
     Try,
-    Finally(PromiseHandle),
-    // a per-element reaction of a combinator
+    Constructor,
+    Then,
+    Catch,
+    Finally,
+    Resolve,
+    Reject,
+    // the Symbol.species getter, which hands back its receiver
+    Species,
+    // the executor a promise subclass is constructed with, catching its resolve and reject
+    Capability(Rc<Capability>),
+    // the resolve or reject function of a promise; the pair share whether one already ran
+    Resolving {
+        promise: PromiseHandle,
+        done: Rc<Cell<bool>>,
+        reject: bool,
+    },
+    // a per-element reaction of a combinator, which only counts its first call
     Element {
         state: Rc<Aggregate>,
         index: usize,
         rejected: bool,
+        called: Rc<Cell<bool>>,
     },
     // the reaction finally installs: run the callback, then pass the outcome through
     AfterFinally {
         callback: Value,
+        constructor: Value,
         rejected: bool,
     },
     // resolves to the saved value, or rethrows the saved reason
@@ -55,30 +79,226 @@ fn argument(arguments: &[Value], index: usize) -> Value {
 }
 
 impl ScriptRuntime {
-    fn native_value(function: PromiseFunction) -> Value {
-        Value::Builtin(Builtin::Native(Native::Promise(Rc::new(function))))
+    // an anonymous built-in function object, as the standard's abstract closures are
+    fn promise_closure(&self, function: PromiseFunction, length: u32) -> Value {
+        self.native_function(Native::Promise(Rc::new(function)), "", length)
     }
 
-    fn settle_aggregate(&mut self, state: &Aggregate) {
+    pub(super) fn resolving_functions(&self, promise: &PromiseHandle) -> (Value, Value) {
+        let done = Rc::new(Cell::new(false));
+        let make = |reject| {
+            self.promise_closure(
+                PromiseFunction::Resolving {
+                    promise: promise.clone(),
+                    done: done.clone(),
+                    reject,
+                },
+                1,
+            )
+        };
+        (make(false), make(true))
+    }
+
+    fn settle_aggregate(&mut self, state: &Aggregate) -> Result<(), ScriptError> {
         if state.remaining.get() != 0 {
-            return;
+            return Ok(());
         }
-        let values = std::mem::take(&mut *state.values.borrow_mut());
+        let values = Self::new_array(std::mem::take(&mut *state.values.borrow_mut()));
         if state.combinator == Combinator::Any {
             let error = self.make_error("AggregateError", "All promises were rejected");
             if let Value::Object(object) = &error {
-                object.borrow_mut().define(
-                    "errors".to_string(),
-                    object::Property::hidden(Self::new_array(values)),
-                );
+                object
+                    .borrow_mut()
+                    .define("errors".to_string(), object::Property::hidden(values));
             }
-            self.settle_promise(&state.promise, PromiseOutcome::Rejected(error));
+            self.call_function(state.reject.clone(), Value::Undefined, vec![error])?;
         } else {
-            self.settle_promise(
-                &state.promise,
-                PromiseOutcome::Fulfilled(Self::new_array(values)),
-            );
+            self.call_function(state.resolve.clone(), Value::Undefined, vec![values])?;
         }
+        Ok(())
+    }
+
+    pub(super) fn is_intrinsic_promise(&self, value: &Value) -> bool {
+        matches!(value, Value::Object(object) if Rc::ptr_eq(object, &self.intrinsics.promise_constructor))
+    }
+
+    // NewPromiseCapability: a promise made by a constructor with the resolve and reject it
+    // handed its executor; the intrinsic Promise needs no executor round trip
+    pub(super) fn promise_capability(
+        &mut self,
+        constructor: &Value,
+    ) -> Result<(Value, Value, Value), ScriptError> {
+        if self.is_intrinsic_promise(constructor) {
+            let promise = Self::pending_promise();
+            let (resolve, reject) = self.resolving_functions(&promise);
+            return Ok((Value::Promise(promise), resolve, reject));
+        }
+        if !Self::is_constructor(constructor) {
+            return Err(self.type_error("Promise capability requires a constructor"));
+        }
+        let slots = Rc::new(Capability::default());
+        let executor = self.promise_closure(PromiseFunction::Capability(slots.clone()), 2);
+        let promise = self.construct(constructor.clone(), vec![executor], None)?;
+        let resolve = slots.resolve.borrow().clone().unwrap_or(Value::Undefined);
+        let reject = slots.reject.borrow().clone().unwrap_or(Value::Undefined);
+        if !is_callable(&resolve) || !is_callable(&reject) {
+            return Err(self.type_error("Promise resolve or reject function is not callable"));
+        }
+        Ok((promise, resolve, reject))
+    }
+
+    // PromiseResolve(C, x): a promise made by C already passes through
+    fn promise_resolve_with(
+        &mut self,
+        constructor: &Value,
+        value: Value,
+    ) -> Result<Value, ScriptError> {
+        if let Value::Promise(_) = &value {
+            let made_by = self.get_property(&value, "constructor")?;
+            if same_value(&made_by, constructor) {
+                return Ok(value);
+            }
+        }
+        let (promise, resolve, _) = self.promise_capability(constructor)?;
+        self.call_function(resolve, Value::Undefined, vec![value])?;
+        Ok(promise)
+    }
+
+    fn invoke_then(&mut self, promise: Value, arguments: Vec<Value>) -> Result<Value, ScriptError> {
+        let then = self.get_property(&promise, "then")?;
+        self.call_function(then, promise, arguments)
+    }
+
+    // SpeciesConstructor(promise, %Promise%)
+    fn promise_species(&mut self, promise: &Value) -> Result<Value, ScriptError> {
+        let intrinsic = Value::Object(self.intrinsics.promise_constructor.clone());
+        let constructor = self.get_property(promise, "constructor")?;
+        if matches!(constructor, Value::Undefined) {
+            return Ok(intrinsic);
+        }
+        if is_primitive(&constructor) {
+            return Err(self.type_error("The promise constructor is not an object"));
+        }
+        let species = self.get_property(&constructor, "@@species")?;
+        if matches!(species, Value::Undefined | Value::Null) {
+            return Ok(intrinsic);
+        }
+        if !Self::is_constructor(&species) {
+            return Err(self.type_error("Promise species is not a constructor"));
+        }
+        Ok(species)
+    }
+
+    pub(super) fn construct_promise_object(
+        &mut self,
+        arguments: Vec<Value>,
+        new_target: Value,
+    ) -> Result<Value, ScriptError> {
+        let executor = argument(&arguments, 0);
+        if !is_callable(&executor) {
+            return Err(self.type_error("Promise resolver is not a function"));
+        }
+        let promise = Self::pending_promise();
+        if matches!(new_target, Value::Object(_)) && !self.is_intrinsic_promise(&new_target) {
+            let prototype = match self.get_property(&new_target, "prototype")? {
+                Value::Object(prototype) => prototype,
+                _ => self.intrinsics.promise_prototype.clone(),
+            };
+            super::promise_object(&promise)
+                .borrow_mut()
+                .set_prototype(Some(prototype));
+        }
+        let (resolve, reject) = self.resolving_functions(&promise);
+        if let Err(error) =
+            self.call_function(executor, Value::Undefined, vec![resolve, reject.clone()])
+        {
+            let reason = self.take_thrown(error);
+            self.call_function(reject, Value::Undefined, vec![reason])?;
+        }
+        Ok(Value::Promise(promise))
+    }
+
+    // the loop of all, allSettled, any and race over an iterable
+    fn run_combinator(
+        &mut self,
+        combinator: Combinator,
+        constructor: &Value,
+        iterable: Value,
+        resolve: &Value,
+        reject: &Value,
+    ) -> Result<(), ScriptError> {
+        let promise_resolve = self.get_property(constructor, "resolve")?;
+        if !is_callable(&promise_resolve) {
+            return Err(self.type_error("Promise resolve is not a function"));
+        }
+        let iterator = self.get_iterator(iterable)?;
+        let state = Rc::new(Aggregate {
+            values: RefCell::new(Vec::new()),
+            remaining: Cell::new(1),
+            resolve: resolve.clone(),
+            reject: reject.clone(),
+            combinator,
+        });
+        let mut count = 0;
+        while let Some(item) = self.iterator_step(&iterator)? {
+            count += 1;
+            let step = if count > MAX_USER_ITERATOR_VALUES {
+                Err(self.range_error("Promise combinator input exceeded the deterministic limit"))
+            } else {
+                self.combine_item(&state, constructor, &promise_resolve, item)
+            };
+            if let Err(error) = step {
+                let thrown = self.take_thrown(error);
+                if let Err(error) = self.iterator_close(&iterator) {
+                    self.take_thrown(error);
+                }
+                return Err(self.throw_value(thrown));
+            }
+        }
+        if combinator != Combinator::Race {
+            state.remaining.set(state.remaining.get() - 1);
+            self.settle_aggregate(&state)?;
+        }
+        Ok(())
+    }
+
+    fn combine_item(
+        &mut self,
+        state: &Rc<Aggregate>,
+        constructor: &Value,
+        promise_resolve: &Value,
+        item: Value,
+    ) -> Result<(), ScriptError> {
+        let next = self.call_function(promise_resolve.clone(), constructor.clone(), vec![item])?;
+        let (resolve, reject) = (state.resolve.clone(), state.reject.clone());
+        if state.combinator == Combinator::Race {
+            return self.invoke_then(next, vec![resolve, reject]).map(|_| ());
+        }
+        let index = {
+            let mut values = state.values.borrow_mut();
+            values.push(Value::Undefined);
+            values.len() - 1
+        };
+        let called = Rc::new(Cell::new(false));
+        let element = |rejected| {
+            self.promise_closure(
+                PromiseFunction::Element {
+                    state: state.clone(),
+                    index,
+                    rejected,
+                    called: called.clone(),
+                },
+                1,
+            )
+        };
+        let (fulfilled, rejected) = match state.combinator {
+            Combinator::All => (element(false), reject),
+            Combinator::AllSettled => (element(false), element(true)),
+            _ => (resolve, element(true)),
+        };
+        state.remaining.set(state.remaining.get() + 1);
+        self.invoke_then(next, vec![fulfilled, rejected])
+            .map(|_| ())
     }
 
     pub(super) fn call_promise_function(
@@ -88,103 +308,126 @@ impl ScriptRuntime {
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
         match function {
-            PromiseFunction::All
-            | PromiseFunction::AllSettled
-            | PromiseFunction::Any
-            | PromiseFunction::Race => {
-                let result = Self::pending_promise();
-                let combinator = match function {
-                    PromiseFunction::All => Some(Combinator::All),
-                    PromiseFunction::AllSettled => Some(Combinator::AllSettled),
-                    PromiseFunction::Any => Some(Combinator::Any),
-                    _ => None,
+            PromiseFunction::Constructor => {
+                Err(self.type_error("Promise constructor cannot be invoked without 'new'"))
+            }
+            PromiseFunction::Species => Ok(this),
+            PromiseFunction::Capability(slots) => {
+                let taken = |slot: &RefCell<Option<Value>>| {
+                    !matches!(*slot.borrow(), None | Some(Value::Undefined))
                 };
-                let state = Rc::new(Aggregate {
-                    values: RefCell::new(Vec::new()),
-                    remaining: Cell::new(1),
-                    promise: result.clone(),
-                    combinator: combinator.unwrap_or(Combinator::All),
-                });
-                // a receiver other than Promise itself supplies its own resolve, as subclasses do
-                let resolver = match &this {
-                    Value::PromiseConstructor | Value::Undefined => None,
-                    receiver => match self.get_property(receiver, "resolve") {
-                        Ok(resolver) if is_callable(&resolver) => Some(resolver),
-                        Ok(_) => {
-                            let error = self.type_error("Promise resolve is not a function");
-                            let reason = self.take_thrown(error);
-                            return Ok(Value::Promise(self.rejected_promise_value(reason)));
-                        }
-                        Err(error) => {
-                            let reason = self.take_thrown(error);
-                            return Ok(Value::Promise(self.rejected_promise_value(reason)));
-                        }
-                    },
+                if taken(&slots.resolve) || taken(&slots.reject) {
+                    return Err(self.type_error("Promise executor has already been invoked"));
+                }
+                *slots.resolve.borrow_mut() = Some(argument(&arguments, 0));
+                *slots.reject.borrow_mut() = Some(argument(&arguments, 1));
+                Ok(Value::Undefined)
+            }
+            PromiseFunction::Resolving {
+                promise,
+                done,
+                reject,
+            } => {
+                if done.replace(true) {
+                    return Ok(Value::Undefined);
+                }
+                let value = argument(&arguments, 0);
+                if reject {
+                    self.settle_promise(&promise, PromiseOutcome::Rejected(value));
+                } else {
+                    self.resolve_promise(&promise, value)?;
+                }
+                Ok(Value::Undefined)
+            }
+            PromiseFunction::Then => {
+                let Value::Promise(promise) = this.resolve() else {
+                    return Err(self.type_error(
+                        "Promise.prototype.then called on a value that is not a promise",
+                    ));
                 };
-                let mut count = 0;
-                let iterated = self.for_each_iterated(argument(&arguments, 0), |runtime, item| {
-                    count += 1;
-                    if count > MAX_USER_ITERATOR_VALUES {
-                        return Err(runtime.range_error(
-                            "Promise combinator input exceeded the deterministic limit",
-                        ));
-                    }
-                    let promise = match &resolver {
-                        Some(resolver) => {
-                            let resolved = runtime.call_function(
-                                resolver.clone(),
-                                this.clone(),
-                                vec![item],
-                            )?;
-                            runtime.promise_resolve(resolved)?
-                        }
-                        None => runtime.promise_resolve(item)?,
-                    };
-                    let resolve = Value::Builtin(Builtin::PromiseResolvePending(result.clone()));
-                    let reject = Value::Builtin(Builtin::PromiseRejectPending(result.clone()));
-                    let Some(combinator) = combinator else {
-                        return runtime
-                            .promise_then(promise, Some(&resolve), Some(&reject))
-                            .map(|_| ());
-                    };
-                    let index = {
-                        let mut values = state.values.borrow_mut();
-                        values.push(Value::Undefined);
-                        values.len() - 1
-                    };
-                    state.remaining.set(state.remaining.get() + 1);
-                    let element = |rejected| {
-                        Self::native_value(PromiseFunction::Element {
-                            state: state.clone(),
-                            index,
+                let constructor = self.promise_species(&this)?;
+                let (fulfilled, rejected) = (argument(&arguments, 0), argument(&arguments, 1));
+                if self.is_intrinsic_promise(&constructor) {
+                    return self.promise_then(promise, Some(&fulfilled), Some(&rejected));
+                }
+                let (result, resolve, reject) = self.promise_capability(&constructor)?;
+                let Value::Promise(derived) =
+                    self.promise_then(promise, Some(&fulfilled), Some(&rejected))?
+                else {
+                    unreachable!("promise_then hands back a promise")
+                };
+                self.promise_then(derived, Some(&resolve), Some(&reject))?;
+                Ok(result)
+            }
+            PromiseFunction::Catch => {
+                self.invoke_then(this, vec![Value::Undefined, argument(&arguments, 0)])
+            }
+            PromiseFunction::Finally => {
+                if is_primitive(&this) {
+                    return Err(self.type_error(
+                        "Promise.prototype.finally called on a value that is not an object",
+                    ));
+                }
+                let constructor = self.promise_species(&this)?;
+                let callback = argument(&arguments, 0);
+                if !is_callable(&callback) {
+                    return self.invoke_then(this, vec![callback.clone(), callback]);
+                }
+                let after = |rejected| {
+                    self.promise_closure(
+                        PromiseFunction::AfterFinally {
+                            callback: callback.clone(),
+                            constructor: constructor.clone(),
                             rejected,
-                        })
-                    };
-                    let (fulfilled, rejected) = match combinator {
-                        Combinator::All => (element(false), reject),
-                        Combinator::AllSettled => (element(false), element(true)),
-                        Combinator::Any => (resolve, element(true)),
-                    };
-                    runtime
-                        .promise_then(promise, Some(&fulfilled), Some(&rejected))
-                        .map(|_| ())
-                });
-                if let Err(error) = iterated {
+                        },
+                        1,
+                    )
+                };
+                let (fulfilled, rejected) = (after(false), after(true));
+                self.invoke_then(this, vec![fulfilled, rejected])
+            }
+            PromiseFunction::Resolve => {
+                if is_primitive(&this) {
+                    return Err(
+                        self.type_error("Promise.resolve called on a value that is not an object")
+                    );
+                }
+                self.promise_resolve_with(&this, argument(&arguments, 0))
+            }
+            PromiseFunction::Reject => {
+                if is_primitive(&this) {
+                    return Err(
+                        self.type_error("Promise.reject called on a value that is not an object")
+                    );
+                }
+                let (promise, _, reject) = self.promise_capability(&this)?;
+                self.call_function(reject, Value::Undefined, vec![argument(&arguments, 0)])?;
+                Ok(promise)
+            }
+            PromiseFunction::Combinator(combinator) => {
+                if is_primitive(&this) {
+                    return Err(self
+                        .type_error("Promise combinator called on a value that is not an object"));
+                }
+                let (promise, resolve, reject) = self.promise_capability(&this)?;
+                let iterable = argument(&arguments, 0);
+                if let Err(error) =
+                    self.run_combinator(combinator, &this, iterable, &resolve, &reject)
+                {
                     let reason = self.take_thrown(error);
-                    self.settle_promise(&result, PromiseOutcome::Rejected(reason));
-                    return Ok(Value::Promise(result));
+                    self.call_function(reject, Value::Undefined, vec![reason])?;
                 }
-                if combinator.is_some() {
-                    state.remaining.set(state.remaining.get() - 1);
-                    self.settle_aggregate(&state);
-                }
-                Ok(Value::Promise(result))
+                Ok(promise)
             }
             PromiseFunction::Element {
                 state,
                 index,
                 rejected,
+                called,
             } => {
+                if called.replace(true) {
+                    return Ok(Value::Undefined);
+                }
                 let value = argument(&arguments, 0);
                 let stored = match state.combinator {
                     Combinator::AllSettled => {
@@ -204,63 +447,53 @@ impl ScriptRuntime {
                     *slot = stored;
                 }
                 state.remaining.set(state.remaining.get().saturating_sub(1));
-                self.settle_aggregate(&state);
+                self.settle_aggregate(&state)?;
                 Ok(Value::Undefined)
             }
             PromiseFunction::Try => {
-                let callback = argument(&arguments, 0);
-                if !is_callable(&callback) {
-                    return Err(self.type_error("Promise.try requires a function"));
+                if is_primitive(&this) {
+                    return Err(
+                        self.type_error("Promise.try called on a value that is not an object")
+                    );
                 }
-                let rest = arguments.into_iter().skip(1).collect();
-                Ok(Value::Promise(
-                    match self.call_function(callback, Value::Undefined, rest) {
-                        Ok(value) => self.promise_resolve(value)?,
-                        Err(error) => {
-                            let thrown = self.take_thrown(error);
-                            self.rejected_promise_value(thrown)
-                        }
-                    },
-                ))
+                let mut arguments = arguments.into_iter();
+                let callback = arguments.next().unwrap_or(Value::Undefined);
+                // what the callback returns goes through PromiseResolve, so a promise of this
+                // constructor comes back unwrapped
+                match self.call_function(callback, Value::Undefined, arguments.collect()) {
+                    Ok(value) => self.promise_resolve_with(&this, value),
+                    Err(error) => {
+                        let thrown = self.take_thrown(error);
+                        let (promise, _, reject) = self.promise_capability(&this)?;
+                        self.call_function(reject, Value::Undefined, vec![thrown])?;
+                        Ok(promise)
+                    }
+                }
             }
             PromiseFunction::WithResolvers => {
-                let promise = Self::pending_promise();
+                let (promise, resolve, reject) = self.promise_capability(&this)?;
                 Ok(self.object_from_entries(vec![
-                    ("promise".to_string(), Value::Promise(promise.clone())),
-                    (
-                        "resolve".to_string(),
-                        Value::Builtin(Builtin::PromiseResolvePending(promise.clone())),
-                    ),
-                    (
-                        "reject".to_string(),
-                        Value::Builtin(Builtin::PromiseRejectPending(promise)),
-                    ),
+                    ("promise".to_string(), promise),
+                    ("resolve".to_string(), resolve),
+                    ("reject".to_string(), reject),
                 ]))
             }
-            PromiseFunction::Finally(promise) => {
-                let callback = argument(&arguments, 0);
-                if !is_callable(&callback) {
-                    return self.promise_then(promise, Some(&callback), Some(&callback));
-                }
-                let fulfilled = Self::native_value(PromiseFunction::AfterFinally {
-                    callback: callback.clone(),
-                    rejected: false,
-                });
-                let rejected = Self::native_value(PromiseFunction::AfterFinally {
-                    callback,
-                    rejected: true,
-                });
-                self.promise_then(promise, Some(&fulfilled), Some(&rejected))
-            }
-            PromiseFunction::AfterFinally { callback, rejected } => {
+            PromiseFunction::AfterFinally {
+                callback,
+                constructor,
+                rejected,
+            } => {
                 let outcome = argument(&arguments, 0);
                 let result = self.call_function(callback, Value::Undefined, Vec::new())?;
-                let waited = self.promise_resolve(result)?;
-                let settle = Self::native_value(PromiseFunction::Settle {
-                    value: outcome,
-                    rejected,
-                });
-                self.promise_then(waited, Some(&settle), None)
+                let waited = self.promise_resolve_with(&constructor, result)?;
+                let settle = self.promise_closure(
+                    PromiseFunction::Settle {
+                        value: outcome,
+                        rejected,
+                    },
+                    0,
+                );
+                self.invoke_then(waited, vec![settle])
             }
             PromiseFunction::Settle { value, rejected } => {
                 if rejected {
@@ -284,5 +517,52 @@ impl ScriptRuntime {
             }
         }
         Value::Object(object)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn promises_are_objects_that_subclasses_and_patches_reach() {
+        let document = crate::dom::Document::parse(r#"<p id="out"></p>"#)
+            .expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [];
+                class Tracked extends Promise {
+                    constructor(executor) { super(executor); this.label = "tracked"; }
+                }
+                const tracked = new Tracked((resolve) => resolve(1));
+                const derived = tracked.then((value) => value + 1);
+                seen.push(tracked instanceof Tracked, derived instanceof Tracked, tracked.label);
+                const plain = Promise.resolve(2);
+                plain.note = "kept";
+                seen.push(plain.note, Object.getPrototypeOf(plain) === Promise.prototype, typeof Promise.prototype.then);
+                seen.push(Promise.resolve(plain) === plain, Tracked.resolve(plain) instanceof Tracked);
+                const original = Promise.prototype.then;
+                let patched = 0;
+                Promise.prototype.then = function (...args) { patched++; return original.apply(this, args); };
+                Promise.all([plain]).then(() => {
+                    Promise.prototype.then = original;
+                    seen.push(patched > 0);
+                    derived.then((value) => {
+                        seen.push(value);
+                        document.getElementById("out").textContent = seen.join("|");
+                    });
+                });
+                try { Promise(() => {}); } catch (error) { seen.push(error.name); }
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some("true|true|tracked|kept|true|function|true|true|TypeError|true|2")
+        );
     }
 }

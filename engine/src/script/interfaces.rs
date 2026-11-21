@@ -1003,6 +1003,7 @@ impl ScriptRuntime {
             Value::Event(event) => Some(event.object.clone()),
             Value::Range(range) => Some(range.object.clone()),
             Value::Selection(selection) => Some(selection.object.clone()),
+            Value::Promise(promise) => Some(super::promise_object(promise)),
             Value::Document => Some(self.node_handle(self.document_node()).object.clone()),
             _ => None,
         }

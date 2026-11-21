@@ -212,7 +212,6 @@ enum Value {
     FormDataConstructor,
     BlobConstructor,
     FileConstructor,
-    PromiseConstructor,
     AbortControllerConstructor,
     WorkerConstructor,
     CacheStorage(StorageHandle),
@@ -406,10 +405,6 @@ enum Builtin {
     ElementQuerySelectorAll(ElementHandle),
     IteratorNext(IteratorHandle),
     IteratorJoin(IteratorHandle),
-    PromiseReject,
-    PromiseResolve,
-    PromiseRejectPending(PromiseHandle),
-    PromiseResolvePending(PromiseHandle),
     ResponseErrorConstructor,
     ResponseJsonConstructor,
     ResponseRedirectConstructor,
@@ -433,8 +428,6 @@ enum Builtin {
     SubtleDigest,
     CryptoGetRandomValues,
     CryptoRandomUuid,
-    PromiseThen(PromiseHandle),
-    PromiseCatch(PromiseHandle),
     RequestClone(RequestHandle),
     RequestText(RequestHandle),
     RequestBytes(RequestHandle),
@@ -1397,6 +1390,29 @@ struct PromiseData {
     reactions: Vec<PromiseReaction>,
     // something waits on the promise, so a rejection of it is not left unhandled
     handled: bool,
+    // the object script sees, made when first read: its own properties and its prototype,
+    // which is Promise.prototype unless a subclass constructed it
+    object: Option<object::ObjectHandle>,
+}
+
+// the object behind a promise value, made the first time script reaches for it
+fn promise_object(promise: &PromiseHandle) -> object::ObjectHandle {
+    promise
+        .borrow_mut()
+        .object
+        .get_or_insert_with(|| {
+            object::new_object(object::JsObject::with_class(object::ObjectClass::Promise))
+        })
+        .clone()
+}
+
+fn new_promise(outcome: PromiseOutcome) -> PromiseHandle {
+    Rc::new(RefCell::new(PromiseData {
+        outcome,
+        reactions: Vec::new(),
+        handled: false,
+        object: None,
+    }))
 }
 
 struct Microtask {
@@ -1409,8 +1425,8 @@ struct Microtask {
 enum MicrotaskKind {
     // a then callback: its result resolves the derived promise
     Reaction(PromiseHandle),
-    // a thenable's then method adopting into a promise; a throw rejects it
-    Adopt(PromiseHandle),
+    // a thenable's then method adopting into a promise; a throw goes to this reject function
+    Adopt(Value),
     Plain,
 }
 
@@ -1602,9 +1618,6 @@ impl ScriptRuntime {
             values
                 .values
                 .insert("WebAssembly".to_string(), Value::WebAssemblyNamespace);
-            values
-                .values
-                .insert("Promise".to_string(), Value::PromiseConstructor);
             values.values.insert(
                 "AbortController".to_string(),
                 Value::AbortControllerConstructor,
@@ -3876,10 +3889,6 @@ impl ScriptRuntime {
         Ok(executed)
     }
 
-    fn promise_native(function: promises::PromiseFunction) -> Value {
-        Value::Builtin(Builtin::Native(Native::Promise(Rc::new(function))))
-    }
-
     fn member(&self, object: Value, property: &str) -> Result<Value, ScriptError> {
         match object.resolve() {
             Value::Document => match property {
@@ -4697,19 +4706,6 @@ impl ScriptRuntime {
                     .unwrap_or(Value::Undefined)),
                 _ => Err(runtime_error(format!("error has no property {property}"))),
             },
-            Value::PromiseConstructor => match property {
-                "reject" => Ok(Value::Builtin(Builtin::PromiseReject)),
-                "resolve" => Ok(Value::Builtin(Builtin::PromiseResolve)),
-                "all" => Ok(Self::promise_native(promises::PromiseFunction::All)),
-                "allSettled" => Ok(Self::promise_native(promises::PromiseFunction::AllSettled)),
-                "race" => Ok(Self::promise_native(promises::PromiseFunction::Race)),
-                "any" => Ok(Self::promise_native(promises::PromiseFunction::Any)),
-                "withResolvers" => Ok(Self::promise_native(
-                    promises::PromiseFunction::WithResolvers,
-                )),
-                "try" => Ok(Self::promise_native(promises::PromiseFunction::Try)),
-                _ => Err(runtime_error(format!("Promise has no property {property}"))),
-            },
             Value::Object(object) => Ok(object
                 .borrow()
                 .get(property)
@@ -4755,14 +4751,6 @@ impl ScriptRuntime {
                 _ => Err(runtime_error(format!(
                     "WebAssembly has no property {property}"
                 ))),
-            },
-            Value::Promise(promise) => match property {
-                "then" => Ok(Value::Builtin(Builtin::PromiseThen(promise))),
-                "catch" => Ok(Value::Builtin(Builtin::PromiseCatch(promise))),
-                "finally" => Ok(Self::promise_native(promises::PromiseFunction::Finally(
-                    promise,
-                ))),
-                _ => Err(runtime_error(format!("promise has no property {property}"))),
             },
             object => Err(runtime_error(format!(
                 "{} value has no property {property}",
@@ -6763,7 +6751,6 @@ impl ScriptRuntime {
             Value::HeadersConstructor => self.construct_headers(arguments),
             Value::RequestConstructor => self.construct_request(arguments),
             Value::ResponseConstructor => self.construct_response(arguments),
-            Value::PromiseConstructor => self.construct_promise(arguments),
             Value::AbortControllerConstructor => Ok(self.construct_abort_controller()),
             Value::WorkerConstructor => self.construct_worker(arguments),
             _ => Err(runtime_error("value is not callable")),
@@ -7157,23 +7144,6 @@ impl ScriptRuntime {
         ))))
     }
 
-    fn construct_promise(&mut self, arguments: Vec<Value>) -> Result<Value, ScriptError> {
-        let promise = Rc::new(RefCell::new(PromiseData {
-            outcome: PromiseOutcome::Pending,
-            reactions: Vec::new(),
-            handled: false,
-        }));
-        if let Some(executor) = arguments.first() {
-            if !is_callable(executor) {
-                return Err(runtime_error("Promise executor must be a function"));
-            }
-            let resolve = Value::Builtin(Builtin::PromiseResolvePending(promise.clone()));
-            let reject = Value::Builtin(Builtin::PromiseRejectPending(promise.clone()));
-            self.call(executor.clone(), vec![resolve, reject])?;
-        }
-        Ok(Value::Promise(promise))
-    }
-
     fn construct_abort_controller(&self) -> Value {
         let signal = new_abort_signal();
         Value::AbortController(Rc::new(RefCell::new(AbortControllerData { signal })))
@@ -7444,24 +7414,6 @@ impl ScriptRuntime {
                 Ok(Value::Range(self.new_range(LiveRange::collapsed(start))))
             }
             Builtin::DocumentGetSelection => Ok(Value::Selection(self.selection.clone())),
-            Builtin::PromiseReject => Ok(Value::Promise(self.rejected_promise_value(
-                arguments.first().cloned().unwrap_or(Value::Undefined),
-            ))),
-            Builtin::PromiseResolve => Ok(Value::Promise(
-                self.promise_resolve(arguments.first().cloned().unwrap_or(Value::Undefined))?,
-            )),
-            Builtin::PromiseRejectPending(promise) => {
-                let reason = arguments.first().cloned().unwrap_or(Value::Undefined);
-                self.settle_promise(&promise, PromiseOutcome::Rejected(reason));
-                Ok(Value::Undefined)
-            }
-            Builtin::PromiseResolvePending(promise) => {
-                let value = arguments.first().cloned().unwrap_or(Value::Undefined);
-                if matches!(promise.borrow().outcome, PromiseOutcome::Pending) {
-                    self.resolve_promise(&promise, value)?;
-                }
-                Ok(Value::Undefined)
-            }
             Builtin::NumberIsFinite => Ok(Value::Bool(arguments.first().is_some_and(
                 |value| matches!(value, Value::Number(number) if number.is_finite()),
             ))),
@@ -8513,10 +8465,6 @@ impl ScriptRuntime {
                     )),
                 }
             }
-            Builtin::PromiseThen(promise) => {
-                self.promise_then(promise, arguments.first(), arguments.get(1))
-            }
-            Builtin::PromiseCatch(promise) => self.promise_then(promise, None, arguments.first()),
             Builtin::RequestClone(request) => Ok(Value::Request(clone_request(&request)?)),
             Builtin::RequestText(request) => match self.consume_request_body(&request) {
                 Ok(body) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
@@ -9501,19 +9449,11 @@ impl ScriptRuntime {
     }
 
     fn fulfilled_promise(&self, value: Value) -> PromiseHandle {
-        Rc::new(RefCell::new(PromiseData {
-            outcome: PromiseOutcome::Fulfilled(value),
-            reactions: Vec::new(),
-            handled: false,
-        }))
+        new_promise(PromiseOutcome::Fulfilled(value))
     }
 
     fn pending_promise() -> PromiseHandle {
-        Rc::new(RefCell::new(PromiseData {
-            outcome: PromiseOutcome::Pending,
-            reactions: Vec::new(),
-            handled: false,
-        }))
+        new_promise(PromiseOutcome::Pending)
     }
 
     // host APIs that fail without a more specific DOMException reject with a TypeError
@@ -9522,11 +9462,7 @@ impl ScriptRuntime {
     }
 
     fn rejected_promise_value(&self, reason: Value) -> PromiseHandle {
-        let promise = Rc::new(RefCell::new(PromiseData {
-            outcome: PromiseOutcome::Rejected(reason),
-            reactions: Vec::new(),
-            handled: false,
-        }));
+        let promise = new_promise(PromiseOutcome::Rejected(reason));
         self.rejections.borrow_mut().push(promise.clone());
         promise
     }
@@ -9543,9 +9479,8 @@ impl ScriptRuntime {
                 let error = self.make_error("TypeError", "Chaining cycle detected for promise");
                 self.settle_promise(promise, PromiseOutcome::Rejected(error));
             }
-            Value::Promise(other) => self.follow_promise(promise.clone(), other.clone()),
-            Value::Object(_) => {
-                let then = match self.get_property(&value, "then") {
+            value if !operations::is_primitive(value) => {
+                let then = match self.get_property(value, "then") {
                     Ok(then) => then,
                     Err(error) => {
                         let reason = self.take_thrown(error);
@@ -9554,16 +9489,16 @@ impl ScriptRuntime {
                     }
                 };
                 if is_callable(&then) {
-                    let resolve = Value::Builtin(Builtin::PromiseResolvePending(promise.clone()));
-                    let reject = Value::Builtin(Builtin::PromiseRejectPending(promise.clone()));
+                    let (resolve, reject) = self.resolving_functions(promise);
+                    let rejecting = reject.clone();
                     self.microtasks.push_back(Microtask {
                         callback: then,
-                        this: value,
+                        this: value.clone(),
                         arguments: vec![resolve, reject],
-                        kind: MicrotaskKind::Adopt(promise.clone()),
+                        kind: MicrotaskKind::Adopt(rejecting),
                     });
                 } else {
-                    self.settle_promise(promise, PromiseOutcome::Fulfilled(value));
+                    self.settle_promise(promise, PromiseOutcome::Fulfilled(value.clone()));
                 }
             }
             _ => self.settle_promise(promise, PromiseOutcome::Fulfilled(value)),
@@ -9682,27 +9617,6 @@ impl ScriptRuntime {
         }
     }
 
-    fn follow_promise(&mut self, next: PromiseHandle, promise: PromiseHandle) {
-        let reaction = PromiseReaction {
-            fulfilled: None,
-            rejected: None,
-            next: next.clone(),
-        };
-        let outcome = {
-            let mut promise = promise.borrow_mut();
-            promise.handled = true;
-            match &promise.outcome {
-                PromiseOutcome::Pending => {
-                    promise.reactions.push(reaction);
-                    return;
-                }
-                PromiseOutcome::Fulfilled(value) => PromiseOutcome::Fulfilled(value.clone()),
-                PromiseOutcome::Rejected(reason) => PromiseOutcome::Rejected(reason.clone()),
-            }
-        };
-        self.queue_reaction(reaction, outcome);
-    }
-
     fn drain_microtasks(&mut self) -> Result<(), ScriptError> {
         let mut executed = 0;
         loop {
@@ -9722,9 +9636,13 @@ impl ScriptRuntime {
             let outcome = self.call_function(task.callback, task.this, task.arguments);
             match (task.kind, outcome) {
                 (MicrotaskKind::Reaction(next), Ok(value)) => self.resolve_promise(&next, value)?,
-                (MicrotaskKind::Reaction(next) | MicrotaskKind::Adopt(next), Err(error)) => {
+                (MicrotaskKind::Reaction(next), Err(error)) => {
                     let reason = self.take_thrown(error);
                     self.settle_promise(&next, PromiseOutcome::Rejected(reason));
+                }
+                (MicrotaskKind::Adopt(reject), Err(error)) => {
+                    let reason = self.take_thrown(error);
+                    self.call_function(reject, Value::Undefined, vec![reason])?;
                 }
                 (MicrotaskKind::Plain, Err(error)) => self.report_exception(error),
                 (MicrotaskKind::Adopt(_) | MicrotaskKind::Plain, Ok(_)) => {}
@@ -11234,7 +11152,6 @@ impl Value {
             Self::FormDataConstructor => "[function FormData]".to_string(),
             Self::BlobConstructor => "[function Blob]".to_string(),
             Self::FileConstructor => "[function File]".to_string(),
-            Self::PromiseConstructor => "[function Promise]".to_string(),
             Self::AbortControllerConstructor => "[function AbortController]".to_string(),
             Self::WorkerConstructor => "[function Worker]".to_string(),
             Self::VmIterator(_) => "[object Iterator]".to_string(),
@@ -14250,7 +14167,6 @@ fn value_typeof(value: &Value) -> &'static str {
         | Value::FormDataConstructor
         | Value::BlobConstructor
         | Value::FileConstructor
-        | Value::PromiseConstructor
         | Value::AbortControllerConstructor
         | Value::WorkerConstructor => "function",
     }
@@ -14725,7 +14641,6 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         | (Value::FormDataConstructor, Value::FormDataConstructor)
         | (Value::BlobConstructor, Value::BlobConstructor)
         | (Value::FileConstructor, Value::FileConstructor)
-        | (Value::PromiseConstructor, Value::PromiseConstructor)
         | (Value::AbortControllerConstructor, Value::AbortControllerConstructor)
         | (Value::WorkerConstructor, Value::WorkerConstructor)
         | (Value::Clipboard, Value::Clipboard)
@@ -19308,7 +19223,7 @@ mod tests {
                 Promise.try(() => { throw new Error("thrown"); }).catch((error) => seen.push(error.message));
                 Promise.try((a, b) => a + b, 2, 3).then((value) => seen.push(value));
                 Promise.try(() => Promise.resolve(7)).then((value) => seen.push(value));
-                try { Promise.try(1); } catch (error) { seen.push(error.name); }
+                Promise.try(1).catch((error) => seen.push(error.name));
                 setTimeout(() => (document.getElementById("status").textContent = seen.join("|")), 0);
                 "#,
             )
@@ -19316,7 +19231,7 @@ mod tests {
         runtime.advance_time(1).expect("the timer should run");
         assert_eq!(
             status_text(&document).as_deref(),
-            Some("TypeError|5|thrown|5|7")
+            Some("5|thrown|5|7|TypeError")
         );
     }
     #[test]

@@ -78,7 +78,6 @@ pub(super) fn is_callable(value: &Value) -> bool {
         | Value::FormDataConstructor
         | Value::BlobConstructor
         | Value::FileConstructor
-        | Value::PromiseConstructor
         | Value::AbortControllerConstructor
         | Value::WorkerConstructor => true,
         _ => false,
@@ -330,7 +329,8 @@ impl ScriptRuntime {
             | Value::Document
             | Value::Event(_)
             | Value::Range(_)
-            | Value::Selection(_) => {
+            | Value::Selection(_)
+            | Value::Promise(_) => {
                 let exotic = self.get_property(&value, "@@toPrimitive")?;
                 if !matches!(exotic, Value::Undefined | Value::Null) {
                     let hint_name = match hint {
@@ -918,7 +918,8 @@ impl ScriptRuntime {
             | Value::Document
             | Value::Event(_)
             | Value::Range(_)
-            | Value::Selection(_) => {
+            | Value::Selection(_)
+            | Value::Promise(_) => {
                 let object = self
                     .wrapper_object(value)
                     .expect("nodes and events have wrappers");
@@ -933,7 +934,6 @@ impl ScriptRuntime {
             Value::BigInt(_) => intrinsics.bigint_prototype.clone(),
             Value::Array(_) => intrinsics.array_prototype.clone(),
             Value::Error(error) => self.error_prototype(&error.name),
-            Value::Promise(_) => intrinsics.promise_prototype.clone(),
             Value::Iterator(_) => intrinsics.iterator_prototype.clone(),
             Value::TypedArray(array) => {
                 let kind = array.borrow().kind;
@@ -956,7 +956,8 @@ impl ScriptRuntime {
             | Value::Document
             | Value::Event(_)
             | Value::Range(_)
-            | Value::Selection(_) => {
+            | Value::Selection(_)
+            | Value::Promise(_) => {
                 let object = self
                     .wrapper_object(value)
                     .expect("nodes and events have wrappers");
@@ -1088,7 +1089,8 @@ impl ScriptRuntime {
             | Value::Document
             | Value::Event(_)
             | Value::Range(_)
-            | Value::Selection(_) => {
+            | Value::Selection(_)
+            | Value::Promise(_) => {
                 let object = self
                     .wrapper_object(target)
                     .expect("nodes and events have wrappers");
@@ -2456,7 +2458,6 @@ fn host_instance_of(value: &Value, constructor: &Value) -> bool {
                 Value::FileConstructor | Value::BlobConstructor
             )
             | (Value::Worker(_), Value::WorkerConstructor)
-            | (Value::Promise(_), Value::PromiseConstructor)
             | (Value::Response(_), Value::ResponseConstructor)
             | (Value::Request(_), Value::RequestConstructor)
             | (Value::Headers(_), Value::HeadersConstructor)
