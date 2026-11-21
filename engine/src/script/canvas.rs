@@ -2057,12 +2057,7 @@ impl ScriptRuntime {
             }
             "getTransform" => {
                 let matrix = context.borrow().state.transform;
-                Ok(plain_object(
-                    ["a", "b", "c", "d", "e", "f"]
-                        .into_iter()
-                        .zip(matrix)
-                        .map(|(key, value)| (key.to_string(), Value::Number(value.into()))),
-                ))
+                Ok(self.matrix_2d(matrix.map(f64::from)))
             }
             "beginPath" => {
                 let mut context = context.borrow_mut();

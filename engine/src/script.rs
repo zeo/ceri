@@ -30,6 +30,7 @@ mod intl;
 mod iterator_helpers;
 mod json;
 mod markup;
+mod matrices;
 mod messaging;
 mod navigator_apis;
 mod netfetch;

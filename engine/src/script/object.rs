@@ -119,6 +119,7 @@ pub(super) enum ObjectClass {
     Registry(Rc<RefCell<super::collections::Registry>>),
     // a Path2D and the calls that made it
     Path(super::path2d::PathHandle),
+    Matrix(Rc<RefCell<super::matrices::MatrixState>>),
     // a stream, its controller, a reader or an iterator over one
     Stream(super::streams::StreamHandle),
     // the object of a typed array of this kind, for its named properties and prototype

@@ -22,7 +22,7 @@ pub(super) struct ShapeInterfaces {
     rect: ObjectHandle,
     rect_read_only: ObjectHandle,
     point: ObjectHandle,
-    point_read_only: ObjectHandle,
+    pub(super) point_read_only: ObjectHandle,
 }
 
 const RECT: [&str; 4] = ["x", "y", "width", "height"];
