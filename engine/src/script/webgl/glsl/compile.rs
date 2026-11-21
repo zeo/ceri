@@ -8,9 +8,9 @@ use super::exec::{ALL, LANES, Machine, Op, SamplerKind};
 use super::parse::{
     Declaration, Expr, ExprKind, External, Parameter, Stmt, Storage, SwitchItem, TypeSpec,
 };
-use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Base {
@@ -32,7 +32,7 @@ pub(crate) enum Ty {
     Vec(Base, u8),
     Mat(u8, u8),
     Sampler(SamplerKind, Base),
-    Struct(Rc<StructTy>),
+    Struct(Arc<StructTy>),
     Array(Box<Ty>, usize),
 }
 
@@ -43,7 +43,7 @@ impl PartialEq for Ty {
             (Ty::Vec(a, n), Ty::Vec(b, m)) => a == b && n == m,
             (Ty::Mat(a, b), Ty::Mat(c, d)) => a == c && b == d,
             (Ty::Sampler(a, b), Ty::Sampler(c, d)) => a == c && b == d,
-            (Ty::Struct(a), Ty::Struct(b)) => Rc::ptr_eq(a, b),
+            (Ty::Struct(a), Ty::Struct(b)) => Arc::ptr_eq(a, b),
             (Ty::Array(a, n), Ty::Array(b, m)) => n == m && a == b,
             _ => false,
         }
@@ -216,12 +216,12 @@ pub(crate) struct Interface {
     pub(crate) flat: bool,
     pub(crate) used: bool,
     // the uniform block it belongs to; an instance-named block is one struct-typed uniform
-    pub(crate) block: Option<Rc<str>>,
+    pub(crate) block: Option<Arc<str>>,
 }
 
 pub(crate) struct Module {
     pub(crate) version: u32,
-    pub(crate) main: Rc<Op>,
+    pub(crate) main: Arc<Op>,
     pub(crate) initial: Vec<u32>,
     pub(crate) inputs: Vec<Interface>,
     pub(crate) outputs: Vec<Interface>,
@@ -247,7 +247,7 @@ struct Function {
     parameters: Vec<(Ty, Storage, usize)>,
     returns: Ty,
     return_slot: usize,
-    body: Rc<OnceCell<Op>>,
+    body: Arc<OnceLock<Op>>,
 }
 
 // a compiled expression: its type, where its value is, the code that puts it there, and
@@ -275,8 +275,8 @@ pub(crate) struct Compiler {
     pub(crate) extensions: Vec<String>,
     pub(crate) initial: Vec<u32>,
     scopes: Vec<HashMap<String, Var>>,
-    functions: HashMap<String, Vec<Rc<Function>>>,
-    structs: Vec<HashMap<String, Rc<StructTy>>>,
+    functions: HashMap<String, Vec<Arc<Function>>>,
+    structs: Vec<HashMap<String, Arc<StructTy>>>,
     returns: Option<(Ty, usize)>,
     loops: usize,
     switches: usize,
@@ -387,7 +387,7 @@ impl Compiler {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
     }
 
-    fn lookup_struct(&self, name: &str) -> Option<Rc<StructTy>> {
+    fn lookup_struct(&self, name: &str) -> Option<Arc<StructTy>> {
         self.structs
             .iter()
             .rev()
@@ -456,7 +456,7 @@ impl Compiler {
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("__anonymous{}", self.initial.len()));
-                let made = Rc::new(StructTy {
+                let made = Arc::new(StructTy {
                     name: name.clone(),
                     fields,
                 });
@@ -1506,7 +1506,7 @@ impl Compiler {
 
     fn user_call(
         &mut self,
-        function: Rc<Function>,
+        function: Arc<Function>,
         values: Vec<Value>,
         places: Vec<Option<Place>>,
     ) -> Value {
@@ -2209,11 +2209,11 @@ impl Compiler {
                     slotted.push((ty.clone(), *storage, slot));
                 }
                 let return_slot = self.allocate(returns.slots());
-                let made = Rc::new(Function {
+                let made = Arc::new(Function {
                     parameters: slotted,
                     returns: returns.clone(),
                     return_slot,
-                    body: Rc::new(OnceCell::new()),
+                    body: Arc::new(OnceLock::new()),
                 });
                 self.functions
                     .entry(function.name.clone())
@@ -2431,7 +2431,7 @@ pub(crate) fn compile(source: &str, stage: Stage, extensions_allowed: &[&str]) -
         used_builtins: compiler.used_builtins,
         extensions: compiler.extensions,
         version: compiler.version,
-        main: Rc::new(entry),
+        main: Arc::new(entry),
         initial: compiler.initial,
         inputs: compiler.inputs,
         outputs: compiler.outputs,
@@ -2464,7 +2464,7 @@ impl Compiler {
         }
         match &block.instance {
             Some((instance, _)) => {
-                let def = Rc::new(StructTy {
+                let def = Arc::new(StructTy {
                     name: block.name.clone(),
                     fields,
                 });

@@ -6,6 +6,7 @@ use super::constants::*;
 use super::glsl::{self, Base, LANES, Lod, Module, SamplerKind, Stage, Textures, Ty};
 use super::raster::{
     Blend, Draw, Fetch, Link, Outcome, Pipeline, Source, Stage as DrawStage, StencilFace, Target,
+    View,
 };
 use super::texture::{
     Bound, Format, Kind, Layout, Level, Params, Texture, channels, pack_pixel, pixel_size, unpack,
@@ -2594,17 +2595,24 @@ impl Context {
                     .map(|(level, _)| (level.width, level.height))
             })
             .unwrap_or(self.draw_size());
-        let mut target = Target {
+        let target = Target {
             width,
             height,
             colors: taken
                 .colors
                 .iter_mut()
-                .map(|entry| entry.as_mut().map(|(level, layer, _)| (level, *layer)))
+                .map(|entry| {
+                    entry
+                        .as_mut()
+                        .map(|(level, layer, _)| View::layer(level, *layer))
+                })
                 .collect(),
-            depth_stencil: taken.depth_stencil.as_mut().map(|(level, _)| level),
+            depth_stencil: taken
+                .depth_stencil
+                .as_mut()
+                .map(|(level, _)| View::layer(level, 0)),
         };
-        Some(draw.run(pipeline, &mut target))
+        Some(draw.run(pipeline, target))
     }
 
     fn units_for<'a>(&'a self, linked: &Linked) -> Units<'a> {

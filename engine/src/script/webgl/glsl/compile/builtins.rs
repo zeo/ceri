@@ -68,7 +68,11 @@ fn from_half(half: u32) -> f32 {
 impl Compiler {
     // a function of floats applied per component, where a scalar argument spreads over the
     // vector size of the result
-    fn float_map(&mut self, values: Vec<Value>, f: impl Fn(&[f32]) -> f32 + 'static) -> Value {
+    fn float_map(
+        &mut self,
+        values: Vec<Value>,
+        f: impl Fn(&[f32]) -> f32 + Send + Sync + 'static,
+    ) -> Value {
         let size = values
             .iter()
             .map(|value| value.ty.size())
@@ -108,7 +112,7 @@ impl Compiler {
         &mut self,
         values: Vec<Value>,
         result: Base,
-        f: impl Fn(&[u32]) -> u32 + 'static,
+        f: impl Fn(&[u32]) -> u32 + Send + Sync + 'static,
     ) -> Value {
         let size = values
             .iter()
@@ -149,7 +153,7 @@ impl Compiler {
         &mut self,
         values: Vec<Value>,
         result: Ty,
-        f: impl Fn(&[&[f32]], &mut [f32]) + 'static,
+        f: impl Fn(&[&[f32]], &mut [f32]) + Send + Sync + 'static,
     ) -> Value {
         let count = result.slots();
         let (codes, slots, constant) = parts(values);

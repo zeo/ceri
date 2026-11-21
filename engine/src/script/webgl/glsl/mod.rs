@@ -13,7 +13,7 @@ pub(crate) use exec::{ALL, LANES, Lod, Machine, SamplerKind, Textures};
 
 impl Module {
     // a machine with this module's memory, ready to run main
-    pub(crate) fn machine<'a>(&self, textures: &'a dyn Textures) -> Machine<'a> {
+    pub(crate) fn machine<'a>(&self, textures: &'a (dyn Textures + Sync)) -> Machine<'a> {
         Machine {
             memory: self.initial.clone(),
             mask: ALL,

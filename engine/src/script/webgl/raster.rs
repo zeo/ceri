@@ -5,7 +5,7 @@
 
 use super::constants::*;
 use super::glsl::{ALL, Base, LANES, Machine, Module, Textures};
-use super::texture::{Level, channels};
+use super::texture::{Format, Level, channels};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StencilFace {
@@ -93,17 +93,107 @@ pub(crate) struct Draw<'a> {
     // fragment output slot and the draw buffer it goes to
     pub(crate) outputs: Vec<(usize, usize)>,
     pub(crate) frag_depth: Option<usize>,
-    pub(crate) textures: &'a dyn Textures,
+    pub(crate) textures: &'a (dyn Textures + Sync),
     // vertex output slots and sizes transform feedback records, in order
     pub(crate) capture: Vec<(usize, usize)>,
+}
+
+// rows of one layer of an attachment, from row `top` down the slice
+pub(crate) struct View<'a> {
+    pub(crate) texels: &'a mut [[f32; 4]],
+    pub(crate) format: Format,
+    pub(crate) width: u32,
+    pub(crate) top: u32,
+}
+
+impl<'a> View<'a> {
+    pub(crate) fn layer(level: &'a mut Level, layer: u32) -> View<'a> {
+        let plane = level.width as usize * level.height as usize;
+        let start = layer as usize * plane;
+        View {
+            format: level.format,
+            width: level.width,
+            top: 0,
+            texels: &mut level.texels[start..start + plane],
+        }
+    }
+
+    #[inline]
+    fn at(&self, x: u32, y: u32) -> usize {
+        ((y - self.top) * self.width + x) as usize
+    }
 }
 
 pub(crate) struct Target<'a> {
     pub(crate) width: u32,
     pub(crate) height: u32,
-    // per draw buffer: the level drawn into and its layer
-    pub(crate) colors: Vec<Option<(&'a mut Level, u32)>>,
-    pub(crate) depth_stencil: Option<&'a mut Level>,
+    // per draw buffer
+    pub(crate) colors: Vec<Option<View<'a>>>,
+    pub(crate) depth_stencil: Option<View<'a>>,
+}
+
+impl<'a> Target<'a> {
+    // horizontal bands of an even number of rows, so no 2x2 quad straddles two of them, each
+    // with its rows of every attachment and the range of rows it covers
+    fn split(self, bands: usize) -> Vec<([i32; 2], Target<'a>)> {
+        let Target {
+            width,
+            height,
+            colors,
+            depth_stencil,
+        } = self;
+        let rows = (height as usize)
+            .div_ceil(bands.max(1))
+            .next_multiple_of(2)
+            .max(2);
+        let count = (height as usize).div_ceil(rows).max(1);
+        let chunk = |view: View<'a>| {
+            let size = rows * view.width as usize;
+            (view.format, view.width, view.texels.chunks_mut(size.max(1)))
+        };
+        let mut colors: Vec<_> = colors.into_iter().map(|view| view.map(chunk)).collect();
+        let mut depth = depth_stencil.map(chunk);
+        let next = |entry: &mut Option<(Format, u32, std::slice::ChunksMut<'a, [f32; 4]>)>,
+                    top: u32| {
+            entry.as_mut().and_then(|(format, width, chunks)| {
+                chunks.next().map(|texels| View {
+                    texels,
+                    format: *format,
+                    width: *width,
+                    top,
+                })
+            })
+        };
+        (0..count)
+            .map(|band| {
+                let top = (band * rows) as u32;
+                let bottom = ((band + 1) * rows).min(height as usize) as u32;
+                let colors = colors.iter_mut().map(|entry| next(entry, top)).collect();
+                let depth_stencil = next(&mut depth, top);
+                (
+                    [top as i32, bottom as i32],
+                    Target {
+                        width,
+                        height,
+                        colors,
+                        depth_stencil,
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+// fragment work worth another thread, as the summed bounding boxes of the primitives
+const PIXELS_PER_WORKER: u64 = 16_384;
+
+fn max_workers() -> usize {
+    static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map_or(1, |count| count.get())
+            .min(8)
+    })
 }
 
 #[derive(Default)]
@@ -316,7 +406,7 @@ impl Draw<'_> {
         shaded
     }
 
-    pub(crate) fn run(&self, pipeline: &Pipeline, target: &mut Target) -> Outcome {
+    pub(crate) fn run(&self, pipeline: &Pipeline, target: Target) -> Outcome {
         let mut outcome = Outcome::default();
         // distinct ids, so a vertex shared by many triangles is shaded once
         let mut order: Vec<u32> = Vec::new();
@@ -338,7 +428,7 @@ impl Draw<'_> {
             .iter()
             .flat_map(|link| std::iter::repeat_n(link.flat, link.count))
             .collect();
-        let mut fragments = Fragments::new(self, pipeline, target, &flat_words);
+        let mut batches: Vec<(Shaded, Vec<Primitive>)> = Vec::new();
         for instance in 0..self.instances {
             let shaded = self.shade_vertices(&order, instance);
             let primitives = assemble(self.mode, &places);
@@ -353,20 +443,48 @@ impl Draw<'_> {
                     }
                 }
             }
-            if pipeline.rasterizer_discard {
-                continue;
+            if !pipeline.rasterizer_discard {
+                batches.push((shaded, primitives));
             }
-            for primitive in primitives {
-                match primitive {
-                    Primitive::Point(a) => fragments.point(&shaded, a as usize),
-                    Primitive::Line(a, b) => fragments.line(&shaded, a as usize, b as usize),
-                    Primitive::Triangle(a, b, c) => {
-                        fragments.triangle(&shaded, [a as usize, b as usize, c as usize])
+        }
+        if batches.is_empty() {
+            return outcome;
+        }
+        let workers = (estimate_area(&batches, pipeline) / PIXELS_PER_WORKER)
+            .clamp(1, max_workers() as u64) as usize;
+        // every band sees every primitive in order, so blending keeps the draw order
+        let rasterize = |rows: [i32; 2], band: Target| -> u64 {
+            let mut fragments = Fragments::new(self, pipeline, band, &flat_words, rows);
+            for (shaded, primitives) in &batches {
+                for primitive in primitives {
+                    match *primitive {
+                        Primitive::Point(a) => fragments.point(shaded, a as usize),
+                        Primitive::Line(a, b) => fragments.line(shaded, a as usize, b as usize),
+                        Primitive::Triangle(a, b, c) => {
+                            fragments.triangle(shaded, [a as usize, b as usize, c as usize])
+                        }
                     }
                 }
             }
-        }
-        outcome.samples_passed = fragments.passed;
+            fragments.passed
+        };
+        let mut bands = target.split(workers);
+        outcome.samples_passed = if bands.len() == 1 {
+            let (rows, band) = bands.pop().expect("one band");
+            rasterize(rows, band)
+        } else {
+            std::thread::scope(|scope| {
+                let rasterize = &rasterize;
+                let handles: Vec<_> = bands
+                    .into_iter()
+                    .map(|(rows, band)| scope.spawn(move || rasterize(rows, band)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("a band of fragments was drawn"))
+                    .sum()
+            })
+        };
         outcome
     }
 }
@@ -430,6 +548,53 @@ fn assemble(mode: u32, places: &[u32]) -> Vec<Primitive> {
         }
     }
     primitives
+}
+
+// how many pixels the primitives may touch, from their window-space bounding boxes; a
+// primitive reaching behind the eye counts as the whole viewport
+fn estimate_area(batches: &[(Shaded, Vec<Primitive>)], pipeline: &Pipeline) -> u64 {
+    let [_, _, width, height] = pipeline.viewport;
+    let (width, height) = (width.max(0) as f32, height.max(0) as f32);
+    let full = (width * height) as u64;
+    let window = |clip: [f32; 4]| -> Option<(f32, f32)> {
+        (clip[3] > 0.0).then(|| {
+            (
+                (clip[0] / clip[3] + 1.0) * 0.5 * width,
+                (clip[1] / clip[3] + 1.0) * 0.5 * height,
+            )
+        })
+    };
+    let mut total = 0_u64;
+    for (shaded, primitives) in batches {
+        for primitive in primitives {
+            let corners: Vec<Option<(f32, f32)>> = primitive
+                .vertices()
+                .iter()
+                .map(|&place| window(shaded.positions[place as usize]))
+                .collect();
+            let area = match (
+                primitive,
+                corners.iter().copied().collect::<Option<Vec<_>>>(),
+            ) {
+                (Primitive::Point(a), _) => {
+                    shaded.sizes[*a as usize].clamp(1.0, 1024.0).powi(2) as u64
+                }
+                (_, None) => full,
+                (_, Some(points)) => {
+                    let (mut low, mut high) = ((f32::MAX, f32::MAX), (f32::MIN, f32::MIN));
+                    for (x, y) in points {
+                        low = (low.0.min(x), low.1.min(y));
+                        high = (high.0.max(x), high.1.max(y));
+                    }
+                    let span =
+                        |low: f32, high: f32, limit: f32| (high.min(limit) - low.max(0.0)).max(1.0);
+                    (span(low.0, high.0, width) * span(low.1, high.1, height)) as u64
+                }
+            };
+            total = total.saturating_add(area.min(full.max(1)));
+        }
+    }
+    total
 }
 
 // a vertex in clip space with its varying words, as clipping makes new ones
@@ -496,10 +661,10 @@ fn clip_polygon(mut polygon: Vec<Corner>, flat: &[bool]) -> Vec<Corner> {
     polygon
 }
 
-struct Fragments<'a, 'b, 't> {
+struct Fragments<'a, 't> {
     draw: &'a Draw<'a>,
     pipeline: &'a Pipeline,
-    target: &'b mut Target<'t>,
+    target: Target<'t>,
     flat: &'a [bool],
     machine: Machine<'a>,
     // the pixels fragments may land on: viewport, scissor and attachment size together
@@ -524,14 +689,20 @@ fn intersect(a: [i32; 4], b: [i32; 4]) -> [i32; 4] {
     ]
 }
 
-impl<'a, 'b, 't> Fragments<'a, 'b, 't> {
+impl<'a, 't> Fragments<'a, 't> {
     fn new(
         draw: &'a Draw<'a>,
         pipeline: &'a Pipeline,
-        target: &'b mut Target<'t>,
+        target: Target<'t>,
         flat: &'a [bool],
+        rows: [i32; 2],
     ) -> Self {
-        let size = [0, 0, target.width as i32, target.height as i32];
+        let size = [
+            0,
+            rows[0],
+            target.width as i32,
+            rows[1].min(target.height as i32),
+        ];
         let [x, y, width, height] = pipeline.viewport;
         let viewport = [x, y, x.saturating_add(width), y.saturating_add(height)];
         let wide_bounds = match pipeline.scissor {
@@ -545,7 +716,7 @@ impl<'a, 'b, 't> Fragments<'a, 'b, 't> {
         let depth_unit = match target
             .depth_stencil
             .as_ref()
-            .map(|level| level.format.bits[0])
+            .map(|view| view.format.bits[0])
         {
             Some(bits @ 1..=24) => 1.0 / ((1_u32 << bits) - 1) as f32,
             _ => 1.0 / 16_777_216.0,
@@ -909,13 +1080,17 @@ impl<'a, 'b, 't> Fragments<'a, 'b, 't> {
         // with no shader depth and no stencil, fragments that fail the depth test need no shading
         if self.draw.frag_depth.is_none()
             && self.pipeline.stencil.is_none()
-            && let (Some(func), Some(level)) =
+            && let (Some(func), Some(view)) =
                 (self.pipeline.depth_test, self.target.depth_stencil.as_ref())
-            && level.format.has_depth()
+            && view.format.has_depth()
         {
             for (lane, &(x, y)) in positions.iter().enumerate() {
                 if mask & (1 << lane) != 0
-                    && !depth_passes(func, depths[lane], level.texel(x as u32, y as u32, 0)[0])
+                    && !depth_passes(
+                        func,
+                        depths[lane],
+                        view.texels[view.at(x as u32, y as u32)][0],
+                    )
                 {
                     mask &= !(1 << lane);
                 }
@@ -943,8 +1118,8 @@ impl<'a, 'b, 't> Fragments<'a, 'b, 't> {
     // the stencil and depth tests, then blending and the color mask into every draw buffer
     fn write(&mut self, x: u32, y: u32, depth: f32, front: bool, lane: usize) {
         let pipeline = self.pipeline;
-        if let Some(level) = self.target.depth_stencil.as_deref_mut() {
-            let index = level.index(x, y, 0);
+        if let Some(level) = self.target.depth_stencil.as_mut() {
+            let index = level.at(x, y);
             let stored = level.texels[index];
             let stencil_face = pipeline
                 .stencil
@@ -986,11 +1161,11 @@ impl<'a, 'b, 't> Fragments<'a, 'b, 't> {
             return;
         }
         for &(slot, buffer) in &self.draw.outputs {
-            let Some(Some((level, layer))) = self.target.colors.get_mut(buffer) else {
+            let Some(Some(level)) = self.target.colors.get_mut(buffer) else {
                 continue;
             };
             let format = level.format;
-            let index = level.index(x, y, *layer);
+            let index = level.at(x, y);
             let destination = level.texels[index];
             let source: [f32; 4] = std::array::from_fn(|channel| {
                 let word = self.machine.get(slot + channel, lane);
@@ -1212,13 +1387,13 @@ mod tests {
         };
         let format = Format::sized(RGBA32F).expect("a float format");
         let mut color = Level::new(format, 8, 8, 1);
-        let mut target = Target {
+        let target = Target {
             width: 8,
             height: 8,
-            colors: vec![Some((&mut color, 0))],
+            colors: vec![Some(View::layer(&mut color, 0))],
             depth_stencil: None,
         };
-        let outcome = draw.run(&pipeline(), &mut target);
+        let outcome = draw.run(&pipeline(), target);
         assert_eq!(outcome.samples_passed, 64);
         let near = |found: [f32; 4], expected: [f32; 4]| {
             found
@@ -1236,5 +1411,30 @@ mod tests {
             "{:?}",
             color.texel(7, 7, 0)
         );
+
+        // a target large enough to be drawn in bands on several threads
+        let mut large = Level::new(format, 256, 256, 1);
+        let target = Target {
+            width: 256,
+            height: 256,
+            colors: vec![Some(View::layer(&mut large, 0))],
+            depth_stencil: None,
+        };
+        let outcome = draw.run(
+            &Pipeline {
+                viewport: [0, 0, 256, 256],
+                ..pipeline()
+            },
+            target,
+        );
+        assert_eq!(outcome.samples_passed, 256 * 256);
+        for (x, y) in [(0, 0), (100, 77), (3, 200), (255, 255)] {
+            let red = 1.0 - (x as f32 + 0.5) / 256.0;
+            assert!(
+                near(large.texel(x, y, 0), [red, 0.0, 1.0 - red, 1.0]),
+                "{x},{y}: {:?}",
+                large.texel(x, y, 0)
+            );
+        }
     }
 }

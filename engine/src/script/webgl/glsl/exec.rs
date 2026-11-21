@@ -71,12 +71,12 @@ pub(crate) struct Machine<'a> {
     pub(crate) continued: u8,
     pub(crate) returned: u8,
     pub(crate) discarded: u8,
-    pub(crate) textures: &'a dyn Textures,
+    pub(crate) textures: &'a (dyn Textures + Sync),
     // loops left to run before a runaway shader is stopped
     pub(crate) budget: u64,
 }
 
-pub(crate) type Op = Box<dyn Fn(&mut Machine)>;
+pub(crate) type Op = Box<dyn Fn(&mut Machine) + Send + Sync>;
 
 impl Machine<'_> {
     #[inline]
