@@ -862,7 +862,7 @@ fn argument(arguments: &[Value], index: usize) -> Value {
 }
 
 impl ScriptRuntime {
-    fn locale_argument(&mut self, value: &Value) -> Result<String, ScriptError> {
+    pub(super) fn locale_argument(&mut self, value: &Value) -> Result<String, ScriptError> {
         Ok(match value {
             Value::Undefined => self.locale.clone(),
             Value::String(text) => text.to_string(),
@@ -874,7 +874,11 @@ impl ScriptRuntime {
         })
     }
 
-    fn option_text(&mut self, options: &Value, key: &str) -> Result<Option<String>, ScriptError> {
+    pub(super) fn option_text(
+        &mut self,
+        options: &Value,
+        key: &str,
+    ) -> Result<Option<String>, ScriptError> {
         if is_primitive(options) {
             return Ok(None);
         }

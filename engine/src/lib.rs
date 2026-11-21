@@ -38,6 +38,7 @@ mod presenter;
 pub mod profile;
 mod range;
 mod script;
+mod segment;
 mod selection;
 mod shaping;
 mod sound;

@@ -52,6 +52,7 @@ mod ranges;
 mod realm;
 mod reflect;
 mod regexp;
+mod segmenter;
 mod sockets;
 mod streams;
 mod strings;

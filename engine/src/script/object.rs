@@ -120,6 +120,8 @@ pub(super) enum ObjectClass {
     // a Path2D and the calls that made it
     Path(super::path2d::PathHandle),
     Matrix(Rc<RefCell<super::matrices::MatrixState>>),
+    // an Intl.Segmenter, the segments of a string, or an iterator over them
+    Segmenter(Rc<super::segmenter::SegmenterState>),
     // a stream, its controller, a reader or an iterator over one
     Stream(super::streams::StreamHandle),
     // the object of a typed array of this kind, for its named properties and prototype
