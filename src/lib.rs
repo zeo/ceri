@@ -26,7 +26,7 @@ mod video;
 
 pub use ceri_engine::{
     APP_ORIGIN, Capabilities, CommandCall, CommandError, Grant, Monitor, NativeHandle,
-    WindowAction, WindowConfig, WindowControl, WindowState,
+    WindowAction, WindowConfig, WindowControl, WindowState, png_from_rgba,
 };
 pub use custom::{App, AppHandle, run};
 pub use dialog::{FileDialog, FileFilter, MessageButtons, MessageDialog, MessageLevel};
