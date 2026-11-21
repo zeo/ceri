@@ -155,6 +155,71 @@ fn array_method_refusal(
 }
 
 impl ScriptRuntime {
+    // ArraySpeciesCreate: an array made like the receiver, so a subclass's map or filter
+    // hands back the subclass; a plain array, or a constructor without a species, gives one
+    // of Array's own
+    fn array_species(
+        &mut self,
+        original: &Value,
+        values: Vec<Value>,
+        set_length: bool,
+    ) -> Result<Value, ScriptError> {
+        if !matches!(original, Value::Array(_)) {
+            return Ok(Self::new_array(values));
+        }
+        let mut constructor = self.get_property(original, "constructor")?;
+        if let Value::Object(object) = &constructor {
+            if matches!(
+                object.borrow().class,
+                ObjectClass::Native(Native::ArrayConstructor)
+            ) {
+                return Ok(Self::new_array(values));
+            }
+            constructor = match self.get_property(&constructor, "@@species")? {
+                Value::Null => Value::Undefined,
+                species => species,
+            };
+        }
+        match &constructor {
+            Value::Undefined => return Ok(Self::new_array(values)),
+            Value::Object(object)
+                if matches!(
+                    object.borrow().class,
+                    ObjectClass::Native(Native::ArrayConstructor)
+                ) =>
+            {
+                return Ok(Self::new_array(values));
+            }
+            _ => {}
+        }
+        if !Self::is_constructor(&constructor) {
+            return Err(self.type_error("object.constructor[Symbol.species] is not a constructor"));
+        }
+        let made = self.construct(constructor, vec![Value::Number(0.0)], None)?;
+        let length = values.len();
+        // CreateDataPropertyOrThrow defines each element, over whatever the constructor put there
+        for (index, value) in values.into_iter().enumerate() {
+            if matches!(value, Value::Uninitialized) {
+                continue;
+            }
+            if matches!(made, Value::Array(_)) {
+                self.set_index(&made, Value::Number(index as f64), value, true)?;
+                continue;
+            }
+            let descriptor = self.object_from_entries(vec![
+                ("value".to_string(), value),
+                ("writable".to_string(), Value::Bool(true)),
+                ("enumerable".to_string(), Value::Bool(true)),
+                ("configurable".to_string(), Value::Bool(true)),
+            ]);
+            self.define_property_value(&made, index.to_string(), &descriptor)?;
+        }
+        if set_length {
+            self.set_property(&made, "length", Value::Number(length as f64), true)?;
+        }
+        Ok(made)
+    }
+
     // the elements a method reads: the array itself, or an array-like receiver's items
     fn receiver_values(&mut self, this: &Value, method: &str) -> Result<Vec<Value>, ScriptError> {
         match this {
@@ -472,7 +537,7 @@ impl ScriptRuntime {
                     }
                 }
                 Ok(match method {
-                    M::Map | M::Filter => Self::new_array(mapped),
+                    M::Map | M::Filter => self.array_species(&this, mapped, false)?,
                     M::Some => Value::Bool(false),
                     M::Every => Value::Bool(true),
                     M::FindIndex => Value::Number(-1.0),
@@ -656,7 +721,7 @@ impl ScriptRuntime {
                     }
                     check_length(result.len())?;
                 }
-                Ok(Self::new_array(result))
+                self.array_species(&this, result, true)
             }
             M::Slice => {
                 let values = self.receiver_values(&this, &name)?;
@@ -665,11 +730,12 @@ impl ScriptRuntime {
                 let end = self.integer(argument(&arguments, 1), length as f64)?;
                 let start = relative(start, length);
                 let end = relative(end, length);
-                Ok(Self::new_array(if start < end {
+                let picked = if start < end {
                     values[start..end].to_vec()
                 } else {
                     Vec::new()
-                }))
+                };
+                self.array_species(&this, picked, true)
             }
             M::Flat | M::FlatMap => {
                 let (values, object) = self.callback_receiver(&this, &name)?;
@@ -690,7 +756,7 @@ impl ScriptRuntime {
                     };
                     flatten_into(&mut result, value, depth)?;
                 }
-                Ok(Self::new_array(result))
+                self.array_species(&this, result, false)
             }
             M::Push => {
                 let array = self.receiver_array(&this, &name)?;
@@ -797,7 +863,7 @@ impl ScriptRuntime {
                 if matches!(method, M::Splice) {
                     let array = self.receiver_array(&this, &name)?;
                     **array.borrow_mut() = values;
-                    Ok(Self::new_array(removed))
+                    self.array_species(&this, removed, true)
                 } else {
                     Ok(Self::new_array(values))
                 }
@@ -1015,6 +1081,8 @@ mod tests {
                 seen.push(sealed.join(), closed.join(), Object.isSealed(sealed), Object.isFrozen(sealed));
                 const plain = Object.setPrototypeOf([1], { hello() { return "hi"; } });
                 seen.push(plain.hello(), Reflect.setPrototypeOf(frozen, null));
+                const doubled = list.map((x) => x * 2);
+                seen.push(doubled instanceof List, doubled.sum(), list.filter((x) => x > 1).length, list.slice(1) instanceof List, [1].map((x) => x) instanceof List, Array[Symbol.species] === Array);
                 document.getElementById("out").textContent = seen.join("|");
                 "#,
             )
@@ -1024,7 +1092,7 @@ mod tests {
             document.borrow().element_text_content(out).as_deref(),
             Some(
                 "true|true|6|true|true|false|false|TypeError|TypeError|TypeError|TypeError|1,2|7|\
-                 TypeError|TypeError|TypeError|5,2|2|true|false|hi|false"
+                 TypeError|TypeError|TypeError|5,2|2|true|false|hi|false|true|12|2|true|false|true"
             )
         );
     }

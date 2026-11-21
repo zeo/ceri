@@ -912,6 +912,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     build.value(&array, "isArray", Value::Builtin(Builtin::ArrayIsArray));
     build.method(&array, "from", Native::ArrayFrom, 1);
     build.method(&array, "of", Native::ArrayOf, 0);
+    build.getter(&array, "@@species", Native::IteratorSelf, None);
     build.method(
         &array,
         "fromAsync",
