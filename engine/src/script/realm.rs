@@ -157,6 +157,7 @@ pub(super) enum Native {
     Walk(super::traversal::WalkMember),
     Anim(super::animations::AnimMember),
     AnimConstructor,
+    ClipboardItemConstructor,
     // an animation of the given generation reaches its end
     AnimFinish(u32, u64),
     Shape(super::geometry_values::ShapeMember),
@@ -218,6 +219,7 @@ impl Native {
                 | Native::ChannelConstructor
                 | Native::ReaderConstructor
                 | Native::AnimConstructor
+                | Native::ClipboardItemConstructor
                 | Native::RectConstructor(_)
                 | Native::PointConstructor(_)
                 | Native::PortConstructor
@@ -1299,6 +1301,13 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let readers = super::filereader::create(&build, &dom.prototype("EventTarget"), &mut globals);
     let traversal = super::traversal::create(&build, &object_prototype, &mut globals);
     let animations = super::animations::create(&build, &dom.prototype("EventTarget"), &mut globals);
+    let clipboard_item = build.constructor(
+        Native::ClipboardItemConstructor,
+        "ClipboardItem",
+        1,
+        &plain(&object_prototype),
+    );
+    globals.push(("ClipboardItem", Value::Object(clipboard_item)));
     let shapes = super::geometry_values::create(&build, &object_prototype, &mut globals);
     let ports = super::messaging::create(
         &build,
@@ -2751,6 +2760,9 @@ impl ScriptRuntime {
             )),
             Native::PortConstructor => Err(self.type_error("Illegal constructor")),
             Native::AnimConstructor => Err(self.type_error("Illegal constructor")),
+            Native::ClipboardItemConstructor => Err(self.type_error(
+                "Failed to construct 'ClipboardItem': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
+            )),
             Native::RectConstructor(_) | Native::PointConstructor(_) => Err(self.type_error(
                 "Failed to construct: Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
@@ -3068,6 +3080,9 @@ impl ScriptRuntime {
             Native::ReaderConstructor => self.construct_reader(new_target),
             Native::MessageChannelConstructor => self.construct_message_channel(new_target),
             Native::AnimConstructor => Err(self.type_error("Illegal constructor")),
+            Native::ClipboardItemConstructor => {
+                self.call_clipboard_member(super::Builtin::ClipboardItemConstructor, arguments)
+            }
             Native::RectConstructor(read_only) => {
                 self.construct_rect(read_only, arguments, new_target)
             }

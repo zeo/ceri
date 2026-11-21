@@ -621,6 +621,13 @@ pub trait ClipboardProvider {
     fn read_image(&self) -> Result<Option<(String, Vec<u8>)>, NavigationError> {
         Ok(None)
     }
+
+    // puts an encoded picture on the clipboard in place of what was there
+    fn write_image(&self, _mime_type: &str, _bytes: &[u8]) -> Result<(), NavigationError> {
+        Err(NavigationError::Clipboard(
+            "this clipboard takes text only".to_string(),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -6249,6 +6256,74 @@ mod tests {
         );
         assert_eq!(writes.borrow().as_slice(), ["copied"]);
         assert_eq!(text.borrow().as_str(), "copied");
+    }
+
+    #[test]
+    fn clipboard_items_write_pictures_and_text_and_read_back() {
+        #[derive(Default)]
+        struct Board {
+            text: RefCell<String>,
+            image: RefCell<Option<(String, Vec<u8>)>>,
+        }
+        struct Shared(Rc<Board>);
+        impl ClipboardProvider for Shared {
+            fn read_text(&self) -> Result<String, NavigationError> {
+                Ok(self.0.text.borrow().clone())
+            }
+            fn write_text(&self, text: &str) -> Result<(), NavigationError> {
+                *self.0.text.borrow_mut() = text.to_string();
+                *self.0.image.borrow_mut() = None;
+                Ok(())
+            }
+            fn read_image(&self) -> Result<Option<(String, Vec<u8>)>, NavigationError> {
+                Ok(self.0.image.borrow().clone())
+            }
+            fn write_image(&self, mime_type: &str, bytes: &[u8]) -> Result<(), NavigationError> {
+                *self.0.image.borrow_mut() = Some((mime_type.to_string(), bytes.to_vec()));
+                Ok(())
+            }
+        }
+        let board = Rc::new(Board::default());
+        let mut browser = Browser::new(bundle(
+            r#"<p id="status">idle</p><script>
+                const seen = [];
+                const show = () => (document.getElementById("status").textContent = seen.join("|"));
+                const later = new Promise((resolve) => setTimeout(() => resolve(new Blob([new Uint8Array([7, 8])], { type: "image/png" })), 5));
+                const item = new ClipboardItem({ "image/png": later, "text/plain": "caption" });
+                seen.push(item.types.join(","));
+                navigator.clipboard.write([item])
+                    .then(() => navigator.clipboard.read())
+                    .then((items) => {
+                        seen.push(items.length, items[0].types.join(","));
+                        return items[0].getType("image/png");
+                    })
+                    .then((blob) => blob.arrayBuffer())
+                    .then((buffer) => {
+                        seen.push(new Uint8Array(buffer).join(","));
+                        return navigator.clipboard.write([new ClipboardItem({ "text/plain": "words" })]);
+                    })
+                    .then(() => navigator.clipboard.readText())
+                    .then((text) => {
+                        seen.push(text);
+                        return navigator.clipboard.write([]);
+                    })
+                    .catch((error) => seen.push(error.name))
+                    .then(() => {
+                        try { new ClipboardItem({}); } catch (error) { seen.push(error.name); }
+                        show();
+                    });
+            </script>"#,
+        ))
+        .with_clipboard_provider(Rc::new(Shared(board.clone())));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        browser.advance_time(10).expect("time should pass");
+        assert_eq!(
+            element_text(&browser, "status"),
+            "image/png,text/plain|1|image/png|7,8|words|DataError|TypeError"
+        );
+        assert_eq!(board.text.borrow().as_str(), "words");
     }
 
     #[test]

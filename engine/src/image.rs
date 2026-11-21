@@ -231,6 +231,17 @@ pub(crate) fn image_source_url(source: ImageSource) -> Option<Rc<str>> {
 }
 
 // the icon as a png file's bytes, for system surfaces that load icons from disk
+// an encoded picture as its size and straight RGBA pixels, row after row
+pub fn decode_rgba(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let image = decode_image(bytes, "").ok()?;
+    let rgba = image
+        .pixels
+        .iter()
+        .flat_map(|color| [color.red, color.green, color.blue, color.alpha])
+        .collect();
+    Some((image.width, image.height, rgba))
+}
+
 pub fn icon_png(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
     let (rgba, size) = rasterize_icon(bytes, size)?;
     Some(crate::png::encode_png(size, size, 4, &rgba))

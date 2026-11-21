@@ -27,6 +27,39 @@ impl ClipboardProvider for DesktopClipboard {
     fn read_image(&self) -> Result<Option<(String, Vec<u8>)>, NavigationError> {
         platform::read_clipboard_image().map_err(NavigationError::Clipboard)
     }
+
+    #[cfg(target_os = "windows")]
+    fn write_image(&self, _mime_type: &str, bytes: &[u8]) -> Result<(), NavigationError> {
+        let (width, height, rgba) = ceri_engine::decode_rgba(bytes).ok_or_else(|| {
+            NavigationError::Clipboard("the picture could not be decoded".to_string())
+        })?;
+        let png = ceri_engine::png_from_rgba(width, height, &rgba);
+        platform::write_clipboard_image(&png, &dib_from_rgba(width, height, &rgba))
+            .map_err(NavigationError::Clipboard)
+    }
+}
+
+// straight RGBA rows as a device independent bitmap: a forty byte header, then blue, green,
+// red and alpha rows from the bottom up, as most programs that paste read them
+#[cfg(any(target_os = "windows", test))]
+fn dib_from_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut dib = Vec::with_capacity(40 + rgba.len());
+    let size = width as usize * height as usize * 4;
+    for value in [40, width, height] {
+        dib.extend_from_slice(&value.to_le_bytes());
+    }
+    dib.extend_from_slice(&1_u16.to_le_bytes());
+    dib.extend_from_slice(&32_u16.to_le_bytes());
+    dib.extend_from_slice(&0_u32.to_le_bytes());
+    dib.extend_from_slice(&(size as u32).to_le_bytes());
+    dib.extend_from_slice(&[0; 16]);
+    let stride = width as usize * 4;
+    for row in rgba.chunks_exact(stride.max(1)).rev() {
+        for pixel in row.as_chunks::<4>().0 {
+            dib.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
+    }
+    dib
 }
 
 // the size and RGBA pixels of a device independent bitmap as the clipboard packs one: a
@@ -330,6 +363,58 @@ mod platform {
         Ok(file.map(|file| ("image/png".to_string(), file)))
     }
 
+    // copies bytes into movable global memory the clipboard can take
+    fn global_copy(bytes: &[u8]) -> Result<HGLOBAL, String> {
+        // SAFETY: the size is the exact byte length copied below
+        let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) }
+            .map_err(|_| "clipboard memory could not be allocated".to_string())?;
+        // SAFETY: memory came from GlobalAlloc with at least this length
+        unsafe {
+            let pointer = GlobalLock(memory) as *mut u8;
+            if pointer.is_null() {
+                let _ = GlobalFree(Some(memory));
+                return Err("clipboard memory could not be locked".to_string());
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len());
+            let _ = GlobalUnlock(memory);
+        }
+        Ok(memory)
+    }
+
+    // a picture as PNG and as a bitmap, in place of what the clipboard held
+    pub(super) fn write_clipboard_image(png: &[u8], dib: &[u8]) -> Result<(), String> {
+        // SAFETY: the name is a terminated wide string
+        let png_format = unsafe { RegisterClipboardFormatW(windows::core::w!("PNG")) };
+        let pieces = [
+            (png_format, global_copy(png)?),
+            (u32::from(CF_DIB.0), global_copy(dib)?),
+        ];
+        let free = |pieces: &[(u32, HGLOBAL)]| {
+            for (_, memory) in pieces {
+                // SAFETY: the memory is still owned here
+                let _ = unsafe { GlobalFree(Some(*memory)) };
+            }
+        };
+        let _clipboard = match Clipboard::open() {
+            Ok(clipboard) => clipboard,
+            Err(error) => {
+                free(&pieces);
+                return Err(error);
+            }
+        };
+        // SAFETY: the clipboard is open, and it takes ownership of each handle it accepts
+        unsafe {
+            let _ = EmptyClipboard();
+            for (index, (format, memory)) in pieces.iter().enumerate() {
+                if *format == 0 || SetClipboardData(*format, Some(HANDLE(memory.0))).is_err() {
+                    free(&pieces[index..]);
+                    return Err("the clipboard rejected the picture".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn write_clipboard_text(
         _clipboard: &super::DesktopClipboard,
         text: &str,
@@ -542,6 +627,11 @@ mod tests {
         assert_eq!(super::dib_pixels(&dib), Some((1, 1, vec![10, 20, 30, 255])));
         assert_eq!(super::dib_pixels(&dib[..44]), None, "cut short");
         assert_eq!(super::dib_pixels(&[]), None);
+        // what is written reads back the same
+        let rgba = [1, 2, 3, 255, 4, 5, 6, 128, 7, 8, 9, 255, 10, 11, 12, 64];
+        let written = super::dib_from_rgba(2, 2, &rgba);
+        assert_eq!(written.len(), 40 + 16);
+        assert_eq!(super::dib_pixels(&written), Some((2, 2, rgba.to_vec())));
     }
 
     #[test]

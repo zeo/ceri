@@ -468,6 +468,13 @@ enum Builtin {
     // an item's text for its callback, and its file; none where the item is of the other kind
     ClipboardItemString(Option<Rc<str>>),
     ClipboardItemFile(Option<FileHandle>),
+    ClipboardItemConstructor,
+    ClipboardItemGetType(clipboard::ItemHandle),
+    ClipboardRead,
+    ClipboardWrite,
+    // one promised piece of a clipboard write arrives, or fails
+    ClipboardWriteStep(clipboard::WriteHandle, usize),
+    ClipboardWriteFailed(clipboard::WriteHandle),
     AbortSignalRemoveEventListener(AbortSignalHandle),
     // the statics: a signal already aborted, one a timer aborts, one that follows others
     AbortSignalAbort,
@@ -4035,6 +4042,8 @@ impl ScriptRuntime {
             Value::Clipboard => match property {
                 "readText" => Ok(Value::Builtin(Builtin::ClipboardReadText)),
                 "writeText" => Ok(Value::Builtin(Builtin::ClipboardWriteText)),
+                "read" => Ok(Value::Builtin(Builtin::ClipboardRead)),
+                "write" => Ok(Value::Builtin(Builtin::ClipboardWrite)),
                 _ => Err(runtime_error(format!(
                     "clipboard has no property {property}"
                 ))),
@@ -8894,7 +8903,13 @@ impl ScriptRuntime {
             | Builtin::ClipboardSetData(_)
             | Builtin::ClipboardClearData(_)
             | Builtin::ClipboardItemString(_)
-            | Builtin::ClipboardItemFile(_)) => self.call_clipboard_member(builtin, arguments),
+            | Builtin::ClipboardItemFile(_)
+            | Builtin::ClipboardItemConstructor
+            | Builtin::ClipboardItemGetType(_)
+            | Builtin::ClipboardRead
+            | Builtin::ClipboardWrite
+            | Builtin::ClipboardWriteStep(..)
+            | Builtin::ClipboardWriteFailed(_)) => self.call_clipboard_member(builtin, arguments),
             Builtin::CanvasGradientAddColorStop(gradient) => {
                 self.add_color_stop(&gradient, &arguments)
             }

@@ -74,7 +74,7 @@ pub use host::{
     ENGINE_STACK, EngineHost, EngineWorker, EngineWorkerEvent, Frame, InputEvent, InputResult,
     KeyModifiers, PointerButton, RegionPress,
 };
-pub use image::{icon_png, rasterize_icon};
+pub use image::{decode_rgba, icon_png, rasterize_icon};
 
 // eight bit RGBA pixels, row after row, as a PNG file
 pub fn png_from_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {

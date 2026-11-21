@@ -12,6 +12,23 @@ pub(super) struct Transfer {
 
 pub(crate) type TransferHandle = Rc<RefCell<Transfer>>;
 
+// a ClipboardItem's types, each with the blob, text or promise of one it was made with
+pub(crate) type ItemHandle = Rc<Vec<(String, Value)>>;
+
+// a clipboard write waiting on promised pieces: each type with its bytes once they arrive,
+// how many are still to come, and the promise write handed back
+pub(crate) struct Write {
+    pieces: Vec<(String, Option<Vec<u8>>)>,
+    waiting: usize,
+    done: PromiseHandle,
+}
+
+pub(crate) type WriteHandle = Rc<RefCell<Write>>;
+
+fn not_allowed(message: &str) -> Value {
+    dom_exception("NotAllowedError", message)
+}
+
 // "text" is the old name of text/plain, and types compare without case
 fn format(value: &Value) -> String {
     match value.string_value().trim().to_ascii_lowercase().as_str() {
@@ -132,9 +149,199 @@ impl ScriptRuntime {
                 Value::Undefined
             }
             Builtin::ClipboardItemFile(file) => file.map_or(Value::Null, Value::File),
+            Builtin::ClipboardItemConstructor => {
+                let mut entries = Vec::new();
+                if let source @ Value::Object(_) = first.resolve() {
+                    for key in self.own_enumerable_keys(&source)? {
+                        let value = self.get_property(&source, &key)?;
+                        entries.push((key.to_ascii_lowercase(), value));
+                    }
+                }
+                if entries.is_empty() {
+                    return Err(self.type_error(
+                        "Failed to construct 'ClipboardItem': Empty dictionary argument",
+                    ));
+                }
+                clipboard_item(Rc::new(entries))
+            }
+            Builtin::ClipboardItemGetType(entries) => {
+                let wanted = first.string_value().to_ascii_lowercase();
+                let Some((kind, value)) = entries.iter().find(|(kind, _)| *kind == wanted) else {
+                    return Ok(Value::Promise(self.rejected_promise_value(dom_exception(
+                        "NotFoundError",
+                        "The type was not found",
+                    ))));
+                };
+                let kind = kind.clone();
+                match value.resolve() {
+                    Value::String(text) => {
+                        Value::Promise(self.fulfilled_promise(Value::Blob(Rc::new(BlobData {
+                            bytes: text.as_bytes().to_vec(),
+                            mime_type: kind,
+                        }))))
+                    }
+                    other => Value::Promise(self.promise_resolve(other)?),
+                }
+            }
+            Builtin::ClipboardRead => {
+                let Some(provider) = self.clipboard_provider.clone() else {
+                    return Ok(Value::Promise(self.rejected_promise_value(not_allowed(
+                        "clipboard access is unavailable",
+                    ))));
+                };
+                let mut entries = Vec::new();
+                if let Ok(Some((mime_type, bytes))) = provider.read_image() {
+                    entries.push((
+                        mime_type.clone(),
+                        Value::Blob(Rc::new(BlobData { bytes, mime_type })),
+                    ));
+                }
+                if let Ok(text) = provider.read_text()
+                    && !text.is_empty()
+                {
+                    entries.push(("text/plain".to_string(), Value::String(text.into())));
+                }
+                let items = if entries.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![clipboard_item(Rc::new(entries))]
+                };
+                Value::Promise(self.fulfilled_promise(Self::new_array(items)))
+            }
+            Builtin::ClipboardWrite => self.write_clipboard(&first)?,
+            Builtin::ClipboardWriteStep(write, index) => {
+                let bytes = match first.resolve() {
+                    Value::Blob(blob) => blob.bytes.clone(),
+                    Value::File(file) => file.bytes.clone(),
+                    Value::String(text) => text.as_bytes().to_vec(),
+                    _ => {
+                        let done = write.borrow().done.clone();
+                        self.settle_promise(
+                            &done,
+                            PromiseOutcome::Rejected(not_allowed("a clipboard item held no data")),
+                        );
+                        return Ok(Value::Undefined);
+                    }
+                };
+                let ready = {
+                    let mut write = write.borrow_mut();
+                    write.pieces[index].1 = Some(bytes);
+                    write.waiting -= 1;
+                    write.waiting == 0
+                };
+                if ready {
+                    self.finish_clipboard_write(&write);
+                }
+                Value::Undefined
+            }
+            Builtin::ClipboardWriteFailed(write) => {
+                let done = write.borrow().done.clone();
+                self.settle_promise(&done, PromiseOutcome::Rejected(first));
+                Value::Undefined
+            }
             _ => Value::Undefined,
         })
     }
+
+    // what the first item holds goes to the clipboard once every promised piece of it is in
+    fn write_clipboard(&mut self, items: &Value) -> Result<Value, ScriptError> {
+        if self.clipboard_provider.is_none() {
+            return Ok(Value::Promise(self.rejected_promise_value(not_allowed(
+                "clipboard access is unavailable",
+            ))));
+        }
+        let first = match items.resolve() {
+            Value::Array(items) => items.borrow().first().cloned(),
+            _ => None,
+        };
+        let entries = match first.map(|item| self.get_property(&item, "getType")) {
+            Some(Ok(Value::Builtin(Builtin::ClipboardItemGetType(entries)))) => entries,
+            _ => {
+                return Ok(Value::Promise(self.rejected_promise_value(dom_exception(
+                    "DataError",
+                    "Failed to execute 'write' on 'Clipboard': No ClipboardItem was given",
+                ))));
+            }
+        };
+        let done = Self::pending_promise();
+        let write = Rc::new(RefCell::new(Write {
+            pieces: entries
+                .iter()
+                .map(|(kind, _)| (kind.clone(), None))
+                .collect(),
+            waiting: entries.len(),
+            done: done.clone(),
+        }));
+        for (index, (kind, value)) in entries.iter().enumerate() {
+            let piece = match value.resolve() {
+                Value::String(text) => Value::Blob(Rc::new(BlobData {
+                    bytes: text.as_bytes().to_vec(),
+                    mime_type: kind.clone(),
+                })),
+                other => other,
+            };
+            let promise = self.promise_resolve(piece)?;
+            self.promise_then(
+                promise,
+                Some(&Value::Builtin(Builtin::ClipboardWriteStep(
+                    write.clone(),
+                    index,
+                ))),
+                Some(&Value::Builtin(Builtin::ClipboardWriteFailed(
+                    write.clone(),
+                ))),
+            )?;
+        }
+        Ok(Value::Promise(done))
+    }
+
+    // a picture wins over text, as only one kind fits the host clipboard at once here
+    fn finish_clipboard_write(&mut self, write: &WriteHandle) {
+        let (pieces, done) = {
+            let write = write.borrow();
+            (write.pieces.clone(), write.done.clone())
+        };
+        let Some(provider) = self.clipboard_provider.clone() else {
+            return;
+        };
+        let image = pieces
+            .iter()
+            .find(|(kind, bytes)| kind.starts_with("image/") && bytes.is_some());
+        let text = pieces
+            .iter()
+            .find(|(kind, bytes)| kind == "text/plain" && bytes.is_some());
+        let outcome = match (image, text) {
+            (Some((kind, Some(bytes))), _) => provider.write_image(kind, bytes),
+            (_, Some((_, Some(bytes)))) => provider.write_text(&String::from_utf8_lossy(bytes)),
+            _ => Err(crate::navigation::NavigationError::Clipboard(
+                "no clipboard item type this host can write".to_string(),
+            )),
+        };
+        let outcome = match outcome {
+            Ok(()) => PromiseOutcome::Fulfilled(Value::Undefined),
+            Err(error) => PromiseOutcome::Rejected(not_allowed(&error.to_string())),
+        };
+        self.settle_promise(&done, outcome);
+    }
+}
+
+// a ClipboardItem: its types, and getType for each
+fn clipboard_item(entries: ItemHandle) -> Value {
+    let types = entries
+        .iter()
+        .map(|(kind, _)| Value::String(kind.clone().into()))
+        .collect();
+    plain_object([
+        ("types".to_string(), ScriptRuntime::new_array(types)),
+        (
+            "presentationStyle".to_string(),
+            Value::String("unspecified".into()),
+        ),
+        (
+            "getType".to_string(),
+            Value::Builtin(Builtin::ClipboardItemGetType(entries)),
+        ),
+    ])
 }
 
 // the DataTransfer a clipboard event hands its listeners; types, items and files show what
