@@ -656,6 +656,36 @@ impl ScriptRuntime {
         None
     }
 
+    // SVGGraphicsElement.getBBox: what an element inside an svg draws, in its own user space
+    pub(super) fn svg_bounding_box(&self, node: NodeId) -> Value {
+        let root = {
+            let document = self.document.borrow();
+            let mut root = None;
+            let mut current = Some(node);
+            while let Some(id) = current {
+                if document.element(id).is_some_and(|element| {
+                    element.namespace == crate::dom::Namespace::Svg && element.name == "svg"
+                }) {
+                    root = Some(id);
+                }
+                current = document.parent(id);
+            }
+            root
+        };
+        let extent = root.and_then(|root| {
+            let measured = self.measure()?;
+            let scene = measured.layout.svg_scene(root)?;
+            scene.bounding_box(&self.document.borrow(), node)
+        });
+        let [left, top, right, bottom] = extent.unwrap_or_default();
+        self.rect_object(crate::layout::Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        })
+    }
+
     // element measurements such as getBoundingClientRect and offsetWidth; None hands the
     // member on
     pub(super) fn element_geometry(

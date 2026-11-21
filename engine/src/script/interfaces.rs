@@ -410,6 +410,16 @@ static INTERFACES: &[Interface] = &[
         members: &[("style", ReadOnly), ("dataset", ReadOnly)],
     },
     Interface {
+        name: "SVGGraphicsElement",
+        parent: "SVGElement",
+        members: &[("getBBox", Method(0))],
+    },
+    Interface {
+        name: "SVGSVGElement",
+        parent: "SVGGraphicsElement",
+        members: &[],
+    },
+    Interface {
         name: "HTMLInputElement",
         parent: "HTMLElement",
         members: &[
@@ -885,7 +895,14 @@ pub(super) fn interface_of(document: &Document, node: NodeId) -> &'static str {
         Some(NodeKind::Fragment) if document.shadow_host(node).is_some() => "ShadowRoot",
         Some(NodeKind::Fragment) => "DocumentFragment",
         Some(NodeKind::Element(element)) => match element.namespace {
-            Namespace::Svg => "SVGElement",
+            Namespace::Svg => match element.name.as_str() {
+                "svg" => "SVGSVGElement",
+                "g" | "path" | "rect" | "circle" | "ellipse" | "line" | "polyline" | "polygon"
+                | "text" | "tspan" | "use" | "image" | "foreignObject" | "a" | "switch" => {
+                    "SVGGraphicsElement"
+                }
+                _ => "SVGElement",
+            },
             Namespace::MathMl => "Element",
             Namespace::Html => match element.name.as_str() {
                 "input" => "HTMLInputElement",
@@ -1885,6 +1902,7 @@ impl ScriptRuntime {
                 Value::Undefined
             }
             ("startViewTransition", Access::Call) => self.start_view_transition(first)?,
+            ("getBBox", Access::Call) => self.svg_bounding_box(node),
             ("execCommand", Access::Call) => {
                 let command = self.coerce_string(first)?;
                 let value = match arguments.get(2).cloned() {

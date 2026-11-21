@@ -1455,6 +1455,20 @@ pub(crate) struct BoxGeometry {
 
 impl LayoutDocument {
     // every node's boxes in viewport coordinates and tree order, leaving out generated content
+    // the shapes an outer svg element drew, for geometry script asks of what is inside it
+    pub(crate) fn svg_scene(&self, root: NodeId) -> Option<Rc<crate::svg::Scene>> {
+        let mut pending = vec![&self.root];
+        while let Some(layout) = pending.pop() {
+            if layout.node == root
+                && let Some(scene) = &layout.svg
+            {
+                return Some(scene.clone());
+            }
+            pending.extend(layout.children.iter());
+        }
+        None
+    }
+
     pub(crate) fn box_index(&self) -> HashMap<NodeId, Vec<BoxGeometry>> {
         let mut index = HashMap::new();
         index_boxes(&self.root, (0.0, 0.0), None, &mut index);

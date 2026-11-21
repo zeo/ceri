@@ -4900,6 +4900,45 @@ mod tests {
     }
 
     #[test]
+    fn svg_bounding_boxes_are_in_each_element_s_own_user_space() {
+        let mut browser = Browser::new(bundle(
+            r##"<svg id="s" width="100" height="100" viewBox="0 0 50 50"><g id="g" transform="translate(5 5)">
+              <rect id="r" x="10" y="10" width="20" height="5" transform="scale(2)"/>
+              <path id="p" d="M0 0 C 0 20 20 20 20 0"/><use id="u" href="#r" x="1"/></g>
+              <defs><linearGradient id="l"></linearGradient></defs></svg>
+            <p id='status'>idle</p><script>
+              const box = (id) => { const b = document.getElementById(id).getBBox(); return [b.x, b.y, b.width, b.height].join(","); };
+              document.getElementById("status").textContent = [
+                box("r"), box("p"), box("u"), box("g"), box("s"),
+                document.getElementById("s") instanceof SVGSVGElement,
+                document.getElementById("r") instanceof SVGGraphicsElement,
+                document.getElementById("l") instanceof SVGGraphicsElement,
+                document.getElementById("r").getBBox() instanceof DOMRect,
+              ].join("|");
+            </script>"##,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 400.0,
+                height: 300.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/index.html")
+            .expect("packaged document should load");
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("10,10,20,5|0,0,20,15|21,20,40,10|0,0,61,30|5,5,61,30|true|true|false|true")
+        );
+    }
+
+    #[test]
     fn browser_pumps_a_packaged_worker_without_a_loopback_server() {
         let mut resources = bundle(
             r#"<p id='status'>idle</p><script>

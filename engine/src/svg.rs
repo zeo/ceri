@@ -842,6 +842,41 @@ pub(crate) struct Scene {
     // the left, top, right and bottom of what each element inside draws, stroke left out, from
     // the border box corner
     pub(crate) extents: Vec<(NodeId, Extent)>,
+    // each element's user space, as the matrix that maps it to the border box corner
+    frames: Vec<(NodeId, Affine)>,
+    // each shape's outline in its own user space, with that space's matrix; a use owns what
+    // it copies
+    outlines: Vec<(NodeId, Vec<Segment>, Affine)>,
+}
+
+pub(crate) fn invert(matrix: Affine) -> Option<Affine> {
+    let determinant = matrix[0] * matrix[3] - matrix[1] * matrix[2];
+    if determinant == 0.0 || !determinant.is_finite() {
+        return None;
+    }
+    Some([
+        matrix[3] / determinant,
+        -matrix[1] / determinant,
+        -matrix[2] / determinant,
+        matrix[0] / determinant,
+        (matrix[2] * matrix[5] - matrix[3] * matrix[4]) / determinant,
+        (matrix[1] * matrix[4] - matrix[0] * matrix[5]) / determinant,
+    ])
+}
+
+impl Scene {
+    // getBBox: the box around what an element and those inside it draw, in its own user
+    // space, stroke left out; none for an element that draws nothing
+    pub(crate) fn bounding_box(&self, document: &Document, node: NodeId) -> Option<Extent> {
+        let (_, space) = self.frames.iter().find(|(held, _)| *held == node)?;
+        let into = invert(*space)?;
+        self.outlines
+            .iter()
+            .filter(|(owner, _, _)| document.is_inclusive_ancestor(node, *owner))
+            .fold(None, |all, (_, path, matrix)| {
+                union(all, extent(path, multiply(into, *matrix)))
+            })
+    }
 }
 
 pub(crate) type Extent = [f32; 4];
@@ -937,6 +972,10 @@ struct Walk<'a> {
     // use targets being expanded, so a reference back into itself stops
     using: Vec<NodeId>,
     extents: Vec<(NodeId, Extent)>,
+    frames: Vec<(NodeId, Affine)>,
+    outlines: Vec<(NodeId, Vec<Segment>, Affine)>,
+    // the use element whose copy is being drawn, which owns the copied outlines
+    use_owner: Option<NodeId>,
 }
 
 // the shapes an outer svg element draws into its content box
@@ -949,6 +988,8 @@ pub(crate) fn build(
 ) -> Scene {
     let mut items = Vec::new();
     let mut extents = Vec::new();
+    let mut frames = Vec::new();
+    let mut outlines = Vec::new();
     if let Some(element) = document.element(root)
         && let Some(view) = viewport_transform(element, (viewport.2, viewport.3))
     {
@@ -958,19 +999,27 @@ pub(crate) fn build(
             budget: MAX_SCENE_ELEMENTS,
             using: Vec::new(),
             extents: Vec::new(),
+            frames: Vec::new(),
+            outlines: Vec::new(),
+            use_owner: None,
         };
         let frame = Frame {
             transform: multiply(translation(viewport.0, viewport.1), view),
             size: view_box(element).map_or((viewport.2, viewport.3), |view| (view.2, view.3)),
             depth: 0,
         };
+        walk.frames.push((root, frame.transform));
         render_children(&mut walk, root, root_style, frame, &mut items);
         extents = walk.extents;
+        frames = walk.frames;
+        outlines = walk.outlines;
     }
     Scene {
         viewport,
         items,
         extents,
+        frames,
+        outlines,
     }
 }
 
@@ -1011,6 +1060,9 @@ fn render(
         depth: frame.depth + 1,
         ..frame
     };
+    if walk.using.is_empty() {
+        walk.frames.push((node, frame.transform));
+    }
     let mut own = Vec::new();
     let extent = match element.name.as_str() {
         "g" | "a" => render_children(walk, node, (&style, font_size), frame, &mut own),
@@ -1031,9 +1083,20 @@ fn render(
                 &mut own,
             )
         }
-        "use" => render_use(walk, element, (&style, font_size), frame, &mut own),
+        "use" => {
+            let owner = walk.use_owner;
+            walk.use_owner = owner.or(Some(node));
+            let extent = render_use(walk, element, (&style, font_size), frame, &mut own);
+            walk.use_owner = owner;
+            extent
+        }
         _ => shape_path(element, frame.size, font_size).and_then(|path| {
             let extent = extent(&path, frame.transform);
+            walk.outlines.push((
+                walk.use_owner.unwrap_or(node),
+                path.clone(),
+                frame.transform,
+            ));
             if style.visibility == Visibility::Visible {
                 own.push(Item::Shape(painted(path, frame, &style, font_size)));
             }
