@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::{Rc, Weak};
 
@@ -45,7 +45,109 @@ impl Namespace {
 pub struct Element {
     pub name: String,
     pub namespace: Namespace,
-    pub attrs: BTreeMap<String, String>,
+    pub attrs: Attributes,
+}
+
+// an element's attributes in the order they were set, the order markup, attribute lists and
+// serialization show them in
+#[derive(Clone, Debug, Default, Eq)]
+pub struct Attributes(Vec<(String, String)>);
+
+impl Attributes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&String> {
+        self.0
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    // changes a value where it stands, or adds the attribute last
+    pub fn insert(&mut self, name: String, value: String) -> Option<String> {
+        match self.0.iter_mut().find(|(key, _)| *key == name) {
+            Some((_, slot)) => Some(std::mem::replace(slot, value)),
+            None => {
+                self.0.push((name, value));
+                None
+            }
+        }
+    }
+
+    // keeps a value already set, as a repeated attribute in markup is dropped
+    pub fn insert_missing(&mut self, name: String, value: String) {
+        if !self.contains_key(&name) {
+            self.0.push((name, value));
+        }
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<String> {
+        let index = self.0.iter().position(|(key, _)| key == name)?;
+        Some(self.0.remove(index).1)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter().map(|(key, value)| (key, value))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.0.iter().map(|(key, _)| key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+// two elements' attributes are the same whatever order they were set in
+impl PartialEq for Attributes {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self
+                .iter()
+                .all(|(name, value)| other.get(name) == Some(value))
+    }
+}
+
+impl<'a> IntoIterator for &'a Attributes {
+    type Item = (&'a String, &'a String);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (String, String)>,
+        fn(&'a (String, String)) -> (&'a String, &'a String),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter().map(|(key, value)| (key, value))
+    }
+}
+
+impl IntoIterator for Attributes {
+    type Item = (String, String);
+    type IntoIter = std::vec::IntoIter<(String, String)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl FromIterator<(String, String)> for Attributes {
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(entries: I) -> Self {
+        let mut attributes = Self::new();
+        for (name, value) in entries {
+            attributes.insert(name, value);
+        }
+        attributes
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1265,7 +1367,7 @@ impl Document {
         self.allocate(NodeKind::Element(Element {
             name,
             namespace,
-            attrs: BTreeMap::new(),
+            attrs: Attributes::new(),
         }))
     }
 
@@ -2077,7 +2179,7 @@ impl Element {
         Self {
             name: name.to_ascii_lowercase(),
             namespace: Namespace::Html,
-            attrs: BTreeMap::new(),
+            attrs: Attributes::new(),
         }
     }
 
@@ -2513,7 +2615,7 @@ impl TreeBuilder {
         document: &mut Document,
         target: NodeId,
         name: String,
-        attrs: BTreeMap<String, String>,
+        attrs: Attributes,
         self_closing: bool,
     ) -> NodeId {
         let in_svg = self.stack.iter().any(|&(open, _)| {
@@ -2552,7 +2654,7 @@ impl TreeBuilder {
 
     fn implied(&mut self, document: &mut Document, name: &str) -> NodeId {
         let target = self.target();
-        self.insert(document, target, name.to_string(), BTreeMap::new(), false)
+        self.insert(document, target, name.to_string(), Attributes::new(), false)
     }
 
     fn ensure_html(&mut self, document: &mut Document) -> NodeId {
@@ -2594,10 +2696,10 @@ impl TreeBuilder {
         }
     }
 
-    fn merge_attributes(document: &mut Document, id: NodeId, attrs: BTreeMap<String, String>) {
+    fn merge_attributes(document: &mut Document, id: NodeId, attrs: Attributes) {
         if let Some(NodeKind::Element(element)) = document.data_mut(id).map(|data| &mut data.kind) {
             for (name, value) in attrs {
-                element.attrs.entry(name).or_insert(value);
+                element.attrs.insert_missing(name, value);
             }
         }
     }
@@ -2649,7 +2751,7 @@ impl TreeBuilder {
         &mut self,
         document: &mut Document,
         name: String,
-        attrs: BTreeMap<String, String>,
+        attrs: Attributes,
         self_closing: bool,
     ) {
         let foreign = self.stack.iter().any(|&(open, _)| {
@@ -2898,16 +3000,13 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
     Ok(tokens)
 }
 
-fn parse_start_tag(
-    raw: &str,
-    offset: usize,
-) -> Result<(String, BTreeMap<String, String>, bool), ParseError> {
+fn parse_start_tag(raw: &str, offset: usize) -> Result<(String, Attributes, bool), ParseError> {
     let mut cursor = 0;
     let name = parse_name_at(raw, &mut cursor).ok_or_else(|| ParseError {
         offset,
         message: "start tag has no name".to_string(),
     })?;
-    let mut attrs = BTreeMap::new();
+    let mut attrs = Attributes::new();
     let mut self_closing = false;
     while cursor < raw.len() {
         skip_ascii_whitespace(raw, &mut cursor);
@@ -2959,7 +3058,7 @@ fn parse_start_tag(
                 value = decode_entities(&raw[value_start..cursor]);
             }
         }
-        attrs.insert(attr_name, value);
+        attrs.insert_missing(attr_name, value);
     }
     Ok((name, attrs, self_closing))
 }
@@ -3044,7 +3143,7 @@ pub(crate) fn is_void_element(name: &str) -> bool {
 enum Token {
     Start {
         name: String,
-        attrs: BTreeMap<String, String>,
+        attrs: Attributes,
         self_closing: bool,
     },
     End {
@@ -3150,7 +3249,7 @@ mod tests {
         .expect("document should parse");
         assert_eq!(
             outline(&document),
-            "<html><head><title>t</title><link href=\"a\" rel=\"icon\"></head><body><p>one</p><p>two</p><ul><li>a</li><li>b</li></ul><dl><dt>x</dt><dd>y</dd></dl><select><option>1</option><option>2</option></select><table><tbody><tr><td>c</td><td>d</td></tr><tr><th>e</th></tr></tbody></table><p></p><h1>h</h1><h2>i</h2></body></html>"
+            "<html><head><title>t</title><link rel=\"icon\" href=\"a\"></head><body><p>one</p><p>two</p><ul><li>a</li><li>b</li></ul><dl><dt>x</dt><dd>y</dd></dl><select><option>1</option><option>2</option></select><table><tbody><tr><td>c</td><td>d</td></tr><tr><th>e</th></tr></tbody></table><p></p><h1>h</h1><h2>i</h2></body></html>"
         );
         let explicit = Document::parse(
             "<html lang=en><head><style>p{}</style></head>\n<body class=app><p>x</p></body></html>\n<body id=late>",

@@ -153,7 +153,7 @@ mod tests {
                 made.textContent = "moved";
                 parsed.body.append(made);
                 document.getElementById("out").append(document.adoptNode(parsed.querySelector("em")));
-                seen.push(new XMLSerializer().serializeToString(parsed.querySelector("title")));
+                seen.push(new XMLSerializer().serializeToString(parsed.getElementById("a")));
                 try { new DOMParser().parseFromString("", "text/plain"); } catch (error) { seen.push(error.name); }
                 document.getElementById("out").setAttribute("data-seen", seen.join("|"));
                 "#,
@@ -165,7 +165,9 @@ mod tests {
                 .borrow()
                 .element(out)
                 .and_then(|element| element.attr("data-seen")),
-            Some("true|Notes|2|one|2|HTML|TITLE|true|true|svg|2|<title>Notes</title>|TypeError")
+            Some(
+                "true|Notes|2|one|2|HTML|TITLE|true|true|svg|2|<p id=\"a\" class=\"x\">one</p>|TypeError"
+            )
         );
         assert_eq!(
             document.borrow().element_text_content(out).as_deref(),

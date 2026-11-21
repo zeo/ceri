@@ -18060,7 +18060,7 @@ mod tests {
         assert_eq!(
             status_text(&document).as_deref(),
             Some(
-                "object|true|true|true|true|true|true|false|1|__vnode|DIV!|true|[object HTMLDivElement]|true|true|true|BODY|head|root|true|true|true|true|true|class,data-x,hidden,id|1|true|2|true|true|false|linearGradient|true|http://www.w3.org/2000/svg|2|0|<span></span>|HR|New|TypeError"
+                "object|true|true|true|true|true|true|false|1|__vnode|DIV!|true|[object HTMLDivElement]|true|true|true|BODY|head|root|true|true|true|true|true|id,class,data-x,hidden|1|true|2|true|true|false|linearGradient|true|http://www.w3.org/2000/svg|2|0|<span></span>|HR|New|TypeError"
             )
         );
     }
@@ -19089,7 +19089,7 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some(
-                "<div data-x=\"a&amp;b\" id=\"source\"><span>inside</span>tail</div>|<em>hello &amp; <strong>world</strong></em>|undefined"
+                "<div id=\"source\" data-x=\"a&amp;b\"><span>inside</span>tail</div>|<em>hello &amp; <strong>world</strong></em>|undefined"
             )
         );
     }
