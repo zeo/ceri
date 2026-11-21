@@ -8490,7 +8490,9 @@ impl ScriptRuntime {
                 };
                 if matches!(
                     kind,
-                    typed::ElementKind::Float32 | typed::ElementKind::Float64
+                    typed::ElementKind::Float16
+                        | typed::ElementKind::Float32
+                        | typed::ElementKind::Float64
                 ) {
                     let name = kind.name().trim_end_matches("Array");
                     return Err(self.throw_value(dom_exception(

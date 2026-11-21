@@ -15,6 +15,7 @@ pub(super) enum ElementKind {
     Uint16,
     Int32,
     Uint32,
+    Float16,
     Float32,
     Float64,
     BigInt64,
@@ -29,6 +30,7 @@ pub(super) const ELEMENT_KINDS: &[(ElementKind, &str)] = &[
     (ElementKind::Uint16, "Uint16Array"),
     (ElementKind::Int32, "Int32Array"),
     (ElementKind::Uint32, "Uint32Array"),
+    (ElementKind::Float16, "Float16Array"),
     (ElementKind::Float32, "Float32Array"),
     (ElementKind::Float64, "Float64Array"),
     (ElementKind::BigInt64, "BigInt64Array"),
@@ -39,7 +41,7 @@ impl ElementKind {
     pub(super) fn size(self) -> usize {
         match self {
             ElementKind::Int8 | ElementKind::Uint8 | ElementKind::Uint8Clamped => 1,
-            ElementKind::Int16 | ElementKind::Uint16 => 2,
+            ElementKind::Int16 | ElementKind::Uint16 | ElementKind::Float16 => 2,
             ElementKind::Int32 | ElementKind::Uint32 | ElementKind::Float32 => 4,
             ElementKind::Float64 | ElementKind::BigInt64 | ElementKind::BigUint64 => 8,
         }
@@ -93,6 +95,7 @@ impl ElementKind {
             ElementKind::Uint32 => f64::from(u32::from_le_bytes(
                 bytes[..4].try_into().expect("four bytes"),
             )),
+            ElementKind::Float16 => half_value(u16::from_le_bytes([bytes[0], bytes[1]])),
             ElementKind::Float32 => f64::from(f32::from_le_bytes(
                 bytes[..4].try_into().expect("four bytes"),
             )),
@@ -139,12 +142,49 @@ impl ElementKind {
             ElementKind::Int32 | ElementKind::Uint32 => {
                 (integer(number) as u32).to_le_bytes().to_vec()
             }
+            ElementKind::Float16 => half_bits(number).to_le_bytes().to_vec(),
             ElementKind::Float32 => (number as f32).to_le_bytes().to_vec(),
             ElementKind::Float64 => number.to_le_bytes().to_vec(),
             ElementKind::BigInt64 | ElementKind::BigUint64 => {
                 (number as i64).to_le_bytes().to_vec()
             }
         }
+    }
+}
+
+// binary16 bits for a number, rounded once to the nearest half with ties to even
+fn half_bits(number: f64) -> u16 {
+    if number.is_nan() {
+        return 0x7e00;
+    }
+    let rounded = super::numbers::f16_round(number);
+    let sign = if rounded.is_sign_negative() {
+        0x8000
+    } else {
+        0
+    };
+    let magnitude = rounded.abs();
+    if magnitude.is_infinite() {
+        return sign | 0x7c00;
+    }
+    if magnitude < 2f64.powi(-14) {
+        // subnormal halves are whole multiples of 2^-24
+        return sign | (magnitude * 2f64.powi(24)) as u16;
+    }
+    let bits = magnitude.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32 - 1023;
+    sign | (((exponent + 15) as u16) << 10) | ((bits >> 42) & 0x3ff) as u16
+}
+
+fn half_value(bits: u16) -> f64 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exponent = i32::from((bits >> 10) & 0x1f);
+    let fraction = f64::from(bits & 0x3ff);
+    sign * match exponent {
+        0 => fraction * 2f64.powi(-24),
+        31 if fraction == 0.0 => f64::INFINITY,
+        31 => f64::NAN,
+        _ => (1.0 + fraction / 1024.0) * 2f64.powi(exponent - 15),
     }
 }
 
@@ -311,6 +351,7 @@ pub(super) const VIEW_ACCESSORS: &[(&str, ElementKind)] = &[
     ("Uint16", ElementKind::Uint16),
     ("Int32", ElementKind::Int32),
     ("Uint32", ElementKind::Uint32),
+    ("Float16", ElementKind::Float16),
     ("Float32", ElementKind::Float32),
     ("Float64", ElementKind::Float64),
     ("BigInt64", ElementKind::BigInt64),
@@ -782,6 +823,18 @@ mod tests {
         assert_eq!(ElementKind::Uint8Clamped.encode(300.0), vec![255]);
         assert_eq!(ElementKind::Uint8Clamped.encode(2.5), vec![2]);
         assert_eq!(ElementKind::Uint8Clamped.encode(3.5), vec![4]);
+        assert_eq!(ElementKind::Float16.encode(1.0), vec![0x00, 0x3c]);
+        assert_eq!(ElementKind::Float16.encode(-0.0), vec![0x00, 0x80]);
+        assert_eq!(ElementKind::Float16.encode(65504.0), vec![0xff, 0x7b]);
+        assert_eq!(ElementKind::Float16.encode(1e6), vec![0x00, 0x7c]);
+        assert_eq!(ElementKind::Float16.encode(2f64.powi(-24)), vec![0x01, 0x00]);
+        assert_eq!(ElementKind::Float16.read(&[0x00, 0x3c]), 1.0);
+        assert_eq!(ElementKind::Float16.read(&[0x01, 0x00]), 2f64.powi(-24));
+        assert!(ElementKind::Float16.read(&[0x01, 0x7c]).is_nan());
+        assert_eq!(
+            ElementKind::Float16.read(&ElementKind::Float16.encode(1.337)),
+            1.3369140625
+        );
         assert_eq!(
             ElementKind::Uint16.read(&ElementKind::Uint16.encode(70000.0)),
             4464.0
