@@ -87,6 +87,14 @@ export interface AppWindow {
   setFullscreen(on: boolean): Promise<void>;
   setAlwaysOnTop(on: boolean): Promise<void>;
   setZoom(zoom: number): Promise<void>;
+  // logical pixels, as the window's size and position are given everywhere
+  setSize(width: number, height: number): Promise<void>;
+  setPosition(x: number, y: number): Promise<void>;
+  setSkipTaskbar(on: boolean): Promise<void>;
+  // pointer input goes to whatever is beneath the window
+  setClickThrough(on: boolean): Promise<void>;
+  // screen capture shows the window blank
+  setContentProtected(on: boolean): Promise<void>;
   setTitle(title: string): Promise<void>;
   // the taskbar button's bar; a number is the fraction done from 0 to 1, and none clears it
   setProgress(progress?: number | ProgressOptions | null): Promise<void>;
@@ -97,6 +105,27 @@ export interface AppWindow {
   onFileHover(handler: (over: boolean) => void): Promise<Unlisten>;
   // the paths of the files let go over the window
   onFileDrop(handler: (paths: readonly string[]) => void): Promise<Unlisten>;
+  // the labels of the app's open windows
+  labels(): Promise<readonly string[]>;
+  monitors(): Promise<readonly Monitor[]>;
+  // another of the app's windows has closed
+  onClosed(handler: (label: string) => void): Promise<Unlisten>;
+}
+
+// a display, in physical pixels
+export interface Monitor {
+  readonly name: string | null;
+  readonly primary: boolean;
+  readonly scale: number;
+  readonly position: { readonly x: number; readonly y: number };
+  readonly size: { readonly width: number; readonly height: number };
+  // what a taskbar or dock leaves free
+  readonly workArea: {
+    readonly x: number;
+    readonly y: number;
+    readonly width: number;
+    readonly height: number;
+  };
 }
 
 export const appWindow: AppWindow;

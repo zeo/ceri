@@ -287,12 +287,17 @@ impl WindowGeometry {
 }
 
 // a display, in physical pixels
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Monitor {
     pub name: Option<String>,
     pub position: (i32, i32),
     pub size: (u32, u32),
     pub scale: f64,
+    // the display new windows open on
+    pub primary: bool,
+    // the position and size of what a taskbar or dock leaves free, the whole display where
+    // the platform does not say
+    pub work_area: ((i32, i32), (u32, u32)),
 }
 
 // the platform's own handle for a window, for native code an app runs beside the page
@@ -687,9 +692,11 @@ where
     }
 
     fn refresh_monitors(&self, event_loop: &ActiveEventLoop) {
-        let monitors = event_loop
-            .available_monitors()
-            .map(|monitor| monitor_of(&monitor));
+        let primary = event_loop.primary_monitor();
+        let monitors = event_loop.available_monitors().map(|monitor| Monitor {
+            primary: primary.as_ref() == Some(&monitor),
+            ..monitor_of(&monitor)
+        });
         self.control.published().monitors = monitors.collect();
     }
 
@@ -710,6 +717,14 @@ where
                     .remove(&window.config.label);
                 if let Some(hook) = &mut self.lifecycle.closed {
                     hook(&self.control, &window.config.label);
+                }
+                // the windows still open hear which one went
+                let payload = format!(
+                    r#"{{"label":{}}}"#,
+                    crate::script::json_quote(&window.config.label)
+                );
+                for open in self.windows.values_mut() {
+                    open.deliver("window:closed", &payload);
                 }
             }
         }
@@ -1682,12 +1697,44 @@ where
 }
 
 fn monitor_of(handle: &winit::monitor::MonitorHandle) -> Monitor {
+    let position = (handle.position().x, handle.position().y);
+    let size = (handle.size().width, handle.size().height);
     Monitor {
         name: handle.name(),
-        position: (handle.position().x, handle.position().y),
-        size: (handle.size().width, handle.size().height),
+        position,
+        size,
         scale: handle.scale_factor(),
+        primary: false,
+        work_area: work_area(handle).unwrap_or((position, size)),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn work_area(handle: &winit::monitor::MonitorHandle) -> Option<((i32, i32), (u32, u32))> {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
+    use winit::platform::windows::MonitorHandleExtWindows;
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the structure names its own size and lives across the call
+    unsafe { GetMonitorInfoW(HMONITOR(handle.hmonitor() as *mut _), &mut info) }
+        .as_bool()
+        .then(|| {
+            let area = info.rcWork;
+            (
+                (area.left, area.top),
+                (
+                    (area.right - area.left).max(0) as u32,
+                    (area.bottom - area.top).max(0) as u32,
+                ),
+            )
+        })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn work_area(_handle: &winit::monitor::MonitorHandle) -> Option<((i32, i32), (u32, u32))> {
+    None
 }
 
 fn centred(monitor: &Monitor, size: (u32, u32)) -> PhysicalPosition<i32> {
@@ -1913,6 +1960,7 @@ mod tests {
             position: (1920, 0),
             size: (2560, 1440),
             scale: 1.5,
+            ..Default::default()
         };
         let placed = centred(&monitor, (1620, 1050));
         assert_eq!((placed.x, placed.y), (1920 + 470, 195));
@@ -1980,12 +2028,14 @@ mod geometry_tests {
                 position: (0, 0),
                 size: (1920, 1080),
                 scale: 1.0,
+                ..Default::default()
             },
             Monitor {
                 name: None,
                 position: (-2560, -200),
                 size: (2560, 1440),
                 scale: 2.0,
+                ..Default::default()
             },
         ];
         let at = |x, y| WindowGeometry {

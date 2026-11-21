@@ -120,6 +120,36 @@ impl CommandRoutes {
                 .and_then(|switch| act(WindowAction::Fullscreen(switch.on))),
             "window:set-always-on-top" => arguments::<Switch>(call)
                 .and_then(|switch| act(WindowAction::AlwaysOnTop(switch.on))),
+            "window:set-size" => arguments::<Extent>(call)
+                .and_then(|size| act(WindowAction::Size(size.width, size.height))),
+            "window:set-position" => {
+                arguments::<Place>(call).and_then(|at| act(WindowAction::Position(at.x, at.y)))
+            }
+            "window:set-skip-taskbar" => arguments::<Switch>(call)
+                .and_then(|switch| act(WindowAction::SkipTaskbar(switch.on))),
+            "window:set-click-through" => arguments::<Switch>(call)
+                .and_then(|switch| act(WindowAction::ClickThrough(switch.on))),
+            "window:set-content-protected" => arguments::<Switch>(call)
+                .and_then(|switch| act(WindowAction::ContentProtected(switch.on))),
+            "window:labels" => json(&control.labels()),
+            "window:monitors" => {
+                let monitors: Vec<_> = control
+                    .monitors()
+                    .iter()
+                    .map(|monitor| {
+                        let ((x, y), (width, height)) = monitor.work_area;
+                        serde_json::json!({
+                            "name": monitor.name,
+                            "primary": monitor.primary,
+                            "scale": monitor.scale,
+                            "position": { "x": monitor.position.0, "y": monitor.position.1 },
+                            "size": { "width": monitor.size.0, "height": monitor.size.1 },
+                            "workArea": { "x": x, "y": y, "width": width, "height": height },
+                        })
+                    })
+                    .collect();
+                json(&monitors)
+            }
             "window:set-zoom" => {
                 arguments::<Zoom>(call).and_then(|zoom| act(WindowAction::Zoom(zoom.zoom)))
             }
@@ -204,6 +234,18 @@ struct Switch {
 #[derive(Deserialize)]
 struct Zoom {
     zoom: f32,
+}
+
+#[derive(Deserialize)]
+struct Extent {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Deserialize)]
+struct Place {
+    x: i32,
+    y: i32,
 }
 
 #[derive(Deserialize)]

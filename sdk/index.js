@@ -136,6 +136,11 @@ export const appWindow = Object.freeze({
   setFullscreen: (on) => invoke("window:set-fullscreen", { on }),
   setAlwaysOnTop: (on) => invoke("window:set-always-on-top", { on }),
   setZoom: (zoom) => invoke("window:set-zoom", { zoom }),
+  setSize: (width, height) => invoke("window:set-size", { width, height }),
+  setPosition: (x, y) => invoke("window:set-position", { x, y }),
+  setSkipTaskbar: (on) => invoke("window:set-skip-taskbar", { on }),
+  setClickThrough: (on) => invoke("window:set-click-through", { on }),
+  setContentProtected: (on) => invoke("window:set-content-protected", { on }),
   setTitle: (title) => invoke("window:set-title", { title }),
   setProgress: (progress) =>
     invoke("window:set-progress", typeof progress === "number" ? { progress } : (progress ?? {})),
@@ -144,6 +149,9 @@ export const appWindow = Object.freeze({
   onResized: (handler) => listen("window:resized", (event) => handler(event.payload)),
   onFileHover: (handler) => listen("window:file-hover", (event) => handler(event.payload.over)),
   onFileDrop: (handler) => listen("window:file-drop", (event) => handler(event.payload.paths)),
+  labels: command("window:labels"),
+  monitors: command("window:monitors"),
+  onClosed: (handler) => listen("window:closed", (event) => handler(event.payload.label)),
 });
 
 function asking(name) {
