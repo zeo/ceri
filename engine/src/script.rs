@@ -71,6 +71,7 @@ mod streams;
 mod strings;
 mod typed;
 mod typed_om;
+mod tz;
 mod urlpattern;
 mod urls;
 mod viewtransitions;

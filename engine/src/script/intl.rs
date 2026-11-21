@@ -270,6 +270,81 @@ pub(super) struct NumberOptions {
     grouping: bool,
 }
 
+// an offset zone as +hh:mm, from +hh, +hhmm or +hh:mm
+fn offset_zone(text: &str) -> Option<String> {
+    let sign = text
+        .chars()
+        .next()
+        .filter(|sign| matches!(sign, '+' | '-'))?;
+    let digits: String = text[1..].chars().filter(|&found| found != ':').collect();
+    let valid_colon = !text.contains(':') || text.len() == 6 && &text[3..4] == ":";
+    if !valid_colon || !digits.chars().all(|found| found.is_ascii_digit()) {
+        return None;
+    }
+    let (hours, minutes) = match digits.len() {
+        2 => (&digits[..2], "00"),
+        4 => (&digits[..2], &digits[2..]),
+        _ => return None,
+    };
+    (hours < "24" && minutes < "60").then(|| format!("{sign}{hours}:{minutes}"))
+}
+
+// zones whose IANA name changed while CLDR, and so Chrome's resolved options, keep the old one
+const CLDR_ZONE_NAMES: &[(&str, &str)] = &[
+    ("Africa/Asmara", "Africa/Asmera"),
+    ("America/Argentina/Buenos_Aires", "America/Buenos_Aires"),
+    ("America/Argentina/Catamarca", "America/Catamarca"),
+    ("America/Atikokan", "America/Coral_Harbour"),
+    ("America/Argentina/Cordoba", "America/Cordoba"),
+    ("America/Nuuk", "America/Godthab"),
+    ("America/Indiana/Indianapolis", "America/Indianapolis"),
+    ("America/Argentina/Jujuy", "America/Jujuy"),
+    ("America/Kentucky/Louisville", "America/Louisville"),
+    ("America/Argentina/Mendoza", "America/Mendoza"),
+    ("Asia/Kolkata", "Asia/Calcutta"),
+    ("Asia/Kathmandu", "Asia/Katmandu"),
+    ("Asia/Yangon", "Asia/Rangoon"),
+    ("Asia/Ho_Chi_Minh", "Asia/Saigon"),
+    ("Atlantic/Faroe", "Atlantic/Faeroe"),
+    ("Europe/Kyiv", "Europe/Kiev"),
+    ("Pacific/Kanton", "Pacific/Enderbury"),
+    ("Pacific/Pohnpei", "Pacific/Ponape"),
+    ("Pacific/Chuuk", "Pacific/Truk"),
+];
+
+// a time zone as a formatter resolves it: UTC for its aliases, a link by the zone it names,
+// in CLDR's spelling
+pub(super) fn canonical_zone(zone: &str) -> Option<String> {
+    if let Some(offset) = offset_zone(zone) {
+        return Some(offset);
+    }
+    let primary = super::tz::primary(zone)?;
+    Some(match primary {
+        "Etc/UTC" | "Etc/GMT" | "Etc/UCT" | "Etc/Universal" | "Etc/Zulu" | "Etc/Greenwich" => {
+            "UTC".to_string()
+        }
+        _ if zone.eq_ignore_ascii_case("utc") || zone.eq_ignore_ascii_case("gmt") => {
+            "UTC".to_string()
+        }
+        other => CLDR_ZONE_NAMES
+            .iter()
+            .find(|(iana, _)| *iana == other)
+            .map_or(other, |(_, cldr)| cldr)
+            .to_string(),
+    })
+}
+
+// a canonical zone's offset from UTC, in seconds, at a time value
+pub(super) fn zone_offset(zone: &str, time: f64) -> i32 {
+    if let Some(sign) = zone.strip_prefix(['+', '-']).map(|_| zone.starts_with('-')) {
+        let hours: i32 = zone[1..3].parse().unwrap_or(0);
+        let minutes: i32 = zone[4..6].parse().unwrap_or(0);
+        let offset = hours * 3600 + minutes * 60;
+        return if sign { -offset } else { offset };
+    }
+    super::tz::lookup(zone).map_or(0, |(_, found)| found.offset((time / 1000.0).floor() as i64))
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct DateOptions {
     locale: String,
@@ -283,7 +358,8 @@ pub(super) struct DateOptions {
     minute: Option<String>,
     second: Option<String>,
     hour12: Option<bool>,
-    utc: bool,
+    // the zone asked for, as an IANA identifier or a +hh:mm offset; none for the host's own
+    zone: Option<String>,
 }
 
 impl DateOptions {
@@ -992,20 +1068,25 @@ impl ScriptRuntime {
                 Value::Undefined => None,
                 value => Some(value.truthy()),
             };
-            result.utc = matches!(
-                self.option_text(options, "timeZone")?.as_deref(),
-                Some("UTC" | "Etc/UTC" | "GMT")
-            );
+            if let Some(zone) = self.option_text(options, "timeZone")? {
+                result.zone = Some(match canonical_zone(&zone) {
+                    Some(zone) => zone,
+                    None => {
+                        return Err(
+                            self.range_error(format!("Invalid time zone specified: {zone}"))
+                        );
+                    }
+                });
+            }
         }
         Ok(result)
     }
 
     // a date's time value in the formatter's zone
     fn zoned(&self, options: &DateOptions, time: f64) -> f64 {
-        if options.utc {
-            time
-        } else {
-            time + f64::from(self.time_zone.offset_minutes(time)) * 60_000.0
+        match &options.zone {
+            Some(zone) => time + f64::from(zone_offset(zone, time)) * 1000.0,
+            None => time + f64::from(self.time_zone.offset_minutes(time)) * 60_000.0,
         }
     }
 
@@ -1262,13 +1343,13 @@ impl ScriptRuntime {
                         ("numberingSystem".to_string(), Value::String("latn".into())),
                         (
                             "timeZone".to_string(),
-                            Value::String(if options.utc {
-                                "UTC".into()
-                            } else {
-                                self.time_zone
+                            Value::String(match &options.zone {
+                                Some(zone) => zone.as_str().into(),
+                                None => self
+                                    .time_zone
                                     .name(0.0)
                                     .unwrap_or_else(|| "UTC".to_string())
-                                    .into()
+                                    .into(),
                             }),
                         ),
                     ],
@@ -1310,6 +1391,43 @@ mod tests {
             minimum_integer: 1,
             grouping: true,
         }
+    }
+
+    #[test]
+    fn time_zones_resolve_and_offset_as_chrome_reports_them() {
+        let resolved: Vec<Option<String>> = [
+            "asia/kolkata",
+            "US/Eastern",
+            "Etc/GMT",
+            "utc",
+            "-0800",
+            "+05:30",
+            "Mars/Olympus",
+            "+25:00",
+        ]
+        .into_iter()
+        .map(canonical_zone)
+        .collect();
+        assert_eq!(
+            resolved,
+            [
+                Some("Asia/Calcutta".to_string()),
+                Some("America/New_York".to_string()),
+                Some("UTC".to_string()),
+                Some("UTC".to_string()),
+                Some("-08:00".to_string()),
+                Some("+05:30".to_string()),
+                None,
+                None,
+            ]
+        );
+        let summer = 1_720_107_000_000.0;
+        let winter = 1_705_332_600_000.0;
+        assert_eq!(zone_offset("America/New_York", summer), -4 * 3600);
+        assert_eq!(zone_offset("America/New_York", winter), -5 * 3600);
+        assert_eq!(zone_offset("Asia/Calcutta", winter), 19_800);
+        assert_eq!(zone_offset("-08:00", winter), -8 * 3600);
+        assert_eq!(zone_offset("America/St_Johns", summer), -9000);
     }
 
     #[test]
