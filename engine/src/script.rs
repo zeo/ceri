@@ -31,6 +31,7 @@ mod iterator_helpers;
 mod json;
 mod markup;
 mod messaging;
+mod navigator_apis;
 mod netfetch;
 mod traversal;
 pub(crate) use json::quote as json_quote;
@@ -675,6 +676,10 @@ pub struct ScriptRuntime {
     // outside fetches the host runs off this thread, and the id the next one takes
     fetches: RefCell<Vec<netfetch::PendingFetch>>,
     event_sources: HashMap<u32, eventsource::SourceState>,
+    // when the user last pressed or typed into the page, for navigator.userActivation
+    activated_at: Option<u64>,
+    // Web Locks requests, granted ones first in the order they were made
+    lock_queue: RefCell<Vec<Rc<navigator_apis::LockRequest>>>,
     next_fetch_id: std::cell::Cell<u32>,
     pattern_cache: HashMap<(String, String), Rc<pattern::Regex>>,
     random_state: u64,
@@ -1013,6 +1018,18 @@ pub(crate) struct StorageData {
 }
 
 impl StorageData {
+    // what the store holds on disk, or its keys and values while it has not been written
+    pub(crate) fn byte_size(&self) -> usize {
+        match self.persisted.borrow().len() {
+            0 => self
+                .values
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum(),
+            written => written,
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             values: BTreeMap::new(),
@@ -1810,6 +1827,8 @@ impl ScriptRuntime {
             registries: Vec::new(),
             fetches: RefCell::new(Vec::new()),
             event_sources: HashMap::new(),
+            activated_at: None,
+            lock_queue: RefCell::new(Vec::new()),
             next_fetch_id: std::cell::Cell::new(0),
             pattern_cache: HashMap::new(),
             random_state: numbers::random_seed(),
@@ -4068,6 +4087,21 @@ impl ScriptRuntime {
                 "onLine" | "cookieEnabled" => Ok(Value::Bool(true)),
                 "webdriver" | "pdfViewerEnabled" => Ok(Value::Bool(false)),
                 "maxTouchPoints" => Ok(Value::Number(0.0)),
+                "permissions" => Ok(Value::Object(
+                    self.intrinsics.navigator_apis.permissions.clone(),
+                )),
+                "storage" => Ok(Value::Object(
+                    self.intrinsics.navigator_apis.storage.clone(),
+                )),
+                "locks" => Ok(Value::Object(self.intrinsics.navigator_apis.locks.clone())),
+                "userActivation" => Ok(Value::Object(
+                    self.intrinsics.navigator_apis.user_activation.clone(),
+                )),
+                "sendBeacon" => Ok(self.native_function(
+                    Native::Nav(Rc::new(navigator_apis::NavFunction::SendBeacon)),
+                    "sendBeacon",
+                    1,
+                )),
                 "hardwareConcurrency" => Ok(Value::Number(
                     std::thread::available_parallelism().map_or(1, |count| count.get()) as f64,
                 )),

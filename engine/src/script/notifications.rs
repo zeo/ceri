@@ -155,7 +155,7 @@ impl Notices {
 
 impl ScriptRuntime {
     // pages get no prompt: the app's capabilities decide, as tauri's do on desktop
-    fn notice_permission(&self) -> &'static str {
+    pub(super) fn notice_permission(&self) -> &'static str {
         match &self.bridge {
             Some(state) if state.permits(SHOW) => "granted",
             _ => "denied",

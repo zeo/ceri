@@ -164,6 +164,7 @@ pub(super) enum Native {
     Helper(super::iterator_helpers::HelperMember),
     Markup(super::markup::MarkupMember),
     Stream(Rc<super::streams::StreamFunction>),
+    Nav(Rc<super::navigator_apis::NavFunction>),
     Anim(super::animations::AnimMember),
     AnimConstructor,
     ClipboardItemConstructor,
@@ -324,6 +325,7 @@ pub(super) struct Intrinsics {
     pub(super) ports: super::messaging::PortInterfaces,
     pub(super) traversal: super::traversal::TraversalInterfaces,
     pub(super) streams: super::streams::StreamInterfaces,
+    pub(super) navigator_apis: super::navigator_apis::NavigatorInterfaces,
     pub(super) helpers: super::iterator_helpers::HelperInterfaces,
     pub(super) animations: super::animations::AnimInterfaces,
     pub(super) shapes: super::geometry_values::ShapeInterfaces,
@@ -1486,6 +1488,12 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let traversal = super::traversal::create(&build, &object_prototype, &mut globals);
     let helpers = super::iterator_helpers::create(&build, &iterator_prototype, &mut globals);
     super::markup::create(&build, &object_prototype, &mut globals);
+    let navigator_apis = super::navigator_apis::create(
+        &build,
+        &object_prototype,
+        &dom.prototype("EventTarget"),
+        &mut globals,
+    );
     let streams = super::streams::create(
         &build,
         &object_prototype,
@@ -1570,6 +1578,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         ports,
         traversal,
         streams,
+        navigator_apis,
         helpers,
         animations,
         shapes,
@@ -2990,6 +2999,7 @@ impl ScriptRuntime {
             Native::Helper(member) => self.call_iterator_helper(member, this, arguments),
             Native::Markup(member) => self.call_markup(member, this, arguments),
             Native::Stream(function) => self.call_stream((*function).clone(), this, arguments),
+            Native::Nav(function) => self.call_nav((*function).clone(), this, arguments),
             Native::Anim(member) => self.call_animation(member, this, arguments),
             Native::AnimFinish(id, generation) => self.deliver_animation_finish(id, generation),
             Native::Shape(member) => self.call_shape(member, this, arguments),

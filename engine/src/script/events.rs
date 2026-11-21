@@ -1648,6 +1648,7 @@ impl ScriptRuntime {
         };
         self.pointer.button = button;
         if pressed {
+            self.note_activation();
             self.pointer.buttons |= bit;
         } else {
             self.pointer.buttons &= !bit;
@@ -1858,6 +1859,13 @@ impl ScriptRuntime {
         repeat: bool,
     ) -> Result<bool, ScriptError> {
         self.key_detail = Some((code.to_string(), repeat));
+        // keys that only modify another, and escape, do not activate the page
+        if !matches!(
+            key,
+            "Escape" | "Shift" | "Control" | "Alt" | "Meta" | "AltGraph" | "CapsLock"
+        ) {
+            self.note_activation();
+        }
         let handled = self.key_down_with_modifiers(key, modifiers);
         self.key_detail = None;
         handled
