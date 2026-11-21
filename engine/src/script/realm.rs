@@ -191,6 +191,8 @@ pub(super) enum Native {
     RectConstructor(bool),
     PointConstructor(bool),
     PortConstructor,
+    // an interface whose objects only the engine makes
+    IllegalConstructor,
     MessageChannelConstructor,
     // the messages posted to ports and the window since the last task arrive
     PortDeliver,
@@ -264,6 +266,7 @@ impl Native {
                 | Native::RectConstructor(_)
                 | Native::PointConstructor(_)
                 | Native::PortConstructor
+                | Native::IllegalConstructor
                 | Native::MessageChannelConstructor
                 | Native::UrlConstructor
                 | Native::UrlSearchParamsConstructor
@@ -286,6 +289,23 @@ impl fmt::Debug for Native {
         formatter.write_str("Native")
     }
 }
+
+// interfaces whose objects the engine hands out, so instanceof and their toString tags answer
+// as in browsers
+const HOST_INTERFACES: &[&str] = &[
+    "History",
+    "Navigator",
+    "Performance",
+    "MediaQueryList",
+    "FileList",
+    "TextMetrics",
+    "IDBFactory",
+    "IdleDeadline",
+    "Lock",
+    "LockManager",
+    "CanvasRenderingContext2D",
+    "ImageBitmap",
+];
 
 pub(super) struct Intrinsics {
     pub(super) object_prototype: ObjectHandle,
@@ -346,6 +366,8 @@ pub(super) struct Intrinsics {
     pub(super) traversal: super::traversal::TraversalInterfaces,
     pub(super) streams: super::streams::StreamInterfaces,
     pub(super) navigator_apis: super::navigator_apis::NavigatorInterfaces,
+    // prototypes of interfaces whose objects only the engine makes, by name
+    pub(super) hosts: HashMap<&'static str, ObjectHandle>,
     pub(super) paths: super::path2d::PathInterfaces,
     pub(super) matrices: super::matrices::MatrixInterfaces,
     pub(super) segmenters: super::segmenter::SegmenterInterfaces,
@@ -1514,6 +1536,14 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
             .define(name.to_string(), Property::hidden(Value::Object(function)));
         intl_prototypes.push(prototype);
     }
+    let mut hosts = HashMap::new();
+    for name in HOST_INTERFACES {
+        let prototype = plain(&object_prototype);
+        build.value(&prototype, "@@toStringTag", Value::String((*name).into()));
+        let constructor = build.constructor(Native::IllegalConstructor, name, 0, &prototype);
+        globals.push((name, Value::Object(constructor)));
+        hosts.insert(*name, prototype);
+    }
     let segmenters =
         super::segmenter::create(&build, &object_prototype, &iterator_prototype, &intl);
     let (disposables, disposable_globals) = super::disposables::create(&build, &object_prototype);
@@ -1569,6 +1599,10 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         &dom.prototype("EventTarget"),
         &mut globals,
     );
+    navigator_apis
+        .locks
+        .borrow_mut()
+        .set_prototype(Some(hosts["LockManager"].clone()));
     let streams = super::streams::create(
         &build,
         &object_prototype,
@@ -1664,6 +1698,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         paths,
         matrices,
         segmenters,
+        hosts,
         disposables,
         cssom,
         font_faces,
@@ -3143,7 +3178,9 @@ impl ScriptRuntime {
             Native::MessageChannelConstructor => Err(self.type_error(
                 "Failed to construct 'MessageChannel': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
-            Native::PortConstructor => Err(self.type_error("Illegal constructor")),
+            Native::PortConstructor | Native::IllegalConstructor => {
+                Err(self.type_error("Illegal constructor"))
+            }
             Native::AnimConstructor => Err(self.type_error("Illegal constructor")),
             Native::ClipboardItemConstructor => Err(self.type_error(
                 "Failed to construct 'ClipboardItem': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
@@ -3546,7 +3583,9 @@ impl ScriptRuntime {
             Native::PointConstructor(read_only) => {
                 self.construct_point(read_only, arguments, new_target)
             }
-            Native::PortConstructor => Err(self.type_error("Illegal constructor")),
+            Native::PortConstructor | Native::IllegalConstructor => {
+                Err(self.type_error("Illegal constructor"))
+            }
             Native::UrlConstructor => self.construct_url(arguments, new_target),
             Native::UrlSearchParamsConstructor => {
                 self.construct_url_search_params(arguments, new_target)

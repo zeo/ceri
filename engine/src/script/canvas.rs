@@ -2152,7 +2152,7 @@ impl ScriptRuntime {
                     "right" | "end" => width,
                     _ => 0.0,
                 };
-                Ok(plain_object(
+                let metrics = plain_object(
                     [
                         ("width", width),
                         ("actualBoundingBoxLeft", left),
@@ -2168,7 +2168,8 @@ impl ScriptRuntime {
                         ("ideographicBaseline", -descent),
                     ]
                     .map(|(key, value)| (key.to_string(), Value::Number(value.into()))),
-                ))
+                );
+                Ok(self.host_object(metrics, "TextMetrics"))
             }
             "clip" => {
                 let even_odd = arguments
@@ -2326,14 +2327,15 @@ impl ScriptRuntime {
                     .borrow()
                     .as_ref()
                     .map_or((0, 0), |bitmap| (bitmap.width, bitmap.height));
-                self.fulfilled_promise(plain_object([
+                let bitmap = plain_object([
                     ("width".to_string(), Value::Number(f64::from(width))),
                     ("height".to_string(), Value::Number(f64::from(height))),
                     (
                         "close".to_string(),
                         Value::Builtin(Builtin::ImageBitmapClose(held)),
                     ),
-                ]))
+                ]);
+                self.fulfilled_promise(self.host_object(bitmap, "ImageBitmap"))
             }
             None => self.rejected_promise_value(dom_exception(
                 "InvalidStateError",

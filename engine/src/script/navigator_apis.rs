@@ -420,6 +420,7 @@ impl ScriptRuntime {
                         ),
                     ),
                 ]);
+                let lock = self.host_object(lock, "Lock");
                 let outcome =
                     self.call_function(request.callback.clone(), Value::Undefined, vec![lock]);
                 let promise = match outcome {

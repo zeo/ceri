@@ -6531,6 +6531,16 @@ impl ScriptRuntime {
         Ok(())
     }
 
+    // an object the engine made, given the prototype of the interface it belongs to
+    fn host_object(&self, value: Value, interface: &str) -> Value {
+        if let Value::Object(object) = &value {
+            object
+                .borrow_mut()
+                .set_prototype(Some(self.intrinsics.hosts[interface].clone()));
+        }
+        value
+    }
+
     fn element_files(&self, handle: &ElementHandle) -> Value {
         let node = handle.id;
         let is_file = self.document.borrow().element(node).is_some_and(|element| {

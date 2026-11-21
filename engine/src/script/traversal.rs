@@ -143,6 +143,8 @@ pub(super) fn create(
             "@@toStringTag".to_string(),
             Property::hidden(Value::String(tag.into())),
         );
+        let constructor = build.constructor(Native::IllegalConstructor, tag, 0, target);
+        globals.push((tag, Value::Object(constructor)));
     }
     let filter = plain();
     for (name, value) in [

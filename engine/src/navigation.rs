@@ -4726,6 +4726,54 @@ mod tests {
     }
 
     #[test]
+    fn engine_made_objects_belong_to_their_interfaces() {
+        let mut browser = Browser::new(bundle(
+            r#"<canvas id="c"></canvas><input id="f" type="file"><p id='status'>idle</p><script>
+              const context = document.getElementById("c").getContext("2d");
+              const checks = [
+                history instanceof History, navigator instanceof Navigator,
+                performance instanceof Performance, performance instanceof EventTarget,
+                matchMedia("(min-width: 1px)") instanceof MediaQueryList,
+                document.getElementById("f").files instanceof FileList,
+                context instanceof CanvasRenderingContext2D,
+                context.measureText("a") instanceof TextMetrics,
+                indexedDB instanceof IDBFactory, navigator.locks instanceof LockManager,
+                document.createTreeWalker(document.body) instanceof TreeWalker,
+                document.createNodeIterator(document.body) instanceof NodeIterator,
+                Object.prototype.toString.call(history),
+              ];
+              try { new History(); } catch (error) { checks.push(error.name); }
+              const stored = new StorageEvent("storage", { key: "k", newValue: "v" });
+              checks.push(stored.key, stored.oldValue, stored.newValue, stored.url === "");
+              checks.push(new FormDataEvent("formdata", { formData: new FormData() }).formData instanceof FormData);
+              navigator.locks.request("x", (lock) => {
+                checks.push(lock instanceof Lock);
+                requestIdleCallback((deadline) => {
+                  checks.push(deadline instanceof IdleDeadline);
+                  document.getElementById("status").textContent = checks.join("|");
+                });
+              });
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/index.html")
+            .expect("packaged document should load");
+        browser.advance_time(100).expect("time should advance");
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "true|true|true|true|true|true|true|true|true|true|true|true|[object History]|\
+                 TypeError|k||v|true|true|true|true"
+            )
+        );
+    }
+
+    #[test]
     fn browser_pumps_a_packaged_worker_without_a_loopback_server() {
         let mut resources = bundle(
             r#"<p id='status'>idle</p><script>

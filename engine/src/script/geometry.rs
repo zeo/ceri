@@ -1,7 +1,7 @@
 // what script can measure: element boxes from a layout of the current document, computed
 // style, media queries, the performance timeline and idle callbacks
 
-use super::object::{JsObject, ObjectClass, Property, new_object};
+use super::object::{JsObject, Property, new_object};
 use super::operations::{is_callable, is_primitive, number_to_string, plain_object};
 use super::realm::Native;
 use super::*;
@@ -880,10 +880,10 @@ impl ScriptRuntime {
         let prototype = match &self.media_list_prototype {
             Some(prototype) => prototype.clone(),
             None => {
-                let prototype = new_object(JsObject::with_prototype(
-                    Some(self.intrinsics.dom.prototype("EventTarget")),
-                    ObjectClass::Ordinary,
-                ));
+                let prototype = self.intrinsics.hosts["MediaQueryList"].clone();
+                prototype
+                    .borrow_mut()
+                    .set_prototype(Some(self.intrinsics.dom.prototype("EventTarget")));
                 {
                     let mut prototype = prototype.borrow_mut();
                     prototype.define(
@@ -1039,7 +1039,7 @@ impl ScriptRuntime {
             ("clearMarks", WindowMethod::PerformanceClearMarks),
             ("clearMeasures", WindowMethod::PerformanceClearMeasures),
         ];
-        plain_object(
+        let performance = plain_object(
             methods
                 .into_iter()
                 .map(|(name, method)| {
@@ -1053,7 +1053,11 @@ impl ScriptRuntime {
                     )
                 })
                 .chain([("timeOrigin".to_string(), Value::Number(self.time_origin))]),
-        )
+        );
+        self.intrinsics.hosts["Performance"]
+            .borrow_mut()
+            .set_prototype(Some(self.intrinsics.dom.prototype("EventTarget")));
+        self.host_object(performance, "Performance")
     }
 
     pub(super) fn call_window_method(
@@ -1174,7 +1178,7 @@ impl ScriptRuntime {
     // the IdleDeadline handed to an idle callback; the page clock stands still while a task
     // runs, so the whole idle period remains
     pub(super) fn idle_deadline(&self) -> Value {
-        plain_object([
+        let deadline = plain_object([
             (
                 "timeRemaining".to_string(),
                 self.native_function(
@@ -1184,7 +1188,8 @@ impl ScriptRuntime {
                 ),
             ),
             ("didTimeout".to_string(), Value::Bool(false)),
-        ])
+        ]);
+        self.host_object(deadline, "IdleDeadline")
     }
 }
 

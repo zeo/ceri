@@ -953,6 +953,11 @@ impl ScriptRuntime {
                 intrinsics.typed_prototypes[index].clone()
             }
             Value::Bytes(_) => intrinsics.array_buffer_prototype.clone(),
+            Value::Navigator => intrinsics.hosts["Navigator"].clone(),
+            Value::History(_) => intrinsics.hosts["History"].clone(),
+            Value::FileList(_) => intrinsics.hosts["FileList"].clone(),
+            Value::CanvasContext(_) => intrinsics.hosts["CanvasRenderingContext2D"].clone(),
+            Value::IndexedDbFactory(_) => intrinsics.hosts["IDBFactory"].clone(),
             value if is_callable(value) => intrinsics.function_prototype.clone(),
             _ => intrinsics.object_prototype.clone(),
         })

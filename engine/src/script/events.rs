@@ -263,6 +263,22 @@ static EVENT_INTERFACES: &[EventInterface] = &[
         parent: "Event",
         members: &[("submitter", Any)],
     },
+    EventInterface {
+        name: "StorageEvent",
+        parent: "Event",
+        members: &[
+            ("key", Any),
+            ("oldValue", Any),
+            ("newValue", Any),
+            ("url", Text),
+            ("storageArea", Any),
+        ],
+    },
+    EventInterface {
+        name: "FormDataEvent",
+        parent: "Event",
+        members: &[("formData", Any)],
+    },
 ];
 
 const PHASES: &[(&str, f64)] = &[
