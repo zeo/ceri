@@ -19317,6 +19317,29 @@ mod tests {
         );
     }
     #[test]
+    fn regexp_escape_and_error_is_error_follow_the_standard() {
+        let document = document(r#"<main><p id="status">idle</p></main>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const escaped = ["foo", "a.b", "$1,000", " x", "_x", "tab\there", "😀"].map(RegExp.escape);
+                const works = new RegExp(RegExp.escape("1+1=2?")).test("is 1+1=2?");
+                const errors = [new TypeError("x"), new Error("y"), {}, Object.create(Error.prototype), "Error"].map(Error.isError);
+                let name = "";
+                try { RegExp.escape(1); } catch (error) { name = error.name; }
+                document.getElementById("status").textContent = [JSON.stringify(escaped), works, errors.join(","), name].join("|");
+                "#,
+            )
+            .expect("script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                r#"["\\x66oo","\\x61\\.b","\\$1\\x2c000","\\x20x","_x","\\x74ab\\there","😀"]|true|true,true,false,false,false|TypeError"#
+            )
+        );
+    }
+    #[test]
     fn atob_and_btoa_carry_bytes_one_to_a_character() {
         let document = document(r#"<main><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());

@@ -68,6 +68,8 @@ pub(super) enum Native {
     ErrorConstructor(&'static str),
     ErrorToString,
     ErrorCaptureStackTrace,
+    ErrorIsError,
+    RegExpEscape,
     BooleanConstructor,
     BooleanToString,
     BooleanValueOf,
@@ -572,6 +574,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         Native::ErrorCaptureStackTrace,
         1,
     );
+    build.method(&error, "isError", Native::ErrorIsError, 1);
     globals.push(("Error", Value::Object(error.clone())));
     let mut error_prototypes = Vec::new();
     for kind in [
@@ -812,6 +815,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         2,
         &regexp_prototype,
     );
+    build.method(&regexp, "escape", Native::RegExpEscape, 1);
     globals.push(("RegExp", Value::Object(regexp)));
 
     let math = plain(&object_prototype);
@@ -2431,6 +2435,17 @@ impl ScriptRuntime {
                 };
                 Ok(Value::String(text.into()))
             }
+            Native::ErrorIsError => Ok(Value::Bool(match first.resolve() {
+                Value::Error(_) => true,
+                Value::Object(object) => matches!(object.borrow().class, ObjectClass::Error),
+                _ => false,
+            })),
+            Native::RegExpEscape => {
+                let Value::String(text) = first.resolve() else {
+                    return Err(self.type_error("RegExp.escape requires a string"));
+                };
+                Ok(Value::String(regexp_escape(&text).into()))
+            }
             Native::ErrorCaptureStackTrace => {
                 if let Value::Object(object) = &first {
                     let mut text = self.coerce_string(first.clone())?;
@@ -3265,4 +3280,39 @@ fn number_to_radix(value: f64, radix: u32) -> String {
         text.insert(0, '-');
     }
     text
+}
+
+// a string as a pattern that matches it exactly: syntax characters take a backslash, and a
+// leading letter or digit, punctuators and white space are written as escapes, so the result
+// can follow anything in a larger pattern
+pub(super) fn regexp_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len() * 2);
+    for (index, character) in text.chars().enumerate() {
+        let code = u32::from(character);
+        let hex = || {
+            if code <= 0xff {
+                format!("\\x{code:02x}")
+            } else {
+                format!("\\u{code:04x}")
+            }
+        };
+        let piece = match character {
+            _ if index == 0 && character.is_ascii_alphanumeric() => hex(),
+            _ if "^$\\.*+?()[]{}|/".contains(character) => format!("\\{character}"),
+            '\t' => "\\t".to_string(),
+            '\n' => "\\n".to_string(),
+            '\u{b}' => "\\v".to_string(),
+            '\u{c}' => "\\f".to_string(),
+            '\r' => "\\r".to_string(),
+            _ if ",-=<>#&!%:;@~'`\"".contains(character)
+                || character.is_whitespace()
+                || character == '\u{feff}' =>
+            {
+                hex()
+            }
+            _ => character.to_string(),
+        };
+        escaped.push_str(&piece);
+    }
+    escaped
 }
