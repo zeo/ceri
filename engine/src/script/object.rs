@@ -84,6 +84,7 @@ pub(super) enum ObjectClass {
     DurationFormat(Rc<super::durationformat::DurationOptions>),
     // an OffscreenCanvas and the canvas element it keeps alive
     Offscreen(super::ElementHandle),
+    UrlPattern(Rc<super::urlpattern::UrlPattern>),
     PerfObserver(Rc<super::perf_observers::PerfObserver>),
     // the entries a PerformanceObserver callback is handed
     PerfEntries(Rc<Vec<super::geometry::PerformanceEntry>>),

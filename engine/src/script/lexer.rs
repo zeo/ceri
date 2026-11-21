@@ -55,14 +55,14 @@ fn is_line_terminator(character: char) -> bool {
     matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}')
 }
 
-fn is_identifier_start(character: char) -> bool {
+pub(super) fn is_identifier_start(character: char) -> bool {
     if character.is_ascii() {
         return character.is_ascii_alphabetic() || character == '$' || character == '_';
     }
     in_ranges(ID_START, character as u32)
 }
 
-fn is_identifier_part(character: char) -> bool {
+pub(super) fn is_identifier_part(character: char) -> bool {
     if character.is_ascii() {
         return character.is_ascii_alphanumeric() || character == '$' || character == '_';
     }

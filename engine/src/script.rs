@@ -68,6 +68,7 @@ mod sockets;
 mod streams;
 mod strings;
 mod typed;
+mod urlpattern;
 mod urls;
 mod viewtransitions;
 mod vm;
