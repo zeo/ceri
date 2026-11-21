@@ -45,6 +45,10 @@ pub(crate) const PRESENTATION_ATTRIBUTES: &[&str] = &[
     "color",
     "display",
     "visibility",
+    "font-family",
+    "font-size",
+    "font-style",
+    "font-weight",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -746,6 +750,140 @@ fn length_attribute(element: &Element, name: &str, reference: f32, font_size: f3
         .filter(|value| value.is_finite())
 }
 
+// the first of a list of lengths, as x, y, dx and dy on text may give one per character
+fn first_length(element: &Element, name: &str, reference: f32, font_size: f32) -> Option<f32> {
+    let value = element.attr(name)?;
+    let first = value
+        .split(|character: char| character.is_ascii_whitespace() || character == ',')
+        .find(|part| !part.is_empty())?;
+    parse_number(first)
+        .or_else(|| crate::css::parse_length(first)?.resolve(reference, font_size))
+        .filter(|value| value.is_finite())
+}
+
+// text as svg lays it out without xml:space: line breaks and tabs become spaces, runs of
+// spaces become one, and the ends are trimmed
+fn svg_text_content(document: &Document, node: NodeId) -> String {
+    let mut raw = String::new();
+    for descendant in document.descendants(node) {
+        if let Some(text) = document.text(descendant) {
+            raw.push_str(text);
+        }
+    }
+    let mut text = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        let character = if matches!(character, '\n' | '\r' | '\t') {
+            ' '
+        } else {
+            character
+        };
+        if character == ' ' && (text.is_empty() || text.ends_with(' ')) {
+            continue;
+        }
+        text.push(character);
+    }
+    text.trim_end().to_string()
+}
+
+// a glyph outline in font units as path segments, quadratic curves raised to cubics
+fn append_glyph(
+    path: &mut Vec<Segment>,
+    contours: &[Vec<crate::font::OutlinePoint>],
+    place: impl Fn(f32, f32) -> Point,
+) {
+    for contour in contours {
+        let points = crate::font::resolve_implied_points(contour);
+        if points.len() < 2 {
+            continue;
+        }
+        let at = |point: &crate::font::OutlinePoint| place(point.x, point.y);
+        let mut current = at(&points[0]);
+        path.push(Segment::Move(current));
+        let mut index = 0;
+        while index < points.len() {
+            let point = points[(index + 1) % points.len()];
+            if point.on_curve {
+                current = at(&point);
+                path.push(Segment::Line(current));
+                index += 1;
+                continue;
+            }
+            let control = at(&point);
+            let next = at(&points[(index + 2) % points.len()]);
+            let toward = |from: Point| {
+                (
+                    from.0 + (control.0 - from.0) * 2.0 / 3.0,
+                    from.1 + (control.1 - from.1) * 2.0 / 3.0,
+                )
+            };
+            path.push(Segment::Cubic(toward(current), toward(next), next));
+            current = next;
+            index += 2;
+        }
+        path.push(Segment::Close);
+    }
+}
+
+// a text element drawn as the outlines of its glyphs, from its x and y on the baseline, moved
+// back by half or all of its advance for a middle or end text-anchor
+fn text_path(
+    document: &Document,
+    node: NodeId,
+    element: &Element,
+    style: &Style,
+    font_size: f32,
+    viewport: Point,
+) -> Option<Vec<Segment>> {
+    let text = svg_text_content(document, node);
+    if text.is_empty() {
+        return None;
+    }
+    let fonts = crate::font::active_fonts();
+    let font = crate::layout::font_style(style, font_size);
+    let run = fonts.shape(&text, style.font_family, font_size, font, true);
+    let offset = |name: &str, reference: f32| {
+        first_length(element, name, reference, font_size).unwrap_or(0.0)
+    };
+    let x = offset("x", viewport.0) + offset("dx", viewport.0);
+    let y = offset("y", viewport.1) + offset("dy", viewport.1);
+    let mut anchor = None;
+    let mut current = Some(node);
+    while let Some(id) = current {
+        let Some(holder) = document
+            .element(id)
+            .filter(|held| held.namespace == Namespace::Svg)
+        else {
+            break;
+        };
+        if let Some(value) = holder.attr("text-anchor") {
+            anchor = Some(value.trim().to_ascii_lowercase());
+            break;
+        }
+        current = document.parent(id);
+    }
+    let start = match anchor.as_deref() {
+        Some("middle") => x - run.width / 2.0,
+        Some("end") => x - run.width,
+        _ => x,
+    };
+    let mut path = Vec::new();
+    for glyph in &run.glyphs {
+        let Some(chosen) = &glyph.face else {
+            continue;
+        };
+        let Some(outline) = chosen.face.outline(glyph.glyph) else {
+            continue;
+        };
+        let scale = font_size / chosen.face.units_per_em();
+        let left = start + glyph.x;
+        // font units grow upwards and user space grows downwards
+        append_glyph(&mut path, &outline.contours, |gx, gy| {
+            (left + gx * scale, y - gy * scale)
+        });
+    }
+    (!path.is_empty()).then_some(path)
+}
+
 fn shape_path(element: &Element, viewport: Point, font_size: f32) -> Option<Vec<Segment>> {
     let diagonal = (viewport.0.hypot(viewport.1)) / std::f32::consts::SQRT_2;
     let length = |name: &str, reference: f32| length_attribute(element, name, reference, font_size);
@@ -1090,7 +1228,12 @@ fn render(
             walk.use_owner = owner;
             extent
         }
-        _ => shape_path(element, frame.size, font_size).and_then(|path| {
+        _ => if element.name == "text" {
+            text_path(document, node, element, &style, font_size, frame.size)
+        } else {
+            shape_path(element, frame.size, font_size)
+        }
+        .and_then(|path| {
             let extent = extent(&path, frame.transform);
             walk.outlines.push((
                 walk.use_owner.unwrap_or(node),

@@ -12047,6 +12047,47 @@ mod tests {
     }
 
     #[test]
+    fn svg_text_draws_its_glyph_outlines_on_the_baseline() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fonts/ceri-test.ttf"
+        );
+        let face = crate::font::FontFace::parse(std::fs::read(path).expect("the font should read"))
+            .expect("the font should parse");
+        let fonts = Rc::new(crate::font::FontSet::new(Rc::new(face), None));
+        let _fonts = crate::font::use_fonts(fonts, 1.0);
+        let markup = "<style>* { margin: 0; padding: 0; } svg { display: block; }</style><svg width='300' height='100' font-size='20'><text id='start' x='10' y='50'>Ab \n  cd</text><text id='end' x='200' y='50' text-anchor='end'>Ab cd</text><g text-anchor='middle'><text id='middle' x='100' y='90'>Ab cd</text></g><text id='empty' x='5' y='5'>  </text></svg>";
+        let document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 300.0,
+            },
+        );
+        let index = result.box_index();
+        let measured = |id: &str| {
+            index
+                .get(&document.find_element_by_id(id).expect("element"))
+                .map(|boxes| boxes[0].rect)
+        };
+        let start = measured("start").expect("the text draws");
+        let end = measured("end").expect("the anchored text draws");
+        let middle = measured("middle").expect("the middle text draws");
+        assert!(start.width > 20.0 && start.height > 5.0);
+        assert!(start.x >= 9.0 && start.x < 14.0);
+        // glyphs sit on the baseline, with only descenders below it
+        assert!(start.y < 50.0 && start.y + start.height <= 56.0);
+        // the collapsed spaces leave both runs the same width
+        assert!((end.width - start.width).abs() < 0.5);
+        assert!(end.x + end.width <= 200.5 && end.x + end.width > 195.0);
+        assert!((middle.x + middle.width / 2.0 - 100.0).abs() < 3.0);
+        assert!(measured("empty").is_none());
+    }
+
+    #[test]
     fn a_client_rect_is_the_box_as_its_transforms_leave_it() {
         let markup = "<style>* { margin: 0; padding: 0; } #a { width: 100px; height: 40px; transform: scale(0.5); } #b { width: 20px; height: 20px; }</style><div id='a'><div id='b'></div></div>";
         let document = Document::parse_markup(markup).expect("document should parse");

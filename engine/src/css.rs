@@ -3780,7 +3780,8 @@ fn presentation_hints(element: &Element) -> impl Iterator<Item = (&'static str, 
         .chain(sizes)
         .filter_map(move |name| {
             let value = element.attr(name)?.trim();
-            let pixels = matches!(name, "width" | "height") && value.parse::<f32>().is_ok();
+            let pixels =
+                matches!(name, "width" | "height" | "font-size") && value.parse::<f32>().is_ok();
             Some((
                 name,
                 if pixels {

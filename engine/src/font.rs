@@ -896,7 +896,7 @@ fn flatten_contour(
     }
 }
 
-fn resolve_implied_points(contour: &[OutlinePoint]) -> Vec<OutlinePoint> {
+pub(crate) fn resolve_implied_points(contour: &[OutlinePoint]) -> Vec<OutlinePoint> {
     if contour.is_empty() {
         return Vec::new();
     }
