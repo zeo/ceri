@@ -6252,6 +6252,69 @@ mod tests {
     }
 
     #[test]
+    fn element_animate_moves_a_box_finishes_and_cancels() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>body { margin: 0 } #box { width: 10px; height: 10px }</style>
+            <div id="box"></div><button id="go">go</button><p id="status">idle</p><script>
+                const box = document.getElementById("box");
+                const seen = [];
+                const show = () => (document.getElementById("status").textContent = seen.join("|"));
+                const grow = box.animate([{ width: "10px" }, { width: "110px" }], { duration: 100, fill: "forwards" });
+                seen.push(grow.playState, grow.currentTime, document.getAnimations().length,
+                    box.getAnimations()[0] === grow, grow instanceof Animation, String(grow));
+                grow.onfinish = (event) => (seen.push("finish:" + event.type + ":" + grow.playState + ":" + grow.currentTime), show());
+                grow.finished.then((done) => (seen.push("promise:" + (done === grow)), show()));
+                const fade = box.animate({ opacity: [0, 1] }, 1000);
+                fade.oncancel = () => seen.push("cancel");
+                fade.finished.catch((error) => (seen.push("rejected:" + error.name), show()));
+                document.getElementById("go").addEventListener("click", () => {
+                    fade.pause();
+                    seen.push(fade.playState, fade.currentTime);
+                    fade.cancel();
+                    seen.push(fade.playState, fade.currentTime, document.getAnimations().length);
+                    show();
+                });
+                show();
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 300.0,
+            height: 200.0,
+        };
+        let width = |browser: &Browser| {
+            let layout = browser.layout(viewport).expect("layout");
+            find_box(&layout.root, "div").expect("box").rect.width
+        };
+        assert_eq!(width(&browser), 10.0);
+        assert_eq!(
+            element_text(&browser, "status"),
+            "running|0|1|true|true|[object Animation]"
+        );
+        browser.advance_time(50).expect("time should pass");
+        assert_eq!(width(&browser), 60.0);
+        browser.advance_time(60).expect("time should pass");
+        // held at its last keyframe, as fill forwards asks
+        assert_eq!(width(&browser), 110.0);
+        assert_eq!(
+            element_text(&browser, "status"),
+            "running|0|1|true|true|[object Animation]|finish:finish:finished:100|promise:true"
+        );
+        browser
+            .click_id("go")
+            .expect("the button should take the click");
+        browser.advance_time(1).expect("time should pass");
+        assert!(
+            element_text(&browser, "status")
+                .ends_with("|paused|110|cancel|idle||1|rejected:AbortError"),
+            "{}",
+            element_text(&browser, "status")
+        );
+    }
+
+    #[test]
     fn screen_reports_the_display_or_the_viewport_until_one_is_known() {
         let mut browser = Browser::new(bundle(
             r#"<button id="go">read</button><p id="status">idle</p><script>

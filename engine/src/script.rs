@@ -1,3 +1,4 @@
+mod animations;
 mod arrays;
 mod ast;
 mod audio;
@@ -357,6 +358,11 @@ enum Builtin {
     Btoa,
     CreateImageBitmap,
     WindowPostMessage,
+    // a function that hands back the same value each call
+    ReturnValue(Rc<Value>),
+    ElementAnimate(ElementHandle),
+    ElementGetAnimations(ElementHandle),
+    DocumentGetAnimations,
     // an ImageBitmap's close, which carries its pixels until it is called
     ImageBitmapClose(canvas::ImageBitmapHandle),
     SetTimeout,
@@ -609,6 +615,7 @@ pub struct ScriptRuntime {
     channels: broadcast::Channels,
     readers: filereader::Readers,
     ports: messaging::Ports,
+    animations: animations::Animations,
     audio: audio::AudioState,
     // decoded images by URL, shared with layout so a picture is decoded once per document
     images: images::ImageCache,
@@ -1717,6 +1724,7 @@ impl ScriptRuntime {
             channels: broadcast::Channels::default(),
             readers: filereader::Readers::default(),
             ports: messaging::Ports::default(),
+            animations: animations::Animations::default(),
             audio: audio::AudioState::default(),
             images: RefCell::default(),
             object_urls: HashMap::new(),
@@ -3160,6 +3168,7 @@ impl ScriptRuntime {
                     )
                 })
                 .collect(),
+            script_animations: Rc::new(self.animation_snapshot()),
             ..StyleState::default()
         };
         for (control, checked) in &self.control_checked {
@@ -3873,6 +3882,7 @@ impl ScriptRuntime {
                 "adoptNode" => Ok(Value::Builtin(Builtin::DocumentAdoptNode)),
                 "createRange" => Ok(Value::Builtin(Builtin::DocumentCreateRange)),
                 "createTreeWalker" => Ok(Value::Builtin(Builtin::DocumentCreateTreeWalker)),
+                "getAnimations" => Ok(Value::Builtin(Builtin::DocumentGetAnimations)),
                 "createNodeIterator" => Ok(Value::Builtin(Builtin::DocumentCreateNodeIterator)),
                 "getSelection" => Ok(Value::Builtin(Builtin::DocumentGetSelection)),
                 "documentElement" => Ok(self
@@ -4200,6 +4210,8 @@ impl ScriptRuntime {
                     "removeChild" => bound(Builtin::ElementRemoveChild),
                     "insertBefore" => bound(Builtin::ElementInsertBefore),
                     "remove" => bound(Builtin::ElementRemove),
+                    "animate" => bound(Builtin::ElementAnimate),
+                    "getAnimations" => bound(Builtin::ElementGetAnimations),
                     "setAttribute" => bound(Builtin::ElementSetAttribute),
                     "removeAttribute" => bound(Builtin::ElementRemoveAttribute),
                     "getAttribute" => bound(Builtin::ElementGetAttribute),
@@ -8318,6 +8330,10 @@ impl ScriptRuntime {
             }
             Builtin::CreateImageBitmap => self.create_image_bitmap(&arguments),
             Builtin::WindowPostMessage => self.post_window_message(&arguments),
+            Builtin::ReturnValue(value) => Ok((*value).clone()),
+            Builtin::ElementAnimate(handle) => self.animate_element(handle.id, &arguments),
+            Builtin::ElementGetAnimations(handle) => Ok(self.animations_of(Some(handle.id))),
+            Builtin::DocumentGetAnimations => Ok(self.animations_of(None)),
             Builtin::ImageBitmapClose(held) => {
                 held.borrow_mut().take();
                 Ok(Value::Undefined)

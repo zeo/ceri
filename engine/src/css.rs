@@ -1339,6 +1339,8 @@ pub(crate) struct StyleState {
     pub(crate) image_sizes: BTreeMap<NodeId, (u32, u32)>,
     // when each element's current animation began, on the page clock
     pub(crate) animation_starts: BTreeMap<NodeId, u64>,
+    // the animations script made with Element.animate, oldest first, on each element
+    pub(crate) script_animations: Rc<BTreeMap<NodeId, Vec<ScriptAnimation>>>,
     // query containers and their content sizes from the last layout
     pub(crate) container_sizes: BTreeMap<NodeId, crate::media::ContainerSize>,
     // modal dialogs above the page, bottom first
@@ -2187,7 +2189,7 @@ fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, progress: f32) -> f32 {
     curve(y1, y2, t)
 }
 
-fn parse_timing(value: &str) -> Option<Timing> {
+pub(crate) fn parse_timing(value: &str) -> Option<Timing> {
     let lowered = value.trim().to_ascii_lowercase();
     let arguments = |name: &str| {
         lowered
@@ -2395,6 +2397,166 @@ impl Animation {
         let change = remaining.map_or(change, |remaining| change.min(remaining));
         Some(change.ceil() as u64)
     }
+}
+
+// an animation script made with Element.animate, as style sampling needs it
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ScriptAnimation {
+    // offsets from 0 to 1, each with the css properties and values it sets
+    pub(crate) keyframes: Vec<(f32, Vec<(String, String)>)>,
+    pub(crate) timing: ScriptTiming,
+    pub(crate) clock: ScriptClock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScriptTiming {
+    pub(crate) delay: f64,
+    pub(crate) duration: f64,
+    // infinity for an animation that never ends
+    pub(crate) iterations: f64,
+    pub(crate) direction: ScriptDirection,
+    pub(crate) easing: Timing,
+    pub(crate) fill_backwards: bool,
+    pub(crate) fill_forwards: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScriptDirection {
+    Normal,
+    Reverse,
+    Alternate,
+    AlternateReverse,
+}
+
+// a running animation counts its local time from a page time, a paused one holds it
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ScriptClock {
+    Running(u64),
+    Held(f64),
+}
+
+impl ScriptTiming {
+    pub(crate) fn active_duration(&self) -> f64 {
+        if self.duration <= 0.0 || self.iterations <= 0.0 {
+            0.0
+        } else {
+            self.duration * self.iterations
+        }
+    }
+
+    // the eased progress through the keyframes at a local time, none where the animation
+    // has no effect
+    pub(crate) fn progress(&self, local: f64) -> Option<f32> {
+        let active = self.active_duration();
+        let (iteration, progress) = if local < self.delay {
+            if !self.fill_backwards {
+                return None;
+            }
+            (0.0, 0.0)
+        } else if local >= self.delay + active {
+            if !self.fill_forwards {
+                return None;
+            }
+            // an animation ends at the end of its last iteration, not the start of the next
+            let iterations = self.iterations.max(0.0);
+            match iterations.fract() {
+                0.0 if iterations > 0.0 => (iterations - 1.0, 1.0),
+                fraction => (iterations.floor(), fraction),
+            }
+        } else if self.duration <= 0.0 {
+            (0.0, 1.0)
+        } else {
+            let elapsed = local - self.delay;
+            (
+                (elapsed / self.duration).floor(),
+                (elapsed % self.duration) / self.duration,
+            )
+        };
+        let odd = iteration as u64 % 2 == 1;
+        let forward = match self.direction {
+            ScriptDirection::Normal => true,
+            ScriptDirection::Reverse => false,
+            ScriptDirection::Alternate => !odd,
+            ScriptDirection::AlternateReverse => odd,
+        };
+        let progress = if forward { progress } else { 1.0 - progress };
+        Some(self.easing.apply(progress as f32))
+    }
+}
+
+impl ScriptAnimation {
+    pub(crate) fn local_time(&self, clock: u64) -> f64 {
+        match self.clock {
+            ScriptClock::Running(start) => clock.saturating_sub(start) as f64,
+            ScriptClock::Held(time) => time,
+        }
+    }
+
+    // the values it sets at a page time, and how soon they change again while it runs
+    fn sample(&self, clock: u64) -> (Vec<(String, String)>, Option<u64>) {
+        let local = self.local_time(clock);
+        let wake = match self.clock {
+            ScriptClock::Held(_) => None,
+            ScriptClock::Running(_) if local < self.timing.delay => {
+                Some((self.timing.delay - local).ceil() as u64)
+            }
+            ScriptClock::Running(_)
+                if local < self.timing.delay + self.timing.active_duration() =>
+            {
+                Some(0)
+            }
+            ScriptClock::Running(_) => None,
+        };
+        let Some(progress) = self.timing.progress(local) else {
+            return (Vec::new(), wake);
+        };
+        let mut properties: Vec<&str> = Vec::new();
+        for (_, values) in &self.keyframes {
+            for (property, _) in values {
+                if !properties.contains(&property.as_str()) {
+                    properties.push(property);
+                }
+            }
+        }
+        let values = properties
+            .into_iter()
+            .filter_map(|property| {
+                let stops: Vec<(f32, &str)> = self
+                    .keyframes
+                    .iter()
+                    .filter_map(|(offset, values)| {
+                        values
+                            .iter()
+                            .find(|(name, _)| name == property)
+                            .map(|(_, value)| (*offset, value.as_str()))
+                    })
+                    .collect();
+                let (first, last) = (stops.first()?, stops.last()?);
+                let value = if progress <= first.0 {
+                    first.1.to_string()
+                } else if progress >= last.0 {
+                    last.1.to_string()
+                } else {
+                    let at = stops.windows(2).find(|pair| progress <= pair[1].0)?;
+                    let (from, to) = (at[0], at[1]);
+                    let span = (to.0 - from.0).max(f32::EPSILON);
+                    let local = (progress - from.0) / span;
+                    crate::interpolate::interpolate_value(property, from.1, to.1, local)
+                        .unwrap_or_else(|| if local < 0.5 { from.1 } else { to.1 }.to_string())
+                };
+                Some((property.to_string(), value))
+            })
+            .collect();
+        (values, wake)
+    }
+}
+
+// the values a script animation sets at a page time
+pub(crate) fn sample_script_values(
+    animation: &ScriptAnimation,
+    clock: u64,
+) -> Vec<(String, String)> {
+    animation.sample(clock).0
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2885,6 +3047,21 @@ impl Stylesheet {
                 apply_declaration(&mut style, &property, &value);
             }
         }
+        // script animations come above css ones, the latest made on top
+        if let Some(animations) = own.and_then(|node| state.script_animations.get(&node)) {
+            for animation in animations {
+                let (values, wake) = animation.sample(state.clock);
+                if let Some(wake) = wake {
+                    note_motion(own, values.iter().map(|(property, _)| property.as_str()));
+                    note_animation_wake(wake);
+                }
+                for (property, value) in values {
+                    if let Some(value) = resolve_custom_value(&value, custom_properties) {
+                        apply_declaration(&mut style, &property, &value);
+                    }
+                }
+            }
+        }
         // an image with no declared size takes its natural size; with one side
         // declared, the other follows the natural ratio
         if let Some(&(width, height)) = own.and_then(|node| state.image_sizes.get(&node))
@@ -3294,6 +3471,9 @@ impl Stylesheet {
         let Some(element) = document.element(node) else {
             return false;
         };
+        if state.script_animations.contains_key(&node) {
+            return true;
+        }
         if !document.style_blocked(node)
             && element
                 .attr("style")

@@ -236,6 +236,8 @@ static INTERFACES: &[Interface] = &[
             ("slot", Attr("slot")),
             ("getBoundingClientRect", Method(0)),
             ("getClientRects", Method(0)),
+            ("animate", Method(1)),
+            ("getAnimations", Method(0)),
             ("checkVisibility", Method(0)),
             ("scrollIntoView", Method(0)),
             ("setPointerCapture", Method(1)),
@@ -352,6 +354,7 @@ static INTERFACES: &[Interface] = &[
             ("createEvent", Method(1)),
             ("createRange", Method(0)),
             ("createTreeWalker", Method(1)),
+            ("getAnimations", Method(0)),
             ("createNodeIterator", Method(1)),
             ("getSelection", Method(0)),
             ("elementFromPoint", Method(2)),
@@ -1103,7 +1106,7 @@ impl ScriptRuntime {
                 "getElementById" | "querySelector" | "querySelectorAll" | "createElement"
                 | "createTextNode" | "createRange" | "getSelection" | "documentElement"
                 | "activeElement" | "importNode" | "adoptNode" | "createTreeWalker"
-                | "createNodeIterator",
+                | "createNodeIterator" | "getAnimations",
             ) => Value::Document,
             _ => Value::Element(handle),
         };
