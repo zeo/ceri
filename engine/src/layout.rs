@@ -3216,6 +3216,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
                             parent,
                             containing_width,
                             own_width: true,
+                            definite: true,
                         },
                         minimum,
                     )
@@ -4833,6 +4834,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                             parent: child_parent,
                             containing_width: content_width,
                             own_width: false,
+                            definite: true,
                         },
                         minimum,
                     ) - extras)
@@ -5461,7 +5463,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         auto_margin_alignment(item.style.margin.top, item.style.margin.bottom)
             .unwrap_or(item.style.align_self.unwrap_or(style.align_items))
     };
-    // an item's outer min-content and max-content widths
+    // an item's outer min-content and max-content widths; its grid area is what the tracks
+    // being sized make, so a percentage width there counts as auto
     let intrinsic = |item: &GridItem<'_>| -> (f32, f32) {
         match &item.source {
             FlexSource::Text(pieces) => text_intrinsic_widths(pieces, text_context),
@@ -5475,6 +5478,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                             parent: child_parent,
                             containing_width: content_width,
                             own_width: true,
+                            definite: false,
                         },
                         minimum,
                     )
@@ -6130,6 +6134,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 // a width in percent is a share of the table, set once the table is as wide
                 // as it will be, so the cell counts by its content alone
                 own_width: !cell.style.width.has_percent(),
+                definite: true,
             },
             minimum,
         )
@@ -6928,6 +6933,9 @@ struct MaxContentInput<'a> {
     containing_width: f32,
     // false measures what the content needs, ignoring the element's own width
     own_width: bool,
+    // whether containing_width is the box's own containing block; inside another box's
+    // measurement it is not, and a percentage width there is cyclic and counts as auto
+    definite: bool,
 }
 
 // the widest the element can be before wrapping, used for auto grid tracks
@@ -6939,6 +6947,7 @@ fn max_content_width(input: MaxContentInput<'_>) -> f32 {
 #[derive(Clone, Copy, PartialEq)]
 struct IntrinsicInputs {
     containing_width: u32,
+    definite: bool,
     font_size: u32,
     weight: FontWeight,
     text: InheritedText,
@@ -6959,6 +6968,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
     );
     let inputs = IntrinsicInputs {
         containing_width: input.containing_width.to_bits(),
+        definite: input.definite,
         font_size: input.parent.font_size.to_bits(),
         weight: input.parent.weight,
         text: input.parent.text,
@@ -7024,6 +7034,7 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         parent,
         containing_width,
         own_width,
+        definite,
     } = input;
     let style = stylesheet.style_for(node.style_context(parent, style_state));
     if style.display == Display::None {
@@ -7059,15 +7070,14 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
             width
         }
     };
+    let sized = |length: Length| {
+        (definite || !length.has_percent())
+            .then(|| length.resolve(containing_width, font_size))
+            .flatten()
+    };
     let bounds = (
-        style
-            .min_width
-            .resolve(containing_width, font_size)
-            .map_or(0.0, content_box),
-        style
-            .max_width
-            .resolve(containing_width, font_size)
-            .map_or(f32::INFINITY, content_box),
+        sized(style.min_width).map_or(0.0, content_box),
+        sized(style.max_width).map_or(f32::INFINITY, content_box),
     );
     let bounded = |width: f32| {
         if own_width {
@@ -7076,7 +7086,7 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
             width
         }
     };
-    if own_width && let Some(width) = style.width.resolve(containing_width, font_size) {
+    if own_width && let Some(width) = sized(style.width) {
         return extras + bounded(content_box(width).max(0.0));
     }
     if let (Some(width), _) = control_content_size(
@@ -7153,6 +7163,7 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
                     parent: child_parent,
                     containing_width,
                     own_width: true,
+                    definite: false,
                 },
                 minimum,
             );
@@ -7232,6 +7243,7 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
                         parent: child_parent,
                         containing_width,
                         own_width: true,
+                        definite: false,
                     },
                     minimum,
                 );
@@ -8893,6 +8905,7 @@ fn append_atomic(
                 parent,
                 containing_width: context.content_width,
                 own_width: true,
+                definite: true,
             })
             .min(context.content_width)
         } else {
@@ -9498,6 +9511,7 @@ fn place_float(input: InlineElementInput<'_>, style: &Style, line: &mut InlineLi
                     parent,
                     containing_width: content_width,
                     own_width: true,
+                    definite: true,
                 },
                 minimum,
             )
@@ -10443,6 +10457,46 @@ mod tests {
         // the builtin cell is 12px at a 16px font, and tracking adds 2px per character
         assert_eq!(runs[0].width, 2.0 * 12.0 + 2.0 * 2.0);
         assert_eq!(runs[1].width, 3.0 * 12.0 + 3.0 * 2.0);
+    }
+
+    #[test]
+    fn a_percentage_width_inside_a_measured_box_counts_as_auto() {
+        let document = Document::parse_markup(concat!(
+            "<div class='card'><footer><button>Block</button><button>Allow</button></footer></div>",
+            "<div class='card'><nav><button>Block</button></nav></div>",
+        ))
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(concat!(
+            ".card { width: 420px; display: grid }",
+            "footer { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 0 16px }",
+            "nav { display: flex } button { width: 100% }",
+        ))
+        .expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 800.0,
+                height: 200.0,
+            },
+        );
+        let footer = find_box(&layout.root, "footer").expect("a footer box");
+        assert_eq!(
+            footer.rect.width, 420.0,
+            "the footer fills the card's one column"
+        );
+        let nav = find_box(&layout.root, "nav").expect("a nav box");
+        assert_eq!(nav.rect.width, 420.0);
+        let buttons: Vec<(f32, f32)> = footer
+            .children
+            .iter()
+            .map(|button| (button.rect.x, button.rect.width))
+            .collect();
+        assert_eq!(
+            buttons,
+            [(16.0, 190.0), (214.0, 190.0)],
+            "each button fills its half"
+        );
     }
 
     #[test]
