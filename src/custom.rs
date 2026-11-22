@@ -870,16 +870,16 @@ fn app_icon_source(assets: &AssetOrigin) -> Option<Vec<u8>> {
         "/favicon.svg",
         "/favicon.png",
     ] {
-        let route = assets
-            .route(
-                &format!("{}{candidate}", ceri_engine::APP_ORIGIN),
-                RequestTarget::Subresource,
-            )
-            .ok()?;
-        let AssetRoute::File(asset) = route else {
+        // a candidate that is missing or unreadable gives way to the next
+        let Ok(AssetRoute::File(asset)) = assets.route(
+            &format!("{}{candidate}", ceri_engine::APP_ORIGIN),
+            RequestTarget::Subresource,
+        ) else {
             continue;
         };
-        let source = asset.read().ok()?;
+        let Ok(source) = asset.read() else {
+            continue;
+        };
         if ceri_engine::rasterize_icon(&source, 16).is_some() {
             return Some(source);
         }

@@ -2,7 +2,7 @@
   "identifier": "Ceri",
   "name": "Ceri",
   "binary": "ceri",
-  "icons": ["web/favicon.svg"],
+  "icons": ["icons/ceri.ico", "icons/ceri-256.png"],
   "resources": {
     "web": "assets/web",
     "sdk": "assets/sdk"
