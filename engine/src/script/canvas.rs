@@ -8,6 +8,7 @@ use crate::dom::Namespace;
 use crate::image::Image;
 use crate::layout::ImageLayer;
 use crate::svg::{Affine, Coverage, IDENTITY, LineCap, LineJoin, Pen, Segment};
+use std::cell::Cell;
 
 type Rect4 = (f32, f32, f32, f32);
 // a drawImage source's pixels and the width and height script measures it in
@@ -44,6 +45,8 @@ const METHODS: &[&str] = &[
     "getLineDash",
     "createLinearGradient",
     "createRadialGradient",
+    "createConicGradient",
+    "createPattern",
     "fillText",
     "strokeText",
     "measureText",
@@ -95,11 +98,78 @@ enum Sampling {
 // a gradient a context made: its line or its two circles in the user space of whatever
 // later paints with it, and the stops script adds
 pub(super) struct Gradient {
-    // the start point and radius, then the end point and radius; a line has no radii
+    // the start point and radius, then the end point and radius; a line has no radii, and a
+    // conic gradient keeps its centre and start angle in the first
     from: (f32, f32, f32),
     to: (f32, f32, f32),
-    radial: bool,
+    shape: Shape,
     stops: Vec<(f32, Color)>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    Linear,
+    Radial,
+    Conic,
+}
+
+// a CanvasPattern: the picture with alpha multiplied in, which axes repeat, and the matrix
+// setTransform gave from pattern space to the user space of what paints with it
+pub(super) struct Pattern {
+    bitmap: Bitmap,
+    repeat: (bool, bool),
+    transform: Cell<[f32; 6]>,
+}
+
+pub(super) type PatternHandle = Rc<Pattern>;
+
+impl Pattern {
+    // the pixel the pattern puts at a point of user space, alpha already multiplied in,
+    // filtered between its four nearest texels when smoothing is on; transparent past the
+    // picture along an axis that does not repeat
+    fn pixel_at(&self, point: (f32, f32), smooth: bool) -> Option<[u8; 4]> {
+        let (width, height) = (self.bitmap.width as i64, self.bitmap.height as i64);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let (x, y) = crate::svg::map(crate::svg::invert(self.transform.get())?, point);
+        let place = |at: i64, size: i64, repeat: bool| -> Option<i64> {
+            if repeat {
+                Some(at.rem_euclid(size))
+            } else {
+                (0..size).contains(&at).then_some(at)
+            }
+        };
+        let texel = |column: i64, row: i64| -> Option<[u8; 4]> {
+            let column = place(column, width, self.repeat.0)?;
+            let row = place(row, height, self.repeat.1)?;
+            Some(self.bitmap.pixels[(row * width + column) as usize])
+        };
+        if !smooth {
+            return texel(x.floor() as i64, y.floor() as i64);
+        }
+        // skia's legacy bilinear, as drawImage samples: 16.16 fixed point with four bits of
+        // subpixel weight
+        let (fixed_x, fixed_y) = (Bitmap::fixed(x) - (1 << 15), Bitmap::fixed(y) - (1 << 15));
+        let (left, top) = (fixed_x >> 16, fixed_y >> 16);
+        let (sub_x, sub_y) = (((fixed_x >> 12) & 15) as u32, ((fixed_y >> 12) & 15) as u32);
+        let corners = [
+            (texel(left, top), (16 - sub_x) * (16 - sub_y)),
+            (texel(left + 1, top), sub_x * (16 - sub_y)),
+            (texel(left, top + 1), (16 - sub_x) * sub_y),
+            (texel(left + 1, top + 1), sub_x * sub_y),
+        ];
+        if corners.iter().all(|(found, _)| found.is_none()) {
+            return None;
+        }
+        Some(std::array::from_fn(|channel| {
+            let total: u32 = corners
+                .iter()
+                .map(|(found, weight)| u32::from(found.unwrap_or([0; 4])[channel]) * weight)
+                .sum();
+            (total >> 8) as u8
+        }))
+    }
 }
 
 pub(super) type GradientHandle = Rc<RefCell<Gradient>>;
@@ -111,7 +181,12 @@ impl Gradient {
         let (first, last) = (self.stops.first()?, self.stops.last()?);
         let (dx, dy) = (self.to.0 - self.from.0, self.to.1 - self.from.1);
         let (px, py) = (point.0 - self.from.0, point.1 - self.from.1);
-        let at = if self.radial {
+        let at = if self.shape == Shape::Conic {
+            // the angle from the start angle, clockwise as the y axis runs down, in (0, 1] so
+            // the seam itself takes the last stop as skia's sweep does
+            let turn = (py.atan2(px) - self.from.2) / std::f32::consts::TAU;
+            turn - turn.ceil() + 1.0
+        } else if self.shape == Shape::Radial {
             // the largest t whose circle, between the two, passes through the point
             let dr = self.to.2 - self.from.2;
             let a = dx * dx + dy * dy - dr * dr;
@@ -166,8 +241,9 @@ impl Gradient {
 #[derive(Clone)]
 enum Paint {
     Color(Color),
-    // the gradient, and the object script holds it by
+    // the gradient or pattern, and the object script holds it by
     Gradient(GradientHandle, Value),
+    Pattern(PatternHandle, Value),
 }
 
 // how what is drawn meets what is there; each of these changes only where the shape lands
@@ -768,7 +844,7 @@ impl CanvasContextData {
         // a paint that is itself see-through casts a fainter shadow
         let strength = match paint {
             Paint::Color(color) => f32::from(color.alpha) / 255.0,
-            Paint::Gradient(..) => 1.0,
+            Paint::Gradient(..) | Paint::Pattern(..) => 1.0,
         };
         let (wide, tall) = (
             coverage.width as i32,
@@ -841,6 +917,7 @@ impl CanvasContextData {
         };
         // a gradient is laid out in the user space of the moment it paints
         let back = inverse(self.state.transform);
+        let smooth = self.smoothing_enabled;
         let alpha = self.state.alpha;
         let composite = self.state.composite;
         let clip = self.state.clip.clone();
@@ -854,23 +931,36 @@ impl CanvasContextData {
             if amount == 0 {
                 continue;
             }
-            let color = match paint {
-                Paint::Color(color) => *color,
+            let premultiplied = match paint {
+                Paint::Color(color) => {
+                    premultiply([color.red, color.green, color.blue, color.alpha])
+                }
                 Paint::Gradient(gradient, _) => {
                     let Some(back) = back else {
                         return;
                     };
                     let point = crate::svg::map(back, (x as f32 + 0.5, y as f32 + 0.5));
                     match gradient.borrow().color_at(point) {
-                        Some(color) => color,
+                        Some(color) => {
+                            premultiply([color.red, color.green, color.blue, color.alpha])
+                        }
+                        None => continue,
+                    }
+                }
+                Paint::Pattern(pattern, _) => {
+                    let Some(back) = back else {
+                        return;
+                    };
+                    match pattern.pixel_at(
+                        crate::svg::map(back, (x as f32 + 0.5, y as f32 + 0.5)),
+                        smooth,
+                    ) {
+                        Some(pixel) => pixel,
                         None => continue,
                     }
                 }
             };
-            let source = scale(
-                premultiply([color.red, color.green, color.blue, color.alpha]),
-                amount,
-            );
+            let source = scale(premultiplied, amount);
             let pixel = &mut self.bitmap.pixels[at];
             if composite == Composite::SourceOver {
                 source_over(pixel, source);
@@ -1650,7 +1740,7 @@ impl ScriptRuntime {
                 };
                 match paint {
                     Paint::Color(color) => Value::String(color_css(*color).into()),
-                    Paint::Gradient(_, object) => object.clone(),
+                    Paint::Gradient(_, object) | Paint::Pattern(_, object) => object.clone(),
                 }
             }
             "lineDashOffset" => Value::Number(context.borrow().state.dash_offset.into()),
@@ -1873,17 +1963,93 @@ impl ScriptRuntime {
         if !matches!(property, "fillStyle" | "strokeStyle") || !matches!(value, Value::Object(_)) {
             return false;
         }
-        let Ok(Value::Builtin(Builtin::CanvasGradientAddColorStop(gradient))) =
-            self.get_property(value, "addColorStop")
-        else {
-            return false;
+        let paint = match (
+            self.get_property(value, "addColorStop"),
+            self.get_property(value, "setTransform"),
+        ) {
+            (Ok(Value::Builtin(Builtin::CanvasGradientAddColorStop(gradient))), _) => {
+                Paint::Gradient(gradient, value.clone())
+            }
+            (_, Ok(Value::Builtin(Builtin::CanvasPatternSetTransform(pattern)))) => {
+                Paint::Pattern(pattern, value.clone())
+            }
+            _ => return false,
         };
         let mut context = context.borrow_mut();
         match property {
-            "fillStyle" => context.state.fill_style = Paint::Gradient(gradient, value.clone()),
-            _ => context.state.stroke_style = Paint::Gradient(gradient, value.clone()),
+            "fillStyle" => context.state.fill_style = paint,
+            _ => context.state.stroke_style = paint,
         }
         true
+    }
+
+    // createPattern(image, repetition): null while the image has nothing to show
+    fn create_pattern(&mut self, arguments: &[Value]) -> Result<Value, ScriptError> {
+        if arguments.len() < 2 {
+            return Err(self.type_error(format!(
+                "Failed to execute 'createPattern' on 'CanvasRenderingContext2D': 2 arguments required, but only {} present.",
+                arguments.len()
+            )));
+        }
+        let repetition = match &arguments[1] {
+            Value::Null => String::new(),
+            value => self.coerce_string(value.clone())?,
+        };
+        let repeat = match repetition.as_str() {
+            "" | "repeat" => (true, true),
+            "repeat-x" => (true, false),
+            "repeat-y" => (false, true),
+            "no-repeat" => (false, false),
+            _ => {
+                return Err(self.throw_value(dom_exception(
+                    "SyntaxError",
+                    &format!("Failed to execute 'createPattern' on 'CanvasRenderingContext2D': The provided type ('{repetition}') is not one of 'repeat', 'no-repeat', 'repeat-x', or 'repeat-y'."),
+                )));
+            }
+        };
+        let Some((bitmap, _)) = self.canvas_source(&arguments[0])? else {
+            return Ok(Value::Null);
+        };
+        let pattern = Rc::new(Pattern {
+            bitmap,
+            repeat,
+            transform: Cell::new(IDENTITY),
+        });
+        Ok(self.host_object(pattern_object(pattern), "CanvasPattern"))
+    }
+
+    // CanvasPattern.setTransform(matrix): a DOMMatrix2DInit, the identity when left out
+    pub(super) fn set_pattern_transform(
+        &mut self,
+        pattern: &PatternHandle,
+        arguments: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let mut matrix = IDENTITY;
+        if let Some(init @ Value::Object(_)) = arguments.first() {
+            for (index, (short, long)) in [
+                ("a", "m11"),
+                ("b", "m12"),
+                ("c", "m21"),
+                ("d", "m22"),
+                ("e", "m41"),
+                ("f", "m42"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let value = match self.get_property(init, short)? {
+                    Value::Undefined => self.get_property(init, long)?,
+                    value => value,
+                };
+                if !matches!(value, Value::Undefined) {
+                    matrix[index] = self.coerce_number(value)? as f32;
+                }
+            }
+        }
+        if matrix.iter().all(|value| value.is_finite()) {
+            pattern.transform.set(matrix);
+        }
+        Ok(Value::Undefined)
     }
 
     // addColorStop(offset, colour): stops stay in offset order, a later one after its equals
@@ -2239,13 +2405,33 @@ impl ScriptRuntime {
                     ),
                     false => ((numbers[0], numbers[1], 0.0), (numbers[2], numbers[3], 0.0)),
                 };
-                Ok(gradient_object(Rc::new(RefCell::new(Gradient {
-                    from,
-                    to,
-                    radial,
-                    stops: Vec::new(),
-                }))))
+                Ok(self.host_object(
+                    gradient_object(Rc::new(RefCell::new(Gradient {
+                        from,
+                        to,
+                        shape: if radial { Shape::Radial } else { Shape::Linear },
+                        stops: Vec::new(),
+                    }))),
+                    "CanvasGradient",
+                ))
             }
+            "createConicGradient" => {
+                let Some(numbers) = self.canvas_numbers(name, arguments, 3)? else {
+                    return Err(self.type_error(format!(
+                        "Failed to execute '{name}' on 'CanvasRenderingContext2D': The provided double value is non-finite."
+                    )));
+                };
+                Ok(self.host_object(
+                    gradient_object(Rc::new(RefCell::new(Gradient {
+                        from: (numbers[1], numbers[2], numbers[0]),
+                        to: (numbers[1], numbers[2], 0.0),
+                        shape: Shape::Conic,
+                        stops: Vec::new(),
+                    }))),
+                    "CanvasGradient",
+                ))
+            }
+            "createPattern" => self.create_pattern(arguments),
             "drawImage" => {
                 self.draw_canvas_image(context, arguments)?;
                 Ok(Value::Undefined)
@@ -2796,6 +2982,14 @@ impl ScriptRuntime {
     }
 }
 
+// a CanvasPattern as script holds it: its one method, which carries the pattern
+fn pattern_object(pattern: PatternHandle) -> Value {
+    plain_object([(
+        "setTransform".to_string(),
+        Value::Builtin(Builtin::CanvasPatternSetTransform(pattern)),
+    )])
+}
+
 // a CanvasGradient as script holds it: its one method, which carries the gradient
 fn gradient_object(gradient: GradientHandle) -> Value {
     plain_object([(
@@ -3088,6 +3282,69 @@ mod tests {
         assert_eq!(
             document.text_content(status),
             "6,6,6,255 249,249,249,255 object true 4/4 4/4 255,0,0,255 0,0,0,0 255,0,0,255 0,255,0,255 0,0,0,0 true 64,64,64,255 multiply 237,237,237,255 12,12,12,255 IndexSizeError"
+        );
+    }
+
+    #[test]
+    fn patterns_tile_and_conic_gradients_turn_around_their_centre() {
+        let document = crate::dom::Document::parse(
+            r#"<html><body><canvas id="c" width="40" height="10"></canvas><p id="status"></p></body></html>"#,
+        )
+        .expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const c = document.getElementById("c").getContext("2d");
+                const at = (x, y) => [...c.getImageData(x, y, 1, 1).data].join(",");
+                const seen = [];
+                const tile = document.createElement("canvas");
+                tile.width = 2;
+                tile.height = 1;
+                const t = tile.getContext("2d");
+                t.fillStyle = "#f00";
+                t.fillRect(0, 0, 1, 1);
+                t.fillStyle = "#00f";
+                t.fillRect(1, 0, 1, 1);
+                const repeat = c.createPattern(tile, null);
+                seen.push(String(repeat), repeat instanceof CanvasPattern);
+                c.fillStyle = repeat;
+                c.fillRect(0, 0, 4, 2);
+                seen.push(at(0, 0), at(1, 1), at(2, 1), c.fillStyle === repeat);
+                c.fillStyle = c.createPattern(tile, "no-repeat");
+                c.translate(6, 0);
+                c.fillRect(0, 0, 4, 2);
+                c.setTransform(1, 0, 0, 1, 0, 0);
+                seen.push(at(7, 0), at(9, 0));
+                const scaled = c.createPattern(tile, "repeat-x");
+                scaled.setTransform({ a: 2, d: 1 });
+                c.fillStyle = scaled;
+                c.imageSmoothingEnabled = false;
+                c.fillRect(12, 0, 4, 2);
+                seen.push(at(13, 0), at(14, 0), at(13, 1));
+                try {
+                    c.createPattern(tile, "diagonal");
+                } catch (error) {
+                    seen.push(error.name);
+                }
+                const turn = c.createConicGradient(0, 30, 5);
+                turn.addColorStop(0, "#f00");
+                turn.addColorStop(1, "#00f");
+                seen.push(String(turn));
+                c.fillStyle = turn;
+                c.fillRect(20, 0, 20, 10);
+                // right of the centre is the start, left of it half way round
+                seen.push(at(38, 5), at(21, 5));
+                document.getElementById("status").textContent = seen.join(" ");
+                "##,
+            )
+            .expect("canvas drawing should run");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.text_content(status),
+            "[object CanvasPattern] true 255,0,0,255 0,0,255,255 255,0,0,255 true 0,0,255,255 0,0,0,0 255,0,0,255 0,0,255,255 0,0,0,0 SyntaxError [object CanvasGradient] 253,0,2,255 130,0,125,255"
         );
     }
 

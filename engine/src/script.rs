@@ -588,6 +588,7 @@ enum Builtin {
     AbortSignalAddEventListener(AbortSignalHandle),
     AbortSignalThrowIfAborted(AbortSignalHandle),
     CanvasGradientAddColorStop(canvas::GradientHandle),
+    CanvasPatternSetTransform(canvas::PatternHandle),
     ClipboardGetData(clipboard::TransferHandle),
     ClipboardSetData(clipboard::TransferHandle),
     ClipboardClearData(clipboard::TransferHandle),
@@ -9151,6 +9152,9 @@ impl ScriptRuntime {
             | Builtin::ClipboardWriteFailed(_)) => self.call_clipboard_member(builtin, arguments),
             Builtin::CanvasGradientAddColorStop(gradient) => {
                 self.add_color_stop(&gradient, &arguments)
+            }
+            Builtin::CanvasPatternSetTransform(pattern) => {
+                self.set_pattern_transform(&pattern, &arguments)
             }
             Builtin::AbortSignalAbortWith(signal) => {
                 let reason = arguments.first().cloned().unwrap_or_else(abort_error_value);

@@ -1696,6 +1696,8 @@ pub(crate) struct Style {
     // width over height, from aspect-ratio or a replaced element's natural size
     pub aspect_ratio: Option<f32>,
     pub object_fit: ObjectFit,
+    // where object-fit places the picture, when not centred
+    pub object_position: Option<(Length, Length)>,
     // anything beyond a pure translation, which keeps using the visual offset path
     pub transform: Option<crate::transform::TransformList>,
     pub translate_property: Option<crate::transform::TransformList>,
@@ -1886,6 +1888,7 @@ impl Style {
             shadows: None,
             aspect_ratio: None,
             object_fit: ObjectFit::Fill,
+            object_position: None,
             transform: None,
             translate_property: None,
             rotate_property: None,
@@ -6206,6 +6209,7 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "min-height",
     "min-width",
     "object-fit",
+    "object-position",
     "opacity",
     "order",
     "outline",
@@ -7082,6 +7086,14 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             if let Some(ratio) = parse_aspect_ratio(value) {
                 style.aspect_ratio = ratio;
             }
+        }
+        "object-position" => {
+            let centre = Length::Terms(LengthTerms {
+                percent: 50.0,
+                ..LengthTerms::default()
+            });
+            style.object_position =
+                parse_background_position(value).filter(|&position| position != (centre, centre));
         }
         "object-fit" => {
             style.object_fit = match value.trim().to_ascii_lowercase().as_str() {

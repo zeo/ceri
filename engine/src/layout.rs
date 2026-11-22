@@ -127,6 +127,7 @@ pub struct LayoutBox {
     // the mask-image layers, whose alpha scales everything the box and its subtree paint
     pub(crate) masks: Vec<crate::css::BackgroundLayer>,
     pub(crate) object_fit: crate::css::ObjectFit,
+    pub(crate) object_position: Option<(crate::css::Length, crate::css::Length)>,
     // in the top layer, as a modal dialog and its backdrop are
     pub(crate) top_layer: bool,
     // the CSS transform about its origin, in coordinates relative to the border box corner
@@ -979,6 +980,7 @@ pub fn layout_with_state(
         backgrounds: Vec::new(),
         masks: Vec::new(),
         object_fit: crate::css::ObjectFit::Fill,
+        object_position: None,
         top_layer: false,
         transform: None,
         backface_hidden: false,
@@ -3885,6 +3887,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         backgrounds: style.layers(),
         masks: style.mask_layers(),
         object_fit: style.object_fit,
+        object_position: style.object_position,
         top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -4072,6 +4075,7 @@ fn anonymous_box(
         backgrounds: Vec::new(),
         masks: Vec::new(),
         object_fit: crate::css::ObjectFit::Fill,
+        object_position: None,
         top_layer: false,
         transform: None,
         backface_hidden: false,
@@ -5147,6 +5151,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         backgrounds: style.layers(),
         masks: style.mask_layers(),
         object_fit: style.object_fit,
+        object_position: style.object_position,
         top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -5696,6 +5701,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         backgrounds: style.layers(),
         masks: style.mask_layers(),
         object_fit: style.object_fit,
+        object_position: style.object_position,
         top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -6540,6 +6546,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         backgrounds: style.layers(),
         masks: style.mask_layers(),
         object_fit: style.object_fit,
+        object_position: style.object_position,
         top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -9980,6 +9987,7 @@ impl LayoutBox {
             backgrounds,
             masks,
             object_fit,
+            object_position,
             top_layer,
             transform,
             backface_hidden,
@@ -10027,6 +10035,7 @@ impl LayoutBox {
             && *backgrounds == other.backgrounds
             && *masks == other.masks
             && *object_fit == other.object_fit
+            && *object_position == other.object_position
             && *top_layer == other.top_layer
             && *transform == other.transform
             && *backface_hidden == other.backface_hidden

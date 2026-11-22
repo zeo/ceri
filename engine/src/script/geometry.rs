@@ -130,6 +130,7 @@ const PLAIN: &[(&str, &str)] = &[
     ("will-change", "auto"),
     ("user-select", "auto"),
     ("object-fit", "fill"),
+    ("object-position", "50% 50%"),
     ("vertical-align", "baseline"),
     ("text-overflow", "clip"),
     ("resize", "none"),

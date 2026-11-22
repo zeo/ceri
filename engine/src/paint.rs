@@ -3984,7 +3984,13 @@ fn paint_box_surface(
             width: padding_box.width,
             height: padding_box.height,
         };
-        let mut fitted = fitted_placement(content, &layer.image, layout_box.object_fit);
+        let mut fitted = fitted_placement(
+            content,
+            &layer.image,
+            layout_box.object_fit,
+            layout_box.object_position,
+            layout_box.font_size,
+        );
         if layout_box.tag == "video" {
             fitted = whole_sized(fitted, canvas.scale);
         }
@@ -5042,10 +5048,16 @@ fn whole_sized(rect: Rect, scale: f32) -> Rect {
     }
 }
 
-// where object-fit puts the image inside the content box, centered as object-position defaults
+// where object-fit puts the image inside the content box and object-position moves it
 // blink's object-fit in 1/64 px layout units: the constrained side by integer muldiv and the
 // centring offset truncated, so the rect snaps to the pixels chromium paints
-fn fitted_placement(content: Rect, image: &Image, fit: ObjectFit) -> Rect {
+fn fitted_placement(
+    content: Rect,
+    image: &Image,
+    fit: ObjectFit,
+    position: Option<(crate::css::Length, crate::css::Length)>,
+    font_size: f32,
+) -> Rect {
     let scale = crate::font::device_scale();
     let unit = |value: f32| (value * scale * 64.0) as i64;
     let natural = (unit(image.width as f32), unit(image.height as f32));
@@ -5069,9 +5081,20 @@ fn fitted_placement(content: Rect, image: &Image, fit: ObjectFit) -> Rect {
     };
     let centre = |space: i64, object: i64| ((space - object) as f32 / 64.0 * 0.5 * 64.0) as i64;
     let pixels = |raw: i64| raw as f32 / 64.0 / scale;
+    // a percentage places the same point of the picture and the box on each other
+    let (x, y) = match position {
+        Some((x, y)) => (
+            x.resolve(pixels(size.0 - width), font_size).unwrap_or(0.0),
+            y.resolve(pixels(size.1 - height), font_size).unwrap_or(0.0),
+        ),
+        None => (
+            pixels(centre(size.0, width)),
+            pixels(centre(size.1, height)),
+        ),
+    };
     Rect {
-        x: content.x + pixels(centre(size.0, width)),
-        y: content.y + pixels(centre(size.1, height)),
+        x: content.x + x,
+        y: content.y + y,
         width: pixels(width),
         height: pixels(height),
     }
@@ -6317,6 +6340,7 @@ mod tests {
                 backgrounds: Vec::new(),
                 masks: Vec::new(),
                 object_fit: crate::css::ObjectFit::Fill,
+                object_position: None,
                 top_layer: false,
                 transform: None,
                 backface_hidden: false,
@@ -6888,6 +6912,7 @@ mod tests {
                 backgrounds: Vec::new(),
                 masks: Vec::new(),
                 object_fit: crate::css::ObjectFit::Fill,
+                object_position: None,
                 top_layer: false,
                 transform: None,
                 backface_hidden: false,
@@ -7010,6 +7035,7 @@ mod tests {
                 backgrounds: Vec::new(),
                 masks: Vec::new(),
                 object_fit: crate::css::ObjectFit::Fill,
+                object_position: None,
                 top_layer: false,
                 transform: None,
                 backface_hidden: false,

@@ -11524,6 +11524,25 @@ A</div>
     }
 
     #[test]
+    fn object_position_moves_the_fitted_picture() {
+        let (_, _, canvas) = image_page(
+            "<style>body { margin: 0; } img { display: block; width: 26px; height: 26px; }</style><img src=\"/rgb8.png\" style=\"object-fit: contain; object-position: top\"><img src=\"/rgb8.png\" style=\"object-fit: contain; object-position: 0 100%\"><img src=\"/rgb8.png\" style=\"object-fit: none; object-position: 2px 3px\">",
+            100.0,
+            80.0,
+        );
+        let blank = pixel_at(&canvas, 99, 79);
+        // contain makes the picture 26 by 14, at the top of the first box and the bottom of
+        // the second
+        assert_ne!(pixel_at(&canvas, 13, 1), blank);
+        assert_eq!(pixel_at(&canvas, 13, 20), blank);
+        assert_eq!(pixel_at(&canvas, 13, 26 + 5), blank);
+        assert_ne!(pixel_at(&canvas, 13, 26 + 20), blank);
+        // none keeps the natural size, shifted by the lengths
+        assert_eq!(pixel_at(&canvas, 2 + 4, 52 + 3 + 5), fixture_color(4, 5));
+        assert_eq!(pixel_at(&canvas, 1, 52 + 1), blank);
+    }
+
+    #[test]
     fn data_urls_decode_without_reaching_the_resource_bundle() {
         let (_, layout, canvas) = image_page(
             "<style>body { margin: 0; }</style><img style=\"display: block\" src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAA0AAAAHCAIAAABcElBNAAAAJHRFWHRDb21tZW50AGFuY2lsbGFyeSBjaHVua3MgYXJlIHNraXBwZWQXJBj8AAAAQElEQVR42mNgYNAQZjVW47Kz5Pf0EQmJl4wvkstqVS6dodGwWrd7n9G0i+YLn9isYWSXNxVm5SaImNjleYlBzHx2erxCwNKhtwAAAEFJREFUPAQRC0g5KzdBxKA8O9NsQYnn0vqYVV3566c2bVkwdefqFfu27T588NyJMw/PXv9y6RH79beMWrvKiPEHAPIZMLzOFGjtAAAAAElFTkSuQmCC\">",

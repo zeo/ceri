@@ -337,6 +337,8 @@ const HOST_INTERFACES: &[&str] = &[
     "Lock",
     "LockManager",
     "CanvasRenderingContext2D",
+    "CanvasGradient",
+    "CanvasPattern",
     "ImageBitmap",
     "VisualViewport",
     "ViewTransition",
