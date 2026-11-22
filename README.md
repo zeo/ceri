@@ -1,6 +1,9 @@
-<img src="icons/ceri-256.png" alt="" width="96" height="96">
-
-# ceri
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/banner-dark.png">
+    <img src="docs/banner.png" alt="ceri" width="360">
+  </picture>
+</p>
 
 ceri runs a web app as a desktop app with its own engine inside. There is no Chromium, no WebView2, no WebKit and no Node.js underneath: the engine in [engine/](engine/README.md) is written in Rust against the standard library, JavaScript engine included, and ships with the app.
 
