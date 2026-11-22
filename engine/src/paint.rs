@@ -3859,15 +3859,27 @@ fn scrolls_in_own_layer(canvas: &Canvas, layout_box: &LayoutBox) -> bool {
         && (x > 0.0 || y > 0.0)
 }
 
-// chromium gives a box in the top layer a layer of its own, and a fixed box too on a dense
-// display, and text in a layer that is not opaque all over is drawn in grayscale
+// chromium gives a box in the top layer a layer of its own, and a fixed box too, and text in a
+// layer that is not opaque all over is drawn in grayscale: a see-through background or a shadow
+// painted past the box always counts, and rounded corners do on a dense display or in the top
+// layer (fixed boxes measured against webview2 157 at 1x, 1.5x and 2x)
 fn floats_in_own_layer(canvas: &Canvas, layout_box: &LayoutBox) -> bool {
-    (layout_box.top_layer || (canvas.scale >= 1.5 && layout_box.position == Position::Fixed))
+    let dense = canvas.scale >= 1.5;
+    let shadowed = layout_box.shadows.iter().any(|shadow| {
+        !shadow.inset
+            && (shadow.blur > 0.0
+                || shadow.spread > 0.0
+                || shadow.offset_x != 0.0
+                || shadow.offset_y != 0.0)
+    });
+    let rounded = layout_box
+        .radii
+        .iter()
+        .any(|(across, down)| *across > 0.0 && *down > 0.0);
+    (layout_box.top_layer || layout_box.position == Position::Fixed)
         && (layout_box.background.alpha < 255
-            || layout_box
-                .radii
-                .iter()
-                .any(|(across, down)| *across > 0.0 && *down > 0.0))
+            || shadowed
+            || ((dense || layout_box.top_layer) && rounded))
 }
 
 fn paint_context_entry(
@@ -6571,6 +6583,45 @@ mod tests {
             [255, 255, 255],
             "past the closest side is clear"
         );
+    }
+
+    #[test]
+    fn a_fixed_box_draws_grayscale_text_when_its_layer_is_not_opaque() {
+        let document = Document::parse_markup(
+            "<html><body><p id='plain'>a</p><p id='shadow'>a</p><p id='round'>a</p><p id='clear'>a</p></body></html>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(concat!(
+            "p { position: fixed; width: 100px; height: 20px; background: #1c1c1c }",
+            "#shadow { box-shadow: 0 2px 8px #000 } #round { border-radius: 8px }",
+            "#clear { background: rgba(28, 28, 28, 0.9) }",
+        ))
+        .expect("stylesheet should parse");
+        let layout = crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 200.0,
+            },
+        );
+        let mut fixed = Vec::new();
+        let mut stack = vec![&layout.root];
+        while let Some(layout_box) = stack.pop() {
+            if layout_box.position == Position::Fixed {
+                fixed.push(layout_box);
+            }
+            stack.extend(layout_box.children.iter().rev());
+        }
+        let layered = |scale: f32| {
+            let canvas = Canvas::scaled(1.0, 1.0, scale, Color::WHITE);
+            fixed
+                .iter()
+                .map(|layout_box| floats_in_own_layer(&canvas, layout_box))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(layered(1.0), [false, true, false, true]);
+        assert_eq!(layered(2.0), [false, true, true, true]);
     }
 
     #[test]
