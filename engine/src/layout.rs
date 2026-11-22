@@ -1685,13 +1685,16 @@ pub(crate) struct ScrollbarParts {
 }
 
 impl Scrollbar {
+    // blink sizes the platform bars in whole device pixels, rounded half up from their dip width
     fn thickness(&self) -> (f32, f32) {
         match self {
             Self::Native | Self::Standard { thin: false, .. } => {
-                (SCROLLBAR_THICKNESS, SCROLLBAR_THICKNESS)
+                let bar = crate::font::round_to_device(SCROLLBAR_THICKNESS);
+                (bar, bar)
             }
             Self::Standard { thin: true, .. } => {
-                (THIN_SCROLLBAR_THICKNESS, THIN_SCROLLBAR_THICKNESS)
+                let bar = crate::font::round_to_device(THIN_SCROLLBAR_THICKNESS);
+                (bar, bar)
             }
             Self::Styled(parts) => parts.thickness,
             Self::Hidden => (0.0, 0.0),
@@ -12387,6 +12390,30 @@ mod tests {
         };
         assert_eq!(width("auto"), 200.0);
         assert_eq!(width("stable"), 200.0 - SCROLLBAR_THICKNESS);
+    }
+
+    #[test]
+    fn platform_scrollbars_are_whole_device_pixels_wide() {
+        // as measured in edge: 23 device pixels at 1.5, 26 at 1.75, and 18 for a thin bar there
+        let bar = |scale: f32, thin: bool| {
+            let _fonts = crate::font::use_fonts(Rc::new(crate::font::FontSet::default()), scale);
+            let width = if thin { "thin" } else { "auto" };
+            let markup = format!(
+                "<style>* {{ margin: 0; padding: 0; }} div {{ width: 300px; height: 100px; overflow: auto; scrollbar-width: {width}; }} p {{ height: 500px; }}</style><div><p></p></div>"
+            );
+            let document = Document::parse_markup(&markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let size = Size {
+                width: 800.0,
+                height: 300.0,
+            };
+            let result = layout(&document, &stylesheet, size);
+            (300.0 - find_box(&result.root, "p").expect("content").rect.width) * scale
+        };
+        assert_eq!(bar(1.0, false), 15.0);
+        assert!((bar(1.5, false) - 23.0).abs() < 1e-3);
+        assert!((bar(1.75, false) - 26.0).abs() < 1e-3);
+        assert!((bar(1.75, true) - 18.0).abs() < 1e-3);
     }
 
     #[test]
