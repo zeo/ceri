@@ -538,6 +538,13 @@ static INTERFACES: &[Interface] = &[
             ("autocomplete", Attr("autocomplete")),
             ("multiple", Flag("multiple")),
             ("autofocus", Flag("autofocus")),
+            ("indeterminate", ReadWrite),
+            ("alt", Attr("alt")),
+            ("src", Url("src")),
+            ("size", ReadWrite),
+            ("labels", ReadOnly),
+            ("stepUp", Method(0)),
+            ("stepDown", Method(0)),
         ],
     },
     Interface {
@@ -2231,6 +2238,84 @@ impl ScriptRuntime {
                     }
                     self.set_element_attribute(handle, "href", url.to_string());
                 }
+                Value::Undefined
+            }
+            ("indeterminate", Access::Get) => Value::Bool(self.indeterminate.contains(&node)),
+            ("indeterminate", Access::Set) => {
+                if first.truthy() {
+                    self.indeterminate.insert(node);
+                } else {
+                    self.indeterminate.remove(&node);
+                }
+                Value::Undefined
+            }
+            ("size", Access::Get) => Value::Number(f64::from(
+                self.document
+                    .borrow()
+                    .attribute(node, "size")
+                    .and_then(|size| size.trim().parse::<u32>().ok())
+                    .filter(|size| (1..=i32::MAX as u32).contains(size))
+                    .unwrap_or(20),
+            )),
+            ("size", Access::Set) => {
+                let size = self.coerce_uint32(first)?;
+                if size == 0 {
+                    return Err(self.throw_value(dom_exception(
+                        "IndexSizeError",
+                        "The value provided is 0, which is an invalid size.",
+                    )));
+                }
+                self.set_element_attribute(handle, "size", size.to_string());
+                Value::Undefined
+            }
+            ("labels", Access::Get) => {
+                let found = {
+                    let document = self.document.borrow();
+                    let id = document.attribute(node, "id").map(String::from);
+                    document
+                        .descendants(document.root())
+                        .filter(|&label| {
+                            let Some(element) = document.element(label) else {
+                                return false;
+                            };
+                            if element.name != "label" {
+                                return false;
+                            }
+                            match element.attr("for") {
+                                Some(target) => id.as_deref() == Some(target),
+                                // a label without for names the first labelable control in it
+                                None => {
+                                    document.descendants(label).find(|&inside| {
+                                        document.element(inside).is_some_and(|inner| {
+                                            matches!(
+                                                inner.name.as_str(),
+                                                "input"
+                                                    | "button"
+                                                    | "select"
+                                                    | "textarea"
+                                                    | "meter"
+                                                    | "output"
+                                                    | "progress"
+                                            ) && !(inner.name == "input"
+                                                && inner.attr("type").is_some_and(|kind| {
+                                                    kind.eq_ignore_ascii_case("hidden")
+                                                }))
+                                        })
+                                    }) == Some(node)
+                                }
+                            }
+                        })
+                        .collect()
+                };
+                self.node_list(found)
+            }
+            ("stepUp" | "stepDown", Access::Call) => {
+                let steps = match first {
+                    Value::Undefined => 1.0,
+                    value => self.coerce_number(value)?.trunc(),
+                };
+                let sign = if member.name() == "stepUp" { 1.0 } else { -1.0 };
+                self.step_input(handle, sign * steps)?;
                 Value::Undefined
             }
             ("scrollIntoView", Access::Call) => {

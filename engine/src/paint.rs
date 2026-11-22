@@ -2373,6 +2373,14 @@ fn paint_control(
     let point = |x: f32, y: f32| (rect.x + rect.width * x, rect.y + rect.height * y);
     let round = |radius: f32| [(radius, radius); 4];
     match control {
+        ControlPaint::Checkbox {
+            indeterminate: true,
+            ..
+        } => {
+            let white = Color::WHITE.scale_alpha(opacity);
+            let stroke = (rect.width * 0.14).max(1.5);
+            canvas.fill_segment((point(0.25, 0.5), point(0.75, 0.5)), stroke, white, clip);
+        }
         ControlPaint::Checkbox { checked: true, .. } => {
             let white = Color::WHITE.scale_alpha(opacity);
             let stroke = (rect.width * 0.14).max(1.5);

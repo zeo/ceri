@@ -712,6 +712,7 @@ pub struct ScriptRuntime {
     control_values: HashMap<NodeId, String>,
     control_checked: HashMap<NodeId, bool>,
     dirty_checked_controls: BTreeSet<NodeId>,
+    indeterminate: BTreeSet<NodeId>,
     option_selected: HashMap<NodeId, bool>,
     dirty_options: BTreeSet<NodeId>,
     dirty_controls: BTreeSet<NodeId>,
@@ -1917,6 +1918,7 @@ impl ScriptRuntime {
             control_values: HashMap::new(),
             control_checked: HashMap::new(),
             dirty_checked_controls: BTreeSet::new(),
+            indeterminate: BTreeSet::new(),
             option_selected: HashMap::new(),
             dirty_options: BTreeSet::new(),
             dirty_controls: BTreeSet::new(),
@@ -2263,6 +2265,7 @@ impl ScriptRuntime {
         self.control_values.retain(|node, _| !gone(*node));
         self.control_checked.retain(|node, _| !gone(*node));
         self.dirty_checked_controls.retain(|node| !gone(*node));
+        self.indeterminate.retain(|node| !gone(*node));
         self.option_selected.retain(|node, _| !gone(*node));
         self.dirty_options.retain(|node| !gone(*node));
         self.dirty_controls.retain(|node| !gone(*node));
@@ -3519,6 +3522,7 @@ impl ScriptRuntime {
             script_animations: Rc::new(self.animation_snapshot()),
             ..StyleState::default()
         };
+        state.indeterminate = self.indeterminate.clone();
         for (control, checked) in &self.control_checked {
             if *checked {
                 state.checked.insert(*control);
@@ -3836,6 +3840,7 @@ impl ScriptRuntime {
             },
             "checkbox" => {
                 let checked = self.is_control_checked(node);
+                self.indeterminate.remove(&node);
                 self.control_checked.insert(node, !checked);
                 self.dirty_checked_controls.insert(node);
                 true
@@ -6601,6 +6606,63 @@ impl ScriptRuntime {
             .and_then(|value| value.trim().parse::<f64>().ok())
             .filter(|value| value.is_finite())
             .unwrap_or(f64::NAN)
+    }
+
+    // stepUp and stepDown on a number or range input: whole steps from the value, held
+    // between min and max, without the events a person's change would fire
+    fn step_input(&mut self, handle: &ElementHandle, steps: f64) -> Result<(), ScriptError> {
+        let node = handle.id;
+        let (step, min, max) = {
+            let document = self.document.borrow();
+            let number = |name: &str| {
+                document
+                    .attribute(node, name)
+                    .and_then(|value| value.trim().parse::<f64>().ok())
+                    .filter(|value| value.is_finite())
+            };
+            let step = document.attribute(node, "step").map(str::trim);
+            let is_range = document
+                .attribute(node, "type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("range"));
+            let (min, max) = if is_range {
+                (number("min").or(Some(0.0)), number("max").or(Some(100.0)))
+            } else {
+                (number("min"), number("max"))
+            };
+            let step = match step {
+                Some(any) if any.eq_ignore_ascii_case("any") => None,
+                _ => Some(number("step").filter(|step| *step > 0.0).unwrap_or(1.0)),
+            };
+            (step, min, max)
+        };
+        let Some(step) = step.filter(|_| self.is_numeric_input(node)) else {
+            return Err(self.throw_value(dom_exception(
+                "InvalidStateError",
+                "This form element does not have an allowed value step.",
+            )));
+        };
+        let value = self.element_value_as_number(node);
+        let value = if value.is_nan() { 0.0 } else { value };
+        let base = min.unwrap_or(0.0);
+        let mut next = value + step * steps;
+        // a value off the step grid lands on the grid line in the direction it moved
+        let offset = (next - base) / step;
+        if (offset - offset.round()).abs() > 1e-9 {
+            next = base
+                + if steps > 0.0 {
+                    offset.floor()
+                } else {
+                    offset.ceil()
+                } * step;
+        }
+        if let Some(min) = min {
+            next = next.max(min);
+        }
+        if let Some(max) = max {
+            next = next.min(max);
+        }
+        self.set_element_value_as_number(handle, next);
+        Ok(())
     }
 
     fn set_element_value_as_number(&mut self, handle: &ElementHandle, number: f64) -> bool {
@@ -20484,6 +20546,40 @@ mod tests {
             Some(
                 "~/x/y?q=1#h|/x/y|?q=1|#h|true||~/pic.png|40|pic.png|/x/y?r=2#top|/x/y|7|/sub/pic.png"
             )
+        );
+    }
+
+    #[test]
+    fn inputs_step_size_and_find_their_labels() {
+        let document = document(
+            "<label for='n'>N</label><label>wrap <input id='n' type='number' value='5' step='2' min='1' max='9'></label><input id='r' type='range'><input id='t'><p id='status'>idle</p>",
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const n = document.getElementById("n"), r = document.getElementById("r"), t = document.getElementById("t");
+                const seen = [];
+                n.stepUp(); seen.push(n.value);
+                n.stepUp(5); seen.push(n.value);
+                n.value = "4"; n.stepDown(); seen.push(n.value);
+                r.stepUp(); r.stepDown(80); seen.push(r.value);
+                try { t.stepUp(); } catch (error) { seen.push(error.name); }
+                seen.push(n.labels.length, t.labels.length, t.size);
+                try { t.size = 0; } catch (error) { seen.push(error.name); }
+                t.size = 7; seen.push(t.getAttribute("size"));
+                t.indeterminate = true; seen.push(t.indeterminate);
+                document.getElementById("status").textContent = seen.join("|");
+                "#,
+            )
+            .expect("input members should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("7|9|3|0|InvalidStateError|2|0|20|IndexSizeError|7|true")
         );
     }
 

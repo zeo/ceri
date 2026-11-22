@@ -7306,6 +7306,40 @@ mod tests {
     }
 
     #[test]
+    fn an_indeterminate_checkbox_paints_a_dash_until_it_is_clicked() {
+        let resources = bundle(
+            r#"<style>body { margin: 0 } input { margin: 0; width: 20px; height: 20px; display: block } input:indeterminate { accent-color: rgb(0, 200, 0) }</style><input id="box" type="checkbox"><script>document.getElementById("box").indeterminate = true;</script>"#,
+        );
+        let mut browser = Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("checkbox page should load");
+        let size = Size {
+            width: 60.0,
+            height: 40.0,
+        };
+        let canvas = browser.paint(size).expect("page should paint");
+        assert_eq!(pixel_at(&canvas, 10, 10), [255, 255, 255, 255], "the dash");
+        assert_eq!(
+            pixel_at(&canvas, 10, 4),
+            [0, 200, 0, 255],
+            "filled, as :indeterminate"
+        );
+        browser.click_id("box").expect("click should run");
+        let canvas = browser.paint(size).expect("page should paint");
+        assert_eq!(
+            pixel_at(&canvas, 10, 4),
+            [0, 117, 255, 255],
+            "checked, no longer indeterminate"
+        );
+        assert_ne!(
+            pixel_at(&canvas, 6, 10),
+            [255, 255, 255, 255],
+            "the dash is gone"
+        );
+    }
+
+    #[test]
     fn a_video_plays_its_frames_to_the_end_by_the_page_clock() {
         let mut resources = bundle(
             r#"<video id="v" src="/reel.mp4" muted style="display: block; width: 40px; height: 20px"></video><p id="status"></p><script>

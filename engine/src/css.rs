@@ -1321,6 +1321,8 @@ pub(crate) struct StyleState {
     pub(crate) active: Option<NodeId>,
     pub(crate) checked: BTreeSet<NodeId>,
     pub(crate) unchecked: BTreeSet<NodeId>,
+    // checkboxes script set indeterminate, which show a dash whatever their checkedness
+    pub(crate) indeterminate: BTreeSet<NodeId>,
     pub(crate) disabled: BTreeSet<NodeId>,
     pub(crate) scroll_offsets: BTreeMap<NodeId, (f32, f32)>,
     pub(crate) control_values: BTreeMap<NodeId, String>,
@@ -4090,6 +4092,7 @@ enum PseudoClass {
     FocusWithin,
     Active,
     Checked,
+    Indeterminate,
     Disabled,
     Enabled,
     FirstChild,
@@ -4478,6 +4481,11 @@ impl PseudoClass {
                     })
                     && state.is_checked(element, node)
             }
+            // a checkbox script made indeterminate, or a progress bar without a value
+            Self::Indeterminate => {
+                (element.name == "input" && state.indeterminate.contains(&node))
+                    || (element.name == "progress" && element.attr("value").is_none())
+            }
             Self::Disabled => state.is_disabled(element, node),
             Self::Enabled => !state.is_disabled(element, node),
             Self::FirstChild => document.element_sibling(node, false).is_none(),
@@ -4805,6 +4813,7 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                         "focus-within" => PseudoClass::FocusWithin,
                         "active" => PseudoClass::Active,
                         "checked" => PseudoClass::Checked,
+                        "indeterminate" => PseudoClass::Indeterminate,
                         "disabled" => PseudoClass::Disabled,
                         "enabled" => PseudoClass::Enabled,
                         "first-child" => PseudoClass::FirstChild,

@@ -211,6 +211,7 @@ pub(crate) const SQUARE_CORNERS: CornerRadii = [(0.0, 0.0); 4];
 pub(crate) enum ControlPaint {
     Checkbox {
         checked: bool,
+        indeterminate: bool,
         accent: Color,
     },
     Radio {
@@ -3947,9 +3948,10 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     let unstyled = layout.background == Color::WHITE;
     match layout.control {
         Some(ControlPaint::Checkbox {
-            checked: true,
+            checked,
+            indeterminate,
             accent,
-        }) if unstyled => {
+        }) if unstyled && (checked || indeterminate) => {
             layout.background = accent;
             layout.border.colors = [accent; 4];
         }
@@ -6820,6 +6822,7 @@ fn control_paint(
     Some(match control {
         ControlType::Checkbox => ControlPaint::Checkbox {
             checked: style_state.is_checked(element, node.node),
+            indeterminate: style_state.indeterminate.contains(&node.node),
             accent,
         },
         ControlType::Radio => ControlPaint::Radio {
@@ -10658,6 +10661,7 @@ mod tests {
             checkbox.control,
             Some(ControlPaint::Checkbox {
                 checked: true,
+                indeterminate: false,
                 accent: Color::opaque(0, 117, 255)
             })
         );
