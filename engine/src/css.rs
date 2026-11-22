@@ -1067,6 +1067,8 @@ pub(crate) struct InheritedText {
     pub(crate) caption_bottom: bool,
     pub(crate) accent_color: Option<Color>,
     pub(crate) scrollbar_color: Option<(Color, Color)>,
+    // -webkit-text-fill-color, which paints glyphs in place of color; none is currentcolor
+    pub(crate) text_fill: Option<Color>,
     pub(crate) text_align: TextAlign,
     // a factor of the font size, or a length an ancestor already turned into pixels
     pub(crate) line_height: Length,
@@ -1103,6 +1105,7 @@ impl Default for InheritedText {
             caption_bottom: false,
             accent_color: None,
             scrollbar_color: None,
+            text_fill: None,
             text_align: TextAlign::Start,
             line_height: Length::Auto,
             space_collapse: SpaceCollapse::Collapse,
@@ -1138,6 +1141,7 @@ pub(crate) fn inherited_text(style: &Style) -> InheritedText {
         caption_bottom: style.caption_bottom,
         accent_color: style.accent_color,
         scrollbar_color: style.scrollbar_color,
+        text_fill: style.text_fill,
         text_align: style.text_align,
         line_height: style.line_height,
         space_collapse: style.space_collapse,
@@ -1613,6 +1617,7 @@ pub(crate) struct Style {
     pub appearance_none: bool,
     // the thumb and track colors, none for the platform's
     pub scrollbar_color: Option<(Color, Color)>,
+    pub(crate) text_fill: Option<Color>,
     pub scrollbar_width: ScrollbarWidth,
     // room for a vertical scrollbar is kept whether or not one shows
     pub(crate) scrollbar_gutter: bool,
@@ -1696,6 +1701,8 @@ pub(crate) struct Style {
     pub opacity: f32,
     pub(crate) backgrounds: Option<LayerList>,
     pub(crate) masks: Option<LayerList>,
+    // background-clip: text, which paints the backgrounds through the box's glyphs alone
+    pub(crate) background_clip_text: bool,
     pub shadows: Option<ShadowList>,
     // width over height, from aspect-ratio or a replaced element's natural size
     pub aspect_ratio: Option<f32>,
@@ -1814,6 +1821,7 @@ impl Style {
             accent_color: parent_text.accent_color,
             appearance_none: false,
             scrollbar_color: parent_text.scrollbar_color,
+            text_fill: parent_text.text_fill,
             scrollbar_width: ScrollbarWidth::Auto,
             scrollbar_gutter: false,
             filter: None,
@@ -1889,6 +1897,7 @@ impl Style {
             opacity: 1.0,
             backgrounds: None,
             masks: None,
+            background_clip_text: false,
             shadows: None,
             aspect_ratio: None,
             object_fit: ObjectFit::Fill,
@@ -5906,6 +5915,10 @@ fn reset_inherited_property(style: &mut Style, from: &Style, property: &str) -> 
         "caption-side" => style.caption_bottom = from.caption_bottom,
         "accent-color" => style.accent_color = from.accent_color,
         "scrollbar-color" => style.scrollbar_color = from.scrollbar_color,
+        "-webkit-text-fill-color" => style.text_fill = from.text_fill,
+        "background-clip" | "-webkit-background-clip" => {
+            style.background_clip_text = from.background_clip_text
+        }
         "white-space" => {
             style.space_collapse = from.space_collapse;
             style.wrap = from.wrap;
@@ -5957,6 +5970,7 @@ fn reset_property(style: &mut Style, from: &Style, property: &str) {
         "background" => {
             style.background = from.background;
             style.backgrounds = from.backgrounds;
+            style.background_clip_text = from.background_clip_text;
         }
         "background-color" => style.background = from.background,
         "background-image" => style.backgrounds = from.backgrounds,
@@ -6083,6 +6097,9 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "-webkit-text-stroke",
     "-webkit-text-stroke-width",
     "-webkit-text-stroke-color",
+    "-webkit-text-fill-color",
+    "background-clip",
+    "-webkit-background-clip",
     "-webkit-mask",
     "-webkit-mask-image",
     "-webkit-mask-position",
@@ -7074,6 +7091,28 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             if let Some((layers, color)) = parse_layer_shorthand(value, false) {
                 style.backgrounds = Some(intern_layers(None, property, value, layers));
                 style.background = color;
+                style.background_clip_text = false;
+            }
+        }
+        "background-clip" | "-webkit-background-clip" => {
+            match value
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "text" => style.background_clip_text = true,
+                "border-box" | "padding-box" | "content-box" => style.background_clip_text = false,
+                _ => {}
+            }
+        }
+        "-webkit-text-fill-color" => {
+            if value.trim().eq_ignore_ascii_case("currentcolor") {
+                style.text_fill = None;
+            } else if let Some(color) = parse_color(value) {
+                style.text_fill = Some(color);
             }
         }
         "background-image" | "background-size" | "background-position" | "background-repeat" => {

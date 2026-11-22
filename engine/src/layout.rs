@@ -126,6 +126,8 @@ pub struct LayoutBox {
     pub(crate) backgrounds: Vec<crate::css::BackgroundLayer>,
     // the mask-image layers, whose alpha scales everything the box and its subtree paint
     pub(crate) masks: Vec<crate::css::BackgroundLayer>,
+    // the backgrounds show only through the glyphs of the box and its subtree
+    pub(crate) background_clip_text: bool,
     pub(crate) object_fit: crate::css::ObjectFit,
     pub(crate) object_position: Option<(crate::css::Length, crate::css::Length)>,
     // in the top layer, as a modal dialog and its backdrop are
@@ -785,6 +787,18 @@ impl InlineContext {
             features: self.text.font_features,
         }
     }
+
+    // glyphs take -webkit-text-fill-color over color, while lines and strokes keep color
+    fn glyph_paint(&self) -> (Color, crate::css::TextDecoration) {
+        let color = self.color.scale_alpha(self.opacity);
+        let mut decoration = self.text.decoration;
+        let Some(fill) = self.text.text_fill else {
+            return (color, decoration);
+        };
+        decoration.color = decoration.color.or(Some(color));
+        decoration.stroke.color = decoration.stroke.color.or(Some(color));
+        (fill.scale_alpha(self.opacity), decoration)
+    }
 }
 
 // which DOM text node the next appended words belong to, for prose selection
@@ -980,6 +994,7 @@ pub fn layout_with_state(
         background: Color::transparent(),
         backgrounds: Vec::new(),
         masks: Vec::new(),
+        background_clip_text: false,
         object_fit: crate::css::ObjectFit::Fill,
         object_position: None,
         top_layer: false,
@@ -3899,6 +3914,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         background: style.background,
         backgrounds: style.layers(),
         masks: style.mask_layers(),
+        background_clip_text: style.background_clip_text,
         object_fit: style.object_fit,
         object_position: style.object_position,
         top_layer: false,
@@ -4088,6 +4104,7 @@ fn anonymous_box(
         background: Color::transparent(),
         backgrounds: Vec::new(),
         masks: Vec::new(),
+        background_clip_text: false,
         object_fit: crate::css::ObjectFit::Fill,
         object_position: None,
         top_layer: false,
@@ -5164,6 +5181,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         background: style.background,
         backgrounds: style.layers(),
         masks: style.mask_layers(),
+        background_clip_text: style.background_clip_text,
         object_fit: style.object_fit,
         object_position: style.object_position,
         top_layer: false,
@@ -5714,6 +5732,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         background: style.background,
         backgrounds: style.layers(),
         masks: style.mask_layers(),
+        background_clip_text: style.background_clip_text,
         object_fit: style.object_fit,
         object_position: style.object_position,
         top_layer: false,
@@ -6463,6 +6482,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         section.background = section_style.background;
         section.backgrounds = section_style.layers();
         section.masks = section_style.mask_layers();
+        section.background_clip_text = section_style.background_clip_text;
         section.visible = section_style.visibility == Visibility::Visible;
         section.pointer_events = section_style.pointer_events;
         section.selectable = section_style.selectable;
@@ -6559,6 +6579,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         background: style.background,
         backgrounds: style.layers(),
         masks: style.mask_layers(),
+        background_clip_text: style.background_clip_text,
         object_fit: style.object_fit,
         object_position: style.object_position,
         top_layer: false,
@@ -8811,19 +8832,20 @@ impl TextPlacer {
         });
         line.used += width;
         line.height = line.height.max(self.context.line_height);
+        let (color, decoration) = self.context.glyph_paint();
         line.fragments.push(InlineFragment {
             text: shown,
             width,
             font_size: self.context.font_size,
             letter_spacing: self.letter_spacing,
             font_stack: self.context.text.family,
-            color: self.context.color.scale_alpha(self.context.opacity),
+            color,
             font: self.font,
             node: self.source.node,
             node_offset: offset,
             source_len,
             rtl: false,
-            decoration: self.context.text.decoration,
+            decoration,
             line_height: self.context.line_height,
             atomic: None,
             edge: None,
@@ -10017,6 +10039,7 @@ impl LayoutBox {
             background,
             backgrounds,
             masks,
+            background_clip_text,
             object_fit,
             object_position,
             top_layer,
@@ -10065,6 +10088,7 @@ impl LayoutBox {
             && *background == other.background
             && *backgrounds == other.backgrounds
             && *masks == other.masks
+            && *background_clip_text == other.background_clip_text
             && *object_fit == other.object_fit
             && *object_position == other.object_position
             && *top_layer == other.top_layer

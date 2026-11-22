@@ -1155,6 +1155,55 @@ impl Canvas {
         self.masks.push(mask);
     }
 
+    // background-clip: text, the coverage of every glyph the box and its subtree draw, whatever
+    // their fill
+    fn push_glyph_mask(
+        &mut self,
+        layout_box: &LayoutBox,
+        bounds: Option<DeviceBounds>,
+        offset: (f32, f32),
+    ) {
+        fn silhouettes(layer: &mut Canvas, layout_box: &LayoutBox, offset: (f32, f32)) {
+            for run in &layout_box.text {
+                let solid = TextRun {
+                    color: Color::opaque(0, 0, 0),
+                    ..run.clone()
+                };
+                paint_glyphs(layer, &solid, None, offset, true);
+            }
+            for child in &layout_box.children {
+                silhouettes(layer, child, offset);
+            }
+        }
+        let mask = match bounds {
+            Some(bounds) => {
+                let mut layer = self.layer(bounds);
+                silhouettes(&mut layer, layout_box, offset);
+                let alpha = layer
+                    .pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|pixel| pixel[3])
+                    .collect();
+                recycle_layer(layer.pixels);
+                Mask::Alpha {
+                    left: bounds.left,
+                    top: bounds.top,
+                    width: bounds.right - bounds.left,
+                    alpha,
+                }
+            }
+            None => Mask::Alpha {
+                left: 0,
+                top: 0,
+                width: 0,
+                alpha: Vec::new(),
+            },
+        };
+        self.masks.push(mask);
+    }
+
     fn pop_mask(&mut self) {
         self.masks.pop();
     }
@@ -3981,7 +4030,20 @@ fn paint_box_surface(
     {
         paint_shadow(canvas, shadow, outer, surface, opacity, clip);
     }
-    paint_backgrounds(canvas, layout_box, images, outer, surface, opacity, clip);
+    if layout_box.background_clip_text {
+        let area = Rect {
+            x: outer.x,
+            y: outer.y,
+            width: outer.width,
+            height: outer.height,
+        };
+        let bounds = DeviceBounds::of(canvas, area, clip);
+        canvas.push_glyph_mask(layout_box, bounds, offset);
+        paint_backgrounds(canvas, layout_box, images, outer, surface, opacity, clip);
+        canvas.pop_mask();
+    } else {
+        paint_backgrounds(canvas, layout_box, images, outer, surface, opacity, clip);
+    }
     paint_border(canvas, outer, surface, &layout_box.border, opacity, clip);
     if let Some(control) = layout_box.control {
         let inner = Rect {
@@ -6368,6 +6430,7 @@ mod tests {
                 background: Color::opaque(245, 248, 250),
                 backgrounds: Vec::new(),
                 masks: Vec::new(),
+                background_clip_text: false,
                 object_fit: crate::css::ObjectFit::Fill,
                 object_position: None,
                 top_layer: false,
@@ -6507,6 +6570,58 @@ mod tests {
             pixel(0, 81),
             [255, 255, 255],
             "past the closest side is clear"
+        );
+    }
+
+    #[test]
+    fn background_clip_text_paints_the_background_through_the_glyphs_alone() {
+        let document = Document::parse_markup(
+            "<html><body><div id='a'>HH<span>H</span></div><div id='b'>HH</div></body></html>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(concat!(
+            "html, body { margin: 0; background: #ffffff }",
+            "div { width: 160px; height: 50px; font-size: 32px; color: #00ff00; background: #ff0000 }",
+            "#a { -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent }",
+        ))
+        .expect("stylesheet should parse");
+        let canvas = paint(&crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 160.0,
+                height: 100.0,
+            },
+        ));
+        let count = |rows: std::ops::Range<usize>, wanted: fn([u8; 3]) -> bool| {
+            rows.flat_map(|y| (0..160).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let index = (y * canvas.width() as usize + x) * 4;
+                    wanted([0, 1, 2].map(|channel| canvas.rgba_pixels()[index + channel]))
+                })
+                .count()
+        };
+        let red = |[r, g, b]: [u8; 3]| r > 200 && g < 60 && b < 60;
+        let white = |[r, g, b]: [u8; 3]| r > 250 && g > 250 && b > 250;
+        let green = |[r, g, _]: [u8; 3]| g > 200 && r < 60;
+        let painted = count(0..50, red);
+        assert!(
+            painted > 40,
+            "the glyphs show the background, {painted} red pixels"
+        );
+        assert!(
+            count(0..50, white) > painted,
+            "the box around the glyphs stays clear"
+        );
+        assert_eq!(
+            count(0..50, green),
+            0,
+            "a transparent fill hides the text colour"
+        );
+        assert_eq!(
+            count(50..100, white),
+            0,
+            "a border-box background fills its box"
         );
     }
 
@@ -6940,6 +7055,7 @@ mod tests {
                 background: Color::opaque(10, 20, 30),
                 backgrounds: Vec::new(),
                 masks: Vec::new(),
+                background_clip_text: false,
                 object_fit: crate::css::ObjectFit::Fill,
                 object_position: None,
                 top_layer: false,
@@ -7063,6 +7179,7 @@ mod tests {
                 background: Color::opaque(10, 20, 30),
                 backgrounds: Vec::new(),
                 masks: Vec::new(),
+                background_clip_text: false,
                 object_fit: crate::css::ObjectFit::Fill,
                 object_position: None,
                 top_layer: false,
