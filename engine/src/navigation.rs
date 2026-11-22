@@ -2643,6 +2643,16 @@ impl Browser {
                 cursor
             };
         }
+        // a press anywhere, even on no element, may close the auto popovers it is outside of
+        if event == "pointerdown" {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            let target = node.or_else(|| page.runtime.document().borrow().document_element());
+            if let Some(target) = target {
+                page.runtime
+                    .light_dismiss_popovers(target)
+                    .map_err(|error| NavigationError::Script(error.to_string()))?;
+            }
+        }
         let Some(node) = node else {
             return Ok(hover_changed);
         };
@@ -7807,6 +7817,88 @@ mod tests {
                 "true,true,open,true,,2,rgb(0, 0, 255),rgb(255, 0, 0),4px,20,true,true,1,true,true,inner:text|host:text:9|host:card:7"
             )
         );
+    }
+
+    #[test]
+    fn popovers_show_hide_and_dismiss_as_chrome_does() {
+        let mut browser = Browser::new(bundle(
+            r##"<body style="margin: 0"><button id="opener" popovertarget="a" style="position: fixed; left: 0; top: 0; width: 40px; height: 20px">a</button><div id="a" popover style="width: 100px; height: 40px">A<div id="inner" popover>inner</div></div><div id="b" popover>B</div><div id="m" popover="manual">M</div><p id="status"></p><script>
+                const $ = (id) => document.getElementById(id);
+                const out = [];
+                const log = [];
+                for (const id of ["a", "b", "inner"]) {
+                    $(id).addEventListener("toggle", (event) => log.push(id + ":" + event.oldState + ">" + event.newState));
+                }
+                $("a").showPopover();
+                $("m").showPopover();
+                $("inner").showPopover();
+                out.push($("a").matches(":popover-open"), $("inner").matches(":popover-open"), document.querySelectorAll(":popover-open").length);
+                $("b").showPopover();
+                out.push($("a").matches(":popover-open"), $("inner").matches(":popover-open"), $("m").matches(":popover-open"));
+                out.push(getComputedStyle($("b")).position, getComputedStyle($("a")).display);
+                $("b").addEventListener("beforetoggle", (event) => { if (event.newState === "open") event.preventDefault(); });
+                $("b").hidePopover();
+                $("b").showPopover();
+                out.push($("b").matches(":popover-open"));
+                $("opener").click();
+                out.push($("a").matches(":popover-open"));
+                $("status").textContent = out.join(" ");
+                setTimeout(() => { $("status").textContent += " | " + log.join(" "); }, 0);
+            </script></body>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        browser.advance_time(10).expect("tasks should run");
+        let status = |browser: &mut Browser| {
+            let document = browser.document().expect("document should exist");
+            let document = document.borrow();
+            let status = document.find_element_by_id("status").expect("status");
+            document.text_content(status)
+        };
+        assert_eq!(
+            status(&mut browser),
+            "true true 3 false false true fixed none false true | inner:closed>closed b:closed>closed a:closed>open"
+        );
+        let open = |browser: &mut Browser, id: &str| {
+            let document = browser.document().expect("document should exist");
+            let node = document.borrow().find_element_by_id(id).expect("popover");
+            browser
+                .page
+                .as_ref()
+                .expect("page")
+                .runtime
+                .selector_state(None)
+                .popovers
+                .contains(&node)
+        };
+        let viewport = Size {
+            width: 400.0,
+            height: 300.0,
+        };
+        // a press on the button that opens it keeps it open; a press elsewhere closes it
+        browser
+            .dispatch_at(viewport, 10.0, 10.0, "pointerdown")
+            .expect("press should dispatch");
+        assert!(open(&mut browser, "a"), "the invoker counts as inside");
+        browser
+            .dispatch_at(viewport, 390.0, 290.0, "pointerdown")
+            .expect("press should dispatch");
+        assert!(!open(&mut browser, "a"), "a press outside dismisses");
+        assert!(open(&mut browser, "m"), "a manual popover stays");
+        browser
+            .page
+            .as_mut()
+            .expect("page")
+            .runtime
+            .execute(r#"document.getElementById("a").showPopover();"#)
+            .expect("script should run");
+        browser.key_down("Escape").expect("escape should dispatch");
+        assert!(
+            !open(&mut browser, "a"),
+            "escape closes the top auto popover"
+        );
+        assert!(open(&mut browser, "m"));
     }
 
     #[test]

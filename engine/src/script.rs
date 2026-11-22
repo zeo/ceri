@@ -786,6 +786,13 @@ pub struct ScriptRuntime {
     dialogs: HashMap<NodeId, dialogs::DialogState>,
     // modal dialogs in the order they were shown, closed or removed ones included
     top_layer: Vec<NodeId>,
+    // popovers on show, oldest first; they are in the top layer as well
+    popovers: Vec<NodeId>,
+    // toggle events queued for popovers: whether each was open before its first change, and
+    // how many of its tasks are still to run, the last of which fires
+    popover_toggles: HashMap<NodeId, (bool, usize)>,
+    // the element under the pointer, for :hover in script's selector matching
+    hovered_node: Option<NodeId>,
     // a press since the last cancel script was allowed to refuse
     history_activation: bool,
     custom_definitions: Vec<custom::Definition>,
@@ -1972,6 +1979,9 @@ impl ScriptRuntime {
             media: media::MediaState::default(),
             dialogs: HashMap::new(),
             top_layer: Vec::new(),
+            popovers: Vec::new(),
+            popover_toggles: HashMap::new(),
+            hovered_node: None,
             history_activation: false,
             custom_definitions: Vec::new(),
             custom_states: HashMap::new(),
@@ -2626,6 +2636,7 @@ impl ScriptRuntime {
         }
         if !dispatch.default_prevented && self.pending_navigation.is_none() {
             self.apply_click_default(node)?;
+            self.invoke_popover_target(node)?;
             if let Some(form) = self.reset_form_for_click(node) {
                 self.reset_form(form)?;
             } else if let Some(form) = self.submit_form_for_click(node) {
@@ -3138,6 +3149,14 @@ impl ScriptRuntime {
         }
         if key == "Escape"
             && !dispatch.default_prevented
+            && let Some(popover) = self.topmost_auto_popover()
+        {
+            self.hide_popover(popover, true)?;
+            self.drain_microtasks()?;
+            return Ok(true);
+        }
+        if key == "Escape"
+            && !dispatch.default_prevented
             && let Some(&dialog) = self.modal_dialogs().last()
         {
             self.request_dialog_close(dialog, None)?;
@@ -3495,17 +3514,8 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn style_state(&self, hovered_path: Option<NodeId>) -> StyleState {
-        let mut state = StyleState {
-            hovered: hovered_path,
-            focused: self.focused_element,
-            top_layer: self.modal_dialogs(),
-            focus_visible: self
-                .focused_element
-                .is_some_and(|node| !self.pointer_modality || self.is_text_control(node)),
-            active: self.active_node,
-            forced: self.forced_pseudo_classes.clone(),
+        StyleState {
             scroll_offsets: self.scroll_offsets.clone(),
-            control_values: self.control_values.clone().into_iter().collect(),
             text_selections: self
                 .text_selections
                 .iter()
@@ -3521,6 +3531,23 @@ impl ScriptRuntime {
                 })
                 .collect(),
             script_animations: Rc::new(self.animation_snapshot()),
+            ..self.selector_state(hovered_path)
+        }
+    }
+
+    // what selectors match against, without the scroll and animation state only styling reads
+    pub(crate) fn selector_state(&self, hovered_path: Option<NodeId>) -> StyleState {
+        let mut state = StyleState {
+            hovered: hovered_path,
+            focused: self.focused_element,
+            top_layer: self.top_layer_elements(),
+            popovers: self.popovers.iter().copied().collect(),
+            focus_visible: self
+                .focused_element
+                .is_some_and(|node| !self.pointer_modality || self.is_text_control(node)),
+            active: self.active_node,
+            forced: self.forced_pseudo_classes.clone(),
+            control_values: self.control_values.clone().into_iter().collect(),
             ..StyleState::default()
         };
         state.indeterminate = self.indeterminate.clone();
@@ -7901,10 +7928,13 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
+                let state = self.selector_state(self.hovered_node);
+                let root = self.document.borrow().root();
                 Ok(self
                     .document
                     .borrow()
-                    .find_element_by_selector(&selector)
+                    .select_within(root, &selector, &state)
+                    .and_then(|found| found.first().copied())
                     .map_or(Value::Null, |node| self.node_value(node)))
             }
             Builtin::DocumentQuerySelectorAll => {
@@ -7912,10 +7942,12 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
+                let state = self.selector_state(self.hovered_node);
+                let root = self.document.borrow().root();
                 let nodes = self
                     .document
                     .borrow()
-                    .find_elements_by_selector(&selector)
+                    .select_within(root, &selector, &state)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|node| self.node_handle(node))
@@ -9785,10 +9817,12 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let node = handle.id;
+                let state = self.selector_state(self.hovered_node);
                 Ok(self
                     .document
                     .borrow()
-                    .find_element_by_selector_within(node, &selector)
+                    .select_within(node, &selector, &state)
+                    .and_then(|found| found.first().copied())
                     .map_or(Value::Null, |node| self.node_value(node)))
             }
             Builtin::ElementQuerySelectorAll(handle) => {
@@ -9797,10 +9831,11 @@ impl ScriptRuntime {
                     .map(Value::string_value)
                     .unwrap_or_default();
                 let node = handle.id;
+                let state = self.selector_state(self.hovered_node);
                 let nodes = self
                     .document
                     .borrow()
-                    .find_elements_by_selector_within(node, &selector)
+                    .select_within(node, &selector, &state)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|node| self.node_handle(node))

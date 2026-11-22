@@ -235,6 +235,11 @@ static EVENT_INTERFACES: &[EventInterface] = &[
         members: &[("clipboardData", Any)],
     },
     EventInterface {
+        name: "ToggleEvent",
+        parent: "Event",
+        members: &[("oldState", Text), ("newState", Text)],
+    },
+    EventInterface {
         name: "PopStateEvent",
         parent: "Event",
         members: &[("state", Any)],
@@ -500,6 +505,8 @@ fn event_defaults(event_type: &str) -> (&'static str, bool, bool) {
         "invalid" => ("Event", false, true),
         "copy" | "cut" | "paste" => ("ClipboardEvent", true, true),
         "popstate" => ("PopStateEvent", false, false),
+        "beforetoggle" => ("ToggleEvent", false, true),
+        "toggle" => ("ToggleEvent", false, false),
         "hashchange" => ("HashChangeEvent", false, false),
         "message" | "messageerror" => ("MessageEvent", false, false),
         "error" => ("ErrorEvent", false, true),
@@ -1822,6 +1829,7 @@ impl ScriptRuntime {
         previous: Option<NodeId>,
         next: Option<NodeId>,
     ) -> Result<bool, ScriptError> {
+        self.hovered_node = next;
         let (previous, next, left, entered) = {
             let document = self.document.borrow();
             let live = |node: Option<NodeId>| node.filter(|&node| document.is_connected(node));

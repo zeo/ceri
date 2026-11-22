@@ -1323,6 +1323,8 @@ pub(crate) struct StyleState {
     pub(crate) unchecked: BTreeSet<NodeId>,
     // checkboxes script set indeterminate, which show a dash whatever their checkedness
     pub(crate) indeterminate: BTreeSet<NodeId>,
+    // popovers on show, which sit in the top layer too
+    pub(crate) popovers: BTreeSet<NodeId>,
     pub(crate) disabled: BTreeSet<NodeId>,
     pub(crate) scroll_offsets: BTreeMap<NodeId, (f32, f32)>,
     pub(crate) control_values: BTreeMap<NodeId, String>,
@@ -4093,6 +4095,7 @@ enum PseudoClass {
     Active,
     Checked,
     Indeterminate,
+    PopoverOpen,
     Disabled,
     Enabled,
     FirstChild,
@@ -4481,6 +4484,7 @@ impl PseudoClass {
                     })
                     && state.is_checked(element, node)
             }
+            Self::PopoverOpen => state.popovers.contains(&node),
             // a checkbox script made indeterminate, or a progress bar without a value
             Self::Indeterminate => {
                 (element.name == "input" && state.indeterminate.contains(&node))
@@ -4590,7 +4594,7 @@ impl PseudoClass {
                     && (element.attr("required").is_some() == matches!(self, Self::Required))
             }
             Self::Defined => true,
-            Self::Modal => state.top_layer.contains(&node),
+            Self::Modal => state.top_layer.contains(&node) && !state.popovers.contains(&node),
             Self::Is(selectors) | Self::Where(selectors) => selectors
                 .iter()
                 .any(|selector| selector.matches(document, node, None, state)),
@@ -4814,6 +4818,7 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                         "active" => PseudoClass::Active,
                         "checked" => PseudoClass::Checked,
                         "indeterminate" => PseudoClass::Indeterminate,
+                        "popover-open" => PseudoClass::PopoverOpen,
                         "disabled" => PseudoClass::Disabled,
                         "enabled" => PseudoClass::Enabled,
                         "first-child" => PseudoClass::FirstChild,
@@ -6691,6 +6696,8 @@ button, input[type="button" i], input[type="submit" i], input[type="reset" i], i
   padding: 1px 6px; border: 1px solid #767676; border-radius: 3px; background-color: #efefef; text-align: center
 }
 select { padding: 1px 20px 1px 4px; text-align: start; background-color: white }
+[popover]:not(:popover-open):not(dialog[open]) { display: none }
+[popover] { position: fixed; inset: 0; width: fit-content; height: fit-content; margin: auto; border: solid; padding: 0.25em; overflow: auto; color: CanvasText; background-color: Canvas }
 input[type="checkbox" i], input[type="radio" i] { box-sizing: border-box; width: 13px; height: 13px; margin: 3px 3px 3px 4px; padding: 0; border: 1px solid #767676; border-radius: 2px; background-color: white }
 input[type="radio" i] { border-radius: 50%; margin: 3px 3px 0 5px }
 input[type="range" i] { width: 129px; height: 16px; margin: 2px; padding: 0; border: none; background-color: transparent }

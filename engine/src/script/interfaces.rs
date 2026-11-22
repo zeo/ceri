@@ -487,6 +487,10 @@ static INTERFACES: &[Interface] = &[
             ("autofocus", Flag("autofocus")),
             ("inert", Flag("inert")),
             ("tabIndex", ReadWrite),
+            ("popover", ReadWrite),
+            ("showPopover", Method(0)),
+            ("hidePopover", Method(0)),
+            ("togglePopover", Method(0)),
             ("draggable", ReadWrite),
             ("spellcheck", ReadWrite),
             ("translate", ReadWrite),
@@ -539,6 +543,7 @@ static INTERFACES: &[Interface] = &[
             ("multiple", Flag("multiple")),
             ("autofocus", Flag("autofocus")),
             ("indeterminate", ReadWrite),
+            ("popoverTargetAction", ReadWrite),
             ("alt", Attr("alt")),
             ("src", Url("src")),
             ("size", ReadWrite),
@@ -602,6 +607,7 @@ static INTERFACES: &[Interface] = &[
             ("name", Attr("name")),
             ("type", Attr("type")),
             ("autofocus", Flag("autofocus")),
+            ("popoverTargetAction", ReadWrite),
         ],
     },
     Interface {
@@ -1637,6 +1643,10 @@ impl ScriptRuntime {
             ("setPointerCapture" | "releasePointerCapture" | "hasPointerCapture", Access::Call) => {
                 self.pointer_capture_member(node, member.name(), first)?
             }
+            ("popover" | "popoverTargetAction", _)
+            | ("showPopover" | "hidePopover" | "togglePopover", Access::Call) => {
+                self.popover_member(handle, member.name(), member.access, first)?
+            }
             ("returnValue", _)
             | ("show" | "showModal" | "close" | "requestClose", Access::Call) => {
                 self.dialog_member(handle, member.name(), member.access, first)?
@@ -1727,16 +1737,24 @@ impl ScriptRuntime {
             ("matches" | "webkitMatchesSelector", Access::Call) => {
                 let source = self.coerce_string(first)?;
                 let selectors = self.selector_list(&source)?;
-                Value::Bool(self.document.borrow().matches_selectors(node, &selectors))
+                let state = self.selector_state(self.hovered_node);
+                Value::Bool(
+                    self.document
+                        .borrow()
+                        .matches_selectors_in(node, &selectors, &state),
+                )
             }
             ("closest", Access::Call) => {
                 let source = self.coerce_string(first)?;
                 let selectors = self.selector_list(&source)?;
+                let state = self.selector_state(self.hovered_node);
                 let found = {
                     let document = self.document.borrow();
                     std::iter::once(node)
                         .chain(document.ancestors(node))
-                        .find(|&candidate| document.matches_selectors(candidate, &selectors))
+                        .find(|&candidate| {
+                            document.matches_selectors_in(candidate, &selectors, &state)
+                        })
                 };
                 self.optional_node(found)
             }

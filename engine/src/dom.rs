@@ -2241,10 +2241,34 @@ impl Document {
         node: NodeId,
         selectors: &[crate::css::Selector],
     ) -> bool {
+        self.matches_selectors_in(node, selectors, &crate::css::StyleState::default())
+    }
+
+    // matching against what the page is doing: focus, hover, checkedness and the top layer
+    pub(crate) fn matches_selectors_in(
+        &self,
+        node: NodeId,
+        selectors: &[crate::css::Selector],
+        state: &crate::css::StyleState,
+    ) -> bool {
         self.is_element(node)
-            && selectors.iter().any(|selector| {
-                selector.matches(self, node, None, &crate::css::StyleState::default())
-            })
+            && selectors
+                .iter()
+                .any(|selector| selector.matches(self, node, None, state))
+    }
+
+    pub(crate) fn select_within(
+        &self,
+        scope: NodeId,
+        selector: &str,
+        state: &crate::css::StyleState,
+    ) -> Option<Vec<NodeId>> {
+        let selectors = crate::css::Selector::parse_list(selector).ok()?;
+        Some(
+            self.descendants(scope)
+                .filter(|&node| self.matches_selectors_in(node, &selectors, state))
+                .collect(),
+        )
     }
 
     pub fn accessibility_tree(&self) -> AccessibilityNode {

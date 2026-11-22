@@ -227,6 +227,8 @@ pub(super) enum Native {
     ScriptElement(crate::dom::NodeId),
     // a dialog reporting that it closed
     DialogClose(crate::dom::NodeId),
+    // a popover's queued toggle event
+    PopoverToggle(crate::dom::NodeId),
     // a media element's source selection and its events, for one run of its load algorithm
     MediaLoad(crate::dom::NodeId, u64),
     MediaCue(Box<(crate::dom::NodeId, u64, super::media::Cue)>),
@@ -3338,6 +3340,7 @@ impl ScriptRuntime {
             Native::ImageDeliver(node, generation) => self.deliver_image(node, generation),
             Native::ScriptElement(node) => self.run_script_element(node),
             Native::DialogClose(node) => self.deliver_dialog_close(node),
+            Native::PopoverToggle(node) => self.deliver_popover_toggle(node),
             Native::MediaLoad(node, generation) => self.deliver_media_load(node, generation),
             Native::MediaCue(cue) => {
                 let (node, generation, cue) = *cue;
