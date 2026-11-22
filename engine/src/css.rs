@@ -591,9 +591,33 @@ impl Color {
 pub(crate) enum Length {
     Auto,
     Terms(LengthTerms),
-    Clamp(LengthTerms, LengthTerms, LengthTerms),
-    Smallest(LengthTerms, LengthTerms),
-    Largest(LengthTerms, LengthTerms),
+    Clamp(TermsList),
+    Smallest(TermsList),
+    Largest(TermsList),
+}
+
+// the arguments of a clamp(), min() or max(), kept in a table so every length in a style stays
+// as small as one sum of terms
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TermsList(u32);
+
+thread_local! {
+    static TERMS_LISTS: RefCell<crate::intern::Table<[LengthTerms]>> =
+        RefCell::new(crate::intern::Table::new());
+}
+
+impl TermsList {
+    fn new(terms: Vec<LengthTerms>) -> Self {
+        // keyed by value, so equal arguments written differently still make equal lengths
+        let key = format!("{terms:?}");
+        Self(TERMS_LISTS.with(|lists| lists.borrow_mut().insert(&key, Rc::from(terms))))
+    }
+
+    fn terms(self) -> Rc<[LengthTerms]> {
+        TERMS_LISTS
+            .with(|lists| lists.borrow().get(self.0))
+            .unwrap_or_else(|| Rc::from(Vec::new()))
+    }
 }
 
 // a length is a sum of unit terms, so calc() and plain values share one resolver
@@ -665,11 +689,8 @@ impl Length {
         match self {
             Self::Auto => false,
             Self::Terms(terms) => terms.percent != 0.0,
-            Self::Clamp(minimum, preferred, maximum) => {
-                minimum.percent != 0.0 || preferred.percent != 0.0 || maximum.percent != 0.0
-            }
-            Self::Smallest(left, right) | Self::Largest(left, right) => {
-                left.percent != 0.0 || right.percent != 0.0
+            Self::Clamp(list) | Self::Smallest(list) | Self::Largest(list) => {
+                list.terms().iter().any(|terms| terms.percent != 0.0)
             }
         }
     }
@@ -714,25 +735,34 @@ impl Length {
         match self {
             Self::Auto => None,
             Self::Terms(terms) => Some(terms.resolve(containing, font_size)),
-            Self::Clamp(minimum, preferred, maximum) => {
-                let minimum = minimum.resolve(containing, font_size);
-                let maximum = maximum.resolve(containing, font_size);
-                Some(
-                    preferred
+            Self::Clamp(list) => match *list.terms() {
+                [minimum, preferred, maximum] => {
+                    let minimum = minimum.resolve(containing, font_size);
+                    let maximum = maximum.resolve(containing, font_size);
+                    Some(
+                        preferred
+                            .resolve(containing, font_size)
+                            .clamp(minimum.min(maximum), maximum.max(minimum)),
+                    )
+                }
+                _ => None,
+            },
+            Self::Smallest(list) => match *list.terms() {
+                [first, second] => Some(
+                    first
                         .resolve(containing, font_size)
-                        .clamp(minimum.min(maximum), maximum.max(minimum)),
-                )
-            }
-            Self::Smallest(first, second) => Some(
-                first
-                    .resolve(containing, font_size)
-                    .min(second.resolve(containing, font_size)),
-            ),
-            Self::Largest(first, second) => Some(
-                first
-                    .resolve(containing, font_size)
-                    .max(second.resolve(containing, font_size)),
-            ),
+                        .min(second.resolve(containing, font_size)),
+                ),
+                _ => None,
+            },
+            Self::Largest(list) => match *list.terms() {
+                [first, second] => Some(
+                    first
+                        .resolve(containing, font_size)
+                        .max(second.resolve(containing, font_size)),
+                ),
+                _ => None,
+            },
         }
     }
 }
@@ -7554,21 +7584,21 @@ pub(crate) fn parse_length(value: &str) -> Option<Length> {
         .and_then(|rest| rest.strip_suffix(')'))
     {
         let terms = parse_length_arguments(arguments, 3)?;
-        return Some(Length::Clamp(terms[0], terms[1], terms[2]));
+        return Some(Length::Clamp(TermsList::new(terms)));
     }
     if let Some(arguments) = value
         .strip_prefix("min(")
         .and_then(|rest| rest.strip_suffix(')'))
     {
         let terms = parse_length_arguments(arguments, 2)?;
-        return Some(Length::Smallest(terms[0], terms[1]));
+        return Some(Length::Smallest(TermsList::new(terms)));
     }
     if let Some(arguments) = value
         .strip_prefix("max(")
         .and_then(|rest| rest.strip_suffix(')'))
     {
         let terms = parse_length_arguments(arguments, 2)?;
-        return Some(Length::Largest(terms[0], terms[1]));
+        return Some(Length::Largest(TermsList::new(terms)));
     }
     parse_length_unit(&value).map(Length::Terms)
 }
@@ -8759,6 +8789,29 @@ fn unshift_rules(rules: &mut [Rule], shifts: &[(usize, usize)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_style_stays_small_enough_to_keep_one_per_element() {
+        assert!(std::mem::size_of::<Length>() <= 32);
+        assert!(std::mem::size_of::<Style>() <= 2048);
+    }
+
+    #[test]
+    fn clamp_min_and_max_lengths_resolve_through_their_kept_arguments() {
+        let clamp = parse_length("clamp(10px, 50%, 30px)").expect("clamp parses");
+        assert_eq!(clamp.resolve(100.0, 16.0), Some(30.0));
+        assert_eq!(clamp.resolve(40.0, 16.0), Some(20.0));
+        assert!(clamp.has_percent());
+        assert_eq!(
+            parse_length("min(10px, 2em)").and_then(|l| l.resolve(0.0, 4.0)),
+            Some(8.0)
+        );
+        assert_eq!(
+            parse_length("max(10px, 2em)").and_then(|l| l.resolve(0.0, 4.0)),
+            Some(10.0)
+        );
+        assert_eq!(parse_length("clamp(10px,50%,30px)"), Some(clamp));
+    }
 
     // an element placed under its ancestors, outermost first, in a fresh document
     fn placed(element: &Element, ancestors: &[&Element]) -> (Document, NodeId) {
