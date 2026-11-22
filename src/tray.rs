@@ -88,6 +88,9 @@ pub struct TrayConfig {
 pub enum TrayEvent {
     // the icon was clicked, or chosen from the keyboard
     Click,
+    // the icon was double clicked with the left button, after the Click its first press made;
+    // windows only, as the linux tray protocol reports no double click
+    DoubleClick,
     // a menu item was chosen, by its id
     Menu(String),
 }

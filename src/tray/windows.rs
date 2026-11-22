@@ -15,7 +15,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_SEPARATOR, MF_STRING, MSGFLT_ALLOW, PostMessageW, RegisterClassW, RegisterWindowMessageW,
     SM_CXSMICON, SM_MENUDROPALIGNMENT, SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN,
     TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu,
-    WM_APP, WM_CONTEXTMENU, WM_NCDESTROY, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    WM_APP, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_NCDESTROY, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_OVERLAPPED,
 };
 use windows::core::{PCSTR, PCWSTR, w};
 
@@ -320,6 +321,7 @@ unsafe extern "system" fn procedure(
             // version 4 puts the event in the low word and the anchor point in wparam
             match lparam.0 as u32 & 0xffff {
                 NIN_SELECT | NIN_KEYSELECT => (shared.handler)(TrayEvent::Click),
+                WM_LBUTTONDBLCLK => (shared.handler)(TrayEvent::DoubleClick),
                 WM_CONTEXTMENU => {
                     let x = i32::from(wparam.0 as u16 as i16);
                     let y = i32::from((wparam.0 >> 16) as u16 as i16);
