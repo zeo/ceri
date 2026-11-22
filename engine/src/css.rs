@@ -6691,7 +6691,7 @@ button, input[type="button" i], input[type="submit" i], input[type="reset" i], i
   padding: 1px 6px; border: 1px solid #767676; border-radius: 3px; background-color: #efefef; text-align: center
 }
 select { padding: 1px 20px 1px 4px; text-align: start; background-color: white }
-input[type="checkbox" i], input[type="radio" i] { width: 13px; height: 13px; margin: 3px 3px 3px 4px; padding: 0; border: 1px solid #767676; border-radius: 2px; background-color: white }
+input[type="checkbox" i], input[type="radio" i] { box-sizing: border-box; width: 13px; height: 13px; margin: 3px 3px 3px 4px; padding: 0; border: 1px solid #767676; border-radius: 2px; background-color: white }
 input[type="radio" i] { border-radius: 50%; margin: 3px 3px 0 5px }
 input[type="range" i] { width: 129px; height: 16px; margin: 2px; padding: 0; border: none; background-color: transparent }
 input[type="range" i]::-webkit-slider-runnable-track, input[type="range" i]::-webkit-slider-thumb { display: block; box-sizing: border-box }

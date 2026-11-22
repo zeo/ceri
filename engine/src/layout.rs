@@ -10666,7 +10666,7 @@ mod tests {
             })
         );
         assert_eq!(checkbox.background, Color::opaque(0, 117, 255));
-        assert_eq!(checkbox.rect.width, 15.0, "13px with a 1px border");
+        assert_eq!(checkbox.rect.width, 13.0, "13px with its 1px border inside");
         assert!(matches!(
             range.control,
             Some(ControlPaint::Range { fraction, .. }) if (fraction - 0.5).abs() < 1e-6
@@ -10686,8 +10686,8 @@ mod tests {
             "a checked box fills"
         );
         let mark = (
-            checkbox.rect.x + 1.0 + 13.0 * 0.42,
-            checkbox.rect.y + 1.0 + 13.0 * 0.72,
+            checkbox.rect.x + 1.0 + 11.0 * 0.42,
+            checkbox.rect.y + 1.0 + 11.0 * 0.72,
         );
         assert_eq!(
             pixel(mark.0, mark.1),
