@@ -45,3 +45,14 @@ test("resize dragging names the edge as Tauri does", async () => {
   await appWindow.startResizeDragging("SouthEast");
   assert.deepEqual(calls, [["window:start-resize-dragging", { direction: "SouthEast" }]]);
 });
+
+test("file urls take canonical windows paths in their verbatim form too", async () => {
+  const { fileSrc } = await import("../sdk/index.js");
+  const expected = "https://files.ceri.invalid/E/Pictures/capscr/a%20b.png";
+  const share = "https://files.ceri.invalid/UNC/server/share/a.png";
+  assert.equal(fileSrc(String.raw`E:\Pictures\capscr\a b.png`), expected);
+  assert.equal(fileSrc(String.raw`\\?\E:\Pictures\capscr\a b.png`), expected);
+  assert.equal(fileSrc(String.raw`\\server\share\a.png`), share);
+  assert.equal(fileSrc(String.raw`\\?\UNC\server\share\a.png`), share);
+  assert.equal(fileSrc("/home/me/a.png"), "https://files.ceri.invalid/home/me/a.png");
+});

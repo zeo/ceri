@@ -280,6 +280,8 @@ const FILES_ORIGIN = "https://files.ceri.invalid";
 
 // the URL a page loads an absolute file path from, once the app allows a folder holding it
 export function fileSrc(path) {
+  // a canonicalized windows path comes verbatim, as \\?\C:\... or \\?\UNC\server\share\...
+  path = path.replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\\?\\(?=[A-Za-z]:)/, "");
   const drive = /^([A-Za-z]):[\\/]+(.*)$/s.exec(path);
   const share = /^\\\\(.*)$/s.exec(path);
   const parts = drive
