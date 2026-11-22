@@ -832,7 +832,6 @@ test/built-ins/Function/prototype/toString/class-expression-explicit-ctor.js
 test/built-ins/Function/prototype/toString/getter-class-expression-static.js
 test/built-ins/Function/prototype/toString/getter-class-statement-static.js
 test/built-ins/Function/prototype/toString/line-terminator-normalisation-CR.js
-test/built-ins/Function/prototype/toString/line-terminator-normalisation-LF.js
 test/built-ins/Function/prototype/toString/method-class-expression-static.js
 test/built-ins/Function/prototype/toString/method-class-statement-static.js
 test/built-ins/Function/prototype/toString/private-static-method-class-expression.js
