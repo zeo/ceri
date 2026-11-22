@@ -415,6 +415,9 @@ enum Builtin {
     LocationReload,
     WindowScrollTo,
     WindowScrollBy,
+    WindowAlert,
+    WindowConfirm,
+    WindowPrompt,
     WindowGetSelection,
     ClipboardReadText,
     ClipboardWriteText,
@@ -795,6 +798,7 @@ pub struct ScriptRuntime {
     file_lists: RefCell<HashMap<NodeId, FileListHandle>>,
     file_picker: Option<Rc<dyn FilePicker>>,
     clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
+    script_dialogs: Option<Rc<dyn crate::navigation::ScriptDialogs>>,
     display: Option<Display>,
     screen_object: RefCell<Option<Value>>,
     scroll_offsets: BTreeMap<NodeId, (f32, f32)>,
@@ -1976,6 +1980,7 @@ impl ScriptRuntime {
             file_lists: RefCell::new(HashMap::new()),
             file_picker: None,
             clipboard_provider: None,
+            script_dialogs: None,
             display: None,
             screen_object: RefCell::new(None),
             bridge: None,
@@ -2467,6 +2472,13 @@ impl ScriptRuntime {
         clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
     ) {
         self.clipboard_provider = clipboard_provider;
+    }
+
+    pub(crate) fn set_script_dialogs(
+        &mut self,
+        dialogs: Option<Rc<dyn crate::navigation::ScriptDialogs>>,
+    ) {
+        self.script_dialogs = dialogs;
     }
 
     // a page script that throws or fails to parse is reported as uncaught, as browsers do,
@@ -4324,6 +4336,27 @@ impl ScriptRuntime {
                 "WebAssembly" => Ok(Value::WebAssemblyNamespace),
                 "scroll" | "scrollTo" => Ok(Value::Builtin(Builtin::WindowScrollTo)),
                 "scrollBy" => Ok(Value::Builtin(Builtin::WindowScrollBy)),
+                "alert" if self.worker_sender.is_none() => Ok(Value::Builtin(Builtin::WindowAlert)),
+                "confirm" if self.worker_sender.is_none() => {
+                    Ok(Value::Builtin(Builtin::WindowConfirm))
+                }
+                "prompt" if self.worker_sender.is_none() => {
+                    Ok(Value::Builtin(Builtin::WindowPrompt))
+                }
+                // a top-level window is its own self, top and parent, with no frames in it
+                "self" | "window" | "frames" => Ok(Value::Window),
+                "top" | "parent" if self.worker_sender.is_none() => Ok(Value::Window),
+                "opener" | "frameElement" if self.worker_sender.is_none() => Ok(Value::Null),
+                "length" if self.worker_sender.is_none() => Ok(Value::Number(0.0)),
+                "closed" if self.worker_sender.is_none() => Ok(Value::Bool(false)),
+                "name" if self.worker_sender.is_none() => Ok(Value::String("".into())),
+                "origin" => Ok(Value::String(
+                    self.location.borrow().origin().to_string().into(),
+                )),
+                "isSecureContext" => Ok(Value::Bool(true)),
+                "outerWidth" => Ok(Value::Number(self.viewport.width as f64)),
+                "outerHeight" => Ok(Value::Number(self.viewport.height as f64)),
+                "screenX" | "screenY" | "screenLeft" | "screenTop" => Ok(Value::Number(0.0)),
                 "structuredClone" => Ok(Value::Builtin(Builtin::StructuredClone)),
                 "postMessage" if self.worker_sender.is_none() => {
                     Ok(Value::Builtin(Builtin::WindowPostMessage))
@@ -8114,6 +8147,39 @@ impl ScriptRuntime {
             Builtin::WindowScrollBy => {
                 self.set_window_scroll(&arguments, true)?;
                 Ok(Value::Undefined)
+            }
+            Builtin::WindowAlert | Builtin::WindowConfirm | Builtin::WindowPrompt => {
+                let message = match arguments.first() {
+                    Some(message) => self.coerce_string(message.clone())?,
+                    None => String::new(),
+                };
+                let Some(dialogs) = self.script_dialogs.clone() else {
+                    return Ok(match builtin {
+                        Builtin::WindowConfirm => Value::Bool(false),
+                        Builtin::WindowPrompt => Value::Null,
+                        _ => Value::Undefined,
+                    });
+                };
+                let title = {
+                    let document = self.document.borrow();
+                    document.title_of(document.root()).unwrap_or_default()
+                };
+                Ok(match builtin {
+                    Builtin::WindowConfirm => Value::Bool(dialogs.confirm(&title, &message)),
+                    Builtin::WindowPrompt => {
+                        let default = match arguments.get(1) {
+                            Some(Value::Undefined) | None => String::new(),
+                            Some(default) => self.coerce_string(default.clone())?,
+                        };
+                        dialogs
+                            .prompt(&title, &message, &default)
+                            .map_or(Value::Null, |text| Value::String(text.into()))
+                    }
+                    _ => {
+                        dialogs.alert(&title, &message);
+                        Value::Undefined
+                    }
+                })
             }
             Builtin::LocationAssign => {
                 let reference = arguments
@@ -20303,6 +20369,68 @@ mod tests {
             Some(
                 "-1|0|true|true|false|4|||hi|SyntaxError|false|true|true|UTF-8|CSS1Compat|1|1|true|a=3; c=4|<b>x</b>|<a name=\"&quot;q\">x</a>|auto||Uint8Array|104,105"
             )
+        );
+    }
+
+    #[test]
+    fn window_dialogs_ask_the_host_and_answer_like_headless_chrome_without_one() {
+        struct Recorded(RefCell<Vec<String>>);
+        impl crate::navigation::ScriptDialogs for Recorded {
+            fn alert(&self, title: &str, message: &str) {
+                self.0
+                    .borrow_mut()
+                    .push(format!("alert {title}: {message}"));
+            }
+            fn confirm(&self, title: &str, message: &str) -> bool {
+                self.0
+                    .borrow_mut()
+                    .push(format!("confirm {title}: {message}"));
+                true
+            }
+            fn prompt(&self, _title: &str, message: &str, default: &str) -> Option<String> {
+                self.0
+                    .borrow_mut()
+                    .push(format!("prompt {message} [{default}]"));
+                Some(format!("{default}!"))
+            }
+        }
+        let source = r#"
+            const seen = [alert("hi"), confirm("sure?"), prompt("name", "zed"), prompt("again")];
+            seen.push(self === window, top === window, parent === window, frames === window, window.length, window.opener, isSecureContext, escape("a b+ü€"), unescape("%41%u20AC%zz"));
+            window.name = "main";
+            seen.push(window.name);
+            document.getElementById("status").textContent = seen.join("|");
+        "#;
+        let ask = |dialogs: Option<Rc<Recorded>>| {
+            let document = document("<title>Shots</title><p id='status'>idle</p>");
+            let mut runtime = ScriptRuntime::new(document.clone());
+            runtime.set_script_dialogs(
+                dialogs.map(|dialogs| dialogs as Rc<dyn crate::navigation::ScriptDialogs>),
+            );
+            runtime.execute(source).expect("dialogs should execute");
+            let status = document
+                .borrow()
+                .find_element_by_id("status")
+                .expect("status should exist");
+            document.borrow().element_text_content(status)
+        };
+        let recorded = Rc::new(Recorded(RefCell::new(Vec::new())));
+        assert_eq!(
+            ask(Some(recorded.clone())).as_deref(),
+            Some("|true|zed!|!|true|true|true|true|0||true|a%20b+%FC%u20AC|A\u{20ac}%zz|main")
+        );
+        assert_eq!(
+            *recorded.0.borrow(),
+            [
+                "alert Shots: hi",
+                "confirm Shots: sure?",
+                "prompt name [zed]",
+                "prompt again []"
+            ]
+        );
+        assert_eq!(
+            ask(None).as_deref(),
+            Some("|false|||true|true|true|true|0||true|a%20b+%FC%u20AC|A\u{20ac}%zz|main")
         );
     }
 

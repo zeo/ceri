@@ -104,6 +104,21 @@ impl MessageDialog {
     }
 }
 
+// a line of text asked for under a message, as window.prompt does
+#[derive(Clone, Debug, Default)]
+pub struct InputDialog {
+    pub title: String,
+    pub text: String,
+    pub default: String,
+}
+
+impl InputDialog {
+    // the text entered, none for a cancel
+    pub fn show(&self) -> Result<Option<String>, String> {
+        platform::input(self)
+    }
+}
+
 // an input's accept list: its extensions as one filter, then any file; MIME types fall to the latter
 pub(crate) fn accept_filters(accept: Option<&str>) -> Vec<FileFilter> {
     let extensions: Vec<String> = accept

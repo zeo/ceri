@@ -91,8 +91,8 @@ pub use navigation::{
     APP_ORIGIN, AppUrl, Browser, ClipboardProvider, ExternalEvent, ExternalReport, ExternalRequest,
     FILES_ORIGIN, FilePicker, FilePickerRequest, FileSelection, NavigationError, NavigationFailure,
     NavigationStatus, Resource, ResourceBundle, ResourceCacheMode, ResourceProvider,
-    ResourceRequest, ResourceResponse, SocketConnector, SocketStream, UserPreferences,
-    external_url, mime_type_for,
+    ResourceRequest, ResourceResponse, ScriptDialogs, SocketConnector, SocketStream,
+    UserPreferences, external_url, mime_type_for,
 };
 pub use paint::Canvas;
 pub use script::{

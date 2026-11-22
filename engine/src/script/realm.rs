@@ -113,6 +113,8 @@ pub(super) enum Native {
     CssEscape,
     CssSupports,
     DecodeUri(bool),
+    // annex B escape, or unescape for false
+    Escape(bool),
     GlobalIsNaN,
     GlobalIsFinite,
     StringRaw,
@@ -854,6 +856,8 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         ("encodeURIComponent", Native::EncodeUri(true)),
         ("decodeURI", Native::DecodeUri(false)),
         ("decodeURIComponent", Native::DecodeUri(true)),
+        ("escape", Native::Escape(true)),
+        ("unescape", Native::Escape(false)),
     ] {
         globals.push((name, Value::Object(build.function(native, name, 1))));
     }
@@ -3456,6 +3460,17 @@ impl ScriptRuntime {
                     Some(decoded) => Ok(Value::String(decoded.into())),
                     None => Err(self.throw_error("URIError", "URI malformed")),
                 }
+            }
+            Native::Escape(escape) => {
+                let units = super::strings::units(&self.coerce_string(first)?);
+                Ok(Value::String(
+                    if escape {
+                        super::strings::escape(&units)
+                    } else {
+                        super::strings::unescape(&units)
+                    }
+                    .into(),
+                ))
             }
             Native::GlobalIsNaN => Ok(Value::Bool(self.coerce_number(first)?.is_nan())),
             Native::GlobalIsFinite => Ok(Value::Bool(self.coerce_number(first)?.is_finite())),

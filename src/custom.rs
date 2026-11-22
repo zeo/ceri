@@ -3,7 +3,9 @@ use crate::audio::DesktopAudio;
 use crate::autostart::Autostart;
 use crate::commands::{CommandRoutes, Commands};
 use crate::deep_link;
-use crate::desktop::{DesktopClipboard, DesktopFilePicker, DesktopTimeZone, user_locale};
+use crate::desktop::{
+    DesktopClipboard, DesktopDialogs, DesktopFilePicker, DesktopTimeZone, user_locale,
+};
 use crate::dev::DevServer;
 use crate::files::FileScope;
 use crate::fonts::SystemFonts;
@@ -733,6 +735,7 @@ fn run_app(
         windows,
         move |window| {
             handle.attach(&window.control);
+            // only a window a person sees asks them anything; captures answer as headless Chrome
             build_browser(
                 assets.clone(),
                 storage.clone(),
@@ -742,6 +745,7 @@ fn run_app(
                 bridge.content_security_policy.clone(),
                 bridge.dev.clone(),
             )
+            .map(|browser| browser.with_script_dialogs(Rc::new(DesktopDialogs)))
         },
         lifecycle,
     );

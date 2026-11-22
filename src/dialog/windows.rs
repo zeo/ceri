@@ -1,17 +1,17 @@
-use super::{FileDialog, MessageButtons, MessageDialog, MessageLevel, Pick};
+use super::{FileDialog, InputDialog, MessageButtons, MessageDialog, MessageLevel, Pick};
 use ceri_engine::NativeHandle;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
-use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
+use windows::Win32::Foundation::{ERROR_CANCELLED, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
     CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::Controls::{
-    TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TD_ERROR_ICON, TD_INFORMATION_ICON, TD_WARNING_ICON,
-    TDF_ALLOW_DIALOG_CANCELLATION, TDF_POSITION_RELATIVE_TO_WINDOW,
+    EM_SETSEL, TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TD_ERROR_ICON, TD_INFORMATION_ICON,
+    TD_WARNING_ICON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_POSITION_RELATIVE_TO_WINDOW,
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
@@ -20,8 +20,12 @@ use windows::Win32::UI::Shell::{
     IFileOpenDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    IDCANCEL, IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL,
-    MB_YESNO, MessageBoxW,
+    BS_DEFPUSHBUTTON, BS_PUSHBUTTON, DLGTEMPLATE, DS_CENTER, DS_MODALFRAME, DS_SETFONT,
+    DialogBoxIndirectParamW, ES_AUTOHSCROLL, EndDialog, GWLP_USERDATA, GetDlgItemTextW,
+    GetWindowLongPtrW, IDCANCEL, IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING,
+    MB_OK, MB_OKCANCEL, MB_YESNO, MessageBoxW, SendDlgItemMessageW, SetDlgItemTextW,
+    SetWindowLongPtrW, WM_COMMAND, WM_INITDIALOG, WS_BORDER, WS_CAPTION, WS_CHILD, WS_POPUP,
+    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, Interface, PCWSTR};
 
@@ -239,6 +243,139 @@ fn labelled(dialog: &MessageDialog) -> Option<Result<bool, String>> {
             .map(|()| chosen == IDOK.0)
             .map_err(|error| error.message()),
     )
+}
+
+const PROMPT_EDIT: i32 = 100;
+
+struct Prompt {
+    default: HSTRING,
+    answer: Option<String>,
+}
+
+// one control of a dialog template: its style, place in dialog units, id, class atom and text
+fn template_item(out: &mut Vec<u16>, style: u32, place: [i16; 4], id: u16, class: u16, text: &str) {
+    if out.len() % 2 == 1 {
+        out.push(0);
+    }
+    out.extend([style as u16, (style >> 16) as u16, 0, 0]);
+    out.extend(place.map(|value| value as u16));
+    out.extend([id, 0xffff, class]);
+    out.extend(text.encode_utf16().chain([0]));
+    out.push(0);
+}
+
+// a modal dialog with the message, an edit box holding the default, and OK and Cancel; windows
+// has no stock one, so it is laid out in memory the way a resource script would describe it
+pub(super) fn input(dialog: &InputDialog) -> Result<Option<String>, String> {
+    let lines: usize = dialog
+        .text
+        .lines()
+        .map(|line| line.chars().count().div_ceil(52).max(1))
+        .sum::<usize>()
+        .clamp(1, 24);
+    let text_height = (lines * 9) as i16;
+    let edit_top = 7 + text_height + 4;
+    let buttons_top = edit_top + 14 + 8;
+    let style =
+        (WS_POPUP | WS_CAPTION | WS_SYSMENU).0 | (DS_MODALFRAME | DS_CENTER | DS_SETFONT) as u32;
+    let mut template: Vec<u16> = vec![style as u16, (style >> 16) as u16, 0, 0, 4];
+    template.extend([0, 0, 260, (buttons_top + 14 + 7) as u16, 0, 0]);
+    template.extend(dialog.title.encode_utf16().chain([0]));
+    template.push(9);
+    template.extend("Segoe UI".encode_utf16().chain([0]));
+    let child = (WS_CHILD | WS_VISIBLE).0;
+    template_item(
+        &mut template,
+        child,
+        [7, 7, 246, text_height],
+        0xffff,
+        0x82,
+        &dialog.text,
+    );
+    template_item(
+        &mut template,
+        child | (WS_BORDER | WS_TABSTOP).0 | ES_AUTOHSCROLL as u32,
+        [7, edit_top, 246, 14],
+        PROMPT_EDIT as u16,
+        0x81,
+        "",
+    );
+    template_item(
+        &mut template,
+        child | WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32,
+        [149, buttons_top, 50, 14],
+        IDOK.0 as u16,
+        0x80,
+        "OK",
+    );
+    template_item(
+        &mut template,
+        child | WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
+        [203, buttons_top, 50, 14],
+        IDCANCEL.0 as u16,
+        0x80,
+        "Cancel",
+    );
+    // the template and each control in it start on a four byte boundary
+    let aligned: Vec<u32> = template
+        .chunks(2)
+        .map(|pair| u32::from(pair[0]) | u32::from(pair.get(1).copied().unwrap_or(0)) << 16)
+        .collect();
+    let mut prompt = Prompt {
+        default: HSTRING::from(dialog.default.as_str()),
+        answer: None,
+    };
+    // SAFETY: the template and the prompt outlive the modal loop, which is the only reader of
+    // the pointer the dialog keeps
+    let result = unsafe {
+        let instance = GetModuleHandleW(None).map_err(|error| error.message())?;
+        DialogBoxIndirectParamW(
+            Some(instance.into()),
+            aligned.as_ptr().cast::<DLGTEMPLATE>(),
+            None,
+            Some(prompt_procedure),
+            LPARAM(&raw mut prompt as isize),
+        )
+    };
+    match result {
+        -1 => Err(windows::core::Error::from_thread().message()),
+        _ => Ok(prompt.answer),
+    }
+}
+
+unsafe extern "system" fn prompt_procedure(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    // SAFETY: the user data is the prompt the caller of the modal loop owns, set before any
+    // command can arrive
+    unsafe {
+        match message {
+            WM_INITDIALOG => {
+                SetWindowLongPtrW(window, GWLP_USERDATA, lparam.0);
+                let prompt = &*(lparam.0 as *const Prompt);
+                let _ = SetDlgItemTextW(window, PROMPT_EDIT, &prompt.default);
+                SendDlgItemMessageW(window, PROMPT_EDIT, EM_SETSEL, WPARAM(0), LPARAM(-1));
+                1
+            }
+            WM_COMMAND => {
+                let id = (wparam.0 & 0xffff) as i32;
+                if id == IDOK.0 {
+                    let prompt = &mut *(GetWindowLongPtrW(window, GWLP_USERDATA) as *mut Prompt);
+                    let mut text = vec![0_u16; 32 * 1024];
+                    let length = GetDlgItemTextW(window, PROMPT_EDIT, &mut text) as usize;
+                    prompt.answer = Some(String::from_utf16_lossy(&text[..length]));
+                    let _ = EndDialog(window, 1);
+                } else if id == IDCANCEL.0 {
+                    let _ = EndDialog(window, 0);
+                }
+                1
+            }
+            _ => 0,
+        }
+    }
 }
 
 pub(super) fn message(dialog: &MessageDialog) -> Result<bool, String> {

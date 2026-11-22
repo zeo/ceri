@@ -1,6 +1,7 @@
+use crate::dialog::{InputDialog, MessageButtons, MessageDialog};
 use ceri_engine::{
-    ClipboardProvider, FilePicker, FilePickerRequest, FileSelection, NavigationError, TimeZone,
-    mime_type_for,
+    ClipboardProvider, FilePicker, FilePickerRequest, FileSelection, NavigationError,
+    ScriptDialogs, TimeZone, mime_type_for,
 };
 use std::path::Path;
 
@@ -132,6 +133,60 @@ pub fn user_locale() -> Option<String> {
 fn posix_locale_tag(value: &str) -> Option<String> {
     let name = value.split(['.', '@']).next()?;
     (!name.is_empty() && name != "C" && name != "POSIX").then(|| name.replace('_', "-"))
+}
+
+pub struct DesktopDialogs;
+
+// a page without a title borrows the app's name for the dialog's
+fn dialog_title(title: &str) -> String {
+    if !title.is_empty() {
+        return title.to_string();
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| Some(path.file_stem()?.to_string_lossy().into_owned()))
+        .unwrap_or_default()
+}
+
+impl ScriptDialogs for DesktopDialogs {
+    fn alert(&self, title: &str, message: &str) {
+        let shown = MessageDialog {
+            title: dialog_title(title),
+            text: message.to_string(),
+            ..Default::default()
+        }
+        .show();
+        if let Err(error) = shown {
+            eprintln!("could not show an alert: {error}");
+        }
+    }
+
+    fn confirm(&self, title: &str, message: &str) -> bool {
+        MessageDialog {
+            title: dialog_title(title),
+            text: message.to_string(),
+            buttons: MessageButtons::OkCancel,
+            ..Default::default()
+        }
+        .show()
+        .unwrap_or_else(|error| {
+            eprintln!("could not show a confirm: {error}");
+            false
+        })
+    }
+
+    fn prompt(&self, title: &str, message: &str, default: &str) -> Option<String> {
+        InputDialog {
+            title: dialog_title(title),
+            text: message.to_string(),
+            default: default.to_string(),
+        }
+        .show()
+        .unwrap_or_else(|error| {
+            eprintln!("could not show a prompt: {error}");
+            None
+        })
+    }
 }
 
 pub struct DesktopFilePicker;

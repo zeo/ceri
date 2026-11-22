@@ -652,6 +652,17 @@ pub trait ClipboardProvider {
     }
 }
 
+// the modal alert, confirm and prompt a page asks for, titled with the page's title; without
+// one a page goes on as headless Chrome does, with no answer from anyone
+pub trait ScriptDialogs {
+    fn alert(&self, title: &str, message: &str);
+
+    fn confirm(&self, title: &str, message: &str) -> bool;
+
+    // the text entered, none when the prompt is dismissed
+    fn prompt(&self, title: &str, message: &str, default: &str) -> Option<String>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ResourceBundle {
     resources: BTreeMap<String, Resource>,
@@ -1027,6 +1038,7 @@ pub struct Browser {
     resource_provider: Option<Rc<dyn ResourceProvider>>,
     file_picker: Option<Rc<dyn FilePicker>>,
     clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
+    script_dialogs: Option<Rc<dyn ScriptDialogs>>,
     audio_device: Option<Rc<dyn crate::AudioDevice>>,
     media_decoder: Option<Arc<dyn crate::MediaDecoder>>,
     time_zone: Option<Rc<dyn crate::TimeZone>>,
@@ -1209,6 +1221,7 @@ impl Browser {
             resource_provider: None,
             file_picker: None,
             clipboard_provider: None,
+            script_dialogs: None,
             audio_device: None,
             media_decoder: None,
             time_zone: None,
@@ -1274,6 +1287,11 @@ impl Browser {
         clipboard_provider: Rc<dyn ClipboardProvider>,
     ) -> Self {
         self.clipboard_provider = Some(clipboard_provider);
+        self
+    }
+
+    pub fn with_script_dialogs(mut self, dialogs: Rc<dyn ScriptDialogs>) -> Self {
+        self.script_dialogs = Some(dialogs);
         self
     }
 
@@ -1714,6 +1732,7 @@ impl Browser {
         );
         runtime.set_file_picker(self.file_picker.clone());
         runtime.set_clipboard_provider(self.clipboard_provider.clone());
+        runtime.set_script_dialogs(self.script_dialogs.clone());
         runtime.set_audio(self.audio_device.clone(), self.waker.clone());
         runtime.set_media_decoder(self.media_decoder.clone(), self.waker.clone());
         runtime.set_socket_waker(self.waker.clone());
@@ -3644,6 +3663,7 @@ impl Browser {
                 );
                 runtime.set_file_picker(self.file_picker.clone());
                 runtime.set_clipboard_provider(self.clipboard_provider.clone());
+                runtime.set_script_dialogs(self.script_dialogs.clone());
                 runtime.set_audio(self.audio_device.clone(), self.waker.clone());
                 runtime.set_media_decoder(self.media_decoder.clone(), self.waker.clone());
                 runtime.set_socket_waker(self.waker.clone());

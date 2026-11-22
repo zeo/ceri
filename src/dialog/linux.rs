@@ -1,4 +1,4 @@
-use super::{FileDialog, MessageButtons, MessageDialog, MessageLevel, Pick};
+use super::{FileDialog, InputDialog, MessageButtons, MessageDialog, MessageLevel, Pick};
 use crate::dbus::{Bus, Message, SIGNAL, Value, unescape};
 use ceri_engine::NativeHandle;
 use std::ffi::OsString;
@@ -303,6 +303,28 @@ fn run(candidates: Vec<(&str, Vec<OsString>)>) -> Result<Option<Vec<u8>>, String
         };
     }
     Err(MISSING.to_string())
+}
+
+pub(super) fn input(dialog: &InputDialog) -> Result<Option<String>, String> {
+    let zenity: Vec<OsString> = vec![
+        "--entry".into(),
+        format!("--title={}", dialog.title).into(),
+        format!("--text={}", dialog.text).into(),
+        format!("--entry-text={}", dialog.default).into(),
+    ];
+    let kdialog: Vec<OsString> = vec![
+        "--title".into(),
+        (&dialog.title).into(),
+        "--inputbox".into(),
+        (&dialog.text).into(),
+        (&dialog.default).into(),
+    ];
+    Ok(
+        run(vec![("zenity", zenity), ("kdialog", kdialog)])?.map(|stdout| {
+            let text = String::from_utf8_lossy(&stdout);
+            text.strip_suffix('\n').unwrap_or(&text).to_string()
+        }),
+    )
 }
 
 pub(super) fn message(dialog: &MessageDialog) -> Result<bool, String> {

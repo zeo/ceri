@@ -111,6 +111,62 @@ const HTML_METHODS: &[(&str, Option<&str>)] = &[
     ("sup", None),
 ];
 
+// annex B escape: the unreserved ASCII stays, other units become %XX or %uXXXX
+pub(super) fn escape(units: &[u16]) -> String {
+    let mut out = String::with_capacity(units.len());
+    for &unit in units {
+        match u8::try_from(unit) {
+            Ok(byte) if byte.is_ascii_alphanumeric() || b"@*_+-./".contains(&byte) => {
+                out.push(char::from(byte))
+            }
+            Ok(byte) => out.push_str(&format!("%{byte:02X}")),
+            Err(_) => out.push_str(&format!("%u{unit:04X}")),
+        }
+    }
+    out
+}
+
+pub(super) fn unescape(units: &[u16]) -> String {
+    let hex = |slice: &[u16]| {
+        slice.iter().try_fold(0_u16, |value, &unit| {
+            char::from_u32(u32::from(unit))?
+                .to_digit(16)
+                .map(|digit| value * 16 + digit as u16)
+        })
+    };
+    let mut out = Vec::with_capacity(units.len());
+    let mut index = 0;
+    while index < units.len() {
+        let unit = units[index];
+        let decoded = (unit == u16::from(b'%'))
+            .then(|| {
+                if units.get(index + 1) == Some(&u16::from(b'u')) {
+                    units
+                        .get(index + 2..index + 6)
+                        .and_then(hex)
+                        .map(|value| (value, 6))
+                } else {
+                    units
+                        .get(index + 1..index + 3)
+                        .and_then(hex)
+                        .map(|value| (value, 3))
+                }
+            })
+            .flatten();
+        match decoded {
+            Some((value, length)) => {
+                out.push(value);
+                index += length;
+            }
+            None => {
+                out.push(unit);
+                index += 1;
+            }
+        }
+    }
+    from_units(&out)
+}
+
 // WhiteSpace and LineTerminator from the specification
 pub(super) fn is_js_whitespace(character: char) -> bool {
     matches!(
