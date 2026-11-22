@@ -330,6 +330,21 @@ impl Canvas {
     }
 
     fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
+        self.fill_snapped(x, y, width, height, color, [0, self.width, 0, self.height]);
+    }
+
+    // the device pixels a rect covers once its edges snap to the nearest device pixel, as
+    // browsers snap boxes, so a 1px border at a fractional offset stays one pixel and
+    // neighbouring boxes neither overlap nor gap; then only those inside `within`
+    fn fill_snapped(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: Color,
+        within: [u32; 4],
+    ) {
         if width <= 0.0 || height <= 0.0 || color.alpha == 0 {
             return;
         }
@@ -339,10 +354,10 @@ impl Canvas {
             width * self.scale,
             height * self.scale,
         );
-        // edges snap to the nearest device pixel, as browsers snap boxes, so a 1px border at a
-        // fractional offset stays one pixel and neighbouring boxes neither overlap nor gap
         let (left, right) = snap_span(x, width, self.width);
         let (top, bottom) = snap_span(y, height, self.height);
+        let (left, right) = (left.max(within[0]), right.min(within[1]));
+        let (top, bottom) = (top.max(within[2]), bottom.min(within[3]));
         if right <= left || bottom <= top {
             return;
         }
@@ -373,11 +388,18 @@ impl Canvas {
         color: Color,
         clip: crate::layout::Rect,
     ) {
-        let left = x.max(clip.x);
-        let top = y.max(clip.y);
-        let right = (x + width).min(clip.x + clip.width);
-        let bottom = (y + height).min(clip.y + clip.height);
-        self.fill_rect(left, top, right - left, bottom - top, color);
+        // the rect snaps whole before the clip cuts it, so a sliver the clip leaves of a box
+        // never grows into a row the box does not cover
+        let edge = |at: f32, shift: f32, limit: u32| {
+            ((at - shift) * self.scale).round().clamp(0.0, limit as f32) as u32
+        };
+        let within = [
+            edge(clip.x, self.shift.0, self.width),
+            edge(clip.x + clip.width, self.shift.0, self.width),
+            edge(clip.y, self.shift.1, self.height),
+            edge(clip.y + clip.height, self.shift.1, self.height),
+        ];
+        self.fill_snapped(x, y, width, height, color, within);
     }
 
     // device-space glyph blit, the coverage bitmap is already rasterized at this scale;
