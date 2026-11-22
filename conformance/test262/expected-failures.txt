@@ -1249,7 +1249,6 @@ test/built-ins/Proxy/has/return-false-target-not-extensible.js
 test/built-ins/Proxy/has/return-false-targetdesc-not-configurable-using-with.js
 test/built-ins/Proxy/has/return-false-targetdesc-not-configurable.js
 test/built-ins/Proxy/has/trap-is-not-callable-realm.js
-test/built-ins/Proxy/has/trap-is-undefined-using-with.js
 test/built-ins/Proxy/has/trap-is-undefined.js
 test/built-ins/Proxy/isExtensible/call-parameters.js
 test/built-ins/Proxy/isExtensible/null-handler.js

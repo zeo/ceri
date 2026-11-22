@@ -316,15 +316,17 @@ fn pinned_test262_subset_matches_its_expectations() {
         .filter(|(name, _)| !expected.contains(name))
         .map(|(name, reason)| format!("{name}: {reason}"))
         .collect::<Vec<_>>();
-    let fixed = expected.difference(&failing).count();
+    let fixed = expected.difference(&failing).cloned().collect::<Vec<_>>();
     assert!(
         regressions.is_empty(),
         "{} test262 tests regressed:\n{}",
         regressions.len(),
         regressions.join("\n")
     );
-    assert_eq!(
-        fixed, 0,
-        "{fixed} tests listed as failing now pass; rerun with CERI_TEST262_UPDATE=1"
+    assert!(
+        fixed.is_empty(),
+        "{} tests listed as failing now pass; rerun with CERI_TEST262_UPDATE=1:\n{}",
+        fixed.len(),
+        fixed.join("\n")
     );
 }
