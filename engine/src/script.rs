@@ -5844,6 +5844,25 @@ impl ScriptRuntime {
         }
     }
 
+    // a URL attribute resolved against the document's base: the first base element's href, or
+    // the document's own address
+    pub(crate) fn resolve_document_url(&self, value: &str) -> Option<crate::weburl::Url> {
+        let address = crate::weburl::Url::parse(&self.location.borrow().to_string(), None)?;
+        let base = {
+            let document = self.document.borrow();
+            document.descendants(document.root()).find_map(|node| {
+                let element = document
+                    .element(node)
+                    .filter(|element| element.name == "base")?;
+                element.attr("href").map(String::from)
+            })
+        };
+        let base = base
+            .and_then(|href| crate::weburl::Url::parse(&href, Some(&address)))
+            .unwrap_or(address);
+        crate::weburl::Url::parse(value, Some(&base))
+    }
+
     // the tabindex attribute as an integer, or what the element's kind gives without one
     fn tab_index(&self, node: NodeId) -> i32 {
         let document = self.document.borrow();
@@ -20431,6 +20450,40 @@ mod tests {
         assert_eq!(
             ask(None).as_deref(),
             Some("|false|||true|true|true|true|0||true|a%20b+%FC%u20AC|A\u{20ac}%zz|main")
+        );
+    }
+
+    #[test]
+    fn url_attributes_read_resolved_and_anchors_split_their_address() {
+        let document = document(
+            "<a id='a' href='/x/y?q=1#h'>a</a><a id='bare'>b</a><img id='m' src='pic.png' width='40'><p id='status'>idle</p>",
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const a = document.getElementById("a"), m = document.getElementById("m");
+                const seen = [a.href, a.pathname, a.search, a.hash, a.origin === location.origin, document.getElementById("bare").href, m.src, m.width, m.getAttribute("src")];
+                a.search = "?r=2";
+                a.hash = "top";
+                seen.push(a.getAttribute("href").replace(location.origin, ""), new URL(a.href).pathname);
+                m.width = 7;
+                seen.push(m.getAttribute("width"));
+                a.insertAdjacentHTML("beforebegin", "<base href='/sub/'>");
+                seen.push(m.src.replace(location.origin, ""));
+                document.getElementById("status").textContent = seen.join("|").split(location.origin).join("~");
+                "#,
+            )
+            .expect("url members should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "~/x/y?q=1#h|/x/y|?q=1|#h|true||~/pic.png|40|pic.png|/x/y?r=2#top|/x/y|7|/sub/pic.png"
+            )
         );
     }
 

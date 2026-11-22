@@ -32,6 +32,7 @@ impl DomMember {
         match self.entry.1 {
             Attr(attribute) => Reflect::Text(attribute),
             Flag(attribute) => Reflect::Flag(attribute),
+            Url(attribute) => Reflect::Url(attribute),
             _ => Reflect::None,
         }
     }
@@ -42,6 +43,7 @@ enum Reflect {
     None,
     Text(&'static str),
     Flag(&'static str),
+    Url(&'static str),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,11 +53,13 @@ enum Kind {
     Method(u32),
     Reflect(&'static str),
     Flag(&'static str),
+    // an attribute holding a URL, read resolved against the document's base
+    Url(&'static str),
     // an on* event handler property
     Handler,
 }
 
-use Kind::{Flag, Handler, Method, ReadOnly, ReadWrite, Reflect as Attr};
+use Kind::{Flag, Handler, Method, ReadOnly, ReadWrite, Reflect as Attr, Url};
 
 struct Interface {
     name: &'static str,
@@ -640,18 +644,33 @@ static INTERFACES: &[Interface] = &[
         name: "HTMLAnchorElement",
         parent: "HTMLElement",
         members: &[
-            ("href", Attr("href")),
+            ("href", Url("href")),
             ("target", Attr("target")),
             ("rel", Attr("rel")),
             ("download", Attr("download")),
+            ("origin", ReadOnly),
+            ("protocol", ReadWrite),
+            ("username", ReadWrite),
+            ("password", ReadWrite),
+            ("host", ReadWrite),
+            ("hostname", ReadWrite),
+            ("port", ReadWrite),
+            ("pathname", ReadWrite),
+            ("search", ReadWrite),
+            ("hash", ReadWrite),
         ],
     },
     Interface {
         name: "HTMLImageElement",
         parent: "HTMLElement",
         members: &[
-            ("src", Attr("src")),
+            ("src", Url("src")),
             ("alt", Attr("alt")),
+            ("width", ReadWrite),
+            ("height", ReadWrite),
+            ("name", Attr("name")),
+            ("useMap", Attr("usemap")),
+            ("isMap", Flag("ismap")),
             ("srcset", Attr("srcset")),
             ("sizes", Attr("sizes")),
             ("crossOrigin", ReadWrite),
@@ -668,7 +687,7 @@ static INTERFACES: &[Interface] = &[
         name: "HTMLMediaElement",
         parent: "HTMLElement",
         members: &[
-            ("src", Attr("src")),
+            ("src", Url("src")),
             ("currentSrc", ReadOnly),
             ("crossOrigin", ReadWrite),
             ("networkState", ReadOnly),
@@ -702,7 +721,7 @@ static INTERFACES: &[Interface] = &[
         members: &[
             ("videoWidth", ReadOnly),
             ("videoHeight", ReadOnly),
-            ("poster", Attr("poster")),
+            ("poster", Url("poster")),
             ("playsInline", Flag("playsinline")),
         ],
     },
@@ -719,12 +738,12 @@ static INTERFACES: &[Interface] = &[
     Interface {
         name: "HTMLScriptElement",
         parent: "HTMLElement",
-        members: &[("src", Attr("src")), ("type", Attr("type"))],
+        members: &[("src", Url("src")), ("type", Attr("type"))],
     },
     Interface {
         name: "HTMLLinkElement",
         parent: "HTMLElement",
-        members: &[("href", Attr("href")), ("rel", Attr("rel"))],
+        members: &[("href", Url("href")), ("rel", Attr("rel"))],
     },
     Interface {
         name: "HTMLStyleElement",
@@ -859,7 +878,7 @@ fn define_member(build: &Builder, prototype: &ObjectHandle, entry: &'static (&'s
             return;
         }
         ReadOnly => (true, false),
-        ReadWrite | Attr(_) | Flag(_) | Handler => (true, true),
+        ReadWrite | Attr(_) | Flag(_) | Url(_) | Handler => (true, true),
     };
     let get = getter.then(|| {
         Value::Object(build.function(Native::Dom(member(Access::Get)), &format!("get {name}"), 0))
@@ -1207,7 +1226,23 @@ impl ScriptRuntime {
                     self.document.borrow().attribute(node, attribute).is_some(),
                 ));
             }
-            (Reflect::Text(attribute), Access::Set) => {
+            (Reflect::Url(attribute), Access::Get) => {
+                let value = self
+                    .document
+                    .borrow()
+                    .attribute(node, attribute)
+                    .map(String::from);
+                return Ok(Value::String(
+                    value
+                        .map(|value| {
+                            self.resolve_document_url(&value)
+                                .map_or(value, |url| url.to_string())
+                        })
+                        .unwrap_or_default()
+                        .into(),
+                ));
+            }
+            (Reflect::Text(attribute) | Reflect::Url(attribute), Access::Set) => {
                 let value = self.coerce_string(first)?;
                 self.set_element_attribute(&handle, attribute, value);
                 return Ok(Value::Undefined);
@@ -1547,6 +1582,45 @@ impl ScriptRuntime {
                 Value::String(if self.visible { "visible" } else { "hidden" }.into())
             }
             ("hidden", Access::Get) => Value::Bool(!self.visible),
+            ("width" | "height", access)
+                if self
+                    .document
+                    .borrow()
+                    .element(node)
+                    .is_some_and(|element| element.name == "img") =>
+            {
+                let horizontal = member.name() == "width";
+                if access == Access::Set {
+                    let size = self.coerce_uint32(first)?;
+                    self.set_element_attribute(handle, member.name(), size.to_string());
+                    return Ok(Some(Value::Undefined));
+                }
+                // the rendered size, else the attribute, else the picture's own
+                let rendered = self.box_sizes(node).map(|(_, content)| {
+                    if horizontal {
+                        content.width
+                    } else {
+                        content.height
+                    }
+                });
+                let attribute = self
+                    .document
+                    .borrow()
+                    .attribute(node, member.name())
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                match (rendered, attribute) {
+                    (Some(size), _) => Value::Number(f64::from(size.round().max(0.0) as u32)),
+                    (None, Some(size)) => Value::Number(f64::from(size)),
+                    (None, None) => self.image_member(
+                        node,
+                        if horizontal {
+                            "naturalWidth"
+                        } else {
+                            "naturalHeight"
+                        },
+                    ),
+                }
+            }
             ("width" | "height", Access::Get) => {
                 self.canvas_element_member(handle, member.name(), None)?
             }
@@ -2107,6 +2181,57 @@ impl ScriptRuntime {
                         content_editable_state(document.attribute(ancestor, "contenteditable"))
                     });
                 Value::Bool(state.is_some_and(|state| state != "false"))
+            }
+            (
+                "origin" | "protocol" | "username" | "password" | "host" | "hostname" | "port"
+                | "pathname" | "search" | "hash",
+                access,
+            ) if self
+                .document
+                .borrow()
+                .element(node)
+                .is_some_and(|element| element.name == "a") =>
+            {
+                let href = self
+                    .document
+                    .borrow()
+                    .attribute(node, "href")
+                    .map(String::from);
+                let url = href.and_then(|href| self.resolve_document_url(&href));
+                if access == Access::Get {
+                    let Some(url) = url else {
+                        return Ok(Some(Value::String("".into())));
+                    };
+                    let part = match member.name() {
+                        "origin" => url.origin(),
+                        "protocol" => format!("{}:", url.scheme()),
+                        "username" => url.username().to_string(),
+                        "password" => url.password().to_string(),
+                        "host" => url.host(),
+                        "hostname" => url.hostname().to_string(),
+                        "port" => url.port().map(|port| port.to_string()).unwrap_or_default(),
+                        "pathname" => url.pathname(),
+                        "search" => url.search(),
+                        _ => url.hash(),
+                    };
+                    return Ok(Some(Value::String(part.into())));
+                }
+                let value = self.coerce_string(first)?;
+                if let Some(mut url) = url {
+                    match member.name() {
+                        "protocol" => url.set_protocol(&value),
+                        "username" => url.set_username(&value),
+                        "password" => url.set_password(&value),
+                        "host" => url.set_host(&value),
+                        "hostname" => url.set_hostname(&value),
+                        "port" => url.set_port(&value),
+                        "pathname" => url.set_pathname(&value),
+                        "search" => url.set_search(&value),
+                        _ => url.set_hash(&value),
+                    }
+                    self.set_element_attribute(handle, "href", url.to_string());
+                }
+                Value::Undefined
             }
             ("scrollIntoView", Access::Call) => {
                 self.scroll_into_view(node, &first)?;
