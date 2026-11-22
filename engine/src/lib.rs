@@ -89,10 +89,10 @@ pub use layout::{LayoutDocument, Rect, Size, ThumbDrag, layout};
 pub use native_http::{NativeHttpProvider, request_external};
 pub use navigation::{
     APP_ORIGIN, AppUrl, Browser, ClipboardProvider, ExternalEvent, ExternalReport, ExternalRequest,
-    FILES_ORIGIN, FilePicker, FilePickerRequest, FileSelection, NavigationError, NavigationFailure,
-    NavigationStatus, Resource, ResourceBundle, ResourceCacheMode, ResourceProvider,
-    ResourceRequest, ResourceResponse, ScriptDialogs, SocketConnector, SocketStream,
-    UserPreferences, external_url, mime_type_for,
+    FILES_ORIGIN, FilePicker, FilePickerRequest, FileSelection, LinkOpener, NavigationError,
+    NavigationFailure, NavigationStatus, Resource, ResourceBundle, ResourceCacheMode,
+    ResourceProvider, ResourceRequest, ResourceResponse, ScriptDialogs, SocketConnector,
+    SocketStream, UserPreferences, external_url, mime_type_for,
 };
 pub use paint::Canvas;
 pub use script::{

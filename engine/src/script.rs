@@ -419,6 +419,7 @@ enum Builtin {
     WindowAlert,
     WindowConfirm,
     WindowPrompt,
+    WindowOpen,
     WindowGetSelection,
     ClipboardReadText,
     ClipboardWriteText,
@@ -1543,6 +1544,9 @@ pub(crate) enum NavigationRequest {
     },
     Traverse {
         delta: isize,
+    },
+    Open {
+        reference: String,
     },
 }
 
@@ -4380,6 +4384,7 @@ impl ScriptRuntime {
                 "scroll" | "scrollTo" => Ok(Value::Builtin(Builtin::WindowScrollTo)),
                 "scrollBy" => Ok(Value::Builtin(Builtin::WindowScrollBy)),
                 "alert" if self.worker_sender.is_none() => Ok(Value::Builtin(Builtin::WindowAlert)),
+                "open" if self.worker_sender.is_none() => Ok(Value::Builtin(Builtin::WindowOpen)),
                 "confirm" if self.worker_sender.is_none() => {
                     Ok(Value::Builtin(Builtin::WindowConfirm))
                 }
@@ -8271,6 +8276,17 @@ impl ScriptRuntime {
             Builtin::WindowScrollBy => {
                 self.set_window_scroll(&arguments, true)?;
                 Ok(Value::Undefined)
+            }
+            // the opened window is never handed back, as with noopener
+            Builtin::WindowOpen => {
+                let reference = match arguments.first() {
+                    Some(Value::Undefined) | None => String::new(),
+                    Some(reference) => self.coerce_string(reference.clone())?,
+                };
+                if !reference.is_empty() && reference != "about:blank" {
+                    self.queue_navigation(NavigationRequest::Open { reference });
+                }
+                Ok(Value::Null)
             }
             Builtin::WindowAlert | Builtin::WindowConfirm | Builtin::WindowPrompt => {
                 let message = match arguments.first() {

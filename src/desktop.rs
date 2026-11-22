@@ -1,6 +1,6 @@
 use crate::dialog::{InputDialog, MessageButtons, MessageDialog};
 use ceri_engine::{
-    ClipboardProvider, FilePicker, FilePickerRequest, FileSelection, NavigationError,
+    ClipboardProvider, FilePicker, FilePickerRequest, FileSelection, LinkOpener, NavigationError,
     ScriptDialogs, TimeZone, mime_type_for,
 };
 use std::path::Path;
@@ -133,6 +133,22 @@ pub fn user_locale() -> Option<String> {
 fn posix_locale_tag(value: &str) -> Option<String> {
     let name = value.split(['.', '@']).next()?;
     (!name.is_empty() && name != "C" && name != "POSIX").then(|| name.replace('_', "-"))
+}
+
+pub struct DesktopLinks;
+
+// a page's links out of the app open in the system's handler, as far as tauri's default opener
+// scope goes: web, mail and phone links
+impl LinkOpener for DesktopLinks {
+    fn open(&self, url: &str) {
+        if !crate::opener::page_may_open(url) {
+            eprintln!("a page tried to open {url}, which pages may not open");
+            return;
+        }
+        if let Err(error) = crate::opener::open_url(url) {
+            eprintln!("could not open {url}: {error}");
+        }
+    }
 }
 
 pub struct DesktopDialogs;

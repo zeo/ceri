@@ -455,6 +455,12 @@ impl ExternalRequest {
 }
 
 // only absolute https targets without credentials or fragments can leave the app origin
+// an absolute URL whose origin is not the app's own, a mailto: or tel: link included
+fn outside_app(reference: &str) -> bool {
+    crate::weburl::Url::parse(reference.trim(), None)
+        .is_some_and(|url| ![APP_ORIGIN, FILES_ORIGIN].contains(&url.origin().as_str()))
+}
+
 pub fn external_url(reference: &str) -> Result<String, NavigationError> {
     let reference = reference.trim();
     let Some(rest) = reference.strip_prefix("https://") else {
@@ -650,6 +656,13 @@ pub trait ClipboardProvider {
             "this clipboard takes text only".to_string(),
         ))
     }
+}
+
+// where a page's links and window.open go when they leave the app origin: the host decides what
+// it opens, typically web, mail and phone links in the system's own handler; without one such a
+// navigation fails, as it always did
+pub trait LinkOpener {
+    fn open(&self, url: &str);
 }
 
 // the modal alert, confirm and prompt a page asks for, titled with the page's title; without
@@ -1039,6 +1052,7 @@ pub struct Browser {
     file_picker: Option<Rc<dyn FilePicker>>,
     clipboard_provider: Option<Rc<dyn ClipboardProvider>>,
     script_dialogs: Option<Rc<dyn ScriptDialogs>>,
+    link_opener: Option<Rc<dyn LinkOpener>>,
     audio_device: Option<Rc<dyn crate::AudioDevice>>,
     media_decoder: Option<Arc<dyn crate::MediaDecoder>>,
     time_zone: Option<Rc<dyn crate::TimeZone>>,
@@ -1222,6 +1236,7 @@ impl Browser {
             file_picker: None,
             clipboard_provider: None,
             script_dialogs: None,
+            link_opener: None,
             audio_device: None,
             media_decoder: None,
             time_zone: None,
@@ -1287,6 +1302,11 @@ impl Browser {
         clipboard_provider: Rc<dyn ClipboardProvider>,
     ) -> Self {
         self.clipboard_provider = Some(clipboard_provider);
+        self
+    }
+
+    pub fn with_link_opener(mut self, opener: Rc<dyn LinkOpener>) -> Self {
+        self.link_opener = Some(opener);
         self
     }
 
@@ -3374,6 +3394,21 @@ impl Browser {
                 replace_history,
             } => {
                 let base = self.current_url.clone().ok_or(NavigationError::NoPage)?;
+                // a javascript: link stays on the page, as void(0) and friends ask
+                if reference
+                    .trim_start()
+                    .get(..11)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("javascript:"))
+                {
+                    return Ok(NavigationStatus::Loaded);
+                }
+                // the page stays where it is and a link out of the app opens outside it
+                if outside_app(&reference)
+                    && let Some(opener) = &self.link_opener
+                {
+                    opener.open(reference.trim());
+                    return Ok(NavigationStatus::Loaded);
+                }
                 let url = base.resolve(&reference)?;
                 let commit = if replace_history {
                     HistoryCommit::Replace {
@@ -3402,6 +3437,16 @@ impl Browser {
                 Ok(NavigationStatus::Loaded)
             }
             NavigationRequest::Traverse { delta } => self.traverse_history(delta),
+            // window.open: a page outside the app opens in the host's handler; the app has one
+            // window per page, so an app page opens nowhere new
+            NavigationRequest::Open { reference } => {
+                if outside_app(&reference)
+                    && let Some(opener) = &self.link_opener
+                {
+                    opener.open(reference.trim());
+                }
+                Ok(NavigationStatus::Loaded)
+            }
         }
     }
 
@@ -7863,6 +7908,75 @@ mod tests {
             Some(
                 "true,true,open,true,,2,rgb(0, 0, 255),rgb(255, 0, 0),4px,20,true,true,1,true,true,inner:text|host:text:9|host:card:7"
             )
+        );
+    }
+
+    #[test]
+    fn links_out_of_the_app_go_to_the_host_and_the_page_stays() {
+        struct Recorded(RefCell<Vec<String>>);
+        impl LinkOpener for Recorded {
+            fn open(&self, url: &str) {
+                self.0.borrow_mut().push(url.to_string());
+            }
+        }
+        let page = r##"<a id="out" href="https://example.com/page">out</a><a id="mail" href="mailto:hi@example.com">mail</a><a id="void" href="javascript:void(0)">void</a><p id="status">idle</p><script>
+            document.getElementById("status").textContent = [window.open("https://example.com/new"), window.open("/inner"), window.open()].join(",");
+        </script>"##;
+        let opened = Rc::new(Recorded(RefCell::new(Vec::new())));
+        let mut browser = Browser::new(bundle(page)).with_link_opener(opened.clone());
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        browser
+            .click_id("out")
+            .expect("an outside link should not fail");
+        browser
+            .click_id("mail")
+            .expect("a mail link should not fail");
+        browser
+            .click_id("void")
+            .expect("a javascript: link should not fail");
+        browser
+            .page
+            .as_mut()
+            .expect("page")
+            .runtime
+            .execute(r#"location.href = "https://example.org/";"#)
+            .expect("script should run");
+        browser
+            .process_pending_navigation()
+            .expect("an outside location should not fail");
+        assert_eq!(
+            *opened.0.borrow(),
+            [
+                "https://example.com/new",
+                "https://example.com/page",
+                "mailto:hi@example.com",
+                "https://example.org/"
+            ]
+        );
+        assert_eq!(
+            browser
+                .current_url
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("https://app.ceri.invalid/"),
+            "the page stays, and window.open of an app page opens nothing"
+        );
+        let document = browser.document().expect("document should exist");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status");
+        assert_eq!(document.borrow().text_content(status), ",,");
+
+        let mut bare = Browser::new(bundle(page));
+        bare.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        assert!(
+            bare.click_id("out").is_err(),
+            "without an opener it fails as before"
         );
     }
 

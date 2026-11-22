@@ -4,7 +4,7 @@ use crate::autostart::Autostart;
 use crate::commands::{CommandRoutes, Commands};
 use crate::deep_link;
 use crate::desktop::{
-    DesktopClipboard, DesktopDialogs, DesktopFilePicker, DesktopTimeZone, user_locale,
+    DesktopClipboard, DesktopDialogs, DesktopFilePicker, DesktopLinks, DesktopTimeZone, user_locale,
 };
 use crate::dev::DevServer;
 use crate::files::FileScope;
@@ -745,7 +745,11 @@ fn run_app(
                 bridge.content_security_policy.clone(),
                 bridge.dev.clone(),
             )
-            .map(|browser| browser.with_script_dialogs(Rc::new(DesktopDialogs)))
+            .map(|browser| {
+                browser
+                    .with_script_dialogs(Rc::new(DesktopDialogs))
+                    .with_link_opener(Rc::new(DesktopLinks))
+            })
         },
         lifecycle,
     );

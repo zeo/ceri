@@ -138,6 +138,8 @@ See [docs/architecture.md](architecture.md) for the process model and security b
 
 Host-owned seams keep platform work outside the renderer: `ResourceProvider` for assets and networking, `FilePicker` for file input, `ClipboardProvider` for clipboard text and pasted pictures, `ScriptDialogs` for `alert`, `confirm` and `prompt` (native message boxes and an input dialog in windows, none in captures), `FontSource` for installed faces, and typed `HostRuntimeInfo` for the runtime identity query. The renderer never receives a filesystem path, a native clipboard handle or a socket. On Windows the runtime backs the clipboard and file input with the platform clipboard and file dialog.
 
+Links and `window.open` that leave the app origin go to the host instead of navigating the window: the desktop host opens web, mail and phone links in the system's handler, as Tauri's default opener scope allows, and leaves the page where it is. `window.open` returns `null`, as with `noopener`, and an app page opens no second window. A `javascript:` link stays on the page.
+
 A page can fetch outside its own origin only through origins the operator lists, and only over HTTPS. Windows uses the platform HTTP stack, so TLS trust and updates stay with the operating system and the bundle carries no TLS library:
 
 ```powershell
