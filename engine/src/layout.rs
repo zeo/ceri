@@ -6446,8 +6446,13 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             - laid_out.border.widths.bottom
             - resolve_edges(cell.style.padding, span_width(cell), font_size).bottom;
         let free = inner_bottom - content_bottom;
-        laid_out.rect.height = laid_out.rect.height.max(height);
-        if free > 0.01 {
+        // a cell element displayed as a flex, grid or block box sits in an anonymous cell, so it
+        // keeps its own height and lays out its own content, as in blink
+        let own_cell = cell.style.display == Display::TableCell;
+        if own_cell {
+            laid_out.rect.height = laid_out.rect.height.max(height);
+        }
+        if own_cell && free > 0.01 {
             let shift = match cell.style.vertical_align {
                 VerticalAlign::Middle => free / 2.0,
                 VerticalAlign::Bottom => free,
@@ -10457,6 +10462,45 @@ mod tests {
         // the builtin cell is 12px at a 16px font, and tracking adds 2px per character
         assert_eq!(runs[0].width, 2.0 * 12.0 + 2.0 * 2.0);
         assert_eq!(runs[1].width, 3.0 * 12.0 + 3.0 * 2.0);
+    }
+
+    #[test]
+    fn a_cell_displayed_as_flex_keeps_its_height_and_places_its_own_content() {
+        let document = Document::parse_markup(concat!(
+            "<table><tbody><tr><td class='f' id='sized'><i></i></td></tr></tbody></table>",
+            "<table><tbody><tr><td class='f'><b></b></td><td class='tall'></td></tr></tbody></table>",
+        ))
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(concat!(
+            "* { box-sizing: border-box } table { border-collapse: collapse; width: 400px }",
+            ".f { display: flex; align-items: center; padding: 7px 12px; border-top: 1px solid #444 }",
+            "#sized { height: 49px } i, b { display: block; width: 10px; height: 12px }",
+            ".tall { height: 54px; padding: 0 }",
+        ))
+        .expect("stylesheet should parse");
+        let layout = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 600.0,
+                height: 300.0,
+            },
+        );
+        let item = find_box(&layout.root, "i").expect("an i box");
+        let sized = find_box(&layout.root, "td").expect("a td box");
+        assert_eq!(sized.rect.height, 49.0);
+        assert_eq!(
+            item.rect.y - sized.rect.y,
+            19.0,
+            "centred in the content box alone"
+        );
+        let lone = find_box(&layout.root, "b").expect("a b box");
+        let second = &layout.root.children[1];
+        assert_eq!(
+            lone.rect.y - second.rect.y,
+            8.0,
+            "a flex cell beside a taller one stays at the top, its own height"
+        );
     }
 
     #[test]
