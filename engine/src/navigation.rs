@@ -11568,10 +11568,13 @@ A</div>
                 })
                 .count()
         };
-        assert!(fringes(1.0, 0) > 0, "page text blends per subpixel");
-        assert!(fringes(1.0, 1) > 0, "a fixed box is no layer at 1x");
+        // only directwrite rasterizes per subpixel, so elsewhere all text is grayscale
+        if cfg!(windows) {
+            assert!(fringes(1.0, 0) > 0, "page text blends per subpixel");
+            assert!(fringes(1.0, 1) > 0, "a fixed box is no layer at 1x");
+            assert!(fringes(1.5, 0) > 0);
+        }
         assert_eq!(fringes(1.0, 2), 0, "a modal is a layer at any scale");
-        assert!(fringes(1.5, 0) > 0);
         assert_eq!(fringes(1.5, 1), 0, "a fixed box is a layer from 1.5x");
         assert_eq!(fringes(1.5, 2), 0);
     }
