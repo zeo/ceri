@@ -105,7 +105,7 @@ The current slice implements:
 - `calc()` with `+`, `-`, `*`, `/` and nested parentheses inside lengths and `min()`, `max()` and `clamp()` arguments; stylesheet text with braces, semicolons or comment markers inside strings and `url()` stays intact, and `url()` references in external sheets resolve against the sheet
 - CSS Grid and inline grids: track lists of any length with `minmax()`, `fit-content()`, `min-content`, `max-content`, `repeat()` including `auto-fill` and `auto-fit`, and line names; `grid-template-areas` and the `grid-template` and `grid` shorthands; placement by line number, negative line, `span`, line name and area name; sparse and dense auto-placement by row or column; implicit tracks sized by `grid-auto-rows` and `grid-auto-columns`; the track sizing algorithm with intrinsic and flexible tracks; separate row and column gaps; `justify-items`, `justify-self`, `align-items`, `align-self`, auto margins, `justify-content` and `align-content`; text runs as anonymous items
 - `overflow: hidden` and `overflow: clip` clipping for software paint and coordinate hit testing
-- bounded element and document scrolling with persistent `scrollTop`/`scrollLeft`, `window.scrollX`/`scrollY`, wheel input, and `scroll` events
+- bounded element and document scrolling with persistent `scrollTop`/`scrollLeft`, element and window `scroll`/`scrollTo`/`scrollBy`, `window.scrollX`/`scrollY`, wheel input, and `scroll` events
 - app-origin `Location` state, nested anchor activation, bounded script redirects, extensionless app-shell fallback, history, and app-owned recovery pages
 - PPM or BMP output and a textual layout dump
 

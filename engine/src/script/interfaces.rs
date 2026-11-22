@@ -244,6 +244,9 @@ static INTERFACES: &[Interface] = &[
             ("getAnimations", Method(0)),
             ("checkVisibility", Method(0)),
             ("scrollIntoView", Method(0)),
+            ("scroll", Method(0)),
+            ("scrollTo", Method(0)),
+            ("scrollBy", Method(0)),
             ("setPointerCapture", Method(1)),
             ("releasePointerCapture", Method(1)),
             ("hasPointerCapture", Method(1)),
@@ -1783,6 +1786,17 @@ impl ScriptRuntime {
             ("checkVisibility", Access::Call) => Value::Bool(self.check_visibility(node, &first)?),
             ("scrollIntoView", Access::Call) => {
                 self.scroll_into_view(node, &first)?;
+                Value::Undefined
+            }
+            ("scroll" | "scrollTo" | "scrollBy", Access::Call) => {
+                let offset = Self::scroll_target(
+                    self.scroll_offset(node),
+                    arguments,
+                    member.name() == "scrollBy",
+                )?;
+                if self.set_scroll_offset(node, offset) {
+                    self.dispatch_node_event(node, "scroll")?;
+                }
                 Value::Undefined
             }
             ("elementFromPoint", Access::Call) if on_document => {

@@ -7622,12 +7622,14 @@ impl ScriptRuntime {
         Ok(())
     }
 
-    fn set_window_scroll(
-        &mut self,
+    // the offset scroll, scrollTo or scrollBy moves a box to from (x, y) or {left, top},
+    // where a side the options leave out stays put
+    fn scroll_target(
+        current: (f32, f32),
         arguments: &[Value],
         relative: bool,
-    ) -> Result<(), ScriptError> {
-        let current = self.document_scroll_offset();
+    ) -> Result<(f32, f32), ScriptError> {
+        let base = if relative { (0.0, 0.0) } else { current };
         let (x, y) = match arguments.first().map(Value::resolve) {
             Some(Value::Object(options)) => {
                 let options = options.borrow();
@@ -7636,13 +7638,13 @@ impl ScriptRuntime {
                     .or_else(|| options.get("x"))
                     .map(Value::number)
                     .transpose()?
-                    .unwrap_or(0.0) as f32;
+                    .map_or(base.0, |x| x as f32);
                 let y = options
                     .get("top")
                     .or_else(|| options.get("y"))
                     .map(Value::number)
                     .transpose()?
-                    .unwrap_or(0.0) as f32;
+                    .map_or(base.1, |y| y as f32);
                 (x, y)
             }
             Some(value) => (
@@ -7653,13 +7655,21 @@ impl ScriptRuntime {
                     .transpose()?
                     .unwrap_or(0.0) as f32,
             ),
-            None => (0.0, 0.0),
+            None => base,
         };
-        let offset = if relative {
+        Ok(if relative {
             (current.0 + x, current.1 + y)
         } else {
             (x, y)
-        };
+        })
+    }
+
+    fn set_window_scroll(
+        &mut self,
+        arguments: &[Value],
+        relative: bool,
+    ) -> Result<(), ScriptError> {
+        let offset = Self::scroll_target(self.document_scroll_offset(), arguments, relative)?;
         if self.set_document_scroll_offset(offset) {
             self.dispatch_window_event("scroll")?;
         }
@@ -20146,6 +20156,36 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("12:34:event:34")
+        );
+    }
+
+    #[test]
+    fn element_scroll_methods_move_one_side_or_both() {
+        let document = document("<div id='viewport'><p id='status'>idle</p></div>");
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const viewport = document.getElementById("viewport");
+                let events = 0;
+                viewport.addEventListener("scroll", () => events++);
+                viewport.scrollTo(10, 20);
+                viewport.scroll({ top: 5 });
+                const kept = viewport.scrollLeft + ":" + viewport.scrollTop;
+                viewport.scrollBy({ left: 3 });
+                viewport.scrollBy(0, 0);
+                document.getElementById("status").textContent =
+                    kept + "|" + viewport.scrollLeft + ":" + viewport.scrollTop + "|" + events;
+                "#,
+            )
+            .expect("element scroll methods should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some("10:5|13:5|3")
         );
     }
 
