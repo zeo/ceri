@@ -481,10 +481,12 @@ enum Builtin {
     BlobText(BlobHandle),
     BlobStream(BlobHandle),
     BlobBytes(BlobHandle),
+    BlobUint8(BlobHandle),
     FileSlice(FileHandle),
     FileText(FileHandle),
     FileStream(FileHandle),
     FileBytes(FileHandle),
+    FileUint8(FileHandle),
     FileListItem(FileListHandle),
     NodeListItem(NodeListHandle),
     NodeListForEach(NodeListHandle),
@@ -567,6 +569,7 @@ enum Builtin {
     RequestClone(RequestHandle),
     RequestText(RequestHandle),
     RequestBytes(RequestHandle),
+    RequestUint8(RequestHandle),
     RequestBlob(RequestHandle),
     RequestFormData(RequestHandle),
     HeadersAppend(HeadersHandle),
@@ -582,6 +585,7 @@ enum Builtin {
     ResponseText(ResponseHandle),
     ResponseJson(ResponseHandle),
     ResponseBytes(ResponseHandle),
+    ResponseUint8(ResponseHandle),
     ResponseBlob(ResponseHandle),
     ResponseFormData(ResponseHandle),
     AbortControllerAbort(AbortControllerHandle),
@@ -794,6 +798,8 @@ pub struct ScriptRuntime {
     display: Option<Display>,
     screen_object: RefCell<Option<Value>>,
     scroll_offsets: BTreeMap<NodeId, (f32, f32)>,
+    // document.cookie's name, value and expiry time, kept for the page's lifetime
+    cookies: Vec<(String, String, Option<f64>)>,
     viewport: ViewportMetrics,
     canvas_contexts: HashMap<NodeId, CanvasContextHandle>,
     // each canvas's WebGL context, with the object script holds
@@ -1974,6 +1980,7 @@ impl ScriptRuntime {
             screen_object: RefCell::new(None),
             bridge: None,
             scroll_offsets: BTreeMap::new(),
+            cookies: Vec::new(),
             canvas_contexts: HashMap::new(),
             webgl_contexts: HashMap::new(),
             offscreen_canvases: HashMap::new(),
@@ -4683,6 +4690,13 @@ impl ScriptRuntime {
                     "origin" => Ok(Value::String(url.origin().to_string().into())),
                     "protocol" => Ok(Value::String("https:".to_string().into())),
                     "host" | "hostname" => Ok(Value::String(url.host().to_string().into())),
+                    "port" => Ok(Value::String(
+                        url.host()
+                            .rsplit_once(':')
+                            .map_or("", |(_, port)| port)
+                            .to_string()
+                            .into(),
+                    )),
                     "pathname" => Ok(Value::String(url.path().to_string().into())),
                     "search" => Ok(Value::String(
                         (if url.query().is_empty() {
@@ -4711,6 +4725,7 @@ impl ScriptRuntime {
             Value::History(history) => match property {
                 "state" => Ok(history.borrow().state.clone()),
                 "length" => Ok(Value::Number(history.borrow().length as f64)),
+                "scrollRestoration" => Ok(Value::String("auto".into())),
                 "pushState" => Ok(Value::Builtin(Builtin::HistoryPushState)),
                 "replaceState" => Ok(Value::Builtin(Builtin::HistoryReplaceState)),
                 "back" => Ok(Value::Builtin(Builtin::HistoryBack)),
@@ -4923,6 +4938,7 @@ impl ScriptRuntime {
                 "slice" => Ok(Value::Builtin(Builtin::BlobSlice(blob))),
                 "text" => Ok(Value::Builtin(Builtin::BlobText(blob))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::BlobBytes(blob))),
+                "bytes" => Ok(Value::Builtin(Builtin::BlobUint8(blob))),
                 "stream" => Ok(Value::Builtin(Builtin::BlobStream(blob))),
                 _ => Err(runtime_error(format!("Blob has no property {property}"))),
             },
@@ -4937,6 +4953,7 @@ impl ScriptRuntime {
                 "slice" => Ok(Value::Builtin(Builtin::FileSlice(file))),
                 "text" => Ok(Value::Builtin(Builtin::FileText(file))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::FileBytes(file))),
+                "bytes" => Ok(Value::Builtin(Builtin::FileUint8(file))),
                 "stream" => Ok(Value::Builtin(Builtin::FileStream(file))),
                 _ => Err(runtime_error(format!("File has no property {property}"))),
             },
@@ -4979,6 +4996,7 @@ impl ScriptRuntime {
                 "text" => Ok(Value::Builtin(Builtin::ResponseText(response))),
                 "json" => Ok(Value::Builtin(Builtin::ResponseJson(response))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::ResponseBytes(response))),
+                "bytes" => Ok(Value::Builtin(Builtin::ResponseUint8(response))),
                 "blob" => Ok(Value::Builtin(Builtin::ResponseBlob(response))),
                 "formData" => Ok(Value::Builtin(Builtin::ResponseFormData(response))),
                 _ => Err(runtime_error(format!(
@@ -5013,6 +5031,7 @@ impl ScriptRuntime {
                 "clone" => Ok(Value::Builtin(Builtin::RequestClone(request))),
                 "text" => Ok(Value::Builtin(Builtin::RequestText(request))),
                 "arrayBuffer" => Ok(Value::Builtin(Builtin::RequestBytes(request))),
+                "bytes" => Ok(Value::Builtin(Builtin::RequestUint8(request))),
                 "blob" => Ok(Value::Builtin(Builtin::RequestBlob(request))),
                 "formData" => Ok(Value::Builtin(Builtin::RequestFormData(request))),
                 _ => Err(runtime_error(format!("request has no property {property}"))),
@@ -5789,6 +5808,74 @@ impl ScriptRuntime {
                 .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")),
             "a" => element.attr("href").is_some(),
             _ => false,
+        }
+    }
+
+    // the tabindex attribute as an integer, or what the element's kind gives without one
+    fn tab_index(&self, node: NodeId) -> i32 {
+        let document = self.document.borrow();
+        let Some(element) = document.element(node) else {
+            return -1;
+        };
+        let parsed = element.attr("tabindex").and_then(|value| {
+            let value = value.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            let sign = usize::from(value.starts_with(['-', '+']));
+            let digits = value[sign..].len()
+                - value[sign..]
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .len();
+            value[..sign + digits].parse::<i32>().ok()
+        });
+        parsed.unwrap_or(
+            if matches!(
+                element.name.as_str(),
+                "a" | "area" | "button" | "input" | "select" | "textarea" | "iframe"
+            ) {
+                0
+            } else {
+                -1
+            },
+        )
+    }
+
+    // one document.cookie assignment: a name=value pair whose max-age or expires may
+    // remove it at once or later
+    fn set_cookie(&mut self, text: &str) {
+        let mut parts = text.split(';');
+        let pair = parts.next().unwrap_or_default().trim();
+        let (name, value) = pair
+            .split_once('=')
+            .map_or(("", pair), |(name, value)| (name.trim(), value.trim()));
+        let now = self.now_milliseconds();
+        let (mut max_age, mut expires) = (None, None);
+        for attribute in parts {
+            let (key, argument) = attribute.split_once('=').unwrap_or((attribute, ""));
+            match key.trim().to_ascii_lowercase().as_str() {
+                "max-age" => {
+                    if let Ok(seconds) = argument.trim().parse::<f64>() {
+                        max_age = Some(now + seconds * 1000.0);
+                    }
+                }
+                "expires" => {
+                    let time = self.parse_date(argument.trim());
+                    if time.is_finite() {
+                        expires = Some(time);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // max-age wins over expires wherever each one comes
+        let expires = max_age.or(expires);
+        let cookie = (name.to_string(), value.to_string(), expires);
+        let existing = self.cookies.iter().position(|cookie| cookie.0 == name);
+        match (existing, expires.is_some_and(|expires| expires <= now)) {
+            (Some(index), true) => {
+                self.cookies.remove(index);
+            }
+            (Some(index), false) => self.cookies[index] = cookie,
+            (None, true) => {}
+            (None, false) => self.cookies.push(cookie),
         }
     }
 
@@ -8584,6 +8671,25 @@ impl ScriptRuntime {
             Builtin::BlobText(blob) => Ok(Value::Promise(self.fulfilled_promise(Value::String(
                 String::from_utf8_lossy(&blob.bytes).into_owned().into(),
             )))),
+            Builtin::BlobUint8(blob) => Ok(Value::Promise(
+                self.fulfilled_promise(typed::uint8_array(blob.bytes.clone())),
+            )),
+            Builtin::FileUint8(file) => Ok(Value::Promise(
+                self.fulfilled_promise(typed::uint8_array(file.bytes.clone())),
+            )),
+            Builtin::RequestUint8(request) => match self.consume_request_body(&request) {
+                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(typed::uint8_array(body)))),
+                Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
+            },
+            Builtin::ResponseUint8(response) if Self::script_body(&response.stream).is_some() => {
+                let stream = Self::script_body(&response.stream).expect("checked above");
+                response.body.borrow_mut().disturbed = true;
+                self.collect_body(&stream, streams::BodyKind::Uint8, response.mime_type.clone())
+            }
+            Builtin::ResponseUint8(response) => match self.consume_response_body(&response) {
+                Ok(body) => Ok(Value::Promise(self.fulfilled_promise(typed::uint8_array(body)))),
+                Err(error) => Ok(Value::Promise(self.rejected_promise(error.message))),
+            },
             Builtin::BlobBytes(blob) => Ok(Value::Promise(
                 self.fulfilled_promise(Value::Bytes(Rc::new(RefCell::new(blob.bytes.clone().into())))),
             )),
@@ -20156,6 +20262,47 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some("12:34:event:34")
+        );
+    }
+
+    #[test]
+    fn document_and_element_members_answer_as_chrome_does() {
+        let document = document(
+            "<form></form><a href='x'>a</a><div id='d' contenteditable><span id='s'>x</span></div><p id='status'>idle</p>",
+        );
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r##"
+                const d = document.getElementById("d"), s = document.getElementById("s");
+                const seen = [];
+                seen.push(d.tabIndex, document.querySelector("a").tabIndex, d.contentEditable, s.isContentEditable, s.draggable);
+                d.setAttribute("tabindex", " 4x");
+                seen.push(d.tabIndex, d.role, d.ariaLabel);
+                d.ariaLabel = "hi";
+                seen.push(d.getAttribute("aria-label"));
+                try { d.contentEditable = "bogus"; } catch (error) { seen.push(error.name); }
+                d.translate = false;
+                seen.push(s.translate, s.spellcheck, s.webkitMatchesSelector("#d span"));
+                seen.push(document.characterSet, document.compatMode, document.forms.length, document.links.length, document.scrollingElement === document.documentElement);
+                document.cookie = "a=1"; document.cookie = "b=2; path=/"; document.cookie = "a=3"; document.cookie = "b=; max-age=0"; document.cookie = "c=4";
+                seen.push(document.cookie, "x".bold(), "x".anchor('"q'), history.scrollRestoration, location.port);
+                new Blob(["hi"]).bytes().then((bytes) => {
+                    seen.push(bytes.constructor.name, bytes.join(","));
+                    document.getElementById("status").textContent = seen.join("|");
+                });
+                "##,
+            )
+            .expect("members should execute");
+        let status = document
+            .borrow()
+            .find_element_by_id("status")
+            .expect("status should exist");
+        assert_eq!(
+            document.borrow().element_text_content(status).as_deref(),
+            Some(
+                "-1|0|true|true|false|4|||hi|SyntaxError|false|true|true|UTF-8|CSS1Compat|1|1|true|a=3; c=4|<b>x</b>|<a name=\"&quot;q\">x</a>|auto||Uint8Array|104,105"
+            )
         );
     }
 

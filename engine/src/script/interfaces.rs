@@ -201,6 +201,7 @@ static INTERFACES: &[Interface] = &[
             ("isSameNode", Method(1)),
             ("isEqualNode", Method(1)),
             ("lookupNamespaceURI", Method(1)),
+            ("baseURI", ReadOnly),
         ],
     },
     Interface {
@@ -274,6 +275,52 @@ static INTERFACES: &[Interface] = &[
             ("setHTMLUnsafe", Method(1)),
             ("insertAdjacentElement", Method(2)),
             ("insertAdjacentText", Method(2)),
+            ("webkitMatchesSelector", Method(1)),
+            ("getAttributeNS", Method(2)),
+            ("setAttributeNS", Method(3)),
+            ("removeAttributeNS", Method(2)),
+            ("hasAttributeNS", Method(2)),
+            ("getHTML", Method(0)),
+            ("role", ReadWrite),
+            ("ariaAtomic", ReadWrite),
+            ("ariaAutoComplete", ReadWrite),
+            ("ariaBusy", ReadWrite),
+            ("ariaChecked", ReadWrite),
+            ("ariaColCount", ReadWrite),
+            ("ariaColIndex", ReadWrite),
+            ("ariaColSpan", ReadWrite),
+            ("ariaCurrent", ReadWrite),
+            ("ariaDescription", ReadWrite),
+            ("ariaDisabled", ReadWrite),
+            ("ariaExpanded", ReadWrite),
+            ("ariaHasPopup", ReadWrite),
+            ("ariaHidden", ReadWrite),
+            ("ariaInvalid", ReadWrite),
+            ("ariaKeyShortcuts", ReadWrite),
+            ("ariaLabel", ReadWrite),
+            ("ariaLevel", ReadWrite),
+            ("ariaLive", ReadWrite),
+            ("ariaModal", ReadWrite),
+            ("ariaMultiLine", ReadWrite),
+            ("ariaMultiSelectable", ReadWrite),
+            ("ariaOrientation", ReadWrite),
+            ("ariaPlaceholder", ReadWrite),
+            ("ariaPosInSet", ReadWrite),
+            ("ariaPressed", ReadWrite),
+            ("ariaReadOnly", ReadWrite),
+            ("ariaRelevant", ReadWrite),
+            ("ariaRequired", ReadWrite),
+            ("ariaRoleDescription", ReadWrite),
+            ("ariaRowCount", ReadWrite),
+            ("ariaRowIndex", ReadWrite),
+            ("ariaRowSpan", ReadWrite),
+            ("ariaSelected", ReadWrite),
+            ("ariaSetSize", ReadWrite),
+            ("ariaSort", ReadWrite),
+            ("ariaValueMax", ReadWrite),
+            ("ariaValueMin", ReadWrite),
+            ("ariaValueNow", ReadWrite),
+            ("ariaValueText", ReadWrite),
         ],
     },
     Interface {
@@ -391,6 +438,27 @@ static INTERFACES: &[Interface] = &[
             ("append", Method(0)),
             ("prepend", Method(0)),
             ("replaceChildren", Method(0)),
+            ("URL", ReadOnly),
+            ("documentURI", ReadOnly),
+            ("characterSet", ReadOnly),
+            ("charset", ReadOnly),
+            ("inputEncoding", ReadOnly),
+            ("contentType", ReadOnly),
+            ("compatMode", ReadOnly),
+            ("referrer", ReadOnly),
+            ("dir", ReadWrite),
+            ("cookie", ReadWrite),
+            ("location", ReadOnly),
+            ("scrollingElement", ReadOnly),
+            ("forms", ReadOnly),
+            ("images", ReadOnly),
+            ("links", ReadOnly),
+            ("scripts", ReadOnly),
+            ("embeds", ReadOnly),
+            ("plugins", ReadOnly),
+            ("anchors", ReadOnly),
+            ("getElementsByName", Method(1)),
+            ("hasFocus", Method(0)),
         ],
     },
     Interface {
@@ -409,6 +477,17 @@ static INTERFACES: &[Interface] = &[
             ("title", Attr("title")),
             ("lang", Attr("lang")),
             ("dir", Attr("dir")),
+            ("accessKey", Attr("accesskey")),
+            ("inputMode", Attr("inputmode")),
+            ("enterKeyHint", Attr("enterkeyhint")),
+            ("autofocus", Flag("autofocus")),
+            ("inert", Flag("inert")),
+            ("tabIndex", ReadWrite),
+            ("draggable", ReadWrite),
+            ("spellcheck", ReadWrite),
+            ("translate", ReadWrite),
+            ("contentEditable", ReadWrite),
+            ("isContentEditable", ReadOnly),
             ("click", Method(0)),
             ("focus", Method(0)),
             ("blur", Method(0)),
@@ -1564,7 +1643,7 @@ impl ScriptRuntime {
                 }
                 Value::Bool(enabled)
             }
-            ("matches", Access::Call) => {
+            ("matches" | "webkitMatchesSelector", Access::Call) => {
                 let source = self.coerce_string(first)?;
                 let selectors = self.selector_list(&source)?;
                 Value::Bool(self.document.borrow().matches_selectors(node, &selectors))
@@ -1784,6 +1863,251 @@ impl ScriptRuntime {
                 )
             }
             ("checkVisibility", Access::Call) => Value::Bool(self.check_visibility(node, &first)?),
+            (name, access) if name == "role" || name.starts_with("aria") => {
+                let attribute = match name {
+                    "role" => "role".to_string(),
+                    _ => format!("aria-{}", name[4..].to_ascii_lowercase()),
+                };
+                match access {
+                    Access::Get => self
+                        .document
+                        .borrow()
+                        .attribute(node, &attribute)
+                        .map_or(Value::Null, |value| Value::String(value.into())),
+                    _ => {
+                        if matches!(first, Value::Null) {
+                            self.remove_element_attribute(handle, &attribute);
+                        } else {
+                            let value = self.coerce_string(first)?;
+                            self.set_element_attribute(handle, &attribute, value);
+                        }
+                        Value::Undefined
+                    }
+                }
+            }
+            ("getAttributeNS" | "hasAttributeNS" | "removeAttributeNS", Access::Call) => {
+                let local = self.coerce_string(second)?;
+                let found = self.document.borrow().element(node).and_then(|element| {
+                    element
+                        .attrs
+                        .keys()
+                        .find(|name| {
+                            **name == local
+                                || name.rsplit_once(':').is_some_and(|(_, tail)| tail == local)
+                        })
+                        .cloned()
+                });
+                match member.name() {
+                    "getAttributeNS" => found
+                        .and_then(|name| {
+                            self.document
+                                .borrow()
+                                .attribute(node, &name)
+                                .map(String::from)
+                        })
+                        .map_or(Value::Null, |value| Value::String(value.into())),
+                    "hasAttributeNS" => Value::Bool(found.is_some()),
+                    _ => {
+                        if let Some(name) = found {
+                            self.remove_element_attribute(handle, &name);
+                        }
+                        Value::Undefined
+                    }
+                }
+            }
+            ("setAttributeNS", Access::Call) => {
+                let name = self.coerce_string(second)?;
+                let value =
+                    self.coerce_string(arguments.get(2).cloned().unwrap_or(Value::Undefined))?;
+                self.set_element_attribute(handle, &name, value);
+                Value::Undefined
+            }
+            ("getHTML", Access::Call) => {
+                self.member(Value::Element(handle.clone()), "innerHTML")?
+            }
+            ("baseURI", Access::Get) | ("URL" | "documentURI", Access::Get) => {
+                Value::String(self.location.borrow().to_string().into())
+            }
+            ("characterSet" | "charset" | "inputEncoding", Access::Get) => {
+                Value::String("UTF-8".into())
+            }
+            ("contentType", Access::Get) => Value::String("text/html".into()),
+            ("compatMode", Access::Get) => Value::String("CSS1Compat".into()),
+            ("referrer", Access::Get) => Value::String("".into()),
+            ("location", Access::Get) if on_document => self.member(Value::Window, "location")?,
+            ("scrollingElement", Access::Get) => {
+                let root = self.document.borrow().document_element_of(node);
+                self.optional_node(root)
+            }
+            ("dir", _) if on_document => {
+                let root = self.document.borrow().document_element_of(node);
+                match (root, member.access) {
+                    (Some(root), Access::Set) => {
+                        let value = self.coerce_string(first)?;
+                        let root = self.node_handle(root);
+                        self.set_element_attribute(&root, "dir", value);
+                        Value::Undefined
+                    }
+                    (Some(root), _) => Value::String(
+                        self.document
+                            .borrow()
+                            .attribute(root, "dir")
+                            .map(str::to_ascii_lowercase)
+                            .filter(|dir| matches!(dir.as_str(), "ltr" | "rtl" | "auto"))
+                            .unwrap_or_default()
+                            .into(),
+                    ),
+                    _ => Value::String("".into()),
+                }
+            }
+            ("cookie", Access::Get) => {
+                let now = self.now_milliseconds();
+                self.cookies
+                    .retain(|cookie| cookie.2.is_none_or(|expires| expires > now));
+                Value::String(
+                    self.cookies
+                        .iter()
+                        .map(|(name, value, _)| {
+                            if name.is_empty() {
+                                value.clone()
+                            } else {
+                                format!("{name}={value}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                        .into(),
+                )
+            }
+            ("cookie", Access::Set) => {
+                let text = self.coerce_string(first)?;
+                self.set_cookie(&text);
+                Value::Undefined
+            }
+            (
+                "forms" | "images" | "links" | "scripts" | "embeds" | "plugins" | "anchors",
+                Access::Get,
+            ) if on_document => {
+                let found = {
+                    let document = self.document.borrow();
+                    document
+                        .descendants(node)
+                        .filter(|&candidate| {
+                            document
+                                .element(candidate)
+                                .is_some_and(|element| match member.name() {
+                                    "forms" => element.name == "form",
+                                    "images" => element.name == "img",
+                                    "scripts" => element.name == "script",
+                                    "embeds" | "plugins" => element.name == "embed",
+                                    "anchors" => {
+                                        element.name == "a" && element.attr("name").is_some()
+                                    }
+                                    _ => {
+                                        matches!(element.name.as_str(), "a" | "area")
+                                            && element.attr("href").is_some()
+                                    }
+                                })
+                        })
+                        .collect()
+                };
+                self.node_list(found)
+            }
+            ("getElementsByName", Access::Call) => {
+                let name = self.coerce_string(first)?;
+                let found = {
+                    let document = self.document.borrow();
+                    document
+                        .descendants(node)
+                        .filter(|&candidate| {
+                            document.attribute(candidate, "name") == Some(name.as_str())
+                        })
+                        .collect()
+                };
+                self.node_list(found)
+            }
+            ("hasFocus", Access::Call) => Value::Bool(self.visible),
+            ("tabIndex", Access::Get) => Value::Number(f64::from(self.tab_index(node))),
+            ("tabIndex", Access::Set) => {
+                let index = super::operations::to_int32_number(self.coerce_number(first)?);
+                self.set_element_attribute(handle, "tabindex", index.to_string());
+                Value::Undefined
+            }
+            ("draggable" | "spellcheck" | "translate", Access::Set) => {
+                let on = first.truthy();
+                let value = match (member.name(), on) {
+                    ("translate", true) => "yes",
+                    ("translate", false) => "no",
+                    (_, true) => "true",
+                    (_, false) => "false",
+                };
+                self.set_element_attribute(handle, member.name(), value.to_string());
+                Value::Undefined
+            }
+            ("draggable", Access::Get) => {
+                let document = self.document.borrow();
+                Value::Bool(match document.attribute(node, "draggable") {
+                    Some(value) if value.eq_ignore_ascii_case("true") => true,
+                    Some(value) if value.eq_ignore_ascii_case("false") => false,
+                    _ => document.element(node).is_some_and(|element| {
+                        element.name == "img"
+                            || (matches!(element.name.as_str(), "a" | "area")
+                                && element.attr("href").is_some())
+                    }),
+                })
+            }
+            ("spellcheck" | "translate", Access::Get) => {
+                let (on, off) = match member.name() {
+                    "spellcheck" => (["", "true"], "false"),
+                    _ => (["", "yes"], "no"),
+                };
+                let document = self.document.borrow();
+                let inherited = std::iter::once(node)
+                    .chain(document.ancestors(node))
+                    .find_map(|ancestor| {
+                        let value = document.attribute(ancestor, member.name())?;
+                        if on.iter().any(|keyword| value.eq_ignore_ascii_case(keyword)) {
+                            Some(true)
+                        } else if value.eq_ignore_ascii_case(off) {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    });
+                Value::Bool(inherited.unwrap_or(true))
+            }
+            ("contentEditable", Access::Get) => Value::String(
+                content_editable_state(self.document.borrow().attribute(node, "contenteditable"))
+                    .unwrap_or("inherit")
+                    .into(),
+            ),
+            ("contentEditable", Access::Set) => {
+                let value = self.coerce_string(first)?.to_ascii_lowercase();
+                match value.as_str() {
+                    "inherit" => {
+                        self.remove_element_attribute(handle, "contenteditable");
+                    }
+                    "true" | "false" | "plaintext-only" => {
+                        self.set_element_attribute(handle, "contenteditable", value);
+                    }
+                    _ => {
+                        return Err(self.throw_value(dom_exception(
+                            "SyntaxError",
+                            "The value provided is not one of 'true', 'false', 'plaintext-only', or 'inherit'.",
+                        )));
+                    }
+                }
+                Value::Undefined
+            }
+            ("isContentEditable", Access::Get) => {
+                let document = self.document.borrow();
+                let state = std::iter::once(node)
+                    .chain(document.ancestors(node))
+                    .find_map(|ancestor| {
+                        content_editable_state(document.attribute(ancestor, "contenteditable"))
+                    });
+                Value::Bool(state.is_some_and(|state| state != "false"))
+            }
             ("scrollIntoView", Access::Call) => {
                 self.scroll_into_view(node, &first)?;
                 Value::Undefined
@@ -2074,5 +2398,15 @@ fn document_position(document: &Document, node: NodeId, other: NodeId) -> u16 {
     match document.tree_order(other, node) {
         TreeOrdering::Less => PRECEDING,
         _ => FOLLOWING,
+    }
+}
+
+// the keyword a contenteditable attribute value stands for, none when it is missing or invalid
+fn content_editable_state(value: Option<&str>) -> Option<&'static str> {
+    match value?.to_ascii_lowercase().as_str() {
+        "" | "true" => Some("true"),
+        "false" => Some("false"),
+        "plaintext-only" => Some("plaintext-only"),
+        _ => None,
     }
 }

@@ -275,6 +275,16 @@ pub(super) fn elements(array: &TypedArrayData) -> Vec<Value> {
         .collect()
 }
 
+pub(super) fn uint8_array(bytes: Vec<u8>) -> Value {
+    let length = bytes.len();
+    new_typed(
+        ElementKind::Uint8,
+        Rc::new(RefCell::new(bytes.into())),
+        0,
+        length,
+    )
+}
+
 pub(super) fn new_typed(kind: ElementKind, buffer: BytesHandle, start: usize, end: usize) -> Value {
     Value::TypedArray(Rc::new(RefCell::new(TypedArrayData {
         buffer,

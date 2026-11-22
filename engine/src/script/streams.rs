@@ -145,6 +145,7 @@ pub(super) enum BodyKind {
     Text,
     Json,
     Bytes,
+    Uint8,
     Blob,
 }
 
@@ -794,6 +795,7 @@ impl ScriptRuntime {
             )),
             BodyKind::Json => self.parse_json(&String::from_utf8_lossy(&bytes)),
             BodyKind::Bytes => Ok(Value::Bytes(Rc::new(RefCell::new(bytes.into())))),
+            BodyKind::Uint8 => Ok(typed::uint8_array(bytes)),
             BodyKind::Blob => Ok(Value::Blob(Rc::new(BlobData {
                 bytes,
                 mime_type: collect.mime_type.clone(),

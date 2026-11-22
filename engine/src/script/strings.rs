@@ -38,6 +38,8 @@ pub(super) enum StringMethod {
     TrimEnd,
     TrimStart,
     Iterator,
+    // an annex B method that wraps a string in a tag, by its place in HTML_METHODS
+    Html(u8),
 }
 
 pub(super) const STRING_METHODS: &[(&str, StringMethod, u32)] = &[
@@ -77,6 +79,36 @@ pub(super) const STRING_METHODS: &[(&str, StringMethod, u32)] = &[
     ("trimStart", StringMethod::TrimStart, 0),
     ("trimLeft", StringMethod::TrimStart, 0),
     ("@@iterator", StringMethod::Iterator, 0),
+    ("anchor", StringMethod::Html(0), 1),
+    ("big", StringMethod::Html(1), 0),
+    ("blink", StringMethod::Html(2), 0),
+    ("bold", StringMethod::Html(3), 0),
+    ("fixed", StringMethod::Html(4), 0),
+    ("fontcolor", StringMethod::Html(5), 1),
+    ("fontsize", StringMethod::Html(6), 1),
+    ("italics", StringMethod::Html(7), 0),
+    ("link", StringMethod::Html(8), 1),
+    ("small", StringMethod::Html(9), 0),
+    ("strike", StringMethod::Html(10), 0),
+    ("sub", StringMethod::Html(11), 0),
+    ("sup", StringMethod::Html(12), 0),
+];
+
+// each annex B HTML method's tag and the attribute its argument fills
+const HTML_METHODS: &[(&str, Option<&str>)] = &[
+    ("a", Some("name")),
+    ("big", None),
+    ("blink", None),
+    ("b", None),
+    ("tt", None),
+    ("font", Some("color")),
+    ("font", Some("size")),
+    ("i", None),
+    ("a", Some("href")),
+    ("small", None),
+    ("strike", None),
+    ("sub", None),
+    ("sup", None),
 ];
 
 // WhiteSpace and LineTerminator from the specification
@@ -652,6 +684,17 @@ impl ScriptRuntime {
             M::Trim => Value::String(text.trim_matches(is_js_whitespace).into()),
             M::TrimStart => Value::String(text.trim_start_matches(is_js_whitespace).into()),
             M::TrimEnd => Value::String(text.trim_end_matches(is_js_whitespace).into()),
+            M::Html(index) => {
+                let (tag, attribute) = HTML_METHODS[usize::from(index)];
+                let attribute = match attribute {
+                    Some(name) => format!(
+                        " {name}=\"{}\"",
+                        self.coerce_string(first)?.replace('"', "&quot;")
+                    ),
+                    None => String::new(),
+                };
+                Value::String(format!("<{tag}{attribute}>{text}</{tag}>").into())
+            }
             M::Iterator => Value::Iterator(Rc::new(RefCell::new(IteratorData {
                 values: text
                     .chars()
