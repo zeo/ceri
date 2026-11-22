@@ -411,7 +411,8 @@ mod speakers {
                     &mut error,
                 )
             };
-            (!handle.is_null()).then_some(Self { pulse, handle })
+            // built only for a handle, as its drop frees what pa_simple_new opened
+            (!handle.is_null()).then(|| Self { pulse, handle })
         }
 
         // blocks until the server has room, which is what paces the thread

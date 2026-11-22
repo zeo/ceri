@@ -686,10 +686,10 @@ fn reconstruct(planes: &mut Planes, block: &Block, mb_x: usize, mb_y: usize, mb_
             mb_x == 0,
             mb_y == 0,
         );
-        for n in 0..16 {
-            if block.coefficients[n].iter().any(|&value| value != 0) {
+        for (n, coefficients) in block.coefficients.iter().enumerate().take(16) {
+            if coefficients.iter().any(|&value| value != 0) {
                 idct_add(
-                    &block.coefficients[n],
+                    coefficients,
                     &mut work,
                     at((n % 4) * 4, (n / 4) * 4),
                     STRIDE,

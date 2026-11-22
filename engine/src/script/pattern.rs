@@ -1365,10 +1365,10 @@ impl Regex {
                     pc += 1;
                 }
                 Inst::Clear(low, high) => {
-                    for slot in low..=high {
-                        if state.slots[slot].is_some() {
-                            undo.push(Entry::Slot(slot, state.slots[slot]));
-                            state.slots[slot] = None;
+                    for (slot, saved) in state.slots.iter_mut().enumerate().take(high + 1).skip(low)
+                    {
+                        if saved.is_some() {
+                            undo.push(Entry::Slot(slot, saved.take()));
                         }
                     }
                     pc += 1;

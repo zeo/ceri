@@ -37,6 +37,7 @@ mod messaging;
 mod navigator_apis;
 mod netfetch;
 mod traversal;
+#[cfg(feature = "windowed")]
 pub(crate) use json::quote as json_quote;
 mod atomics;
 mod display_names_data;
