@@ -3160,6 +3160,24 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
             cursor = start + 4 + end + 3;
             continue;
         }
+        if source[start + 1..].starts_with(['!', '?']) {
+            // any other declaration and a processing instruction end at the first > as a
+            // comment of what they hold, so solid's <!> markers stay in its templates
+            let close = source[start..]
+                .find('>')
+                .map_or(source.len(), |at| start + at);
+            let body = &source[start + 1..close];
+            if !body
+                .get(..8)
+                .is_some_and(|head| head.eq_ignore_ascii_case("!doctype"))
+            {
+                tokens.push(Token::Comment(
+                    body.strip_prefix('!').unwrap_or(body).to_string(),
+                ));
+            }
+            cursor = (close + 1).min(source.len());
+            continue;
+        }
         let Some(end) = find_tag_end(source, start + 1) else {
             return Err(ParseError {
                 offset: start,
@@ -3497,6 +3515,23 @@ mod tests {
         assert_eq!(
             document.outer_html(main),
             "<main>a<!-- note -->b<template id=\"row\"><li>item</li></template></main>"
+        );
+    }
+
+    #[test]
+    fn turns_bogus_declarations_into_comments_as_the_html_parser_does() {
+        let document = Document::parse("<!DOCTYPE html><p>down <!> up<?php x ?><!x-y z></p>")
+            .expect("document should parse");
+        let p = element_named(&document, "p");
+        let data: Vec<_> = document
+            .children(p)
+            .iter()
+            .map(|child| document.character_data(*child).unwrap_or_default())
+            .collect();
+        assert_eq!(data, ["down ", "", " up", "?php x ?", "x-y z"]);
+        assert_eq!(
+            document.outer_html(p),
+            "<p>down <!----> up<!--?php x ?--><!--x-y z--></p>"
         );
     }
 
