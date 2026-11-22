@@ -7810,6 +7810,41 @@ mod tests {
     }
 
     #[test]
+    fn ranges_measure_the_text_and_elements_they_select() {
+        let mut browser = Browser::new(bundle(
+            r##"<body style="margin: 8px; user-select: none"><p id="p">Hello <b id="b">bold world</b> and more</p><div id="w" style="width: 60px">one two three four</div><p id="status"></p><script>
+                const t = document.getElementById("p").firstChild, b = document.getElementById("b");
+                const word = document.getElementById("b").getBoundingClientRect();
+                const out = [];
+                let r = document.createRange(); r.setStart(t, 1); r.setEnd(t, 4);
+                const part = r.getBoundingClientRect();
+                out.push(r.getClientRects().length, part.width > 0, part.height > 0);
+                r = document.createRange(); r.setStart(t, 2); r.setEnd(b.nextSibling, 3);
+                const rects = [...r.getClientRects()];
+                out.push(rects.length, rects[1].left === word.left && rects[1].width === word.width, rects[2].width === rects[1].width);
+                const bound = r.getBoundingClientRect();
+                out.push(bound.left === rects[0].left && bound.right === rects[3].right);
+                r = document.createRange(); r.setStart(t, 3); r.setEnd(t, 3);
+                out.push(r.getClientRects().length, r.getBoundingClientRect().width);
+                r = document.createRange(); r.selectNodeContents(document.getElementById("w").firstChild);
+                const lines = [...r.getClientRects()];
+                out.push(lines.length > 1, lines.every((line, index) => index === 0 || line.top > lines[index - 1].top));
+                document.getElementById("status").textContent = out.join(" ");
+            </script></body>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.text_content(status),
+            "1 true true 4 true true true 1 0 true true"
+        );
+    }
+
+    #[test]
     fn themed_checkboxes_radios_and_sliders_sit_on_their_border_edge() {
         let mut browser = Browser::new(bundle(
             r##"<body style="margin: 0"><div>Xy<span id="plain" style="display: inline-block; width: 13px; height: 13px"></span><input id="radio" type="radio" style="margin: 0 0 10px 0"><input id="box" type="checkbox" style="margin: 0 0 10px 0"><input id="range" type="range" style="margin: 0 0 10px 0"><input id="flat" type="checkbox" style="margin: 0 0 10px 0; appearance: none; width: 13px; height: 13px"></div><p id="status"></p><script>

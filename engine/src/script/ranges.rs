@@ -50,6 +50,8 @@ static RANGE_MEMBERS: &[(&str, Kind)] = &[
     ("comparePoint", Method(2)),
     ("intersectsNode", Method(1)),
     ("createContextualFragment", Method(1)),
+    ("getClientRects", Method(0)),
+    ("getBoundingClientRect", Method(0)),
     ("toString", Method(0)),
 ];
 
@@ -387,7 +389,7 @@ impl ScriptRuntime {
     }
 
     // a node whose whole extent lies inside the range
-    fn contained(&self, node: NodeId, range: LiveRange) -> bool {
+    pub(super) fn contained(&self, node: NodeId, range: LiveRange) -> bool {
         let document = self.document.borrow();
         let length = document.node_length(node);
         document.tree_root(node) == document.tree_root(range.start.node)
@@ -992,6 +994,34 @@ impl ScriptRuntime {
                 Value::Undefined
             }
             "cloneRange" => Value::Range(self.new_range(live)),
+            "getClientRects" => {
+                let rects = self.range_rects(live);
+                Self::new_array(
+                    rects
+                        .into_iter()
+                        .map(|rect| self.rect_object(rect))
+                        .collect(),
+                )
+            }
+            "getBoundingClientRect" => {
+                let rects = self.range_rects(live);
+                // the union of the rects with any size, or the first when none has one
+                let sized = rects
+                    .iter()
+                    .filter(|rect| rect.width > 0.0 && rect.height > 0.0)
+                    .copied()
+                    .reduce(|union, rect| {
+                        let left = union.x.min(rect.x);
+                        let top = union.y.min(rect.y);
+                        crate::layout::Rect {
+                            x: left,
+                            y: top,
+                            width: (union.x + union.width).max(rect.x + rect.width) - left,
+                            height: (union.y + union.height).max(rect.y + rect.height) - top,
+                        }
+                    });
+                self.rect_object(sized.or(rects.first().copied()).unwrap_or_default())
+            }
             "detach" => Value::Undefined,
             "isPointInRange" | "comparePoint" => {
                 let node = self.range_node_argument(arguments, 0, name, "Range")?;

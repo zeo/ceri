@@ -91,6 +91,7 @@ The current slice implements:
 - a host-owned `ScriptDialogs` boundary behind `alert`, `confirm` and `prompt`, titled with the page's title; without one they answer as headless Chrome does
 - URL attributes (`a.href`, `img.src`, media `src` and `poster`, `script.src`, `link.href`) read resolved against the document base or its first `base` element, anchors split their address into `origin`, `pathname`, `search`, `hash` and the rest with setters that rewrite `href`, and `img.width` and `height` follow the rendered size, then the attribute, then the picture
 - input `indeterminate` with the `:indeterminate` pseudo-class and a painted dash that a click clears, `stepUp` and `stepDown` on the step grid between `min` and `max`, `size`, `labels`, `alt` and a resolved `src`
+- `Range.getClientRects` and `getBoundingClientRect` in tree order: the boxes of selected elements and one rect per line for each selected text span, measured with the page's fonts
 - the window's own references (`self`, `top`, `parent`, `frames`), `origin`, `isSecureContext`, a settable `name`, and the annex B `escape` and `unescape`
 - a host-owned `ClipboardProvider` boundary behind `navigator.clipboard.readText()` and `writeText()`, with promise results and host-controlled access failures
 - `FormData` key, value, and entry iterators, `forEach()`, and `Symbol.iterator` preserve insertion order and File values

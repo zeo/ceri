@@ -4553,7 +4553,7 @@ fn control_text_position(layout_box: &LayoutBox, value: &str, offset: usize) -> 
 }
 
 // the width of a run's first characters as the font draws them
-fn width_of_characters(run: &TextRun, characters: usize) -> f32 {
+pub(crate) fn width_of_characters(run: &TextRun, characters: usize) -> f32 {
     let fonts = crate::font::active_fonts();
     if fonts.is_builtin() {
         return characters as f32 * text_advance(run.font_size);
@@ -4566,7 +4566,7 @@ fn text_advance(font_size: f32) -> f32 {
     (font_size / 9.0).round().max(1.0) * 6.0
 }
 
-fn utf16_char_offset(value: &str, offset: usize) -> usize {
+pub(crate) fn utf16_char_offset(value: &str, offset: usize) -> usize {
     let mut units = 0;
     let mut characters = 0;
     for character in value.chars() {

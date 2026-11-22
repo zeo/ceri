@@ -1301,7 +1301,14 @@ impl LayoutDocument {
     // every painted prose run in tree order, translated to the viewport
     pub(crate) fn prose_runs(&self) -> Vec<ProseRun> {
         let mut runs = Vec::new();
-        collect_prose_runs(&self.root, (0.0, 0.0), &mut Vec::new(), &mut runs);
+        collect_prose_runs(&self.root, (0.0, 0.0), true, &mut Vec::new(), &mut runs);
+        runs
+    }
+
+    // every text run in tree order, translated to the viewport, selectable or not
+    pub(crate) fn text_runs(&self) -> Vec<ProseRun> {
+        let mut runs = Vec::new();
+        collect_prose_runs(&self.root, (0.0, 0.0), false, &mut Vec::new(), &mut runs);
         runs
     }
 }
@@ -1407,6 +1414,7 @@ fn collect_control_at(
 fn collect_prose_runs(
     layout_box: &LayoutBox,
     ancestor_offset: (f32, f32),
+    selectable_only: bool,
     transforms: &mut Vec<crate::transform::Matrix>,
     found: &mut Vec<ProseRun>,
 ) {
@@ -1415,7 +1423,11 @@ fn collect_prose_runs(
     if let Some(transform) = layout_box.transform {
         transforms.push(transform.about(box_rect.x, box_rect.y));
     }
-    for run in layout_box.text.iter().filter(|_| layout_box.selectable) {
+    for run in layout_box
+        .text
+        .iter()
+        .filter(|_| layout_box.selectable || !selectable_only)
+    {
         let Some(node) = run.node else {
             continue;
         };
@@ -1434,7 +1446,7 @@ fn collect_prose_runs(
         });
     }
     for child in &layout_box.children {
-        collect_prose_runs(child, offset, transforms, found);
+        collect_prose_runs(child, offset, selectable_only, transforms, found);
     }
     if layout_box.transform.is_some() {
         transforms.pop();

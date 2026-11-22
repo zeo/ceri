@@ -712,6 +712,139 @@ impl ScriptRuntime {
         Ok(())
     }
 
+    // a range's rects as cssom view lists them: the boxes of each element it selects whose
+    // parent it does not, then the selected part of each text node, one rect per line
+    pub(super) fn range_rects(&self, range: crate::dom::LiveRange) -> Vec<Rect> {
+        let Some(measured) = self.measure() else {
+            return Vec::new();
+        };
+        let runs = measured.layout.text_runs();
+        let (order, elements, spans) = {
+            let document = self.document.borrow();
+            let root = document.tree_root(range.start.node);
+            let order = document
+                .descendants(root)
+                .enumerate()
+                .map(|(index, node)| (node, index))
+                .collect::<HashMap<_, _>>();
+            let elements = document
+                .descendants(root)
+                .filter(|&node| {
+                    document.element(node).is_some()
+                        && self.contained(node, range)
+                        && !document
+                            .parent(node)
+                            .is_some_and(|parent| self.contained(parent, range))
+                })
+                .collect::<Vec<_>>();
+            let span = |node: NodeId| -> Option<(usize, usize)> {
+                let length = document.node_length(node);
+                let from = if node == range.start.node {
+                    range.start.offset
+                } else {
+                    0
+                };
+                let to = if node == range.end.node {
+                    range.end.offset
+                } else {
+                    length
+                };
+                (node == range.start.node || node == range.end.node || self.contained(node, range))
+                    .then_some((from, to))
+            };
+            let spans = runs
+                .iter()
+                .map(|run| span(run.node).filter(|_| document.is_text(run.node)))
+                .collect::<Vec<_>>();
+            (order, elements, spans)
+        };
+        let place = |node: NodeId| order.get(&node).copied().unwrap_or(usize::MAX);
+        let mut rects = Vec::new();
+        for element in elements {
+            rects.extend(
+                self.node_boxes(element)
+                    .iter()
+                    .map(|geometry| (place(element), geometry.client)),
+            );
+        }
+        // text measures with the page's fonts, which only layout and paint have active
+        let _active = self.layout_inputs.as_ref().map(|inputs| {
+            crate::font::use_fonts(
+                inputs.borrow().fonts.clone(),
+                self.viewport.device_pixel_ratio,
+            )
+        });
+        let fonts = crate::font::active_fonts();
+        let mut texts: Vec<(NodeId, Rect)> = Vec::new();
+        for (prose, span) in runs.iter().zip(spans) {
+            let Some((from, to)) = span else {
+                continue;
+            };
+            let run = &prose.run;
+            let length = run.text.encode_utf16().count();
+            let prefix = usize::from(run.text.starts_with(' '));
+            // the run's own text indices for node offsets, a collapsed range keeping its caret
+            let units = if from == to {
+                (run.node_offset..=run.node_offset + run.source_len)
+                    .contains(&from)
+                    .then(|| {
+                        let at = (prefix + from - run.node_offset).min(length);
+                        (at, at)
+                    })
+            } else {
+                run.selected_units(from, to, false)
+            };
+            let Some((first, last)) = units else {
+                continue;
+            };
+            let x_at = |index: usize| {
+                crate::paint::width_of_characters(
+                    run,
+                    crate::paint::utf16_char_offset(&run.text, index),
+                )
+            };
+            let left = run.x + x_at(first);
+            let rect = Rect {
+                x: left,
+                y: run.y,
+                width: run.x + x_at(last) - left,
+                height: fonts.content_height(run.font_stack, run.font_size),
+            };
+            let rect = prose.transforms.iter().rev().fold(rect, |rect, transform| {
+                let corners = [
+                    (rect.x, rect.y),
+                    (rect.x + rect.width, rect.y),
+                    (rect.x, rect.y + rect.height),
+                    (rect.x + rect.width, rect.y + rect.height),
+                ]
+                .map(|(x, y)| transform.map_point(x, y).unwrap_or((x, y)));
+                let left = corners.iter().map(|point| point.0).fold(f32::MAX, f32::min);
+                let top = corners.iter().map(|point| point.1).fold(f32::MAX, f32::min);
+                let right = corners.iter().map(|point| point.0).fold(f32::MIN, f32::max);
+                let bottom = corners.iter().map(|point| point.1).fold(f32::MIN, f32::max);
+                Rect {
+                    x: left,
+                    y: top,
+                    width: right - left,
+                    height: bottom - top,
+                }
+            });
+            // layout keeps a run per word; chrome reports a text node's line as one box
+            match texts.last_mut() {
+                Some((node, line))
+                    if *node == prose.node && (line.y - rect.y).abs() < 0.5 && rect.x >= line.x =>
+                {
+                    line.width = rect.x + rect.width - line.x;
+                }
+                _ => texts.push((prose.node, rect)),
+            }
+        }
+        rects.extend(texts.into_iter().map(|(node, rect)| (place(node), rect)));
+        // tree order, an element before the text inside it
+        rects.sort_by_key(|(place, _)| *place);
+        rects.into_iter().map(|(_, rect)| rect).collect()
+    }
+
     pub(super) fn bounding_box(&self, node: NodeId) -> Option<Rect> {
         let boxes = self.node_boxes(node);
         let first = boxes.first()?.client;
