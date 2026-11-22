@@ -1,0 +1,2 @@
+# test262 checks that CR LF in this source survives into Function.prototype.toString
+conformance/test262/test/built-ins/Function/prototype/toString/line-terminator-normalisation-CR-LF.js -text
