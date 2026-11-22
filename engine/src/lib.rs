@@ -47,6 +47,7 @@ mod text;
 mod text_tables;
 mod transform;
 mod unicode;
+mod webp;
 #[rustfmt::skip]
 mod unicode_tables;
 mod variation;

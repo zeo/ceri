@@ -107,8 +107,8 @@ pub(crate) fn decode_image(bytes: &[u8], mime_type: &str) -> Result<Image, Image
     if crate::gif::is_gif(bytes) {
         return crate::gif::decode_gif(bytes);
     }
-    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        return Err(ImageError::new("WebP images are not supported yet"));
+    if crate::webp::is_webp(bytes) {
+        return crate::webp::decode_webp(bytes);
     }
     let declared_svg = mime_type
         .split(';')
@@ -391,13 +391,14 @@ mod tests {
     }
 
     #[test]
-    fn decoding_sniffs_the_format_and_names_unsupported_ones() {
-        let webp = b"RIFF\x00\x00\x00\x00WEBPVP8 ";
+    fn decoding_sniffs_the_format_and_names_broken_ones() {
+        // a WebP header with no image in it
+        let webp = b"RIFF\x04\x00\x00\x00WEBP";
         assert!(
             decode_image(webp, "image/webp")
                 .unwrap_err()
                 .to_string()
-                .contains("WebP")
+                .contains("webp")
         );
         let svg = decode_image(
             b"<svg width='3' height='2'><rect width='3' height='2'/></svg>",

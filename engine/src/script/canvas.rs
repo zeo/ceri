@@ -480,12 +480,20 @@ fn premultiply([red, green, blue, alpha]: [u8; 4]) -> [u8; 4] {
     [scale(red), scale(green), scale(blue), alpha]
 }
 
+// chromium's unpremultiply, skia's raster pipeline in float32: each channel over 255 times the
+// reciprocal of alpha over 255, back to bytes rounding half to even; it matches every value
+// getImageData returns in Edge, and premultiplying again gives back the same pixel
 fn unpremultiply([red, green, blue, alpha]: [u8; 4]) -> [u8; 4] {
     if alpha == 0 {
         return [0; 4];
     }
-    let alpha32 = u32::from(alpha);
-    let scale = |channel: u8| ((u32::from(channel) * 255 + alpha32 / 2) / alpha32).min(255) as u8;
+    let inverse = (1.0_f64 / 255.0) as f32;
+    let reciprocal = 1.0 / (f32::from(alpha) * inverse);
+    let scale = |channel: u8| {
+        ((f32::from(channel) * inverse * reciprocal) * 255.0)
+            .round_ties_even()
+            .min(255.0) as u8
+    };
     [scale(red), scale(green), scale(blue), alpha]
 }
 
@@ -1447,10 +1455,15 @@ impl Bitmap {
         });
     }
 
-    // a PNG, or for "image/jpeg" a JPEG blended onto black, which premultiplied colour already is
+    // a PNG, a lossless WebP for "image/webp", or for "image/jpeg" a JPEG blended onto black,
+    // which premultiplied colour already is
     fn encode(&self, mime: &str, quality: u8) -> Option<Vec<u8>> {
         if self.pixels.is_empty() {
             return None;
+        }
+        if mime == "image/webp" {
+            let rgba = self.image_data(0, 0, self.width, self.height);
+            return crate::webp::encode_webp(self.width, self.height, &rgba);
         }
         if mime == "image/jpeg" {
             let rgb = self
@@ -1645,8 +1658,24 @@ impl ScriptRuntime {
         })
     }
 
-    // toDataURL(type, quality) and toBlob(callback, type, quality); types other than PNG and
-    // JPEG fall back to PNG, and quality outside 0 to 1 means Chromium's default of 92
+    // the encoder an export type picks: JPEG and WebP as named, PNG for anything else
+    fn export_mime(&mut self, value: Option<&Value>) -> Result<&'static str, ScriptError> {
+        Ok(match value {
+            None | Some(Value::Undefined) => "image/png",
+            Some(value) => match self
+                .coerce_string(value.clone())?
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "image/jpeg" => "image/jpeg",
+                "image/webp" => "image/webp",
+                _ => "image/png",
+            },
+        })
+    }
+
+    // toDataURL(type, quality) and toBlob(callback, type, quality); types other than PNG,
+    // JPEG and WebP fall back to PNG, and quality outside 0 to 1 means Chromium's default of 92
     pub(super) fn export_canvas(
         &mut self,
         node: NodeId,
@@ -1662,17 +1691,7 @@ impl ScriptRuntime {
         let options = arguments
             .get(usize::from(name == "toBlob")..)
             .unwrap_or_default();
-        let mime = match options.first() {
-            None | Some(Value::Undefined) => "image/png",
-            Some(value)
-                if self
-                    .coerce_string(value.clone())?
-                    .eq_ignore_ascii_case("image/jpeg") =>
-            {
-                "image/jpeg"
-            }
-            Some(_) => "image/png",
-        };
+        let mime = self.export_mime(options.first())?;
         let quality = match options.get(1) {
             Some(&Value::Number(quality)) if (0.0..=1.0).contains(&quality) => {
                 (quality * 100.0 + 0.5) as u8
@@ -2621,17 +2640,7 @@ impl ScriptRuntime {
         kind: Value,
         quality: Value,
     ) -> Result<Value, ScriptError> {
-        let mime = match kind {
-            Value::Undefined => "image/png",
-            value
-                if self
-                    .coerce_string(value.clone())?
-                    .eq_ignore_ascii_case("image/jpeg") =>
-            {
-                "image/jpeg"
-            }
-            _ => "image/png",
-        };
+        let mime = self.export_mime(Some(&kind))?;
         let quality = match quality {
             Value::Number(quality) if (0.0..=1.0).contains(&quality) => {
                 (quality * 100.0 + 0.5) as u8

@@ -20818,7 +20818,7 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(status).as_deref(),
             Some(
-                "300,150,true,null,255 0 0 255,0 0 0 0,#ff0000,255 0 0 255,9 0 0 255,0 0 0 0,#000000,4,data:,,data:image/jpeg;base64,,data:image/png;base64,,IndexSizeError,TypeError,TypeError,TypeError"
+                "300,150,true,null,255 0 0 255,0 0 0 0,#ff0000,255 0 0 255,9 0 0 255,0 0 0 0,#000000,4,data:,,data:image/jpeg;base64,,data:image/webp;base64,IndexSizeError,TypeError,TypeError,TypeError"
             )
         );
     }

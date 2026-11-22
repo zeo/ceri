@@ -205,7 +205,7 @@ fn distance_code(distance: usize) -> usize {
 
 // code lengths no longer than `limit` for the given frequencies; any alphabet in use gets
 // at least two codes, which every decoder accepts
-fn code_lengths(frequencies: &[u32], limit: u8) -> Vec<u8> {
+pub(crate) fn code_lengths(frequencies: &[u32], limit: u8) -> Vec<u8> {
     let mut weights = frequencies.to_vec();
     loop {
         let mut used = weights
@@ -265,7 +265,7 @@ fn code_lengths(frequencies: &[u32], limit: u8) -> Vec<u8> {
 }
 
 // canonical codes for the lengths, per RFC 1951 section 3.2.2
-fn canonical(lengths: &[u8]) -> Vec<(u16, u8)> {
+pub(crate) fn canonical(lengths: &[u8]) -> Vec<(u16, u8)> {
     let mut counts = [0_u16; 16];
     for &length in lengths.iter().filter(|&&length| length > 0) {
         counts[usize::from(length)] += 1;
@@ -290,7 +290,7 @@ fn canonical(lengths: &[u8]) -> Vec<(u16, u8)> {
 }
 
 // the code length sequence with runs folded into codes 16, 17 and 18, as (symbol, extra)
-fn run_lengths(lengths: &[u8]) -> Vec<(u8, u8)> {
+pub(crate) fn run_lengths(lengths: &[u8]) -> Vec<(u8, u8)> {
     let mut runs = Vec::new();
     let mut index = 0;
     while index < lengths.len() {
