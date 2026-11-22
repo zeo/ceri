@@ -971,6 +971,8 @@ struct Page {
     layout_inputs: Rc<RefCell<LayoutInputs>>,
     // the page clock time the last layout's animations next change what they show
     animation_wake: Cell<Option<u64>>,
+    // the animated images of the document, each playing from when it was first decoded
+    animated: RefCell<Vec<crate::animated::Animation>>,
     // the last custom property passes, each keyed by the document version and the state it read
     custom_properties: RefCell<Vec<(u64, StyleState, StyleState)>>,
     // decoded once per document and shared by every frame; failures are remembered too
@@ -1346,7 +1348,20 @@ impl Browser {
                 delay => delay,
             });
         let task = page.runtime.next_task_delay();
-        motion.into_iter().chain(animation).chain(task).min()
+        let now = page.runtime.now();
+        let images = page
+            .animated
+            .borrow()
+            .iter()
+            .filter(|animated| self.visible && animated.shown.get())
+            .filter_map(|animated| animated.next_change(now))
+            .min();
+        motion
+            .into_iter()
+            .chain(animation)
+            .chain(task)
+            .chain(images)
+            .min()
     }
 
     // an event from the host to the page's ceri.listen callbacks
@@ -1757,6 +1772,7 @@ impl Browser {
             runtime,
             layout_inputs,
             animation_wake: Cell::new(None),
+            animated: RefCell::default(),
             custom_properties: RefCell::default(),
         });
         self.last_navigation_failure = None;
@@ -1778,14 +1794,22 @@ impl Browser {
 
     // a page with a running animation or transition needs a frame per clock tick
     pub fn has_active_animations(&self) -> bool {
+        // animated images play whatever the motion preference, as in browsers
+        let images = self.page.as_ref().is_some_and(|page| {
+            let now = page.runtime.now();
+            page.animated
+                .borrow()
+                .iter()
+                .any(|animated| animated.shown.get() && animated.next_change(now).is_some())
+        });
         if self.preferences.reduced_motion {
-            return false;
+            return images;
         }
         let animating = self
             .page
             .as_ref()
             .is_some_and(|page| page.animation_wake.get().is_some());
-        animating || !self.transitions.is_empty()
+        images || animating || !self.transitions.is_empty()
     }
 
     // records which animatable values changed, so layout can blend from the old ones
@@ -3046,6 +3070,7 @@ impl Browser {
             .map(|page| {
                 let mut layers = page.runtime.canvas_layers();
                 layers.extend(page.runtime.video_layers());
+                layers.extend(animated_layers(page, &layout));
                 layers
             })
             .unwrap_or_default();
@@ -3235,20 +3260,25 @@ impl Browser {
         let permitted =
             |url: &str| policies.permits(policies.url(Directive::Img, url, Initiator::default()));
         let held = crate::image::decode_data_url(&key).or_else(|| page.runtime.object_url(&key));
-        let decoded = if let Some((mime_type, bytes)) = held {
-            permitted(&key)
-                .then(|| crate::image::decode_image(&bytes, &mime_type).ok())
-                .flatten()
+        let encoded = if let Some((mime_type, bytes)) = held {
+            permitted(&key).then_some((mime_type, bytes))
         } else {
             base.resolve(reference)
                 .ok()
                 .filter(|url| permitted(&url.to_string()))
                 .and_then(|url| self.load_subresource(&url).ok())
-                .and_then(|resource| {
-                    crate::image::decode_image(resource.body(), &resource.mime_type).ok()
-                })
+                .map(|resource| (resource.mime_type.clone(), resource.body().to_vec()))
+        };
+        let decoded = encoded
+            .as_ref()
+            .and_then(|(mime_type, bytes)| crate::image::decode_image(bytes, mime_type).ok())
+            .map(Arc::new);
+        if let (Some((_, bytes)), Some(image)) = (&encoded, &decoded)
+            && let Some(animation) =
+                crate::animated::Animation::new(bytes, image.clone(), page.runtime.now())
+        {
+            page.animated.borrow_mut().push(animation);
         }
-        .map(Arc::new);
         page.runtime
             .image_cache()
             .borrow_mut()
@@ -3631,6 +3661,7 @@ impl Browser {
             document,
             layout_inputs,
             animation_wake: Cell::new(None),
+            animated: RefCell::default(),
             custom_properties: RefCell::default(),
         });
     }
@@ -4005,6 +4036,33 @@ fn collect_motion_candidates(
 }
 
 // image elements and boxes with background or mask images, in tree order
+// the current frame of each animated image the layout shows, in place of its first frame
+fn animated_layers(page: &Page, layout: &LayoutDocument) -> Vec<ImageLayer> {
+    let mut animated = page.animated.borrow_mut();
+    if animated.is_empty() {
+        return Vec::new();
+    }
+    let now = page.runtime.now();
+    for animation in animated.iter() {
+        animation.shown.set(false);
+    }
+    let mut layers = Vec::new();
+    for layer in &layout.images {
+        if let Some(animation) = animated
+            .iter_mut()
+            .find(|animation| Arc::ptr_eq(&animation.first, &layer.image))
+        {
+            animation.shown.set(true);
+            layers.push(ImageLayer {
+                node: layer.node,
+                image: animation.frame_at(now),
+                background: layer.background,
+            });
+        }
+    }
+    layers
+}
+
 fn collect_image_sources(
     layout: &crate::layout::LayoutBox,
     sources: &mut Vec<(NodeId, Option<crate::image::ImageSource>)>,
@@ -11412,7 +11470,13 @@ A</div>
 
     fn image_bundle(source: &str) -> ResourceBundle {
         let mut resources = bundle(source);
-        for name in ["rgb8.png", "rgba8.png", "baseline-420.jpg", "frame.gif"] {
+        for name in [
+            "rgb8.png",
+            "rgba8.png",
+            "baseline-420.jpg",
+            "frame.gif",
+            "animated.gif",
+        ] {
             let bytes = std::fs::read(format!(
                 "{}/tests/fixtures/{name}",
                 env!("CARGO_MANIFEST_DIR")
@@ -11521,6 +11585,45 @@ A</div>
         // cover fills the whole square
         assert_ne!(pixel_at(&canvas, 1, 27), blank);
         assert_ne!(pixel_at(&canvas, 24, 51), blank);
+    }
+
+    #[test]
+    fn animated_images_show_the_frame_the_clock_reaches() {
+        let bytes = std::fs::read(format!(
+            "{}/tests/fixtures/animated.gif",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("fixture");
+        let first = Arc::new(crate::image::decode_image(&bytes, "image/gif").expect("first frame"));
+        let mut animation =
+            crate::animated::Animation::new(&bytes, first.clone(), 0).expect("an animation");
+        let delay = animation.next_change(0).expect("a second frame comes");
+        let second = animation.frame_at(delay);
+        // a pixel the second frame changes to an opaque colour
+        let (x, y) = (0..first.height)
+            .flat_map(|y| (0..first.width).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                second.pixel(x, y) != first.pixel(x, y) && second.pixel(x, y).alpha == 255
+            })
+            .expect("the frames differ");
+        let (mut browser, _, before) = image_page(
+            "<style>body { margin: 0 } img { display: block }</style><img src=\"/animated.gif\">",
+            100.0,
+            100.0,
+        );
+        let viewport = Size {
+            width: 100.0,
+            height: 100.0,
+        };
+        assert!(browser.next_wake().is_some_and(|wake| wake <= delay));
+        browser.advance_time(delay).expect("time should advance");
+        let after = browser.paint(viewport).expect("page should paint");
+        let want = second.pixel(x, y);
+        assert_ne!(pixel_at(&before, x, y), pixel_at(&after, x, y));
+        assert_eq!(
+            pixel_at(&after, x, y),
+            [want.red, want.green, want.blue, 255]
+        );
     }
 
     #[test]

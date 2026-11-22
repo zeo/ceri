@@ -1,5 +1,6 @@
 // GIF decoding of the first frame: LZW image data, global or local palettes,
-// a transparent index from the graphic control extension and interlaced rows
+// a transparent index from the graphic control extension and interlaced rows; and the frames
+// of an animation, kept compressed until they are shown
 
 use crate::css::Color;
 use crate::image::{Image, ImageError, check_dimensions};
@@ -127,6 +128,124 @@ pub(crate) fn decode_gif(bytes: &[u8]) -> Result<Image, ImageError> {
             _ => return Err(error("unknown block")),
         }
     }
+}
+
+// one frame of an animation: where it goes, how long it shows and what happens to it after
+pub(crate) struct GifFrame {
+    pub(crate) left: u32,
+    pub(crate) top: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) delay: u32,
+    // 2 clears the frame's area after it shows, 3 puts back what was there before it
+    pub(crate) disposal: u8,
+    transparent: Option<u8>,
+    interlaced: bool,
+    palette: Vec<[u8; 3]>,
+    minimum: u8,
+    data: Vec<u8>,
+}
+
+impl GifFrame {
+    // the frame's pixels as straight RGBA, transparent where the index says so
+    pub(crate) fn rgba(&self) -> Vec<u8> {
+        let (width, height) = (self.width as usize, self.height as usize);
+        let indices = decompress(&self.data, self.minimum, width * height).unwrap_or_default();
+        let mut out = vec![0_u8; width * height * 4];
+        for (source_row, &target_row) in row_order(height, self.interlaced).iter().enumerate() {
+            for column in 0..width {
+                let Some(&index) = indices.get(source_row * width + column) else {
+                    continue;
+                };
+                if Some(index) == self.transparent {
+                    continue;
+                }
+                if let Some(&[red, green, blue]) = self.palette.get(usize::from(index)) {
+                    let at = (target_row * width + column) * 4;
+                    out[at..at + 4].copy_from_slice(&[red, green, blue, 255]);
+                }
+            }
+        }
+        out
+    }
+}
+
+// the frames of a GIF with its screen size and how many times it plays, None for ever
+pub(crate) fn gif_frames(
+    bytes: &[u8],
+) -> Result<(u32, u32, Vec<GifFrame>, Option<u32>), ImageError> {
+    if !is_gif(bytes) {
+        return Err(error("missing signature"));
+    }
+    let mut reader = Reader { bytes, position: 6 };
+    let width = u32::from(reader.u16()?);
+    let height = u32::from(reader.u16()?);
+    check_dimensions(width, height)?;
+    let flags = reader.byte()?;
+    reader.take(2)?;
+    let global = if flags & 0x80 != 0 {
+        reader.palette(flags)?
+    } else {
+        Vec::new()
+    };
+    let mut frames = Vec::new();
+    // without the NETSCAPE extension an animation plays once
+    let mut plays = Some(1);
+    let (mut delay, mut disposal, mut transparent) = (0, 0, None);
+    while let Ok(introducer) = reader.byte() {
+        match introducer {
+            0x21 => {
+                let label = reader.byte()?;
+                let data = reader.blocks()?;
+                if label == 0xf9 && data.len() >= 4 {
+                    disposal = (data[0] >> 2) & 7;
+                    transparent = (data[0] & 1 == 1).then_some(data[3]);
+                    delay = u32::from(u16::from_le_bytes([data[1], data[2]])) * 10;
+                } else if label == 0xff
+                    && data.len() >= 14
+                    && &data[..11] == b"NETSCAPE2.0"
+                    && data[11] == 1
+                {
+                    let count = u32::from(u16::from_le_bytes([data[12], data[13]]));
+                    plays = (count != 0).then_some(count + 1);
+                }
+            }
+            0x2c => {
+                let left = u32::from(reader.u16()?);
+                let top = u32::from(reader.u16()?);
+                let frame_width = u32::from(reader.u16()?);
+                let frame_height = u32::from(reader.u16()?);
+                let frame_flags = reader.byte()?;
+                let palette = if frame_flags & 0x80 != 0 {
+                    reader.palette(frame_flags)?
+                } else {
+                    global.clone()
+                };
+                let minimum = reader.byte()?;
+                let data = reader.blocks()?;
+                frames.push(GifFrame {
+                    left,
+                    top,
+                    width: frame_width,
+                    height: frame_height,
+                    // browsers stretch the briefest frames, which ads used to flash
+                    delay: if delay <= 10 { 100 } else { delay },
+                    disposal,
+                    transparent,
+                    interlaced: frame_flags & 0x40 != 0,
+                    palette,
+                    minimum,
+                    data,
+                });
+                (delay, disposal, transparent) = (0, 0, None);
+            }
+            _ => break,
+        }
+    }
+    if frames.is_empty() {
+        return Err(error("no image frame"));
+    }
+    Ok((width, height, frames, plays))
 }
 
 // interlaced frames store every eighth row first, then the rows between

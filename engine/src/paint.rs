@@ -2599,10 +2599,10 @@ pub(crate) fn paint_frame(
     let images = if canvases.is_empty() {
         &document.images
     } else {
-        layers = document
-            .images
+        // a frame taken at paint, as of an animated image, comes before the one layout placed
+        layers = canvases
             .iter()
-            .chain(canvases)
+            .chain(&document.images)
             .cloned()
             .collect::<Vec<_>>();
         &layers
@@ -2846,10 +2846,9 @@ pub(crate) fn repaint(
             canvas.pixels[start + columns.start..start + columns.end].fill(0);
         }
     }
-    let layers = document
-        .images
+    let layers = canvases
         .iter()
-        .chain(canvases)
+        .chain(&document.images)
         .cloned()
         .collect::<Vec<_>>();
     paint_document(canvas, document, &layers, Some(painted));

@@ -1,3 +1,4 @@
+mod animated;
 mod audio;
 mod autohint;
 mod bidi;

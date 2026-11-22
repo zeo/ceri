@@ -82,6 +82,70 @@ pub(crate) fn decode_webp(bytes: &[u8]) -> Result<Image, ImageError> {
     decode_frame(&parts)
 }
 
+// one frame of an animation: its place, how long it shows, whether its area clears after it
+// and whether it blends over what is there, with the chunks that hold its picture
+pub(crate) struct WebpFrame {
+    pub(crate) left: u32,
+    pub(crate) top: u32,
+    pub(crate) duration: u32,
+    pub(crate) dispose: bool,
+    pub(crate) blend: bool,
+    data: Vec<u8>,
+}
+
+impl WebpFrame {
+    // the frame's picture: its size and straight RGBA
+    pub(crate) fn rgba(&self) -> Option<(u32, u32, Vec<u8>)> {
+        let image = decode_frame(&chunks(&self.data)).ok()?;
+        let rgba = image
+            .pixels
+            .iter()
+            .flat_map(|color| [color.red, color.green, color.blue, color.alpha])
+            .collect();
+        Some((image.width, image.height, rgba))
+    }
+}
+
+// the frames of an animated WebP with its canvas size and how many times it plays, None for
+// ever; a still image has none
+pub(crate) fn webp_frames(bytes: &[u8]) -> Option<(u32, u32, Vec<WebpFrame>, Option<u32>)> {
+    if !is_webp(bytes) {
+        return None;
+    }
+    let size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let parts = chunks(&bytes[12..(8 + size).min(bytes.len()).max(12)]);
+    let extended = parts.iter().find(|(code, _)| code == b"VP8X")?.1;
+    if extended.len() < 10 {
+        return None;
+    }
+    let (width, height) = (u24(&extended[4..7]) + 1, u24(&extended[7..10]) + 1);
+    let plays = parts
+        .iter()
+        .find(|(code, _)| code == b"ANIM")
+        .map(|(_, data)| data)
+        .filter(|data| data.len() >= 6)
+        .map_or(Some(1), |data| {
+            let count = u32::from(u16::from_le_bytes([data[4], data[5]]));
+            (count != 0).then_some(count)
+        });
+    let frames: Vec<WebpFrame> = parts
+        .iter()
+        .filter(|(code, data)| code == b"ANMF" && data.len() >= 16)
+        .map(|(_, data)| {
+            let duration = u24(&data[12..15]);
+            WebpFrame {
+                left: u24(&data[0..3]) * 2,
+                top: u24(&data[3..6]) * 2,
+                duration: if duration <= 10 { 100 } else { duration },
+                dispose: data[15] & 1 == 1,
+                blend: data[15] & 2 == 0,
+                data: data[16..].to_vec(),
+            }
+        })
+        .collect();
+    (!frames.is_empty()).then_some((width, height, frames, plays))
+}
+
 // one still image: a VP8L chunk, or a VP8 chunk with an optional ALPH chunk before it
 fn decode_frame(parts: &[([u8; 4], &[u8])]) -> Result<Image, ImageError> {
     let find = |code: &[u8; 4]| {
