@@ -8972,6 +8972,22 @@ fn append_atomic(
         .map_or(outer_height, |baseline| {
             laid_out.margin.top + baseline - laid_out.rect.y
         });
+    // chrome's themed checkbox, radio and slider sit on their border edge, their bottom
+    // margin hanging below the baseline
+    let themed = !style.appearance_none
+        && node.name() == "input"
+        && node.element().is_some_and(|element| {
+            element.attr("type").is_some_and(|kind| {
+                ["checkbox", "radio", "range"]
+                    .iter()
+                    .any(|themed| kind.eq_ignore_ascii_case(themed))
+            })
+        });
+    let baseline = if themed {
+        outer_height - laid_out.margin.bottom
+    } else {
+        baseline
+    };
     let line_height = used_line_height(style, font_size);
     let shift = vertical_shift(
         style.vertical_align,

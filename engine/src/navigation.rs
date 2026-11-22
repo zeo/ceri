@@ -7810,6 +7810,25 @@ mod tests {
     }
 
     #[test]
+    fn themed_checkboxes_radios_and_sliders_sit_on_their_border_edge() {
+        let mut browser = Browser::new(bundle(
+            r##"<body style="margin: 0"><div>Xy<span id="plain" style="display: inline-block; width: 13px; height: 13px"></span><input id="radio" type="radio" style="margin: 0 0 10px 0"><input id="box" type="checkbox" style="margin: 0 0 10px 0"><input id="range" type="range" style="margin: 0 0 10px 0"><input id="flat" type="checkbox" style="margin: 0 0 10px 0; appearance: none; width: 13px; height: 13px"></div><p id="status"></p><script>
+                const bottom = (id) => document.getElementById(id).getBoundingClientRect().bottom;
+                const plain = bottom("plain");
+                document.getElementById("status").textContent = ["radio", "box", "range", "flat"]
+                    .map((id) => bottom(id) - plain).join(" ");
+            </script></body>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(document.text_content(status), "0 0 0 -10");
+    }
+
+    #[test]
     fn text_at_a_font_size_of_zero_takes_no_room_and_draws_nothing() {
         let mut browser = Browser::new(bundle(
             r##"<body style="margin: 0; background: #000; color: #fff; font: 20px/1.5 sans-serif"><div id="gone" style="font-size: 0">hidden <span id="em" style="display: inline-block; width: 2em; height: 2em"></span></div><div id="back" style="font-size: 0"><b id="shown" style="font-size: 20px">shown</b></div><p id="status"></p><script>
