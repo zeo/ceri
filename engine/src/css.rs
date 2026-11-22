@@ -6713,6 +6713,7 @@ button, input[type="button" i], input[type="submit" i], input[type="reset" i], i
   padding: 1px 6px; border: 1px solid #767676; border-radius: 3px; background-color: #efefef; text-align: center
 }
 select { padding: 1px 20px 1px 4px; text-align: start; background-color: white }
+button, select, meter, progress, input[type="button" i], input[type="submit" i], input[type="reset" i], input[type="color" i], input[type="search" i] { box-sizing: border-box }
 [popover]:not(:popover-open):not(dialog[open]) { display: none }
 [popover] { position: fixed; inset: 0; width: fit-content; height: fit-content; margin: auto; border: solid; padding: 0.25em; overflow: auto; color: CanvasText; background-color: Canvas }
 input[type="checkbox" i], input[type="radio" i] { box-sizing: border-box; width: 13px; height: 13px; margin: 3px 3px 3px 4px; padding: 0; border: 1px solid #767676; border-radius: 2px; background-color: white }
