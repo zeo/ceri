@@ -671,21 +671,47 @@ impl ScriptRuntime {
                 record.kind != ObserverKind::Mutation && !record.observations.is_empty()
             })
             .collect::<Vec<_>>();
-        for id in ids {
-            let entries = match self.observers[&id].kind {
-                ObserverKind::Resize => self.resize_entries(id),
-                _ => self.intersection_entries(id),
-            };
-            if entries.is_empty() {
-                continue;
+        let (resize, intersection): (Vec<u32>, Vec<u32>) = ids
+            .into_iter()
+            .partition(|id| self.observers[id].kind == ObserverKind::Resize);
+        for id in resize {
+            let entries = self.resize_entries(id);
+            self.notify_observer(id, entries)?;
+        }
+        // every intersection observer reads the same layout before any callback runs, as the
+        // update intersection observations steps do, so a callback that changes the page
+        // does not lay it out again for each observer after it
+        if intersection.is_empty() {
+            return Ok(());
+        }
+        let pending = self.with_pinned_measure(|runtime| {
+            intersection
+                .into_iter()
+                .map(|id| (id, runtime.intersection_entries(id)))
+                .collect::<Vec<_>>()
+        });
+        for (id, entries) in pending {
+            // a callback before this one may have disconnected it, which drops its entries
+            if self
+                .observers
+                .get(&id)
+                .is_some_and(|record| !record.observations.is_empty())
+            {
+                self.notify_observer(id, entries)?;
             }
-            let record = &self.observers[&id];
-            let callback = record.callback.clone();
-            let observer = record.object.upgrade().map_or(Value::Null, Value::Object);
-            self.invoke_observer(callback, Self::new_array(entries), observer)?;
-            self.drain_microtasks()?;
         }
         Ok(())
+    }
+
+    fn notify_observer(&mut self, id: u32, entries: Vec<Value>) -> Result<(), ScriptError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let record = &self.observers[&id];
+        let callback = record.callback.clone();
+        let observer = record.object.upgrade().map_or(Value::Null, Value::Object);
+        self.invoke_observer(callback, Self::new_array(entries), observer)?;
+        self.drain_microtasks()
     }
 
     fn resize_entries(&mut self, id: u32) -> Vec<Value> {

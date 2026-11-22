@@ -7151,6 +7151,53 @@ mod tests {
     }
 
     #[test]
+    fn intersection_observers_all_read_one_layout_before_their_callbacks() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>body { margin: 0 } div { height: 10px }</style><div id="one"></div><div id="two"></div><div id="three"></div><p id="status">idle</p><script>
+                globalThis.log = [];
+                const watch = (id, callback) => {
+                    const observer = new IntersectionObserver(callback);
+                    observer.observe(document.getElementById(id));
+                    return observer;
+                };
+                let third;
+                watch("one", () => {
+                    log.push("one");
+                    const tall = document.createElement("section");
+                    tall.style.height = "5000px";
+                    document.body.prepend(tall);
+                    third.disconnect();
+                });
+                watch("two", (entries) => log.push("two:" + entries[0].isIntersecting));
+                third = watch("three", () => log.push("three"));
+                globalThis.report = () => document.getElementById("status").textContent = log.join(",");
+            </script>"#,
+        ));
+        browser.set_viewport(
+            Size {
+                width: 800.0,
+                height: 600.0,
+            },
+            1.0,
+        );
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("observer page should load");
+        browser.advance_time(16).expect("rendering step");
+        let page = browser.page.as_mut().expect("page should be loaded");
+        page.runtime
+            .execute("report();")
+            .expect("report should run");
+        let document = browser.document().expect("document should exist");
+        let document = document.borrow();
+        let status = document.find_element_by_id("status").expect("status");
+        assert_eq!(
+            document.element_text_content(status).as_deref(),
+            Some("one,two:true")
+        );
+    }
+
+    #[test]
     fn xml_http_request_loads_packaged_resources_from_a_task() {
         let mut resources = bundle(
             r#"<p id="status">idle</p><script>

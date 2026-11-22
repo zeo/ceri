@@ -424,21 +424,16 @@ impl ScriptRuntime {
         state.animation_starts = extras.animation_starts.clone();
         state.image_sizes = extras.image_sizes.clone();
         // a canvas and a video know their own sizes before the page has first laid out
+        let lists = self.element_lists();
         let document = self.document.borrow();
-        for node in document
-            .find_elements_by_selector("canvas")
-            .unwrap_or_default()
-        {
+        for &node in &lists[2] {
             let size = super::canvas_size(&document, node);
             state.image_sizes.insert(node, size);
         }
-        for node in document
-            .find_elements_by_selector("video")
-            .unwrap_or_default()
-        {
+        drop(document);
+        for &node in &lists[3] {
             state.image_sizes.insert(node, self.video_size(node));
         }
-        drop(document);
         // the last measurement knows container sizes the page's own layout may not yet
         state.container_sizes = self.measured.borrow().as_ref().map_or_else(
             || extras.container_sizes.clone(),
@@ -465,6 +460,9 @@ impl ScriptRuntime {
 
     // a fresh layout when the document or its state changed since the last measurement
     fn measure(&self) -> Option<std::cell::Ref<'_, MeasuredLayout>> {
+        if self.measure_pinned.get() && self.measured.borrow().is_some() {
+            return std::cell::Ref::filter_map(self.measured.borrow(), Option::as_ref).ok();
+        }
         self.refresh_stylesheet();
         let inputs = self.layout_inputs.as_ref()?.borrow();
         let state = self.layout_state(&inputs);
@@ -503,6 +501,15 @@ impl ScriptRuntime {
             });
         }
         std::cell::Ref::filter_map(self.measured.borrow(), Option::as_ref).ok()
+    }
+
+    // reads boxes through one measurement taken at the start, for a pass that runs no script
+    pub(super) fn with_pinned_measure<T>(&mut self, pass: impl FnOnce(&mut Self) -> T) -> T {
+        drop(self.measure());
+        self.measure_pinned.set(true);
+        let result = pass(self);
+        self.measure_pinned.set(false);
+        result
     }
 
     fn run_layout(&self, inputs: &LayoutInputs, state: &StyleState) -> LayoutDocument {

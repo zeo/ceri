@@ -110,7 +110,7 @@ use crate::navigation::{
 };
 use crate::text::{next_word_boundary, previous_word_boundary};
 use crate::wasm;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
@@ -690,7 +690,7 @@ impl Default for ViewportMetrics {
 }
 
 // the selector version the lists were found at, then the options and the form controls
-type ControlLists = (u64, Rc<[Vec<NodeId>; 2]>);
+type ControlLists = (u64, Rc<[Vec<NodeId>; 4]>);
 
 pub struct ScriptRuntime {
     document: Rc<RefCell<Document>>,
@@ -739,8 +739,12 @@ pub struct ScriptRuntime {
     reported_selection: ranges::SelectionSnapshot,
     layout_inputs: Option<Rc<RefCell<geometry::LayoutInputs>>>,
     measured: RefCell<Option<geometry::MeasuredLayout>>,
-    // the document's options and its form controls, found again only once its elements or
-    // attributes change: the style state is built from them for every layout and measure
+    // set while a pass that runs no script reads many boxes, so each read takes the last
+    // measurement as it is instead of building the style state again to check it
+    measure_pinned: Cell<bool>,
+    // the document's options, form controls, canvases and videos, found again only once its
+    // elements or attributes change: the style state is built from them for every layout and
+    // measure
     controls: RefCell<Option<ControlLists>>,
     // milliseconds from an animation frame request to its callback
     frame_interval: u64,
@@ -1946,6 +1950,7 @@ impl ScriptRuntime {
             reported_selection: None,
             layout_inputs: None,
             measured: RefCell::new(None),
+            measure_pinned: Cell::new(false),
             controls: RefCell::new(None),
             frame_interval: crate::navigation::FRAME_INTERVAL,
             visible: true,
@@ -3513,6 +3518,33 @@ impl ScriptRuntime {
         Ok(dispatch)
     }
 
+    // the options, form controls, canvases and videos, in that order
+    pub(crate) fn element_lists(&self) -> Rc<[Vec<NodeId>; 4]> {
+        let document = self.document.borrow();
+        let version = document.selector_version();
+        let mut controls = self.controls.borrow_mut();
+        match controls.as_ref() {
+            Some((found_at, lists)) if *found_at == version => lists.clone(),
+            _ => {
+                let lists = Rc::new(
+                    [
+                        "option",
+                        "button, input, select, textarea, optgroup, option, fieldset",
+                        "canvas",
+                        "video",
+                    ]
+                    .map(|selector| {
+                        document
+                            .find_elements_by_selector(selector)
+                            .unwrap_or_default()
+                    }),
+                );
+                *controls = Some((version, lists.clone()));
+                lists
+            }
+        }
+    }
+
     pub(crate) fn style_state(&self, hovered_path: Option<NodeId>) -> StyleState {
         StyleState {
             scroll_offsets: self.scroll_offsets.clone(),
@@ -3558,29 +3590,7 @@ impl ScriptRuntime {
                 state.unchecked.insert(*control);
             }
         }
-        let controls = {
-            let document = self.document.borrow();
-            let version = document.selector_version();
-            let mut controls = self.controls.borrow_mut();
-            match controls.as_ref() {
-                Some((found_at, lists)) if *found_at == version => lists.clone(),
-                _ => {
-                    let lists = Rc::new(
-                        [
-                            "option",
-                            "button, input, select, textarea, optgroup, option, fieldset",
-                        ]
-                        .map(|selector| {
-                            document
-                                .find_elements_by_selector(selector)
-                                .unwrap_or_default()
-                        }),
-                    );
-                    *controls = Some((version, lists.clone()));
-                    lists
-                }
-            }
-        };
+        let controls = self.element_lists();
         // a selected option matches :checked and is what a closed select shows
         for &option in &controls[0] {
             if self.is_option_selected(option) {
