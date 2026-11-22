@@ -7,8 +7,8 @@ use crate::notification::Notifier;
 use crate::shortcut::GlobalShortcuts;
 use crate::taskbar::{Progress, Taskbar};
 use ceri_engine::{
-    CommandCall, CommandError, CommandReply, CommandRouter, NativeHandle, WindowAction,
-    WindowControl,
+    CommandCall, CommandError, CommandReply, CommandRouter, NativeHandle, ResizeDirection,
+    WindowAction, WindowControl,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -112,6 +112,16 @@ impl CommandRoutes {
             "window:toggle-maximize" => act(WindowAction::ToggleMaximize),
             "window:center" => act(WindowAction::Center),
             "window:request-attention" => act(WindowAction::RequestAttention),
+            "window:start-dragging" => act(WindowAction::Drag),
+            "window:intercept-close" => arguments::<Switch>(call)
+                .and_then(|switch| act(WindowAction::InterceptClose(switch.on))),
+            "window:destroy" => act(WindowAction::Destroy),
+            "window:start-resize-dragging" => arguments::<Edge>(call).and_then(|edge| {
+                let direction = resize_direction(&edge.direction).ok_or_else(|| {
+                    CommandError::failed(format!("{} is not a resize direction", edge.direction))
+                })?;
+                act(WindowAction::ResizeDrag(direction))
+            }),
             "window:close" => {
                 control.close(label);
                 Ok("null".to_string())
@@ -245,6 +255,26 @@ struct Switch {
 #[derive(Deserialize)]
 struct Zoom {
     zoom: f32,
+}
+
+// an edge or corner by Tauri's names, North to SouthWest
+#[derive(Deserialize)]
+struct Edge {
+    direction: String,
+}
+
+fn resize_direction(name: &str) -> Option<ResizeDirection> {
+    Some(match name {
+        "North" => ResizeDirection::North,
+        "South" => ResizeDirection::South,
+        "East" => ResizeDirection::East,
+        "West" => ResizeDirection::West,
+        "NorthEast" => ResizeDirection::NorthEast,
+        "NorthWest" => ResizeDirection::NorthWest,
+        "SouthEast" => ResizeDirection::SouthEast,
+        "SouthWest" => ResizeDirection::SouthWest,
+        _ => return None,
+    })
 }
 
 #[derive(Deserialize)]
@@ -548,6 +578,16 @@ impl CommandRouter for CommandRoutes {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn resize_directions_take_tauri_names() {
+        assert_eq!(
+            resize_direction("NorthWest"),
+            Some(ResizeDirection::NorthWest)
+        );
+        assert_eq!(resize_direction("South"), Some(ResizeDirection::South));
+        assert_eq!(resize_direction("north"), None);
+    }
     use super::*;
     use std::sync::mpsc::channel;
     use std::time::Duration;

@@ -120,6 +120,38 @@ function command(name) {
   return (args) => invoke(name, args);
 }
 
+// the page's close listeners; while there are any, a close asks them first and the window
+// goes only if none refused
+const closeHandlers = new Set();
+let closeListening;
+
+function closeRequested() {
+  let refused = false;
+  const event = Object.freeze({
+    preventDefault: () => {
+      refused = true;
+    },
+    isPreventDefault: () => refused,
+  });
+  return [...closeHandlers]
+    .reduce((ran, handler) => ran.then(() => handler(event)), Promise.resolve())
+    .then(() => {
+      if (!refused) return invoke("window:destroy");
+    });
+}
+
+async function onCloseRequested(handler) {
+  closeHandlers.add(handler);
+  closeListening ??= listen("window:close-requested", closeRequested);
+  await closeListening;
+  if (closeHandlers.size === 1) await invoke("window:intercept-close", { on: true });
+  return () => {
+    if (closeHandlers.delete(handler) && closeHandlers.size === 0) {
+      return invoke("window:intercept-close", { on: false });
+    }
+  };
+}
+
 // the page's own window; the app origin may always drive it
 export const appWindow = Object.freeze({
   show: command("window:show"),
@@ -132,7 +164,11 @@ export const appWindow = Object.freeze({
   toggleMaximize: command("window:toggle-maximize"),
   center: command("window:center"),
   requestAttention: command("window:request-attention"),
+  startDragging: command("window:start-dragging"),
+  startResizeDragging: (direction) => invoke("window:start-resize-dragging", { direction }),
   close: command("window:close"),
+  destroy: command("window:destroy"),
+  onCloseRequested,
   setFullscreen: (on) => invoke("window:set-fullscreen", { on }),
   setAlwaysOnTop: (on) => invoke("window:set-always-on-top", { on }),
   setZoom: (zoom) => invoke("window:set-zoom", { zoom }),

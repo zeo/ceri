@@ -350,6 +350,14 @@ pub enum WindowAction {
     // scales the page like a browser's zoom, from a quarter to five times
     Zoom(f32),
     RequestAttention,
+    // moves or resizes the window with the pointer from a press the page received; a press
+    // already over when the loop gets here ends at once
+    Drag,
+    ResizeDrag(ResizeDirection),
+    // a close the user or app asks for goes to the page, which closes with Destroy unless
+    // one of its listeners refuses
+    InterceptClose(bool),
+    Destroy,
 }
 
 // what the loop publishes for other threads to read without waiting on it
@@ -576,6 +584,7 @@ struct AppWindow {
     dropped: Vec<PathBuf>,
     published: Arc<Mutex<Published>>,
     closing: bool,
+    intercept_close: bool,
 }
 
 impl<F> App<F>
@@ -663,6 +672,7 @@ where
             dropped: Vec::new(),
             published: self.control.published.clone(),
             closing: false,
+            intercept_close: false,
         };
         let monitors = self.control.monitors();
         let Some(id) = this.create(event_loop, &self.context, &monitors) else {
@@ -700,8 +710,12 @@ where
             None => true,
         };
         if allowed && let Some(window) = self.windows.get_mut(&id) {
-            window.remember_geometry();
-            window.closing = true;
+            if window.intercept_close {
+                window.deliver("window:close-requested", "{}");
+            } else {
+                window.remember_geometry();
+                window.closing = true;
+            }
         }
     }
 
@@ -970,6 +984,17 @@ impl AppWindow {
             }
             WindowAction::RequestAttention => {
                 window.request_user_attention(Some(UserAttentionType::Informational));
+            }
+            WindowAction::Drag => {
+                let _ = window.drag_window();
+            }
+            WindowAction::ResizeDrag(direction) => {
+                let _ = window.drag_resize_window(direction);
+            }
+            WindowAction::InterceptClose(on) => self.intercept_close = on,
+            WindowAction::Destroy => {
+                self.remember_geometry();
+                self.closing = true;
             }
         }
         self.publish();

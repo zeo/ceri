@@ -72,6 +72,21 @@ export interface ProgressOptions {
   readonly progress?: number;
 }
 
+export type ResizeDirection =
+  | "North"
+  | "South"
+  | "East"
+  | "West"
+  | "NorthEast"
+  | "NorthWest"
+  | "SouthEast"
+  | "SouthWest";
+
+export interface CloseRequestedEvent {
+  preventDefault(): void;
+  isPreventDefault(): boolean;
+}
+
 export interface AppWindow {
   show(): Promise<void>;
   hide(): Promise<void>;
@@ -83,7 +98,18 @@ export interface AppWindow {
   toggleMaximize(): Promise<void>;
   center(): Promise<void>;
   requestAttention(): Promise<void>;
+  // moves the window with the pointer, from inside a pointerdown or mousedown handler
+  startDragging(): Promise<void>;
+  // resizes the window from an edge or corner with the pointer, from inside a press handler
+  startResizeDragging(direction: ResizeDirection): Promise<void>;
+  // asks the window to close, as its close button does; close listeners may refuse
   close(): Promise<void>;
+  // closes the window without asking its close listeners
+  destroy(): Promise<void>;
+  // a close the user or page asked for; calling preventDefault keeps the window open
+  onCloseRequested(
+    handler: (event: CloseRequestedEvent) => void | Promise<void>,
+  ): Promise<Unlisten>;
   setFullscreen(on: boolean): Promise<void>;
   setAlwaysOnTop(on: boolean): Promise<void>;
   setZoom(zoom: number): Promise<void>;

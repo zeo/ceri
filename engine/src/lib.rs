@@ -107,3 +107,5 @@ pub use window::{
     Lifecycle, Monitor, NativeHandle, WindowAction, WindowConfig, WindowContext, WindowControl,
     WindowState, run as run_window, run_with as run_window_with,
 };
+#[cfg(feature = "windowed")]
+pub use winit::window::ResizeDirection;
