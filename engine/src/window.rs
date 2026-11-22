@@ -1442,7 +1442,11 @@ impl AppWindow {
             RegionPress::Move => {
                 let _ = window.drag_window();
             }
-            RegionPress::ToggleMaximize => window.set_maximized(!window.is_maximized()),
+            // as on a native caption, a window that keeps its size does not maximize
+            RegionPress::ToggleMaximize if self.config.resizable => {
+                window.set_maximized(!window.is_maximized())
+            }
+            RegionPress::ToggleMaximize => {}
         }
     }
 
