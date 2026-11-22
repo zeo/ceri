@@ -339,6 +339,8 @@ pub enum WindowAction {
     Fullscreen(bool),
     Title(String),
     Size(u32, u32),
+    // the same in the display's own pixels, for a host that measured the page in them
+    PhysicalSize(u32, u32),
     // the least the user can shrink the window to, as minimum_width and minimum_height
     MinimumSize(u32, u32),
     Position(i32, i32),
@@ -939,6 +941,9 @@ impl AppWindow {
             }
             WindowAction::Size(width, height) => {
                 let _ = window.request_inner_size(LogicalSize::new(width, height));
+            }
+            WindowAction::PhysicalSize(width, height) => {
+                let _ = window.request_inner_size(PhysicalSize::new(width, height));
             }
             WindowAction::MinimumSize(width, height) => {
                 window.set_min_inner_size(Some(LogicalSize::new(width.max(1), height.max(1))));

@@ -172,7 +172,8 @@ export const appWindow = Object.freeze({
   setFullscreen: (on) => invoke("window:set-fullscreen", { on }),
   setAlwaysOnTop: (on) => invoke("window:set-always-on-top", { on }),
   setZoom: (zoom) => invoke("window:set-zoom", { zoom }),
-  setSize: (width, height) => invoke("window:set-size", { width, height }),
+  // { physical: true } takes device pixels, as tauri's PhysicalSize does
+  setSize: (width, height, options) => invoke("window:set-size", { width, height, physical: options?.physical === true }),
   setPosition: (x, y) => invoke("window:set-position", { x, y }),
   setMinimumSize: (width, height) => invoke("window:set-minimum-size", { width, height }),
   setSkipTaskbar: (on) => invoke("window:set-skip-taskbar", { on }),

@@ -130,8 +130,7 @@ impl CommandRoutes {
                 .and_then(|switch| act(WindowAction::Fullscreen(switch.on))),
             "window:set-always-on-top" => arguments::<Switch>(call)
                 .and_then(|switch| act(WindowAction::AlwaysOnTop(switch.on))),
-            "window:set-size" => arguments::<Extent>(call)
-                .and_then(|size| act(WindowAction::Size(size.width, size.height))),
+            "window:set-size" => arguments::<Extent>(call).and_then(|size| act(size.size())),
             "window:set-minimum-size" => arguments::<Extent>(call)
                 .and_then(|size| act(WindowAction::MinimumSize(size.width, size.height))),
             "window:set-position" => {
@@ -281,6 +280,18 @@ fn resize_direction(name: &str) -> Option<ResizeDirection> {
 struct Extent {
     width: u32,
     height: u32,
+    // device pixels, as tauri's PhysicalSize, rather than logical ones
+    #[serde(default)]
+    physical: bool,
+}
+
+impl Extent {
+    fn size(self) -> WindowAction {
+        match self.physical {
+            true => WindowAction::PhysicalSize(self.width, self.height),
+            false => WindowAction::Size(self.width, self.height),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -600,6 +611,23 @@ mod tests {
             payload: "{\"n\":2}".to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_size_is_logical_unless_it_says_physical() {
+        let size = |payload: &str| {
+            serde_json::from_str::<Extent>(payload)
+                .expect("extent")
+                .size()
+        };
+        assert!(matches!(
+            size(r#"{"width":787,"height":547}"#),
+            WindowAction::Size(787, 547)
+        ));
+        assert!(matches!(
+            size(r#"{"width":1180,"height":820,"physical":true}"#),
+            WindowAction::PhysicalSize(1180, 820)
+        ));
     }
 
     #[test]

@@ -46,6 +46,16 @@ test("resize dragging names the edge as Tauri does", async () => {
   assert.deepEqual(calls, [["window:start-resize-dragging", { direction: "SouthEast" }]]);
 });
 
+test("a size is logical unless it says physical, as Tauri's two size types are", async () => {
+  calls.length = 0;
+  await appWindow.setSize(787, 547);
+  await appWindow.setSize(1180, 820, { physical: true });
+  assert.deepEqual(calls, [
+    ["window:set-size", { width: 787, height: 547, physical: false }],
+    ["window:set-size", { width: 1180, height: 820, physical: true }],
+  ]);
+});
+
 test("file urls take canonical windows paths in their verbatim form too", async () => {
   const { fileSrc } = await import("../sdk/index.js");
   const expected = "https://files.ceri.invalid/E/Pictures/capscr/a%20b.png";

@@ -114,7 +114,7 @@ export interface AppWindow {
   setAlwaysOnTop(on: boolean): Promise<void>;
   setZoom(zoom: number): Promise<void>;
   // logical pixels, as the window's size and position are given everywhere
-  setSize(width: number, height: number): Promise<void>;
+  setSize(width: number, height: number, options?: { physical?: boolean }): Promise<void>;
   setPosition(x: number, y: number): Promise<void>;
   // the least the user can shrink the window to
   setMinimumSize(width: number, height: number): Promise<void>;
