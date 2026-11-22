@@ -18,7 +18,7 @@ globalThis.window = {
     windowLabel: "main",
   },
 };
-const { appWindow } = await import("./index.js");
+const { appWindow } = await import("../sdk/index.js");
 
 test("close listeners decide whether the window goes", async () => {
   let refuse = true;

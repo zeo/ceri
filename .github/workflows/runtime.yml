@@ -9,6 +9,7 @@ on:
       - "engine/**"
       - "web/**"
       - "sdk/**"
+      - "tests/sdk.test.mjs"
       - "Cargo.toml"
       - "Cargo.lock"
   pull_request:
@@ -18,6 +19,7 @@ on:
       - "engine/**"
       - "web/**"
       - "sdk/**"
+      - "tests/sdk.test.mjs"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -45,6 +47,8 @@ jobs:
           sudo apt-get install --no-install-recommends -y libxkbcommon-dev
       - name: test
         run: cargo test --locked --all-targets
+      - name: sdk
+        run: node --test tests/sdk.test.mjs
       - name: test262 subset
         run: cargo test --locked --release -p ceri-engine --test test262 -- --ignored
       - name: clippy
