@@ -1218,14 +1218,20 @@ impl AppWindow {
                 }
             }
             WindowEvent::Resized(size) => {
+                // a minimized window reports no size, and its page keeps the one it had, as in
+                // chromium, instead of laying out at a pixel wide and again on restore
+                let sized = size.width > 0 && size.height > 0;
                 #[cfg(target_os = "windows")]
-                if let Some(output) = &mut self.output
+                if sized
+                    && let Some(output) = &mut self.output
                     && let Err(error) = output.extend(size.width, size.height)
                 {
                     eprintln!("ceri: {error}");
                 }
                 let viewport = layout_viewport(size.width, size.height, self.window_scale());
-                self.submit(InputEvent::Resize(viewport));
+                if sized {
+                    self.submit(InputEvent::Resize(viewport));
+                }
                 self.publish();
                 if let Some(state) = self.published_state() {
                     let payload = format!(
