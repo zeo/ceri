@@ -1328,1239 +1328,1278 @@ impl ScriptRuntime {
 
     // one instruction; Some ends this run with a result
     fn step(&mut self, frames: &mut Vec<Frame>) -> Result<Option<RunResult>, ScriptError> {
-        let frame = frames.last_mut().expect("a frame is running");
-        let op = frame.code.ops[frame.pc];
-        frame.pc += 1;
-        match op {
-            Op::Nop => {}
-            Op::Undefined => frame.stack.push(Value::Undefined),
-            Op::Null => frame.stack.push(Value::Null),
-            Op::True => frame.stack.push(Value::Bool(true)),
-            Op::False => frame.stack.push(Value::Bool(false)),
-            Op::Number(value) => frame.stack.push(Value::Number(value)),
-            Op::BigInt(index) => {
-                let value = super::bigint::BigInt::parse(&frame.code.names[index as usize])
-                    .expect("the lexer produced decimal digits");
-                frame.stack.push(Value::BigInt(Rc::new(value)));
-            }
-            // the literal's text is shared, not copied, each time it is read
-            Op::String(index) => frame
-                .stack
-                .push(Value::String(frame.code.names[index as usize].clone())),
-            Op::Regex { pattern, flags } => {
-                let pattern = frame.code.names[pattern as usize].to_string();
-                let flags = frame.code.names[flags as usize].to_string();
-                let regex = self.new_regexp(&pattern, &flags)?;
-                frames.last_mut().expect("frame").stack.push(regex);
-            }
-            Op::TemplateObject(index) => {
-                let code = frame.code.clone();
-                let value = self.template_object(&code, index as usize);
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::Pop => {
-                frame.stack.pop();
-            }
-            Op::Dup => {
-                let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                frame.stack.push(value);
-            }
-            Op::Dup2 => {
-                let length = frame.stack.len();
-                let pair = frame.stack[length - 2..].to_vec();
-                frame.stack.extend(pair);
-            }
-            Op::Dup3 => {
-                let length = frame.stack.len();
-                let triple = frame.stack[length - 3..].to_vec();
-                frame.stack.extend(triple);
-            }
-            Op::RotateUp4 => {
-                let length = frame.stack.len();
-                let value = frame.stack.remove(length - 4);
-                frame.stack.push(value);
-            }
-            Op::RotateDown5 => {
-                let value = Self::pop(frame);
-                let length = frame.stack.len();
-                frame.stack.insert(length - 4, value);
-            }
-            Op::Swap => {
-                let length = frame.stack.len();
-                frame.stack.swap(length - 1, length - 2);
-            }
-            Op::RotateDown3 => {
-                let value = Self::pop(frame);
-                let length = frame.stack.len();
-                frame.stack.insert(length - 2, value);
-            }
-            Op::RotateDown4 => {
-                let value = Self::pop(frame);
-                let length = frame.stack.len();
-                frame.stack.insert(length - 3, value);
-            }
-            Op::RotateUp3 => {
-                let length = frame.stack.len();
-                let value = frame.stack.remove(length - 3);
-                frame.stack.push(value);
-            }
-            Op::RequireCoercible => {
-                if matches!(
-                    frame.stack.last(),
-                    Some(Value::Undefined | Value::Null) | None
-                ) {
-                    return Err(self.type_error("cannot destructure null or undefined"));
+        // ops that leave the same frame on top run on here, sparing each a trip through the run loop
+        let mut budget = 64;
+        loop {
+            let depth = frames.len();
+            let frame = frames.last_mut().expect("a frame is running");
+            let op = frame.code.ops[frame.pc];
+            frame.pc += 1;
+            match op {
+                Op::Nop => {}
+                Op::Undefined => frame.stack.push(Value::Undefined),
+                Op::Null => frame.stack.push(Value::Null),
+                Op::True => frame.stack.push(Value::Bool(true)),
+                Op::False => frame.stack.push(Value::Bool(false)),
+                Op::Number(value) => frame.stack.push(Value::Number(value)),
+                Op::BigInt(index) => {
+                    let value = super::bigint::BigInt::parse(&frame.code.names[index as usize])
+                        .expect("the lexer produced decimal digits");
+                    frame.stack.push(Value::BigInt(Rc::new(value)));
                 }
-            }
-            Op::CopyRest => {
-                let keys = Self::pop(frame);
-                let source = Self::pop(frame);
-                let excluded: Vec<String> = match keys {
-                    Value::Array(keys) => keys.borrow().iter().map(Value::property_key).collect(),
-                    _ => Vec::new(),
-                };
-                let copy = self.new_plain_object();
-                for (key, value) in self.own_enumerable_entries(&source)? {
-                    if !excluded.contains(&key) {
-                        copy.borrow_mut().insert(key, value);
+                // the literal's text is shared, not copied, each time it is read
+                Op::String(index) => frame
+                    .stack
+                    .push(Value::String(frame.code.names[index as usize].clone())),
+                Op::Regex { pattern, flags } => {
+                    let pattern = frame.code.names[pattern as usize].to_string();
+                    let flags = frame.code.names[flags as usize].to_string();
+                    let regex = self.new_regexp(&pattern, &flags)?;
+                    frames.last_mut().expect("frame").stack.push(regex);
+                }
+                Op::TemplateObject(index) => {
+                    let code = frame.code.clone();
+                    let value = self.template_object(&code, index as usize);
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::Pop => {
+                    frame.stack.pop();
+                }
+                Op::Dup => {
+                    let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    frame.stack.push(value);
+                }
+                Op::Dup2 => {
+                    let length = frame.stack.len();
+                    let pair = frame.stack[length - 2..].to_vec();
+                    frame.stack.extend(pair);
+                }
+                Op::Dup3 => {
+                    let length = frame.stack.len();
+                    let triple = frame.stack[length - 3..].to_vec();
+                    frame.stack.extend(triple);
+                }
+                Op::RotateUp4 => {
+                    let length = frame.stack.len();
+                    let value = frame.stack.remove(length - 4);
+                    frame.stack.push(value);
+                }
+                Op::RotateDown5 => {
+                    let value = Self::pop(frame);
+                    let length = frame.stack.len();
+                    frame.stack.insert(length - 4, value);
+                }
+                Op::Swap => {
+                    let length = frame.stack.len();
+                    frame.stack.swap(length - 1, length - 2);
+                }
+                Op::RotateDown3 => {
+                    let value = Self::pop(frame);
+                    let length = frame.stack.len();
+                    frame.stack.insert(length - 2, value);
+                }
+                Op::RotateDown4 => {
+                    let value = Self::pop(frame);
+                    let length = frame.stack.len();
+                    frame.stack.insert(length - 3, value);
+                }
+                Op::RotateUp3 => {
+                    let length = frame.stack.len();
+                    let value = frame.stack.remove(length - 3);
+                    frame.stack.push(value);
+                }
+                Op::RequireCoercible => {
+                    if matches!(
+                        frame.stack.last(),
+                        Some(Value::Undefined | Value::Null) | None
+                    ) {
+                        return Err(self.type_error("cannot destructure null or undefined"));
                     }
                 }
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Object(copy));
-            }
-            Op::GetLocal { depth, index, name } => {
-                let value = self.read_local(frame, depth, index, name)?;
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::SetLocal { depth, index, name } => {
-                let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                self.write_local(frame, depth, index, name, value)?;
-            }
-            Op::InitLocal { depth, index } => {
-                let value = Self::pop(frame);
-                let mut scope = Self::scope_cell_at(frame, depth).borrow_mut();
-                match &scope.slots[index as usize] {
-                    Value::Binding(cell, _) => *cell.borrow_mut() = value,
-                    _ => scope.slots[index as usize] = value,
+                Op::CopyRest => {
+                    let keys = Self::pop(frame);
+                    let source = Self::pop(frame);
+                    let excluded: Vec<String> = match keys {
+                        Value::Array(keys) => {
+                            keys.borrow().iter().map(Value::property_key).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let copy = self.new_plain_object();
+                    for (key, value) in self.own_enumerable_entries(&source)? {
+                        if !excluded.contains(&key) {
+                            copy.borrow_mut().insert(key, value);
+                        }
+                    }
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::Object(copy));
                 }
-            }
-            Op::GetGlobal(name) => {
-                let name = frame.code.names[name as usize].clone();
-                let value = self.get_global(&name)?;
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::GetName { name, depth, index } => {
-                let (_, value) = self.read_name(frame, name, depth, index)?;
-                if matches!(value, Value::Uninitialized) {
+                Op::GetLocal { depth, index, name } => {
+                    let value = self.read_local(frame, depth, index, name)?;
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::SetLocal { depth, index, name } => {
+                    let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    self.write_local(frame, depth, index, name, value)?;
+                }
+                Op::InitLocal { depth, index } => {
+                    let value = Self::pop(frame);
+                    let mut scope = Self::scope_cell_at(frame, depth).borrow_mut();
+                    match &scope.slots[index as usize] {
+                        Value::Binding(cell, _) => *cell.borrow_mut() = value,
+                        _ => scope.slots[index as usize] = value,
+                    }
+                }
+                Op::GetGlobal(name) => {
                     let name = frame.code.names[name as usize].clone();
-                    return Err(
-                        self.reference_error(format!("cannot access {name} before initialization"))
-                    );
+                    let value = self.get_global(&name)?;
+                    frames.last_mut().expect("frame").stack.push(value);
                 }
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::CalleeName { name, depth, index } => {
-                let (this, callee) = self.read_name(frame, name, depth, index)?;
-                let stack = &mut frames.last_mut().expect("frame").stack;
-                stack.push(this);
-                stack.push(callee);
-            }
-            Op::TypeofName { name, depth, index } => {
-                let key = frame.code.names[name as usize].clone();
-                let value = match self.shadowing(frame.scope.clone(), &key, depth)? {
-                    Some(Shadow::With(object)) => self.get_property(&object, &key)?,
-                    Some(Shadow::Grown(scope, index)) => scope.borrow().slots[index].clone(),
-                    None if depth == GLOBAL => match self.get_global_accessor(&key) {
+                Op::GetName { name, depth, index } => {
+                    let (_, value) = self.read_name(frame, name, depth, index)?;
+                    if matches!(value, Value::Uninitialized) {
+                        let name = frame.code.names[name as usize].clone();
+                        return Err(self.reference_error(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::CalleeName { name, depth, index } => {
+                    let (this, callee) = self.read_name(frame, name, depth, index)?;
+                    let stack = &mut frames.last_mut().expect("frame").stack;
+                    stack.push(this);
+                    stack.push(callee);
+                }
+                Op::TypeofName { name, depth, index } => {
+                    let key = frame.code.names[name as usize].clone();
+                    let value = match self.shadowing(frame.scope.clone(), &key, depth)? {
+                        Some(Shadow::With(object)) => self.get_property(&object, &key)?,
+                        Some(Shadow::Grown(scope, index)) => scope.borrow().slots[index].clone(),
+                        None if depth == GLOBAL => match self.get_global_accessor(&key) {
+                            Some(value) => value?,
+                            None => self.lookup_global(&key).unwrap_or(Value::Undefined),
+                        },
+                        None => self.read_local(frame, depth, index, name)?,
+                    };
+                    let kind = self.type_of(&value);
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::String(type_name(kind)));
+                }
+                Op::SetName {
+                    name,
+                    depth,
+                    index,
+                    kind,
+                } => {
+                    let key = frame.code.names[name as usize].clone();
+                    let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    let strict = frame.code.strict;
+                    match self.shadowing(frame.scope.clone(), &key, depth)? {
+                        Some(Shadow::With(object)) => {
+                            self.set_property(&object, &key, value, strict)?
+                        }
+                        Some(Shadow::Grown(scope, index)) => {
+                            scope.borrow_mut().slots[index] = value
+                        }
+                        None if depth == GLOBAL => self.set_global(&key, value, strict)?,
+                        None => match kind {
+                            BindingKind::Const | BindingKind::Import => {
+                                return Err(self.type_error(format!(
+                                    "Assignment to constant variable '{key}'"
+                                )));
+                            }
+                            BindingKind::SelfName if strict => {
+                                return Err(self.type_error(format!(
+                                    "Assignment to constant variable '{key}'"
+                                )));
+                            }
+                            // a sloppy write to a function expression's own name is dropped
+                            BindingKind::SelfName => {}
+                            _ => self.write_local(frame, depth, index, name, value)?,
+                        },
+                    }
+                }
+                Op::DeleteName { name, depth } => {
+                    let key = frame.code.names[name as usize].clone();
+                    let strict = frame.code.strict;
+                    let deleted = match self.shadowing(frame.scope.clone(), &key, depth)? {
+                        Some(Shadow::With(object)) => {
+                            self.delete_property(&object, &key, strict)?
+                        }
+                        // an eval's binding is deletable, as the eval declaration steps made it
+                        Some(Shadow::Grown(scope, index)) => {
+                            let mut scope = scope.borrow_mut();
+                            let position = index - scope.layout.names.len();
+                            scope.extra[position] = "".into();
+                            scope.slots[index] = Value::Undefined;
+                            true
+                        }
+                        None if depth == GLOBAL => {
+                            self.delete_property(&Value::Window, &key, false)?
+                        }
+                        None => false,
+                    };
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::Bool(deleted));
+                }
+                Op::DeclareLexical(name) => {
+                    let name = frame.code.names[name as usize].to_string();
+                    self.global.borrow_mut().lexicals.insert(name);
+                }
+                Op::TypeofGlobal(name) => {
+                    let name = frame.code.names[name as usize].clone();
+                    let value = match self.get_global_accessor(&name) {
                         Some(value) => value?,
-                        None => self.lookup_global(&key).unwrap_or(Value::Undefined),
-                    },
-                    None => self.read_local(frame, depth, index, name)?,
-                };
-                let kind = self.type_of(&value);
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::String(type_name(kind)));
-            }
-            Op::SetName {
-                name,
-                depth,
-                index,
-                kind,
-            } => {
-                let key = frame.code.names[name as usize].clone();
-                let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let strict = frame.code.strict;
-                match self.shadowing(frame.scope.clone(), &key, depth)? {
-                    Some(Shadow::With(object)) => {
-                        self.set_property(&object, &key, value, strict)?
-                    }
-                    Some(Shadow::Grown(scope, index)) => scope.borrow_mut().slots[index] = value,
-                    None if depth == GLOBAL => self.set_global(&key, value, strict)?,
-                    None => match kind {
-                        BindingKind::Const | BindingKind::Import => {
-                            return Err(
-                                self.type_error(format!("Assignment to constant variable '{key}'"))
-                            );
-                        }
-                        BindingKind::SelfName if strict => {
-                            return Err(
-                                self.type_error(format!("Assignment to constant variable '{key}'"))
-                            );
-                        }
-                        // a sloppy write to a function expression's own name is dropped
-                        BindingKind::SelfName => {}
-                        _ => self.write_local(frame, depth, index, name, value)?,
-                    },
+                        None => self.lookup_global(&name).unwrap_or(Value::Undefined),
+                    };
+                    let kind = self.type_of(&value);
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::String(type_name(kind)));
                 }
-            }
-            Op::DeleteName { name, depth } => {
-                let key = frame.code.names[name as usize].clone();
-                let strict = frame.code.strict;
-                let deleted = match self.shadowing(frame.scope.clone(), &key, depth)? {
-                    Some(Shadow::With(object)) => self.delete_property(&object, &key, strict)?,
-                    // an eval's binding is deletable, as the eval declaration steps made it
-                    Some(Shadow::Grown(scope, index)) => {
-                        let mut scope = scope.borrow_mut();
-                        let position = index - scope.layout.names.len();
-                        scope.extra[position] = "".into();
-                        scope.slots[index] = Value::Undefined;
-                        true
+                Op::SetGlobal(name) | Op::InitGlobal(name) => {
+                    let name = frame.code.names[name as usize].clone();
+                    let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    let strict = frame.code.strict;
+                    let initialize = matches!(op, Op::InitGlobal(_));
+                    // a function declaration replaces a configurable property outright, as
+                    // CreateGlobalFunctionBinding defines it
+                    if initialize {
+                        let mut global = self.global.borrow_mut();
+                        if global
+                            .accessors
+                            .get(&*name)
+                            .is_some_and(|property| property.configurable)
+                        {
+                            global.accessors.remove(&*name);
+                        }
                     }
-                    None if depth == GLOBAL => self.delete_property(&Value::Window, &key, false)?,
-                    None => false,
-                };
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Bool(deleted));
-            }
-            Op::DeclareLexical(name) => {
-                let name = frame.code.names[name as usize].to_string();
-                self.global.borrow_mut().lexicals.insert(name);
-            }
-            Op::TypeofGlobal(name) => {
-                let name = frame.code.names[name as usize].clone();
-                let value = match self.get_global_accessor(&name) {
-                    Some(value) => value?,
-                    None => self.lookup_global(&name).unwrap_or(Value::Undefined),
-                };
-                let kind = self.type_of(&value);
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::String(type_name(kind)));
-            }
-            Op::SetGlobal(name) | Op::InitGlobal(name) => {
-                let name = frame.code.names[name as usize].clone();
-                let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let strict = frame.code.strict;
-                let initialize = matches!(op, Op::InitGlobal(_));
-                // a function declaration replaces a configurable property outright, as
-                // CreateGlobalFunctionBinding defines it
-                if initialize {
-                    let mut global = self.global.borrow_mut();
-                    if global
-                        .accessors
-                        .get(&*name)
-                        .is_some_and(|property| property.configurable)
-                    {
-                        global.accessors.remove(&*name);
-                    }
+                    self.set_global(&name, value, strict && !initialize)?;
                 }
-                self.set_global(&name, value, strict && !initialize)?;
-            }
-            Op::InitGlobalConst(name) => {
-                let name = frame.code.names[name as usize].to_string();
-                let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                self.global
-                    .borrow_mut()
-                    .values
-                    .insert(name, Value::Binding(Rc::new(RefCell::new(value)), false));
-            }
-            Op::DeclareGlobal(name) => {
-                let name = frame.code.names[name as usize].clone();
-                if self.lookup_global(&name).is_none()
-                    && !self.global.borrow().accessors.contains_key(&*name)
-                {
+                Op::InitGlobalConst(name) => {
+                    let name = frame.code.names[name as usize].to_string();
+                    let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
                     self.global
                         .borrow_mut()
                         .values
-                        .insert(name.to_string(), Value::Undefined);
+                        .insert(name, Value::Binding(Rc::new(RefCell::new(value)), false));
                 }
-            }
-            Op::DeleteGlobal(name) => {
-                let name = frame.code.names[name as usize].clone();
-                let deleted = self.delete_property(&Value::Window, &name, false)?;
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Bool(deleted));
-            }
-            Op::PushScope(block) => {
-                let layout = frame.code.blocks[block as usize].clone();
-                let scope = Scope::new(layout, frame.scope.clone());
-                // lexical bindings in a block start in their temporal dead zone
-                for slot in scope.borrow_mut().slots.iter_mut() {
-                    *slot = Value::Uninitialized;
+                Op::DeclareGlobal(name) => {
+                    let name = frame.code.names[name as usize].clone();
+                    if self.lookup_global(&name).is_none()
+                        && !self.global.borrow().accessors.contains_key(&*name)
+                    {
+                        self.global
+                            .borrow_mut()
+                            .values
+                            .insert(name.to_string(), Value::Undefined);
+                    }
                 }
-                frame.scope = Some(scope);
-                frame.scopes += 1;
-            }
-            Op::PushVarScope(block) => {
-                let layout = frame.code.blocks[block as usize].clone();
-                // a function's variable environment, whose bindings start undefined
-                let scope = Scope::new(layout, frame.scope.clone());
-                frame.scope = Some(scope);
-                frame.scopes += 1;
-            }
-            Op::PopScope => {
-                Self::restore_scopes(frame, frame.scopes.saturating_sub(1));
-            }
-            Op::Debugger => {}
-            Op::CloneScope => {
-                let scope = frame.scope.clone().expect("a scope to copy");
-                let scope = scope.borrow();
-                let copy = Scope::new(scope.layout.clone(), scope.parent.clone());
-                copy.borrow_mut().slots = scope.slots.clone();
-                copy.borrow_mut().extra = scope.extra.clone();
-                drop(scope);
-                frame.scope = Some(copy);
-            }
-            Op::This => {
-                if matches!(frame.this, Value::Uninitialized) {
-                    return Err(
-                        self.reference_error("must call super constructor before accessing this")
-                    );
+                Op::DeleteGlobal(name) => {
+                    let name = frame.code.names[name as usize].clone();
+                    let deleted = self.delete_property(&Value::Window, &name, false)?;
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::Bool(deleted));
                 }
-                frame.stack.push(frame.this.clone());
-            }
-            Op::GlobalThis => frame.stack.push(Value::Window),
-            Op::NewTarget => frame.stack.push(frame.new_target.clone()),
-            Op::Home => {
-                let home = frame
-                    .closure
-                    .as_ref()
-                    .and_then(|closure| closure.home.borrow().clone())
-                    .map(Value::Object)
-                    .unwrap_or(Value::Undefined);
-                frame.stack.push(home);
-            }
-            Op::ImportMeta => {
-                let url = frame
-                    .closure
-                    .as_ref()
-                    .and_then(|closure| closure.url.clone());
-                let meta = match url {
-                    Some(url) => {
-                        let key = url.to_string();
-                        match self.import_metas.get(&key) {
-                            Some(meta) => meta.clone(),
-                            None => {
-                                let meta = self.new_plain_object();
-                                meta.borrow_mut()
-                                    .insert("url".to_string(), Value::String(key.as_str().into()));
-                                self.import_metas.insert(key, meta.clone());
-                                meta
+                Op::PushScope(block) => {
+                    let layout = frame.code.blocks[block as usize].clone();
+                    let scope = Scope::new(layout, frame.scope.clone());
+                    // lexical bindings in a block start in their temporal dead zone
+                    for slot in scope.borrow_mut().slots.iter_mut() {
+                        *slot = Value::Uninitialized;
+                    }
+                    frame.scope = Some(scope);
+                    frame.scopes += 1;
+                }
+                Op::PushVarScope(block) => {
+                    let layout = frame.code.blocks[block as usize].clone();
+                    // a function's variable environment, whose bindings start undefined
+                    let scope = Scope::new(layout, frame.scope.clone());
+                    frame.scope = Some(scope);
+                    frame.scopes += 1;
+                }
+                Op::PopScope => {
+                    Self::restore_scopes(frame, frame.scopes.saturating_sub(1));
+                }
+                Op::Debugger => {}
+                Op::CloneScope => {
+                    let scope = frame.scope.clone().expect("a scope to copy");
+                    let scope = scope.borrow();
+                    let copy = Scope::new(scope.layout.clone(), scope.parent.clone());
+                    copy.borrow_mut().slots = scope.slots.clone();
+                    copy.borrow_mut().extra = scope.extra.clone();
+                    drop(scope);
+                    frame.scope = Some(copy);
+                }
+                Op::This => {
+                    if matches!(frame.this, Value::Uninitialized) {
+                        return Err(self
+                            .reference_error("must call super constructor before accessing this"));
+                    }
+                    frame.stack.push(frame.this.clone());
+                }
+                Op::GlobalThis => frame.stack.push(Value::Window),
+                Op::NewTarget => frame.stack.push(frame.new_target.clone()),
+                Op::Home => {
+                    let home = frame
+                        .closure
+                        .as_ref()
+                        .and_then(|closure| closure.home.borrow().clone())
+                        .map(Value::Object)
+                        .unwrap_or(Value::Undefined);
+                    frame.stack.push(home);
+                }
+                Op::ImportMeta => {
+                    let url = frame
+                        .closure
+                        .as_ref()
+                        .and_then(|closure| closure.url.clone());
+                    let meta = match url {
+                        Some(url) => {
+                            let key = url.to_string();
+                            match self.import_metas.get(&key) {
+                                Some(meta) => meta.clone(),
+                                None => {
+                                    let meta = self.new_plain_object();
+                                    meta.borrow_mut().insert(
+                                        "url".to_string(),
+                                        Value::String(key.as_str().into()),
+                                    );
+                                    self.import_metas.insert(key, meta.clone());
+                                    meta
+                                }
                             }
                         }
-                    }
-                    None => self.new_plain_object(),
-                };
-                frames
-                    .last_mut()
-                    .expect("frame")
+                        None => self.new_plain_object(),
+                    };
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::Object(meta));
+                }
+                Op::InitThisSlot(slot) => {
+                    let value = frame.this.clone();
+                    Self::scope_at(frame, 0).borrow_mut().slots[slot as usize] = value;
+                }
+                Op::InitNewTargetSlot(slot) => {
+                    let value = frame.new_target.clone();
+                    Self::scope_at(frame, 0).borrow_mut().slots[slot as usize] = value;
+                }
+                Op::InitHomeSlot(slot) => {
+                    let home = frame
+                        .closure
+                        .as_ref()
+                        .and_then(|closure| closure.home.borrow().clone())
+                        .map(Value::Object)
+                        .unwrap_or(Value::Undefined);
+                    Self::scope_at(frame, 0).borrow_mut().slots[slot as usize] = home;
+                }
+                Op::InitArgumentsSlot(slot) => {
+                    let arguments = frame.arguments.clone();
+                    let object = self.arguments_object(arguments);
+                    let frame = frames.last_mut().expect("frame");
+                    Self::scope_at(frame, 0).borrow_mut().slots[slot as usize] = object;
+                }
+                Op::NewObject => {
+                    let object = self.new_plain_object();
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::Object(object));
+                }
+                Op::NewArray => frame
                     .stack
-                    .push(Value::Object(meta));
-            }
-            Op::InitThisSlot(slot) => {
-                let value = frame.this.clone();
-                Self::scope_at(frame, 0).borrow_mut().slots[slot as usize] = value;
-            }
-            Op::InitNewTargetSlot(slot) => {
-                let value = frame.new_target.clone();
-                Self::scope_at(frame, 0).borrow_mut().slots[slot as usize] = value;
-            }
-            Op::InitHomeSlot(slot) => {
-                let home = frame
-                    .closure
-                    .as_ref()
-                    .and_then(|closure| closure.home.borrow().clone())
-                    .map(Value::Object)
-                    .unwrap_or(Value::Undefined);
-                Self::scope_at(frame, 0).borrow_mut().slots[slot as usize] = home;
-            }
-            Op::InitArgumentsSlot(slot) => {
-                let arguments = frame.arguments.clone();
-                let object = self.arguments_object(arguments);
-                let frame = frames.last_mut().expect("frame");
-                Self::scope_at(frame, 0).borrow_mut().slots[slot as usize] = object;
-            }
-            Op::NewObject => {
-                let object = self.new_plain_object();
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Object(object));
-            }
-            Op::NewArray => frame
-                .stack
-                .push(Value::Array(Rc::new(RefCell::new(Vec::new().into())))),
-            Op::ArrayPush => {
-                let value = Self::pop(frame);
-                if let Some(Value::Array(array)) = frame.stack.last() {
-                    array.borrow_mut().push(value);
-                }
-            }
-            Op::ArrayHole => {
-                if let Some(Value::Array(array)) = frame.stack.last() {
-                    array.borrow_mut().push(Value::Uninitialized);
-                }
-            }
-            Op::ArraySpread(_) | Op::ArgumentSpread(_) => {
-                let value = Self::pop(frame);
-                let name = |index: u32| frame.code.names[index as usize].clone();
-                self.iterable_callsite = match op {
-                    Op::ArraySpread(message) => message.map(name).map(Callsite::Source),
-                    Op::ArgumentSpread(site) => Some(Callsite::Argument(name(site))),
-                    _ => None,
-                };
-                let items = self.iterate_to_vec(value);
-                self.iterable_callsite = None;
-                let items = items?;
-                let frame = frames.last_mut().expect("frame");
-                if let Some(Value::Array(array)) = frame.stack.last() {
-                    let mut array = array.borrow_mut();
-                    if array.len() + items.len() > MAX_RUNTIME_ARRAY_LENGTH {
-                        return Err(self.range_error("array exceeds the length limit"));
-                    }
-                    array.extend(items);
-                }
-            }
-            Op::DefineField(name) => {
-                let value = Self::pop(frame);
-                let key = frame.code.names[name as usize].to_string();
-                if let Some(Value::Object(object)) = frame.stack.last() {
-                    object.borrow_mut().define(key, Property::data(value));
-                }
-            }
-            Op::DefineComputed => {
-                let value = Self::pop(frame);
-                let key = Self::pop(frame).property_key();
-                if let Some(Value::Object(object)) = frame.stack.last() {
-                    object.borrow_mut().define(key, Property::data(value));
-                }
-            }
-            Op::DefineAccessor {
-                getter,
-                computed,
-                name,
-            } => {
-                let function = Self::pop(frame);
-                let key = if computed {
-                    Self::pop(frame).property_key()
-                } else {
-                    frame.code.names[name as usize].to_string()
-                };
-                let Some(Value::Object(object)) = frame.stack.last().cloned() else {
-                    return Err(runtime_error("accessor target is not an object"));
-                };
-                Self::set_home(&function, &object);
-                if getter {
-                    self.merge_accessor(&object, &key, Some(function), None, true);
-                } else {
-                    self.merge_accessor(&object, &key, None, Some(function), true);
-                }
-            }
-            Op::ObjectSpread => {
-                let source = Self::pop(frame);
-                let entries = self.own_enumerable_entries(&source)?;
-                let frame = frames.last_mut().expect("frame");
-                if let Some(Value::Object(object)) = frame.stack.last() {
-                    let mut object = object.borrow_mut();
-                    for (key, value) in entries {
-                        object.define(key, Property::data(value));
+                    .push(Value::Array(Rc::new(RefCell::new(Vec::new().into())))),
+                Op::ArrayPush => {
+                    let value = Self::pop(frame);
+                    if let Some(Value::Array(array)) = frame.stack.last() {
+                        array.borrow_mut().push(value);
                     }
                 }
-            }
-            Op::SetPrototype => {
-                let prototype = Self::pop(frame);
-                if let Some(Value::Object(object)) = frame.stack.last() {
-                    match prototype {
-                        Value::Object(prototype) => {
-                            object.borrow_mut().set_prototype(Some(prototype))
+                Op::ArrayHole => {
+                    if let Some(Value::Array(array)) = frame.stack.last() {
+                        array.borrow_mut().push(Value::Uninitialized);
+                    }
+                }
+                Op::ArraySpread(_) | Op::ArgumentSpread(_) => {
+                    let value = Self::pop(frame);
+                    let name = |index: u32| frame.code.names[index as usize].clone();
+                    self.iterable_callsite = match op {
+                        Op::ArraySpread(message) => message.map(name).map(Callsite::Source),
+                        Op::ArgumentSpread(site) => Some(Callsite::Argument(name(site))),
+                        _ => None,
+                    };
+                    let items = self.iterate_to_vec(value);
+                    self.iterable_callsite = None;
+                    let items = items?;
+                    let frame = frames.last_mut().expect("frame");
+                    if let Some(Value::Array(array)) = frame.stack.last() {
+                        let mut array = array.borrow_mut();
+                        if array.len() + items.len() > MAX_RUNTIME_ARRAY_LENGTH {
+                            return Err(self.range_error("array exceeds the length limit"));
                         }
-                        Value::Null => object.borrow_mut().set_prototype(None),
-                        _ => {}
+                        array.extend(items);
                     }
                 }
-            }
-            Op::GetProp(name) => {
-                let object = Self::pop(frame);
-                let cache = &frame.code.property_caches[name as usize];
-                // an own data property found where it was last time is read straight off
-                let cached = match &object {
-                    Value::Object(handle) => handle
-                        .try_borrow()
-                        .ok()
-                        .and_then(|object| object.cached_value(cache).map(Value::resolve)),
-                    _ => None,
-                };
-                let value = match cached {
-                    Some(value) => value,
-                    None => {
-                        let key = frame.code.names[name as usize].clone();
-                        let value = self.get_property(&object, &key)?;
-                        if let Value::Object(handle) = &object
-                            && let Ok(object) = handle.try_borrow()
-                        {
-                            object.note_position(&key, cache);
-                        }
-                        value
+                Op::DefineField(name) => {
+                    let value = Self::pop(frame);
+                    let key = frame.code.names[name as usize].to_string();
+                    if let Some(Value::Object(object)) = frame.stack.last() {
+                        object.borrow_mut().define(key, Property::data(value));
                     }
-                };
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::GetIndex => {
-                let key = Self::pop(frame);
-                let object = Self::pop(frame);
-                let value = self.get_index(&object, key)?;
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::SetProp(name) => {
-                let value = Self::pop(frame);
-                let object = Self::pop(frame);
-                let key = frame.code.names[name as usize].clone();
-                let strict = frame.code.strict;
-                self.set_property(&object, &key, value.clone(), strict)?;
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::SetIndex => {
-                let value = Self::pop(frame);
-                let key = Self::pop(frame);
-                let object = Self::pop(frame);
-                let strict = frame.code.strict;
-                self.set_index(&object, key, value.clone(), strict)?;
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::WithHas(name) => {
-                let object = Self::pop(frame);
-                let key = frame.code.names[name as usize].clone();
-                let has = self.with_has(&object, &key)?;
-                let stack = &mut frames.last_mut().expect("frame").stack;
-                stack.push(object);
-                stack.push(Value::Bool(has));
-            }
-            Op::DeleteProp(name) => {
-                let object = Self::pop(frame);
-                let key = frame.code.names[name as usize].clone();
-                let strict = frame.code.strict;
-                let deleted = self.delete_property(&object, &key, strict)?;
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Bool(deleted));
-            }
-            Op::DeleteIndex => {
-                let key = Self::pop(frame);
-                let object = Self::pop(frame);
-                let strict = frame.code.strict;
-                let key = self.coerce_key(key)?;
-                let deleted = self.delete_property(&object, &key, strict)?;
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Bool(deleted));
-            }
-            Op::GetSuper(name) => {
-                let home = Self::pop(frame);
-                let this = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let key = frame.code.names[name as usize].clone();
-                let value = self.get_super(&home, &this, &key)?;
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::GetSuperIndex => {
-                let key = Self::pop(frame);
-                let home = Self::pop(frame);
-                let this = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let key = self.coerce_key(key)?;
-                let value = self.get_super(&home, &this, &key)?;
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::SetSuper(name) => {
-                let value = Self::pop(frame);
-                let _home = Self::pop(frame);
-                let this = Self::pop(frame);
-                let key = frame.code.names[name as usize].clone();
-                self.set_property(&this, &key, value.clone(), true)?;
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::SetSuperIndex => {
-                let value = Self::pop(frame);
-                let key = Self::pop(frame);
-                let _home = Self::pop(frame);
-                let this = Self::pop(frame);
-                self.set_index(&this, key, value.clone(), true)?;
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::GetPrivate => {
-                let key = Self::pop(frame).property_key();
-                let object = Self::pop(frame);
-                let value = self.get_private(&object, &key)?;
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::SetPrivate => {
-                let value = Self::pop(frame);
-                let key = Self::pop(frame).property_key();
-                let object = Self::pop(frame);
-                self.set_private(&object, &key, value.clone())?;
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::HasPrivate => {
-                let object = Self::pop(frame);
-                let key = Self::pop(frame).property_key();
-                let Value::Object(object) = object else {
-                    return Err(self.type_error("private brand checks need an object"));
-                };
-                let has = object.borrow().contains_key(&key);
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Bool(has));
-            }
-            Op::NewPrivateName(name) => {
-                self.private_names += 1;
-                let key = format!(
-                    "{}{}:{}",
-                    PRIVATE_PREFIX, self.private_names, frame.code.names[name as usize]
-                );
-                frame.stack.push(Value::String(key.into()));
-            }
-            Op::Call(count) | Op::CallMethod(count) => {
-                let arguments = Self::pop_arguments(frame, count as usize);
-                let callee = Self::pop(frame);
-                let this = if matches!(op, Op::CallMethod(_)) {
-                    Self::pop(frame)
-                } else {
-                    Value::Undefined
-                };
-                return self.call_in_loop(frames, callee, this, arguments);
-            }
-            Op::CallEval(_) | Op::CallEvalSpread => {
-                let arguments = match op {
-                    Op::CallEval(count) => Self::pop_arguments(frame, count as usize),
-                    _ => match Self::pop(frame) {
+                }
+                Op::DefineComputed => {
+                    let value = Self::pop(frame);
+                    let key = Self::pop(frame).property_key();
+                    if let Some(Value::Object(object)) = frame.stack.last() {
+                        object.borrow_mut().define(key, Property::data(value));
+                    }
+                }
+                Op::DefineAccessor {
+                    getter,
+                    computed,
+                    name,
+                } => {
+                    let function = Self::pop(frame);
+                    let key = if computed {
+                        Self::pop(frame).property_key()
+                    } else {
+                        frame.code.names[name as usize].to_string()
+                    };
+                    let Some(Value::Object(object)) = frame.stack.last().cloned() else {
+                        return Err(runtime_error("accessor target is not an object"));
+                    };
+                    Self::set_home(&function, &object);
+                    if getter {
+                        self.merge_accessor(&object, &key, Some(function), None, true);
+                    } else {
+                        self.merge_accessor(&object, &key, None, Some(function), true);
+                    }
+                }
+                Op::ObjectSpread => {
+                    let source = Self::pop(frame);
+                    let entries = self.own_enumerable_entries(&source)?;
+                    let frame = frames.last_mut().expect("frame");
+                    if let Some(Value::Object(object)) = frame.stack.last() {
+                        let mut object = object.borrow_mut();
+                        for (key, value) in entries {
+                            object.define(key, Property::data(value));
+                        }
+                    }
+                }
+                Op::SetPrototype => {
+                    let prototype = Self::pop(frame);
+                    if let Some(Value::Object(object)) = frame.stack.last() {
+                        match prototype {
+                            Value::Object(prototype) => {
+                                object.borrow_mut().set_prototype(Some(prototype))
+                            }
+                            Value::Null => object.borrow_mut().set_prototype(None),
+                            _ => {}
+                        }
+                    }
+                }
+                Op::GetProp(name) => {
+                    let object = Self::pop(frame);
+                    let cache = &frame.code.property_caches[name as usize];
+                    // an own data property found where it was last time is read straight off
+                    let cached = match &object {
+                        Value::Object(handle) => handle
+                            .try_borrow()
+                            .ok()
+                            .and_then(|object| object.cached_value(cache).map(Value::resolve)),
+                        _ => None,
+                    };
+                    let value = match cached {
+                        Some(value) => value,
+                        None => {
+                            let key = frame.code.names[name as usize].clone();
+                            let value = self.get_property(&object, &key)?;
+                            if let Value::Object(handle) = &object
+                                && let Ok(object) = handle.try_borrow()
+                            {
+                                object.note_position(&key, cache);
+                            }
+                            value
+                        }
+                    };
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::GetIndex => {
+                    let key = Self::pop(frame);
+                    let object = Self::pop(frame);
+                    let value = self.get_index(&object, key)?;
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::SetProp(name) => {
+                    let value = Self::pop(frame);
+                    let object = Self::pop(frame);
+                    let key = frame.code.names[name as usize].clone();
+                    let strict = frame.code.strict;
+                    self.set_property(&object, &key, value.clone(), strict)?;
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::SetIndex => {
+                    let value = Self::pop(frame);
+                    let key = Self::pop(frame);
+                    let object = Self::pop(frame);
+                    let strict = frame.code.strict;
+                    self.set_index(&object, key, value.clone(), strict)?;
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::WithHas(name) => {
+                    let object = Self::pop(frame);
+                    let key = frame.code.names[name as usize].clone();
+                    let has = self.with_has(&object, &key)?;
+                    let stack = &mut frames.last_mut().expect("frame").stack;
+                    stack.push(object);
+                    stack.push(Value::Bool(has));
+                }
+                Op::DeleteProp(name) => {
+                    let object = Self::pop(frame);
+                    let key = frame.code.names[name as usize].clone();
+                    let strict = frame.code.strict;
+                    let deleted = self.delete_property(&object, &key, strict)?;
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::Bool(deleted));
+                }
+                Op::DeleteIndex => {
+                    let key = Self::pop(frame);
+                    let object = Self::pop(frame);
+                    let strict = frame.code.strict;
+                    let key = self.coerce_key(key)?;
+                    let deleted = self.delete_property(&object, &key, strict)?;
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::Bool(deleted));
+                }
+                Op::GetSuper(name) => {
+                    let home = Self::pop(frame);
+                    let this = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    let key = frame.code.names[name as usize].clone();
+                    let value = self.get_super(&home, &this, &key)?;
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::GetSuperIndex => {
+                    let key = Self::pop(frame);
+                    let home = Self::pop(frame);
+                    let this = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    let key = self.coerce_key(key)?;
+                    let value = self.get_super(&home, &this, &key)?;
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::SetSuper(name) => {
+                    let value = Self::pop(frame);
+                    let _home = Self::pop(frame);
+                    let this = Self::pop(frame);
+                    let key = frame.code.names[name as usize].clone();
+                    self.set_property(&this, &key, value.clone(), true)?;
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::SetSuperIndex => {
+                    let value = Self::pop(frame);
+                    let key = Self::pop(frame);
+                    let _home = Self::pop(frame);
+                    let this = Self::pop(frame);
+                    self.set_index(&this, key, value.clone(), true)?;
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::GetPrivate => {
+                    let key = Self::pop(frame).property_key();
+                    let object = Self::pop(frame);
+                    let value = self.get_private(&object, &key)?;
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::SetPrivate => {
+                    let value = Self::pop(frame);
+                    let key = Self::pop(frame).property_key();
+                    let object = Self::pop(frame);
+                    self.set_private(&object, &key, value.clone())?;
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::HasPrivate => {
+                    let object = Self::pop(frame);
+                    let key = Self::pop(frame).property_key();
+                    let Value::Object(object) = object else {
+                        return Err(self.type_error("private brand checks need an object"));
+                    };
+                    let has = object.borrow().contains_key(&key);
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::Bool(has));
+                }
+                Op::NewPrivateName(name) => {
+                    self.private_names += 1;
+                    let key = format!(
+                        "{}{}:{}",
+                        PRIVATE_PREFIX, self.private_names, frame.code.names[name as usize]
+                    );
+                    frame.stack.push(Value::String(key.into()));
+                }
+                Op::Call(count) | Op::CallMethod(count) => {
+                    let arguments = Self::pop_arguments(frame, count as usize);
+                    let callee = Self::pop(frame);
+                    let this = if matches!(op, Op::CallMethod(_)) {
+                        Self::pop(frame)
+                    } else {
+                        Value::Undefined
+                    };
+                    return self.call_in_loop(frames, callee, this, arguments);
+                }
+                Op::CallEval(_) | Op::CallEvalSpread => {
+                    let arguments = match op {
+                        Op::CallEval(count) => Self::pop_arguments(frame, count as usize),
+                        _ => match Self::pop(frame) {
+                            Value::Array(array) => {
+                                array.borrow().iter().cloned().map(Value::filled).collect()
+                            }
+                            _ => Vec::new(),
+                        },
+                    };
+                    let callee = Self::pop(frame);
+                    let this = Self::pop(frame);
+                    let direct = matches!(
+                        callee.resolve(),
+                        Value::Object(ref object)
+                            if matches!(object.borrow().class, ObjectClass::Native(Native::Eval))
+                    );
+                    if !direct {
+                        return self.call_in_loop(frames, callee, this, arguments);
+                    }
+                    return match arguments.into_iter().next() {
+                        Some(Value::String(source)) => self.direct_eval(frames, &source),
+                        first => {
+                            frame.stack.push(first.unwrap_or(Value::Undefined));
+                            Ok(None)
+                        }
+                    };
+                }
+                Op::CallSpread | Op::CallMethodSpread => {
+                    let list = Self::pop(frame);
+                    let callee = Self::pop(frame);
+                    let this = if matches!(op, Op::CallMethodSpread) {
+                        Self::pop(frame)
+                    } else {
+                        Value::Undefined
+                    };
+                    let arguments = match list {
                         Value::Array(array) => {
                             array.borrow().iter().cloned().map(Value::filled).collect()
                         }
                         _ => Vec::new(),
-                    },
-                };
-                let callee = Self::pop(frame);
-                let this = Self::pop(frame);
-                let direct = matches!(
-                    callee.resolve(),
-                    Value::Object(ref object)
-                        if matches!(object.borrow().class, ObjectClass::Native(Native::Eval))
-                );
-                if !direct {
+                    };
                     return self.call_in_loop(frames, callee, this, arguments);
                 }
-                return match arguments.into_iter().next() {
-                    Some(Value::String(source)) => self.direct_eval(frames, &source),
-                    first => {
-                        frame.stack.push(first.unwrap_or(Value::Undefined));
-                        Ok(None)
-                    }
-                };
-            }
-            Op::CallSpread | Op::CallMethodSpread => {
-                let list = Self::pop(frame);
-                let callee = Self::pop(frame);
-                let this = if matches!(op, Op::CallMethodSpread) {
-                    Self::pop(frame)
-                } else {
-                    Value::Undefined
-                };
-                let arguments = match list {
-                    Value::Array(array) => {
-                        array.borrow().iter().cloned().map(Value::filled).collect()
-                    }
-                    _ => Vec::new(),
-                };
-                return self.call_in_loop(frames, callee, this, arguments);
-            }
-            Op::New(count) => {
-                let arguments = Self::pop_arguments(frame, count as usize);
-                let callee = Self::pop(frame);
-                return self.construct_in_loop(frames, callee, arguments, None);
-            }
-            Op::NewSpread => {
-                let list = Self::pop(frame);
-                let callee = Self::pop(frame);
-                let arguments = match list {
-                    Value::Array(array) => {
-                        array.borrow().iter().cloned().map(Value::filled).collect()
-                    }
-                    _ => Vec::new(),
-                };
-                return self.construct_in_loop(frames, callee, arguments, None);
-            }
-            Op::SuperCall(count) => {
-                let arguments = Self::pop_arguments(frame, count as usize);
-                return self.super_call(frames, arguments);
-            }
-            Op::SuperCallSpread => {
-                let list = Self::pop(frame);
-                let arguments = match list {
-                    Value::Array(array) => {
-                        array.borrow().iter().cloned().map(Value::filled).collect()
-                    }
-                    _ => Vec::new(),
-                };
-                return self.super_call(frames, arguments);
-            }
-            Op::Closure(index) => {
-                let code = frame.code.children[index as usize].clone();
-                let url = frame
-                    .closure
-                    .as_ref()
-                    .and_then(|closure| closure.url.clone());
-                let scope = frame.scope.clone();
-                let home = frame
-                    .closure
-                    .as_ref()
-                    .and_then(|closure| closure.home.borrow().clone());
-                let function = self.new_closure(code.clone(), scope, url);
-                // arrows and nested methods keep the home object of where they were made
-                if code.kind == FunctionKind::Arrow
-                    && let (Some(home), Some(closure)) = (home, Self::closure_of(&function))
-                {
-                    *closure.home.borrow_mut() = Some(home);
+                Op::New(count) => {
+                    let arguments = Self::pop_arguments(frame, count as usize);
+                    let callee = Self::pop(frame);
+                    return self.construct_in_loop(frames, callee, arguments, None);
                 }
-                frames.last_mut().expect("frame").stack.push(function);
-            }
-            Op::Class {
-                template,
-                has_super,
-            } => {
-                let template = frame.code.classes[template as usize].clone();
-                let superclass = if has_super {
-                    Some(Self::pop(frame))
-                } else {
-                    None
-                };
-                let url = frame
-                    .closure
-                    .as_ref()
-                    .and_then(|closure| closure.url.clone());
-                let scope = frame.scope.clone();
-                let (constructor, prototype) =
-                    self.create_class(&template, superclass, scope, url)?;
-                let frame = frames.last_mut().expect("frame");
-                frame.stack.push(constructor);
-                frame.stack.push(prototype);
-            }
-            Op::DefineMethod {
-                is_static,
-                kind,
-                computed,
-                name,
-            } => {
-                let function = Self::pop(frame);
-                let key = if computed {
-                    Self::pop(frame).property_key()
-                } else {
-                    frame.code.names[name as usize].to_string()
-                };
-                let length = frame.stack.len();
-                let (Value::Object(constructor), Value::Object(prototype)) = (
-                    frame.stack[length - 2].clone(),
-                    frame.stack[length - 1].clone(),
-                ) else {
-                    return Err(runtime_error("method target is not a class"));
-                };
-                let target = if is_static {
-                    constructor.clone()
-                } else {
-                    prototype
-                };
-                Self::set_home(&function, &target);
-                self.define_method(&constructor, &target, key, kind, function, is_static)?;
-            }
-            Op::DefineLiteralMethod { computed, name } => {
-                let function = Self::pop(frame);
-                let key = if computed {
-                    Self::pop(frame).property_key()
-                } else {
-                    frame.code.names[name as usize].to_string()
-                };
-                let Some(Value::Object(object)) = frame.stack.last().cloned() else {
-                    return Err(runtime_error("method target is not an object"));
-                };
-                Self::set_home(&function, &object);
-                object.borrow_mut().define(key, Property::data(function));
-            }
-            Op::AddField {
-                is_static,
-                private,
-                computed,
-                name,
-            } => {
-                let initializer = Self::pop(frame);
-                let key = if name == u32::MAX {
-                    String::new()
-                } else if computed {
-                    Self::pop(frame).property_key()
-                } else {
-                    frame.code.names[name as usize].to_string()
-                };
-                let length = frame.stack.len();
-                let (Value::Object(constructor), Value::Object(prototype)) = (
-                    frame.stack[length - 2].clone(),
-                    frame.stack[length - 1].clone(),
-                ) else {
-                    return Err(runtime_error("field target is not a class"));
-                };
-                let home = if is_static {
-                    constructor.clone()
-                } else {
-                    prototype
-                };
-                Self::set_home(&initializer, &home);
-                let Some(closure) = Self::closure_of(&Value::Object(constructor)) else {
-                    return Err(runtime_error("field target is not a class"));
-                };
-                let kind = if name == u32::MAX {
-                    FieldKind::StaticBlock(initializer)
-                } else if matches!(initializer, Value::Undefined) {
-                    FieldKind::Field(None)
-                } else {
-                    FieldKind::Field(Some(initializer))
-                };
-                let definition = FieldDefinition { key, private, kind };
-                let mut class = closure.class.borrow_mut();
-                let class = class.get_or_insert_with(Default::default);
-                if is_static {
-                    class.statics.push(definition);
-                } else {
-                    class.fields.push(definition);
-                }
-            }
-            Op::RunStaticInit => {
-                let constructor = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                if let Some(closure) = Self::closure_of(&constructor) {
-                    let statics = closure
-                        .class
-                        .borrow_mut()
-                        .as_mut()
-                        .map(|class| std::mem::take(&mut class.statics))
-                        .unwrap_or_default();
-                    for field in statics {
-                        self.install_field(&field, &constructor)?;
-                    }
-                }
-            }
-            Op::Binary(operator) => {
-                let right = Self::pop(frame);
-                let left = Self::pop(frame);
-                let value = self.binary(operator, left, right)?;
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::Negate => {
-                let value = Self::pop(frame);
-                let result = self.negate_numeric(value)?;
-                frames.last_mut().expect("frame").stack.push(result);
-            }
-            Op::Plus => {
-                let value = Self::pop(frame);
-                let number = self.coerce_number(value)?;
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Number(number));
-            }
-            Op::ToNumeric => {
-                let value = Self::pop(frame);
-                let numeric = self.coerce_numeric(value)?;
-                frames.last_mut().expect("frame").stack.push(numeric);
-            }
-            Op::Not => {
-                let value = Self::pop(frame);
-                frame.stack.push(Value::Bool(!value.truthy()));
-            }
-            Op::BitNot => {
-                let value = Self::pop(frame);
-                let result = match self.coerce_numeric(value)? {
-                    Value::BigInt(value) => Value::BigInt(Rc::new(value.not())),
-                    other => Value::Number(f64::from(!super::operations::to_int32_number(
-                        self.coerce_number(other)?,
-                    ))),
-                };
-                frames.last_mut().expect("frame").stack.push(result);
-            }
-            Op::TypeOf => {
-                let value = Self::pop(frame);
-                let kind = self.type_of(&value);
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::String(type_name(kind)));
-            }
-            Op::ToIndexKey if matches!(frame.stack.last(), Some(Value::Number(number)) if *number >= 0.0 && number.fract() == 0.0 && *number < 4_294_967_295.0) =>
-                {}
-            Op::ToPropertyKey | Op::ToIndexKey => {
-                let value = Self::pop(frame);
-                let key = self.coerce_key(value)?;
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::String(key.into()));
-            }
-            Op::Increment | Op::Decrement => {
-                let value = Self::pop(frame);
-                let delta = if matches!(op, Op::Increment) { 1 } else { -1 };
-                let result = match value {
-                    Value::Number(number) => Value::Number(number + f64::from(delta)),
-                    other => match self.coerce_numeric(other)? {
-                        Value::BigInt(value) => Value::BigInt(Rc::new(
-                            value.add(&super::bigint::BigInt::from_i64(i64::from(delta))),
-                        )),
-                        numeric => Value::Number(self.coerce_number(numeric)? + f64::from(delta)),
-                    },
-                };
-                frames.last_mut().expect("frame").stack.push(result);
-            }
-            Op::TemplateConcat(count) => {
-                let parts = Self::pop_arguments(frame, count as usize);
-                let mut text = String::new();
-                for part in parts {
-                    match part {
-                        Value::String(part) => text.push_str(&part),
-                        Value::Symbol(_) => {
-                            return Err(self.type_error("cannot convert a symbol to a string"));
+                Op::NewSpread => {
+                    let list = Self::pop(frame);
+                    let callee = Self::pop(frame);
+                    let arguments = match list {
+                        Value::Array(array) => {
+                            array.borrow().iter().cloned().map(Value::filled).collect()
                         }
-                        other => text.push_str(&self.coerce_string(other)?),
+                        _ => Vec::new(),
+                    };
+                    return self.construct_in_loop(frames, callee, arguments, None);
+                }
+                Op::SuperCall(count) => {
+                    let arguments = Self::pop_arguments(frame, count as usize);
+                    return self.super_call(frames, arguments);
+                }
+                Op::SuperCallSpread => {
+                    let list = Self::pop(frame);
+                    let arguments = match list {
+                        Value::Array(array) => {
+                            array.borrow().iter().cloned().map(Value::filled).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    return self.super_call(frames, arguments);
+                }
+                Op::Closure(index) => {
+                    let code = frame.code.children[index as usize].clone();
+                    let url = frame
+                        .closure
+                        .as_ref()
+                        .and_then(|closure| closure.url.clone());
+                    let scope = frame.scope.clone();
+                    let home = frame
+                        .closure
+                        .as_ref()
+                        .and_then(|closure| closure.home.borrow().clone());
+                    let function = self.new_closure(code.clone(), scope, url);
+                    // arrows and nested methods keep the home object of where they were made
+                    if code.kind == FunctionKind::Arrow
+                        && let (Some(home), Some(closure)) = (home, Self::closure_of(&function))
+                    {
+                        *closure.home.borrow_mut() = Some(home);
+                    }
+                    frames.last_mut().expect("frame").stack.push(function);
+                }
+                Op::Class {
+                    template,
+                    has_super,
+                } => {
+                    let template = frame.code.classes[template as usize].clone();
+                    let superclass = if has_super {
+                        Some(Self::pop(frame))
+                    } else {
+                        None
+                    };
+                    let url = frame
+                        .closure
+                        .as_ref()
+                        .and_then(|closure| closure.url.clone());
+                    let scope = frame.scope.clone();
+                    let (constructor, prototype) =
+                        self.create_class(&template, superclass, scope, url)?;
+                    let frame = frames.last_mut().expect("frame");
+                    frame.stack.push(constructor);
+                    frame.stack.push(prototype);
+                }
+                Op::DefineMethod {
+                    is_static,
+                    kind,
+                    computed,
+                    name,
+                } => {
+                    let function = Self::pop(frame);
+                    let key = if computed {
+                        Self::pop(frame).property_key()
+                    } else {
+                        frame.code.names[name as usize].to_string()
+                    };
+                    let length = frame.stack.len();
+                    let (Value::Object(constructor), Value::Object(prototype)) = (
+                        frame.stack[length - 2].clone(),
+                        frame.stack[length - 1].clone(),
+                    ) else {
+                        return Err(runtime_error("method target is not a class"));
+                    };
+                    let target = if is_static {
+                        constructor.clone()
+                    } else {
+                        prototype
+                    };
+                    Self::set_home(&function, &target);
+                    self.define_method(&constructor, &target, key, kind, function, is_static)?;
+                }
+                Op::DefineLiteralMethod { computed, name } => {
+                    let function = Self::pop(frame);
+                    let key = if computed {
+                        Self::pop(frame).property_key()
+                    } else {
+                        frame.code.names[name as usize].to_string()
+                    };
+                    let Some(Value::Object(object)) = frame.stack.last().cloned() else {
+                        return Err(runtime_error("method target is not an object"));
+                    };
+                    Self::set_home(&function, &object);
+                    object.borrow_mut().define(key, Property::data(function));
+                }
+                Op::AddField {
+                    is_static,
+                    private,
+                    computed,
+                    name,
+                } => {
+                    let initializer = Self::pop(frame);
+                    let key = if name == u32::MAX {
+                        String::new()
+                    } else if computed {
+                        Self::pop(frame).property_key()
+                    } else {
+                        frame.code.names[name as usize].to_string()
+                    };
+                    let length = frame.stack.len();
+                    let (Value::Object(constructor), Value::Object(prototype)) = (
+                        frame.stack[length - 2].clone(),
+                        frame.stack[length - 1].clone(),
+                    ) else {
+                        return Err(runtime_error("field target is not a class"));
+                    };
+                    let home = if is_static {
+                        constructor.clone()
+                    } else {
+                        prototype
+                    };
+                    Self::set_home(&initializer, &home);
+                    let Some(closure) = Self::closure_of(&Value::Object(constructor)) else {
+                        return Err(runtime_error("field target is not a class"));
+                    };
+                    let kind = if name == u32::MAX {
+                        FieldKind::StaticBlock(initializer)
+                    } else if matches!(initializer, Value::Undefined) {
+                        FieldKind::Field(None)
+                    } else {
+                        FieldKind::Field(Some(initializer))
+                    };
+                    let definition = FieldDefinition { key, private, kind };
+                    let mut class = closure.class.borrow_mut();
+                    let class = class.get_or_insert_with(Default::default);
+                    if is_static {
+                        class.statics.push(definition);
+                    } else {
+                        class.fields.push(definition);
                     }
                 }
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::String(text.into()));
-            }
-            Op::Jump(target) => frame.pc = target as usize,
-            Op::JumpIfFalse(target) => {
-                if !Self::pop(frame).truthy() {
-                    frame.pc = target as usize;
-                }
-            }
-            Op::JumpIfTrue(target) => {
-                if Self::pop(frame).truthy() {
-                    frame.pc = target as usize;
-                }
-            }
-            Op::JumpIfFalseKeep(target) => {
-                if !frame.stack.last().is_some_and(Value::truthy) {
-                    frame.pc = target as usize;
-                }
-            }
-            Op::JumpIfTrueKeep(target) => {
-                if frame.stack.last().is_some_and(Value::truthy) {
-                    frame.pc = target as usize;
-                }
-            }
-            Op::JumpIfNotNullishKeep(target) => {
-                if !matches!(
-                    frame.stack.last(),
-                    Some(Value::Undefined | Value::Null) | None
-                ) {
-                    frame.pc = target as usize;
-                }
-            }
-            Op::JumpIfNotUndefined(target) => {
-                if !matches!(frame.stack.last(), Some(Value::Undefined) | None) {
-                    frame.pc = target as usize;
-                }
-            }
-            Op::ChainStart => frame.chains.push(frame.stack.len()),
-            Op::JumpIfNullishChain(target) => {
-                if matches!(
-                    frame.stack.last(),
-                    Some(Value::Undefined | Value::Null) | None
-                ) {
-                    let mark = frame.chains.pop().unwrap_or(frame.stack.len());
-                    frame.stack.truncate(mark);
-                    frame.stack.push(Value::Undefined);
-                    frame.pc = target as usize;
-                }
-            }
-            Op::ChainEnd => {
-                frame.chains.pop();
-            }
-            Op::GetIterator(callsite) => {
-                let value = Self::pop(frame);
-                self.iterable_callsite = callsite
-                    .map(|index| Callsite::Source(frame.code.names[index as usize].clone()));
-                let iterator = self.get_iterator(value);
-                self.iterable_callsite = None;
-                frames.last_mut().expect("frame").stack.push(iterator?);
-            }
-            Op::Disposal(step) => {
-                let value = match step {
-                    super::ast::Disposal::Scope { asynchronous } => self.using_scope(asynchronous),
-                    super::ast::Disposal::Use { asynchronous } => {
-                        let value = Self::pop(frame);
-                        let scope = Self::pop(frame);
-                        self.using_add(&scope, value, asynchronous)?
+                Op::RunStaticInit => {
+                    let constructor = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    if let Some(closure) = Self::closure_of(&constructor) {
+                        let statics = closure
+                            .class
+                            .borrow_mut()
+                            .as_mut()
+                            .map(|class| std::mem::take(&mut class.statics))
+                            .unwrap_or_default();
+                        for field in statics {
+                            self.install_field(&field, &constructor)?;
+                        }
                     }
-                    super::ast::Disposal::End { error } => {
-                        let thrown = error.then(|| Self::pop(frame));
-                        let scope = Self::pop(frame);
-                        self.using_end(&scope, thrown)?
-                    }
-                };
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::ArgumentsIterator => {
-                let Value::Array(array) = Self::pop(frame) else {
-                    unreachable!("arguments arrive as an array")
-                };
-                frame.stack.push(Value::VmIterator(Rc::new(RefCell::new(
-                    VmIterator::Array { array, index: 0 },
-                ))));
-            }
-            Op::GetAsyncIterator => {
-                let value = Self::pop(frame);
-                let iterator = self.get_async_iterator(value)?;
-                frames.last_mut().expect("frame").stack.push(iterator);
-            }
-            Op::IterValue => {
-                let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let value = self.iterator_step(&iterator)?.unwrap_or(Value::Undefined);
-                frames.last_mut().expect("frame").stack.push(value);
-            }
-            Op::IterRest => {
-                let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let mut rest = Vec::new();
-                while let Some(value) = self.iterator_step(&iterator)? {
-                    rest.push(value);
                 }
-                frames
-                    .last_mut()
-                    .expect("frame")
-                    .stack
-                    .push(Value::Array(Rc::new(RefCell::new(rest.into()))));
-            }
-            Op::IterClose => {
-                let iterator = Self::pop(frame);
-                self.iterator_close(&iterator)?;
-            }
-            Op::IterStep(target) => {
-                let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                match self.iterator_step(&iterator)? {
-                    Some(value) => frames.last_mut().expect("frame").stack.push(value),
-                    None => frames.last_mut().expect("frame").pc = target as usize,
-                }
-            }
-            Op::AsyncIterNext => {
-                let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let promise = self.async_iterator_next(&iterator)?;
-                frames.last_mut().expect("frame").stack.push(promise);
-            }
-            Op::IterResultUnpack(target) => {
-                let result = Self::pop(frame);
-                if !matches!(result, Value::Object(_)) {
-                    return Err(self.type_error("iterator result is not an object"));
-                }
-                let done = self.get_property(&result, "done")?.truthy();
-                if done {
-                    frames.last_mut().expect("frame").pc = target as usize;
-                } else {
-                    let value = self.get_property(&result, "value")?;
+                Op::Binary(operator) => {
+                    let right = Self::pop(frame);
+                    let left = Self::pop(frame);
+                    let value = self.binary(operator, left, right)?;
                     frames.last_mut().expect("frame").stack.push(value);
                 }
-            }
-            Op::ForInPrepare => {
-                let value = Self::pop(frame);
-                let keys = self.for_in_keys(&value)?;
-                let iterator = Value::VmIterator(Rc::new(RefCell::new(VmIterator::Keys {
-                    keys,
-                    index: 0,
-                    object: value,
-                })));
-                frames.last_mut().expect("frame").stack.push(iterator);
-            }
-            Op::ForInNext(target) => {
-                let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                match self.for_in_step(&iterator)? {
-                    Some(key) => frames
+                Op::Negate => {
+                    let value = Self::pop(frame);
+                    let result = self.negate_numeric(value)?;
+                    frames.last_mut().expect("frame").stack.push(result);
+                }
+                Op::Plus => {
+                    let value = Self::pop(frame);
+                    let number = self.coerce_number(value)?;
+                    frames
                         .last_mut()
                         .expect("frame")
                         .stack
-                        .push(Value::String(key.into())),
-                    None => frames.last_mut().expect("frame").pc = target as usize,
+                        .push(Value::Number(number));
                 }
-            }
-            Op::Throw => {
-                let value = Self::pop(frame);
-                return Err(self.throw_value(value));
-            }
-            Op::ThrowConstAssign(name) => {
-                let name = frame.code.names[name as usize].clone();
-                return Err(self.type_error(format!("Assignment to constant variable '{name}'")));
-            }
-            Op::PushHandler { catch, finally } => {
-                let handler = Handler {
-                    catch,
-                    finally,
-                    stack: frame.stack.len(),
-                    scopes: frame.scopes,
-                    chains: frame.chains.len(),
-                };
-                frame.handlers.push(handler);
-            }
-            Op::PopHandler => {
-                frame.handlers.pop();
-            }
-            Op::CompletionNormal => frame.pending.push(Pending::Normal),
-            Op::EndFinally => match frame.pending.pop().unwrap_or(Pending::Normal) {
-                Pending::Normal => {}
-                Pending::Throw(value) => {
+                Op::ToNumeric => {
+                    let value = Self::pop(frame);
+                    let numeric = self.coerce_numeric(value)?;
+                    frames.last_mut().expect("frame").stack.push(numeric);
+                }
+                Op::Not => {
+                    let value = Self::pop(frame);
+                    frame.stack.push(Value::Bool(!value.truthy()));
+                }
+                Op::BitNot => {
+                    let value = Self::pop(frame);
+                    let result = match self.coerce_numeric(value)? {
+                        Value::BigInt(value) => Value::BigInt(Rc::new(value.not())),
+                        other => Value::Number(f64::from(!super::operations::to_int32_number(
+                            self.coerce_number(other)?,
+                        ))),
+                    };
+                    frames.last_mut().expect("frame").stack.push(result);
+                }
+                Op::TypeOf => {
+                    let value = Self::pop(frame);
+                    let kind = self.type_of(&value);
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::String(type_name(kind)));
+                }
+                Op::ToIndexKey if matches!(frame.stack.last(), Some(Value::Number(number)) if *number >= 0.0 && number.fract() == 0.0 && *number < 4_294_967_295.0) =>
+                    {}
+                Op::ToPropertyKey | Op::ToIndexKey => {
+                    let value = Self::pop(frame);
+                    let key = self.coerce_key(value)?;
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::String(key.into()));
+                }
+                Op::Increment | Op::Decrement => {
+                    let value = Self::pop(frame);
+                    let delta = if matches!(op, Op::Increment) { 1 } else { -1 };
+                    let result = match value {
+                        Value::Number(number) => Value::Number(number + f64::from(delta)),
+                        other => match self.coerce_numeric(other)? {
+                            Value::BigInt(value) => Value::BigInt(Rc::new(
+                                value.add(&super::bigint::BigInt::from_i64(i64::from(delta))),
+                            )),
+                            numeric => {
+                                Value::Number(self.coerce_number(numeric)? + f64::from(delta))
+                            }
+                        },
+                    };
+                    frames.last_mut().expect("frame").stack.push(result);
+                }
+                Op::TemplateConcat(count) => {
+                    let parts = Self::pop_arguments(frame, count as usize);
+                    let mut text = String::new();
+                    for part in parts {
+                        match part {
+                            Value::String(part) => text.push_str(&part),
+                            Value::Symbol(_) => {
+                                return Err(self.type_error("cannot convert a symbol to a string"));
+                            }
+                            other => text.push_str(&self.coerce_string(other)?),
+                        }
+                    }
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::String(text.into()));
+                }
+                Op::Jump(target) => frame.pc = target as usize,
+                Op::JumpIfFalse(target) => {
+                    if !Self::pop(frame).truthy() {
+                        frame.pc = target as usize;
+                    }
+                }
+                Op::JumpIfTrue(target) => {
+                    if Self::pop(frame).truthy() {
+                        frame.pc = target as usize;
+                    }
+                }
+                Op::JumpIfFalseKeep(target) => {
+                    if !frame.stack.last().is_some_and(Value::truthy) {
+                        frame.pc = target as usize;
+                    }
+                }
+                Op::JumpIfTrueKeep(target) => {
+                    if frame.stack.last().is_some_and(Value::truthy) {
+                        frame.pc = target as usize;
+                    }
+                }
+                Op::JumpIfNotNullishKeep(target) => {
+                    if !matches!(
+                        frame.stack.last(),
+                        Some(Value::Undefined | Value::Null) | None
+                    ) {
+                        frame.pc = target as usize;
+                    }
+                }
+                Op::JumpIfNotUndefined(target) => {
+                    if !matches!(frame.stack.last(), Some(Value::Undefined) | None) {
+                        frame.pc = target as usize;
+                    }
+                }
+                Op::ChainStart => frame.chains.push(frame.stack.len()),
+                Op::JumpIfNullishChain(target) => {
+                    if matches!(
+                        frame.stack.last(),
+                        Some(Value::Undefined | Value::Null) | None
+                    ) {
+                        let mark = frame.chains.pop().unwrap_or(frame.stack.len());
+                        frame.stack.truncate(mark);
+                        frame.stack.push(Value::Undefined);
+                        frame.pc = target as usize;
+                    }
+                }
+                Op::ChainEnd => {
+                    frame.chains.pop();
+                }
+                Op::GetIterator(callsite) => {
+                    let value = Self::pop(frame);
+                    self.iterable_callsite = callsite
+                        .map(|index| Callsite::Source(frame.code.names[index as usize].clone()));
+                    let iterator = self.get_iterator(value);
+                    self.iterable_callsite = None;
+                    frames.last_mut().expect("frame").stack.push(iterator?);
+                }
+                Op::Disposal(step) => {
+                    let value = match step {
+                        super::ast::Disposal::Scope { asynchronous } => {
+                            self.using_scope(asynchronous)
+                        }
+                        super::ast::Disposal::Use { asynchronous } => {
+                            let value = Self::pop(frame);
+                            let scope = Self::pop(frame);
+                            self.using_add(&scope, value, asynchronous)?
+                        }
+                        super::ast::Disposal::End { error } => {
+                            let thrown = error.then(|| Self::pop(frame));
+                            let scope = Self::pop(frame);
+                            self.using_end(&scope, thrown)?
+                        }
+                    };
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::ArgumentsIterator => {
+                    let Value::Array(array) = Self::pop(frame) else {
+                        unreachable!("arguments arrive as an array")
+                    };
+                    frame.stack.push(Value::VmIterator(Rc::new(RefCell::new(
+                        VmIterator::Array { array, index: 0 },
+                    ))));
+                }
+                Op::GetAsyncIterator => {
+                    let value = Self::pop(frame);
+                    let iterator = self.get_async_iterator(value)?;
+                    frames.last_mut().expect("frame").stack.push(iterator);
+                }
+                Op::IterValue => {
+                    let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    let value = self.iterator_step(&iterator)?.unwrap_or(Value::Undefined);
+                    frames.last_mut().expect("frame").stack.push(value);
+                }
+                Op::IterRest => {
+                    let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    let mut rest = Vec::new();
+                    while let Some(value) = self.iterator_step(&iterator)? {
+                        rest.push(value);
+                    }
+                    frames
+                        .last_mut()
+                        .expect("frame")
+                        .stack
+                        .push(Value::Array(Rc::new(RefCell::new(rest.into()))));
+                }
+                Op::IterClose => {
+                    let iterator = Self::pop(frame);
+                    self.iterator_close(&iterator)?;
+                }
+                Op::IterStep(target) => {
+                    let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    match self.iterator_step(&iterator)? {
+                        Some(value) => frames.last_mut().expect("frame").stack.push(value),
+                        None => frames.last_mut().expect("frame").pc = target as usize,
+                    }
+                }
+                Op::AsyncIterNext => {
+                    let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    let promise = self.async_iterator_next(&iterator)?;
+                    frames.last_mut().expect("frame").stack.push(promise);
+                }
+                Op::IterResultUnpack(target) => {
+                    let result = Self::pop(frame);
+                    if !matches!(result, Value::Object(_)) {
+                        return Err(self.type_error("iterator result is not an object"));
+                    }
+                    let done = self.get_property(&result, "done")?.truthy();
+                    if done {
+                        frames.last_mut().expect("frame").pc = target as usize;
+                    } else {
+                        let value = self.get_property(&result, "value")?;
+                        frames.last_mut().expect("frame").stack.push(value);
+                    }
+                }
+                Op::ForInPrepare => {
+                    let value = Self::pop(frame);
+                    let keys = self.for_in_keys(&value)?;
+                    let iterator = Value::VmIterator(Rc::new(RefCell::new(VmIterator::Keys {
+                        keys,
+                        index: 0,
+                        object: value,
+                    })));
+                    frames.last_mut().expect("frame").stack.push(iterator);
+                }
+                Op::ForInNext(target) => {
+                    let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    match self.for_in_step(&iterator)? {
+                        Some(key) => frames
+                            .last_mut()
+                            .expect("frame")
+                            .stack
+                            .push(Value::String(key.into())),
+                        None => frames.last_mut().expect("frame").pc = target as usize,
+                    }
+                }
+                Op::Throw => {
+                    let value = Self::pop(frame);
                     return Err(self.throw_value(value));
                 }
-                Pending::Return(value) => return self.do_return(frames, value),
-                Pending::Jump {
+                Op::ThrowConstAssign(name) => {
+                    let name = frame.code.names[name as usize].clone();
+                    return Err(
+                        self.type_error(format!("Assignment to constant variable '{name}'"))
+                    );
+                }
+                Op::PushHandler { catch, finally } => {
+                    let handler = Handler {
+                        catch,
+                        finally,
+                        stack: frame.stack.len(),
+                        scopes: frame.scopes,
+                        chains: frame.chains.len(),
+                    };
+                    frame.handlers.push(handler);
+                }
+                Op::PopHandler => {
+                    frame.handlers.pop();
+                }
+                Op::CompletionNormal => frame.pending.push(Pending::Normal),
+                Op::EndFinally => match frame.pending.pop().unwrap_or(Pending::Normal) {
+                    Pending::Normal => {}
+                    Pending::Throw(value) => {
+                        return Err(self.throw_value(value));
+                    }
+                    Pending::Return(value) => return self.do_return(frames, value),
+                    Pending::Jump {
+                        target,
+                        handlers,
+                        scopes,
+                    } => Self::do_exit(frame, target, handlers, scopes),
+                },
+                Op::Exit {
                     target,
                     handlers,
                     scopes,
                 } => Self::do_exit(frame, target, handlers, scopes),
-            },
-            Op::Exit {
-                target,
-                handlers,
-                scopes,
-            } => Self::do_exit(frame, target, handlers, scopes),
-            Op::Return => {
-                let value = Self::pop(frame);
-                return self.do_return(frames, value);
-            }
-            Op::Yield | Op::YieldDelegating => {
-                if let Some((mode, value)) = frame.resume.take() {
-                    // resuming: the sent value lands where the yield was
-                    match (mode, matches!(op, Op::YieldDelegating)) {
-                        (ResumeMode::Next, _) => frame.stack.push(value),
-                        (mode, true) => {
-                            frame.delegate_mode = mode;
-                            frame.stack.push(value);
+                Op::Return => {
+                    let value = Self::pop(frame);
+                    return self.do_return(frames, value);
+                }
+                Op::Yield | Op::YieldDelegating => {
+                    if let Some((mode, value)) = frame.resume.take() {
+                        // resuming: the sent value lands where the yield was
+                        match (mode, matches!(op, Op::YieldDelegating)) {
+                            (ResumeMode::Next, _) => frame.stack.push(value),
+                            (mode, true) => {
+                                frame.delegate_mode = mode;
+                                frame.stack.push(value);
+                            }
+                            (ResumeMode::Throw, false) => {
+                                return Err(self.throw_value(value));
+                            }
+                            (ResumeMode::Return, false) => return self.do_return(frames, value),
                         }
-                        (ResumeMode::Throw, false) => {
-                            return Err(self.throw_value(value));
-                        }
-                        (ResumeMode::Return, false) => return self.do_return(frames, value),
+                        return Ok(None);
                     }
-                    return Ok(None);
-                }
-                let value = Self::pop(frame);
-                // the yield runs again on resume to receive the sent value
-                frame.pc -= 1;
-                if frames.len() != 1 {
-                    return Err(runtime_error("yield outside a resumable frame"));
-                }
-                let frame = frames.pop().expect("generator frame");
-                return Ok(Some(RunResult::Yield(value, Box::new(frame))));
-            }
-            Op::DelegateCall => {
-                let sent = Self::pop(frame);
-                let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let mode = std::mem::replace(&mut frame.delegate_mode, ResumeMode::Next);
-                frame.delegate_last = mode;
-                let promise = self.delegate_call(&iterator, mode, sent)?;
-                frames.last_mut().expect("frame").stack.push(promise);
-            }
-            Op::DelegateUnpack(target) => {
-                let result = Self::pop(frame);
-                if super::operations::is_primitive(&result) {
-                    return Err(self.type_error("iterator result is not an object"));
-                }
-                let done = self.get_property(&result, "done")?.truthy();
-                let value = self.get_property(&result, "value")?;
-                let frame = frames.last_mut().expect("frame");
-                if done {
-                    frame.stack.pop();
-                    if frame.delegate_last == ResumeMode::Return {
-                        return self.do_return(frames, value);
+                    let value = Self::pop(frame);
+                    // the yield runs again on resume to receive the sent value
+                    frame.pc -= 1;
+                    if frames.len() != 1 {
+                        return Err(runtime_error("yield outside a resumable frame"));
                     }
-                    frame.stack.push(value);
-                    frame.pc = target as usize;
-                } else {
-                    frame.stack.push(value);
+                    let frame = frames.pop().expect("generator frame");
+                    return Ok(Some(RunResult::Yield(value, Box::new(frame))));
                 }
-            }
-            Op::DelegateStep(target) => {
-                let sent = Self::pop(frame);
-                let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let mode = std::mem::replace(&mut frame.delegate_mode, ResumeMode::Next);
-                let result = self.delegate_resume(&iterator, mode, sent)?;
-                let frame = frames.last_mut().expect("frame");
-                match result {
-                    DelegateResult::Yielded(value) => frame.stack.push(value),
-                    DelegateResult::Done(value) => {
+                Op::DelegateCall => {
+                    let sent = Self::pop(frame);
+                    let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    let mode = std::mem::replace(&mut frame.delegate_mode, ResumeMode::Next);
+                    frame.delegate_last = mode;
+                    let promise = self.delegate_call(&iterator, mode, sent)?;
+                    frames.last_mut().expect("frame").stack.push(promise);
+                }
+                Op::DelegateUnpack(target) => {
+                    let result = Self::pop(frame);
+                    if super::operations::is_primitive(&result) {
+                        return Err(self.type_error("iterator result is not an object"));
+                    }
+                    let done = self.get_property(&result, "done")?.truthy();
+                    let value = self.get_property(&result, "value")?;
+                    let frame = frames.last_mut().expect("frame");
+                    if done {
                         frame.stack.pop();
+                        if frame.delegate_last == ResumeMode::Return {
+                            return self.do_return(frames, value);
+                        }
                         frame.stack.push(value);
                         frame.pc = target as usize;
-                    }
-                    DelegateResult::Returned(value) => {
-                        frame.stack.pop();
-                        return self.do_return(frames, value);
+                    } else {
+                        frame.stack.push(value);
                     }
                 }
-            }
-            Op::Await => {
-                if let Some((mode, value)) = frame.resume.take() {
-                    match mode {
-                        ResumeMode::Next => frame.stack.push(value),
-                        _ => {
-                            return Err(self.throw_value(value));
+                Op::DelegateStep(target) => {
+                    let sent = Self::pop(frame);
+                    let iterator = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                    let mode = std::mem::replace(&mut frame.delegate_mode, ResumeMode::Next);
+                    let result = self.delegate_resume(&iterator, mode, sent)?;
+                    let frame = frames.last_mut().expect("frame");
+                    match result {
+                        DelegateResult::Yielded(value) => frame.stack.push(value),
+                        DelegateResult::Done(value) => {
+                            frame.stack.pop();
+                            frame.stack.push(value);
+                            frame.pc = target as usize;
+                        }
+                        DelegateResult::Returned(value) => {
+                            frame.stack.pop();
+                            return self.do_return(frames, value);
                         }
                     }
-                    return Ok(None);
                 }
-                let value = Self::pop(frame);
-                frame.pc -= 1;
-                if frames.len() != 1 {
-                    return Err(runtime_error("await outside a resumable frame"));
+                Op::Await => {
+                    if let Some((mode, value)) = frame.resume.take() {
+                        match mode {
+                            ResumeMode::Next => frame.stack.push(value),
+                            _ => {
+                                return Err(self.throw_value(value));
+                            }
+                        }
+                        return Ok(None);
+                    }
+                    let value = Self::pop(frame);
+                    frame.pc -= 1;
+                    if frames.len() != 1 {
+                        return Err(runtime_error("await outside a resumable frame"));
+                    }
+                    let frame = frames.pop().expect("async frame");
+                    return Ok(Some(RunResult::Await(value, Box::new(frame))));
                 }
-                let frame = frames.pop().expect("async frame");
-                return Ok(Some(RunResult::Await(value, Box::new(frame))));
+                Op::DynamicImport => {
+                    let options = Self::pop(frame);
+                    let specifier = Self::pop(frame);
+                    let url = frame
+                        .closure
+                        .as_ref()
+                        .and_then(|closure| closure.url.as_deref().cloned())
+                        .or_else(|| self.base_url.clone());
+                    let promise = self.dynamic_import_promise(url, specifier, options);
+                    frames.last_mut().expect("frame").stack.push(promise);
+                }
             }
-            Op::DynamicImport => {
-                let options = Self::pop(frame);
-                let specifier = Self::pop(frame);
-                let url = frame
-                    .closure
-                    .as_ref()
-                    .and_then(|closure| closure.url.as_deref().cloned())
-                    .or_else(|| self.base_url.clone());
-                let promise = self.dynamic_import_promise(url, specifier, options);
-                frames.last_mut().expect("frame").stack.push(promise);
+            budget -= 1;
+            if budget == 0
+                || frames.len() != depth
+                || self.debugger.active
+                || self.step_limit.is_some()
+                || self.interrupted
+            {
+                return Ok(None);
+            }
+            // what the run loop does before each op: note the top frame's place, for an error to
+            // name, and take a profile sample on its turn
+            let top = frames.last().expect("a frame is running");
+            match self.debugger.calls.last_mut() {
+                Some(call) if Rc::ptr_eq(&call.0, &top.code) => call.1 = top.pc,
+                _ => return Ok(None),
+            }
+            self.steps += 1;
+            if self.steps.is_multiple_of(1024) && crate::profile::enabled() {
+                self.sample_script(frames);
             }
         }
-        Ok(None)
     }
 
     fn set_home(function: &Value, home: &ObjectHandle) {
