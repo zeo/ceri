@@ -10331,7 +10331,7 @@ A</div>
                 .text
                 .iter()
                 .any(|run| run.text.ends_with('\u{2026}'));
-            stack.extend(layout_box.children.iter());
+            stack.extend(layout_box.children.iter().map(|child| &**child));
         }
         assert!(ellipsis, "the clipped nowrap row ends in an ellipsis");
         assert!(
@@ -10790,7 +10790,7 @@ A</div>
         if layout.tag == "::marker" {
             return Some(layout);
         }
-        layout.children.iter().find_map(find_marker)
+        layout.children.iter().find_map(|child| find_marker(child))
     }
 
     #[test]

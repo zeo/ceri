@@ -149,7 +149,7 @@ pub struct LayoutBox {
     pub(crate) control_selection: Option<(usize, usize, bool)>,
     pub(crate) control_focused: bool,
     pub(crate) control_text_origin: Option<(f32, f32)>,
-    pub children: Vec<LayoutBox>,
+    pub children: Vec<Rc<LayoutBox>>,
     pub(crate) position: Position,
     pub(crate) visual_offset: (f32, f32),
     pub(crate) z_index: i32,
@@ -1089,7 +1089,7 @@ fn layout_document_children(
     stylesheet: &Stylesheet,
     viewport: Size,
     style_state: &StyleState,
-) -> Vec<LayoutBox> {
+) -> Vec<Rc<LayoutBox>> {
     let viewport_block = viewport_block(viewport);
     let mut children = Vec::new();
     let mut cursor_y = 0.0_f32;
@@ -1188,6 +1188,7 @@ fn layout_document_children(
         stylesheet,
         style_state,
     };
+    let mut children = children.into_iter().map(Rc::new).collect();
     append_positioned_nodes(&mut children, positioned, positioned_context);
     // the top layer paints over everything, each element over its backdrop, inheriting from
     // where it sits in the tree but not its ancestors' opacity
@@ -1221,7 +1222,7 @@ fn layout_document_children(
             };
             append_positioned_nodes(&mut layer, vec![subject], context);
         }
-        for layout in &mut layer {
+        for layout in layer.iter_mut().map(Rc::make_mut) {
             layout.z_index = i32::MAX;
             layout.top_layer = true;
             layout.creates_stacking_context = true;
@@ -1240,7 +1241,7 @@ impl LayoutDocument {
             if layout_box.tag == "body" {
                 return layout_box;
             }
-            stack.extend(layout_box.children.iter().rev());
+            stack.extend(layout_box.children.iter().rev().map(|child| &**child));
         }
         &self.root
     }
@@ -1495,7 +1496,7 @@ impl LayoutDocument {
             {
                 return Some(scene.clone());
             }
-            pending.extend(layout.children.iter());
+            pending.extend(layout.children.iter().map(|child| &**child));
         }
         None
     }
@@ -2113,7 +2114,7 @@ fn position_layout_box(
 }
 
 fn append_positioned_nodes(
-    children: &mut Vec<LayoutBox>,
+    children: &mut Vec<Rc<LayoutBox>>,
     nodes: Vec<Subject<'_>>,
     context: PositionedLayoutContext<'_>,
 ) {
@@ -2159,7 +2160,7 @@ fn append_positioned_nodes(
                 style_state,
             },
         }) {
-            children.push(layout);
+            children.push(Rc::new(layout));
         }
     }
 }
@@ -2523,7 +2524,7 @@ impl LayoutBox {
     }
 }
 
-pub(crate) fn paint_order(children: &[LayoutBox]) -> Vec<usize> {
+pub(crate) fn paint_order(children: &[Rc<LayoutBox>]) -> Vec<usize> {
     let mut order = (0..children.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| (children[*index].z_index, children[*index].floated, *index));
     order
@@ -4032,7 +4033,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         control_focused: node.own().is_some() && style_state.focused == node.own(),
         control_text_origin,
         control_value,
-        children,
+        children: children.into_iter().map(Rc::new).collect(),
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
@@ -4353,7 +4354,7 @@ fn slider_parts(
         track,
         (font_size, cursor),
     );
-    track.children.push(thumb);
+    track.children.push(Rc::new(thumb));
     (track, start, (travel, thumb_width))
 }
 
@@ -4546,7 +4547,7 @@ fn baselines(layout: &LayoutBox) -> Box<dyn Iterator<Item = f32> + '_> {
         .children
         .iter()
         .filter(|child| !child.position.is_out_of_flow())
-        .flat_map(baselines);
+        .flat_map(|child| baselines(child));
     Box::new(own.chain(nested))
 }
 
@@ -5291,7 +5292,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         control_selection: None,
         control_focused: false,
         control_text_origin: None,
-        children,
+        children: children.into_iter().map(Rc::new).collect(),
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
@@ -5844,7 +5845,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         control_selection: None,
         control_focused: false,
         control_text_origin: None,
-        children,
+        children: children.into_iter().map(Rc::new).collect(),
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
@@ -6548,7 +6549,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 VerticalAlign::Bottom => free,
                 _ => 0.0,
             };
-            for child in &mut laid_out.children {
+            for child in laid_out.children.iter_mut().map(Rc::make_mut) {
                 translate_layout_box(child, 0.0, shift);
             }
             for run in &mut laid_out.text {
@@ -6594,7 +6595,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             Some((row_node, row_style)) => {
                 let mut row_box =
                     section_box(row_node, &row_style, row_y[index], row_heights[index]);
-                row_box.children = cells_here;
+                row_box.children = cells_here.into_iter().map(Rc::new).collect();
                 row_boxes.push((row.group, row_box));
             }
             None => {
@@ -6632,7 +6633,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     .map(|row| row.rect.bottom())
                     .fold(f32::NEG_INFINITY, f32::max);
                 let mut group_box = section_box(group_node, &group_style, top, bottom - top);
-                group_box.children = contents;
+                group_box.children = contents.into_iter().map(Rc::new).collect();
                 children.push(group_box);
             }
             None => children.extend(contents),
@@ -6697,7 +6698,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         control_selection: None,
         control_focused: false,
         control_text_origin: None,
-        children,
+        children: children.into_iter().map(Rc::new).collect(),
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
@@ -8168,7 +8169,7 @@ fn apply_transform(layout: &mut LayoutBox, style: &Style, font_size: f32) {
             .resolve(height, font_size)
             .unwrap_or(height / 2.0);
         let (corner_x, corner_y) = (layout.rect.x, layout.rect.y);
-        for child in &mut layout.children {
+        for child in layout.children.iter_mut().map(Rc::make_mut) {
             let Some(transform) = child.transform.as_deref().copied() else {
                 continue;
             };
@@ -8262,7 +8263,7 @@ fn finalize_scroll(layout: &mut LayoutBox, padding: ResolvedEdges, style_state: 
         );
         return;
     }
-    for child in &mut layout.children {
+    for child in layout.children.iter_mut().map(Rc::make_mut) {
         translate_scroll_box(child, -offset.0, -offset.1);
     }
     apply_sticky_descendants(
@@ -8280,7 +8281,7 @@ pub(crate) fn rescroll(
     offsets: &std::collections::BTreeMap<NodeId, (f32, f32)>,
 ) -> Option<LayoutDocument> {
     fn has_sticky(layout: &LayoutBox) -> bool {
-        layout.position == Position::Sticky || layout.children.iter().any(has_sticky)
+        layout.position == Position::Sticky || layout.children.iter().any(|child| has_sticky(child))
     }
     fn scroll(
         layout: &mut LayoutBox,
@@ -8293,14 +8294,14 @@ pub(crate) fn rescroll(
             let requested = offsets.get(&layout.node).copied().unwrap_or_default();
             let offset = (requested.0.clamp(0.0, max_x), requested.1.clamp(0.0, max_y));
             if offset != layout.scroll_offset {
-                if layout.children.iter().any(has_sticky) {
+                if layout.children.iter().any(|child| has_sticky(child)) {
                     return false;
                 }
                 let shift = (
                     layout.scroll_offset.0 - offset.0,
                     layout.scroll_offset.1 - offset.1,
                 );
-                for child in &mut layout.children {
+                for child in layout.children.iter_mut().map(Rc::make_mut) {
                     translate_scroll_box(child, shift.0, shift.1);
                 }
                 layout.scroll_offset = offset;
@@ -8309,6 +8310,7 @@ pub(crate) fn rescroll(
         layout
             .children
             .iter_mut()
+            .map(Rc::make_mut)
             .all(|child| scroll(child, offsets))
     }
     let mut moved = document.clone();
@@ -8316,12 +8318,18 @@ pub(crate) fn rescroll(
 }
 
 fn apply_sticky_descendants(
-    children: &mut [LayoutBox],
+    children: &mut [Rc<LayoutBox>],
     scrollport: Rect,
     containing_block: Rect,
     ancestor_offset: (f32, f32),
 ) {
-    for child in children {
+    // a subtree with no sticky box moves nothing, and is left shared as it is
+    fn holds_sticky(layout: &LayoutBox) -> bool {
+        layout.position == Position::Sticky
+            || layout.children.iter().any(|child| holds_sticky(child))
+    }
+    for child in children.iter_mut().filter(|child| holds_sticky(child)) {
+        let child = Rc::make_mut(child);
         let child_rect = visual_rect_for(child, ancestor_offset);
         if let Some(inset) = child.sticky_inset.as_deref()
             && child.position == Position::Sticky
@@ -8406,7 +8414,7 @@ fn translate_scroll_box(layout: &mut LayoutBox, offset_x: f32, offset_y: f32) {
         origin.0 += offset_x;
         origin.1 += offset_y;
     }
-    for child in &mut layout.children {
+    for child in layout.children.iter_mut().map(Rc::make_mut) {
         translate_scroll_box(child, offset_x, offset_y);
     }
 }
@@ -8422,7 +8430,7 @@ fn translate_layout_box(layout: &mut LayoutBox, offset_x: f32, offset_y: f32) {
         origin.0 += offset_x;
         origin.1 += offset_y;
     }
-    for child in &mut layout.children {
+    for child in layout.children.iter_mut().map(Rc::make_mut) {
         translate_layout_box(child, offset_x, offset_y);
     }
 }
@@ -9920,6 +9928,7 @@ fn patch_motion(
     layout
         .children
         .iter_mut()
+        .map(Rc::make_mut)
         .all(|child| patch_motion(child, document, moved))
 }
 
@@ -10856,7 +10865,10 @@ mod tests {
             if layout.tag == "::before" && !layout.inline {
                 return Some(layout);
             }
-            layout.children.iter().find_map(positioned_before)
+            layout
+                .children
+                .iter()
+                .find_map(|child| positioned_before(child))
         }
         let generated = positioned_before(&layout.root).expect("a generated box should exist");
         assert_eq!(

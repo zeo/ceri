@@ -2979,7 +2979,8 @@ fn has_node(layout_box: &LayoutBox, nodes: &[crate::dom::NodeId]) -> bool {
 }
 
 fn has_backdrop(layout_box: &LayoutBox) -> bool {
-    !layout_box.filters.backdrop.is_empty() || layout_box.children.iter().any(has_backdrop)
+    !layout_box.filters.backdrop.is_empty()
+        || layout_box.children.iter().any(|child| has_backdrop(child))
 }
 
 // everything a box and its subtree can paint, none under a transform; glyphs, outlines and
@@ -3194,7 +3195,7 @@ pub(crate) fn scroll_repaint(
         old.children
             .iter()
             .zip(&new.children)
-            .all(|pair| settle(pair, inner, (clip, delta), repairs))
+            .all(|(old, new)| settle((old, new), inner, (clip, delta), repairs))
     }
     if !canvas.planes().is_empty() || has_backdrop(&after.root) {
         return None;
@@ -3316,7 +3317,7 @@ pub(crate) fn scroll_repaint(
         for child in parent
             .children
             .iter()
-            .filter(|child| !std::ptr::eq(*child, next))
+            .filter(|child| !std::ptr::eq(&***child, next))
         {
             stationary.push(ink(child, offset)?);
         }
@@ -3329,7 +3330,7 @@ pub(crate) fn scroll_repaint(
         .children
         .iter()
         .zip(&scroller.children)
-        .all(|pair| settle(pair, inner, (clip, delta), &mut repairs))
+        .all(|(old, new)| settle((old, new), inner, (clip, delta), &mut repairs))
     {
         return None;
     }
@@ -6481,7 +6482,7 @@ mod tests {
         let mut stack = vec![&layout.root];
         while let Some(layout_box) = stack.pop() {
             scenes.extend(layout_box.svg.clone());
-            stack.extend(&layout_box.children);
+            stack.extend(layout_box.children.iter().map(|child| &**child));
         }
         assert_eq!(scenes.len(), 2);
         let mut rasters = SvgRasters::default();
@@ -6870,7 +6871,7 @@ mod tests {
             if layout_box.position == Position::Fixed {
                 fixed.push(layout_box);
             }
-            stack.extend(layout_box.children.iter().rev());
+            stack.extend(layout_box.children.iter().rev().map(|child| &**child));
         }
         let layered = |scale: f32| {
             let canvas = Canvas::scaled(1.0, 1.0, scale, Color::WHITE);

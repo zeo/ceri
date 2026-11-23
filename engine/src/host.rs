@@ -2321,7 +2321,10 @@ mod tests {
         if layout_box.tag == "button" {
             return Some(layout_box);
         }
-        layout_box.children.iter().find_map(find_button)
+        layout_box
+            .children
+            .iter()
+            .find_map(|child| find_button(child))
     }
 
     #[test]
