@@ -1553,7 +1553,7 @@ fn measure_subtree_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -
     } else {
         layout_box.font_size
     };
-    let mut reach = layout_box.transform.is_none().then(|| outline.max(glyphs));
+    let mut reach = Some(outline.max(glyphs));
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let mut bounds = visual_rect_for(layout_box, ancestor_offset);
     for shadow in layout_box.shadows.iter().filter(|shadow| !shadow.inset) {
@@ -1584,13 +1584,59 @@ fn measure_subtree_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -
         }
     }
     for child in &layout_box.children {
-        let (child_bounds, child_reach) = subtree_extent(child, offset);
+        let (child_bounds, child_reach) = placed_extent(child, offset);
         bounds = union_rect(bounds, child_bounds);
         reach = reach.zip(child_reach).map(|(most, next)| most.max(next));
     }
     (
         outset_rect(bounds, crate::filter::reach(&layout_box.filters.own)),
         reach,
+    )
+}
+
+// a subtree's extent where it lands in its parent's space: a transformed one paints inside
+// where its corners land, as paint maps it about the border box corner, and one that turns
+// away from the viewer is out of reach
+fn placed_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent {
+    let (bounds, reach) = subtree_extent(layout_box, ancestor_offset);
+    let Some(transform) = layout_box.transform.as_deref() else {
+        return (bounds, reach);
+    };
+    let Some(reach) = reach else {
+        return (bounds, None);
+    };
+    let corner = visual_rect_for(layout_box, ancestor_offset);
+    let full = transform.about(corner.x, corner.y);
+    let outer = outset_rect(bounds, reach);
+    let corners = [
+        (outer.x, outer.y),
+        (outer.x + outer.width, outer.y),
+        (outer.x, outer.y + outer.height),
+        (outer.x + outer.width, outer.y + outer.height),
+    ]
+    .map(|(x, y)| full.map_point(x, y));
+    let Some(corners) = corners.into_iter().collect::<Option<Vec<_>>>() else {
+        return (bounds, None);
+    };
+    let (left, top, right, bottom) = corners.iter().fold(
+        (
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ),
+        |(left, top, right, bottom), &(x, y)| {
+            (left.min(x), top.min(y), right.max(x), bottom.max(y))
+        },
+    );
+    (
+        Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        },
+        Some(0.0),
     )
 }
 
@@ -2983,10 +3029,10 @@ fn has_backdrop(layout_box: &LayoutBox) -> bool {
         || layout_box.children.iter().any(|child| has_backdrop(child))
 }
 
-// everything a box and its subtree can paint, none under a transform; glyphs, outlines and
-// focus rings can reach past the boxes and runs subtree_bounds measures
+// everything a box and its subtree can paint where it lands, none when a transform turns it
+// away; glyphs, outlines and focus rings can reach past the boxes and runs subtree_bounds measures
 fn ink(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Option<Rect> {
-    let (bounds, reach) = subtree_extent(layout_box, ancestor_offset);
+    let (bounds, reach) = placed_extent(layout_box, ancestor_offset);
     Some(outset_rect(bounds, reach?))
 }
 
@@ -6322,6 +6368,8 @@ mod tests {
             ),
             ("", "#field { outline-color: #f80 }"),
             ("", "#soft { background: #a48 }"),
+            // a rotated box repaints where its corners land
+            ("", "#turned { background: #533 }"),
             // two changes far apart, which repaint as two rectangles
             ("", "#dot { background: #4dff4d } #fade { opacity: 0.35 }"),
         ];
@@ -6588,6 +6636,48 @@ mod tests {
         );
     }
 
+    // a rotated box reaches where its corners land, so the boxes around it can be culled
+    #[test]
+    fn a_rotated_box_has_ink_where_its_corners_land() {
+        let document = Document::parse_markup(
+            "<html><body><div id='row'><div id='knob'></div></div></body></html>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(concat!(
+            "html, body { margin: 0 } #row { padding: 20px; width: 100px }",
+            "#knob { width: 20px; height: 20px; background: #000; transform: rotate(45deg) }",
+        ))
+        .expect("stylesheet should parse");
+        let layout = crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 100.0,
+            },
+        );
+        let row_node = document.find_element_by_id("row").expect("row");
+        fn find(layout: &LayoutBox, node: crate::dom::NodeId) -> Option<&LayoutBox> {
+            (layout.node == node)
+                .then_some(layout)
+                .or_else(|| layout.children.iter().find_map(|child| find(child, node)))
+        }
+        let row = find(&layout.root, row_node).expect("row box");
+        let knob = &row.children[0];
+        let placed = ink(knob, (0.0, 0.0)).expect("a rotated box has ink");
+        // the diagonal of a 20px square, centered where the square was
+        let diagonal = 20.0 * std::f32::consts::SQRT_2;
+        assert!((placed.width - diagonal).abs() < 0.5, "{placed:?}");
+        assert!(
+            (placed.x - (30.0 - diagonal / 2.0)).abs() < 0.5,
+            "{placed:?}"
+        );
+        assert!(
+            ink(row, (0.0, 0.0)).is_some(),
+            "the box around it has ink too"
+        );
+    }
+
     #[test]
     fn damage_falls_back_to_the_whole_frame_where_it_cannot_bound_a_change() {
         let base = damage_layout("", 0.0);
@@ -6596,7 +6686,6 @@ mod tests {
             Damage::Nothing
         );
         for change in [
-            "#turned { background: #533 }",
             "body { background: #000 }",
             "#words { backdrop-filter: blur(1px) }",
         ] {
