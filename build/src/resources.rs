@@ -7,7 +7,9 @@ const RT_MANIFEST: u16 = 24;
 const EN_US: u16 = 0x0409;
 
 // the manifest tauri-build embeds by default, so dialogs draw with common controls v6, and an
-// as-invoker level so windows never guesses from a name like setup.exe that it needs elevation
+// as-invoker level so windows never guesses from a name like setup.exe that it needs elevation;
+// and the segment heap, which windows 10 2004 and later gives an app that asks, as chromium does,
+// and which hands freed memory back to the system where the default heap keeps it
 const MANIFEST: &str = r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <dependency>
     <dependentAssembly>
@@ -21,6 +23,11 @@ const MANIFEST: &str = r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" man
       </requestedPrivileges>
     </security>
   </trustInfo>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <heapType xmlns="http://schemas.microsoft.com/SMI/2020/WindowsSettings">SegmentHeap</heapType>
+    </windowsSettings>
+  </application>
 </assembly>
 "#;
 
