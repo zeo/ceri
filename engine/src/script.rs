@@ -20142,6 +20142,32 @@ mod tests {
         );
     }
     #[test]
+    fn index_keys_keep_their_meaning_on_arrays_and_objects() {
+        let document = document(r#"<main><p id="status">idle</p></main>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const list = [];
+                list[0] = "a"; list[2] = "c"; list[1.5] = "f"; list[-1] = "n"; list["01"] = "z";
+                list[4294967295] = "big"; list[3] += "!";
+                const keys = Object.keys(list).join(",");
+                const object = {};
+                object[1] = "x"; object[1] += "y"; object["1"] += "z";
+                const named = [1, 2];
+                Object.defineProperty(named, "0", { get: () => "got", set: (value) => { named.seen = value; } });
+                named[0] = "set";
+                const counts = [0]; counts[0]++; counts[0] += 2;
+                document.getElementById("status").textContent = [keys, list.length, list[3], object[1], named[0], named.seen, counts[0], typeof list, typeof 1, typeof undefined].join("|");
+                "#,
+            )
+            .expect("script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some("0,2,3,1.5,-1,01,4294967295|4|undefined!|xyz|got|set|3|object|number|undefined")
+        );
+    }
+    #[test]
     fn atob_and_btoa_carry_bytes_one_to_a_character() {
         let document = document(r#"<main><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());

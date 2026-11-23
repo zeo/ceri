@@ -7,7 +7,7 @@ use super::compiler::{self, BindingKind, Code, GLOBAL, Layout, NO_TARGET, Op, Sc
 use super::object::{
     JsObject, ObjectClass, ObjectHandle, PRIVATE_PREFIX, Property, Slot, new_object,
 };
-use super::operations::Callsite;
+use super::operations::{Callsite, type_name};
 use super::realm::Native;
 use super::*;
 
@@ -1446,7 +1446,7 @@ impl ScriptRuntime {
                     .last_mut()
                     .expect("frame")
                     .stack
-                    .push(Value::String(kind.to_string().into()));
+                    .push(Value::String(type_name(kind)));
             }
             Op::SetName {
                 name,
@@ -1517,7 +1517,7 @@ impl ScriptRuntime {
                     .last_mut()
                     .expect("frame")
                     .stack
-                    .push(Value::String(kind.to_string().into()));
+                    .push(Value::String(type_name(kind)));
             }
             Op::SetGlobal(name) | Op::InitGlobal(name) => {
                 let name = frame.code.names[name as usize].clone();
@@ -2180,9 +2180,11 @@ impl ScriptRuntime {
                     .last_mut()
                     .expect("frame")
                     .stack
-                    .push(Value::String(kind.to_string().into()));
+                    .push(Value::String(type_name(kind)));
             }
-            Op::ToPropertyKey => {
+            Op::ToIndexKey if matches!(frame.stack.last(), Some(Value::Number(number)) if *number >= 0.0 && number.fract() == 0.0 && *number < 4_294_967_295.0) =>
+                {}
+            Op::ToPropertyKey | Op::ToIndexKey => {
                 let value = Self::pop(frame);
                 let key = self.coerce_key(value)?;
                 frames

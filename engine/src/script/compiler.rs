@@ -191,6 +191,8 @@ pub(super) enum Op {
     TypeOf,
     ToNumeric,
     ToPropertyKey,
+    // ToPropertyKey ahead of GetIndex or SetIndex, which take an array index as the number it is
+    ToIndexKey,
     Increment,
     Decrement,
     TemplateConcat(u16),
@@ -2564,7 +2566,7 @@ impl Compiler {
                     Expr::Index { object, index, .. } => {
                         self.compile_expression(object)?;
                         self.compile_expression(index)?;
-                        self.emit(Op::ToPropertyKey);
+                        self.emit(Op::ToIndexKey);
                         self.emit(Op::RotateUp3);
                         self.emit(Op::SetIndex);
                     }
@@ -3748,7 +3750,7 @@ impl Compiler {
             Expr::Index { object, index, .. } => {
                 self.compile_expression(object)?;
                 self.compile_expression(index)?;
-                self.emit(Op::ToPropertyKey);
+                self.emit(Op::ToIndexKey);
                 self.emit(Op::Dup2);
                 self.emit(Op::GetIndex);
                 RefKind::Index
@@ -3838,7 +3840,7 @@ impl Compiler {
                     Expr::Index { object, index, .. } => {
                         self.compile_expression(object)?;
                         self.compile_expression(index)?;
-                        self.emit(Op::ToPropertyKey);
+                        self.emit(Op::ToIndexKey);
                         self.compile_expression(value)?;
                         self.emit(Op::SetIndex);
                     }

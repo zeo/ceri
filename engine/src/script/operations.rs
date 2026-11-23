@@ -198,6 +198,22 @@ fn display_key(key: &str) -> String {
     }
 }
 
+// the string a typeof answers, made once per kind instead of once per typeof
+pub(super) fn type_name(kind: &'static str) -> Rc<str> {
+    thread_local! {
+        static NAMES: RefCell<Vec<(&'static str, Rc<str>)>> = const { RefCell::new(Vec::new()) };
+    }
+    NAMES.with(|names| {
+        let mut names = names.borrow_mut();
+        if let Some((_, name)) = names.iter().find(|(known, _)| *known == kind) {
+            return name.clone();
+        }
+        let name: Rc<str> = kind.into();
+        names.push((kind, name.clone()));
+        name
+    })
+}
+
 pub(super) fn is_missing_property(error: &ScriptError) -> bool {
     error.message.contains(" has no property ")
 }
@@ -1031,10 +1047,18 @@ impl ScriptRuntime {
         {
             return Ok(element);
         }
-        if let Value::Array(array) = value
-            && let Some(found) = self.array_property_get(array, key, value)?
-        {
-            return Ok(found);
+        if let Value::Array(array) = value {
+            if let Some(found) = self.array_property_get(array, key, value)? {
+                return Ok(found);
+            }
+            // an array answers only its length and indices itself, so a method name goes
+            // straight to the prototype chain instead of through a missing-property error
+            if key != "length" && key.parse::<usize>().is_err() {
+                return match self.prototype_of(value) {
+                    Some(prototype) => self.ordinary_get(prototype, key, value),
+                    None => Ok(Value::Undefined),
+                };
+            }
         }
         match self.member(value.clone(), key) {
             Ok(found) => Ok(found),
@@ -1437,7 +1461,15 @@ impl ScriptRuntime {
             match object {
                 Value::Array(array) => {
                     let index = runtime_array_index(&Value::Number(number))?;
-                    if self.array_property_set(array, &index.to_string(), value.clone(), strict)? {
+                    // an index only needs the named-property path when the array has some
+                    if !array.borrow().properties.is_empty()
+                        && self.array_property_set(
+                            array,
+                            &index.to_string(),
+                            value.clone(),
+                            strict,
+                        )?
+                    {
                         return Ok(());
                     }
                     if let Some(refusal) = array_write_refusal(array, index) {
