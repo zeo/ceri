@@ -2865,15 +2865,16 @@ pub(crate) enum Damage {
     Everything,
 }
 
-// the rectangles a frame changed; ones that touch or sit close merge, and past a few the
-// pair that wastes the least area merges, so a repaint never walks the tree many times
+// the rectangles a frame changed; ones that touch or sit close merge, and past a couple of
+// dozen the pair that wastes the least area merges: a repaint culls what lies outside its
+// rectangle, so another walk costs less than painting the space between two changes
 #[derive(Default)]
 struct Region {
     rects: Vec<Rect>,
 }
 
 impl Region {
-    const LIMIT: usize = 6;
+    const LIMIT: usize = 24;
     // a repaint reaches a few device pixels past its rectangle, so near neighbours join
     const NEAR: f32 = 8.0;
 
@@ -6676,6 +6677,27 @@ mod tests {
             ink(row, (0.0, 0.0)).is_some(),
             "the box around it has ink too"
         );
+    }
+
+    // cells changed down a table repaint as cells, not as the block around them
+    #[test]
+    fn a_dozen_changes_apart_stay_apart() {
+        let mut region = Region::default();
+        for row in 0..12 {
+            region.add(Rect {
+                x: (row % 3) as f32 * 300.0,
+                y: row as f32 * 40.0,
+                width: 60.0,
+                height: 14.0,
+            });
+        }
+        assert_eq!(region.rects.len(), 12);
+        let covered: f32 = region
+            .rects
+            .iter()
+            .map(|rect| rect.width * rect.height)
+            .sum();
+        assert_eq!(covered, 12.0 * 60.0 * 14.0);
     }
 
     #[test]
