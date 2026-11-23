@@ -482,6 +482,22 @@ impl ScriptRuntime {
                                 ..state.clone()
                             }))
         });
+        if stale && let Some(measured) = self.measured.borrow().as_ref() {
+            crate::profile::count(if measured.version != version {
+                "measure: again, document changed"
+            } else if measured.stylesheet != stylesheet {
+                "measure: again, sheet changed"
+            } else if measured.state
+                == (StyleState {
+                    clock: measured.state.clock,
+                    ..state.clone()
+                })
+            {
+                "measure: again, clock moved under a timed layout"
+            } else {
+                "measure: again, state changed"
+            });
+        }
         if stale {
             let mut state = state;
             let reported = crate::css::clock_reads();

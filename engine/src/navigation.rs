@@ -1110,6 +1110,67 @@ impl PartialEq for SheetIdentity {
     }
 }
 
+impl LayoutKey {
+    // names in the profile what moved when a frame could not reuse the last layout
+    fn count_differences(&self, other: &Self) {
+        let (last, next) = (&self.state, &other.state);
+        let moved = [
+            (
+                self.document != other.document,
+                "frame: layout key moved by document",
+            ),
+            (
+                self.stylesheet != other.stylesheet,
+                "frame: layout key moved by sheet",
+            ),
+            (
+                self.viewport != other.viewport || self.scale != other.scale,
+                "frame: layout key moved by viewport",
+            ),
+            (
+                self.selections != other.selections,
+                "frame: layout key moved by selection",
+            ),
+            (last.clock != next.clock, "frame: layout key moved by clock"),
+            (
+                last.scroll_offsets != next.scroll_offsets,
+                "frame: layout key moved by scroll",
+            ),
+            (
+                last.image_sizes != next.image_sizes,
+                "frame: layout key moved by image sizes",
+            ),
+            (
+                last.container_sizes != next.container_sizes,
+                "frame: layout key moved by container sizes",
+            ),
+            (
+                last.hovered != next.hovered || last.hovered_part != next.hovered_part,
+                "frame: layout key moved by hover",
+            ),
+            (
+                last.transitions != next.transitions
+                    || last.animation_starts != next.animation_starts
+                    || last.script_animations != next.script_animations,
+                "frame: layout key moved by motion",
+            ),
+            (
+                last.focused != next.focused
+                    || last.focus_visible != next.focus_visible
+                    || last.active != next.active,
+                "frame: layout key moved by focus",
+            ),
+            (
+                last.text_selections != next.text_selections
+                    || last.control_values != next.control_values,
+                "frame: layout key moved by controls",
+            ),
+        ];
+        for (_, name) in moved.into_iter().filter(|(differs, _)| *differs) {
+            crate::profile::count(name);
+        }
+    }
+}
 // everything a layout is a pure function of
 #[derive(PartialEq)]
 struct LayoutKey {
@@ -2976,6 +3037,9 @@ impl Browser {
             && cached.key == key
         {
             return Ok(cached.layout.clone());
+        }
+        if let Some(cached) = self.layout_cache.borrow().as_ref() {
+            cached.key.count_differences(&key);
         }
         let scrolled = self.layout_cache.borrow().as_ref().and_then(|cached| {
             let last = &cached.key;
