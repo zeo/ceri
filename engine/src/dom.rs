@@ -260,7 +260,10 @@ fn attribute_change(name: &str, old: Option<&str>, new: Option<&str>) -> Box<[St
                     .collect()
             };
             let (old, new) = (tokens(old), tokens(new));
-            changed.extend(old.symmetric_difference(&new).map(|token| format!("class:{token}")));
+            changed.extend(
+                old.symmetric_difference(&new)
+                    .map(|token| format!("class:{token}")),
+            );
         }
         "id" => changed.extend([old, new].into_iter().flatten().map(|id| format!("#{id}"))),
         _ => {}

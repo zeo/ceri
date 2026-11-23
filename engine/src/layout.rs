@@ -2998,7 +2998,12 @@ fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet:
     }
     forget(&mut kept.boxes, |_, kept| kept.refers);
     forget(&mut kept.widths, |_, kept| kept.refers);
-    let elements = || written.iter().copied().filter(|&node| document.element(node).is_some());
+    let elements = || {
+        written
+            .iter()
+            .copied()
+            .filter(|&node| document.element(node).is_some())
+    };
     match stylesheet.selector_reach() {
         SelectorReach::Subtree => {}
         SelectorReach::Anywhere if elements().next().is_none() => {}
@@ -3058,7 +3063,11 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     // floats are shared state the layout writes to, so a box that meets one is laid out each
     // time, and one that meets none keeps its answer only while it places none either
     let floats = input.floats.clone();
-    let placed = || floats.as_ref().map_or(0, |floats| floats.placed.borrow().len());
+    let placed = || {
+        floats
+            .as_ref()
+            .map_or(0, |floats| floats.placed.borrow().len())
+    };
     if placed() > 0 {
         return layout_element_fresh(input);
     }
@@ -10429,8 +10438,13 @@ mod tests {
         let kept = layout_with_state(&document, &stylesheet, viewport, &state);
         assert!(kept.root == layout_afresh(&document, &stylesheet, viewport, &state).root);
         let taken = KEPT.with(|kept| kept.borrow().boxes.get(&(b, None)).map(|kept| kept[0].pass));
-        assert!(before.is_some() && taken > before, "the row beside was asked for again");
-        assert!(KEPT.with(|kept| kept.borrow().boxes[&(b, None)][0].stamp) < document.change_stamp());
+        assert!(
+            before.is_some() && taken > before,
+            "the row beside was asked for again"
+        );
+        assert!(
+            KEPT.with(|kept| kept.borrow().boxes[&(b, None)][0].stamp) < document.change_stamp()
+        );
     }
 
     // a box that places a float lays out each time, so the text after it still wraps around it
