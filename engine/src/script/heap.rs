@@ -27,6 +27,13 @@ struct Registry {
 const PRUNE_EVERY: usize = 65_536;
 
 impl Registry {
+    // a prune walks every entry, so with a large heap it waits for a share of that many
+    // registrations, which keeps its cost per registration flat
+    fn prune_due(&self) -> bool {
+        let entries = self.scopes.len() + self.objects.len() + self.arrays.len();
+        self.since_prune >= PRUNE_EVERY.max(entries / 4)
+    }
+
     fn prune(&mut self) {
         self.scopes.retain(|weak| weak.strong_count() > 0);
         self.objects.retain(|weak| weak.strong_count() > 0);
@@ -50,7 +57,7 @@ pub(super) fn register_scope(handle: &ScopeRef) {
         registry.scopes.push(Rc::downgrade(handle));
         registry.since += 1;
         registry.since_prune += 1;
-        if registry.since_prune >= PRUNE_EVERY {
+        if registry.prune_due() {
             registry.prune();
         }
         registry.since >= registry.threshold
@@ -68,7 +75,7 @@ pub(super) fn register_object(handle: &ObjectHandle) {
         registry.objects.push(Rc::downgrade(handle));
         registry.since += 1;
         registry.since_prune += 1;
-        if registry.since_prune >= PRUNE_EVERY {
+        if registry.prune_due() {
             registry.prune();
         }
         registry.since >= registry.threshold
@@ -86,7 +93,7 @@ pub(super) fn register_array(handle: &ArrayHandle) {
         registry.arrays.push(Rc::downgrade(handle));
         registry.since += 1;
         registry.since_prune += 1;
-        if registry.since_prune >= PRUNE_EVERY {
+        if registry.prune_due() {
             registry.prune();
         }
         registry.since >= registry.threshold

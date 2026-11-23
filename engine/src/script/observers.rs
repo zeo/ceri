@@ -606,14 +606,25 @@ impl ScriptRuntime {
     // turns journaled mutations into records queued on the observers that want them
     fn queue_mutation_records(&mut self) {
         let entries = self.document.borrow_mut().take_mutations();
-        let ids = self.observer_ids();
+        // a page may hold thousands of intersection and resize observers, which no mutation
+        // concerns, so each entry is checked against the mutation observers alone
+        let ids: Vec<_> = self
+            .observer_ids()
+            .into_iter()
+            .filter(|id| {
+                self.observers
+                    .get(id)
+                    .is_some_and(|record| record.kind == ObserverKind::Mutation)
+            })
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
         for entry in &entries {
             for &id in &ids {
                 let options = match self.observers.get(&id) {
-                    Some(record) if record.kind == ObserverKind::Mutation => {
-                        Self::interested(&record.observations, entry)
-                    }
-                    _ => None,
+                    Some(record) => Self::interested(&record.observations, entry),
+                    None => None,
                 };
                 if let Some(options) = options {
                     let value = self.mutation_record(entry, &options);
