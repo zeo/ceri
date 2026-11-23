@@ -3042,14 +3042,25 @@ fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet:
             .copied()
             .filter(|&node| document.element(node).is_some())
     };
-    match stylesheet.selector_reach() {
-        SelectorReach::Subtree => {}
-        SelectorReach::Anywhere if elements().next().is_none() => {}
-        SelectorReach::Anywhere => {
+    let mut reach = stylesheet.selector_reach();
+    if reach == SelectorReach::Anywhere && elements().next().is_some() {
+        let Some(roots) = stylesheet.has_reach(document, elements()) else {
             crate::profile::count("kept: all answers reached");
             kept.boxes.clear();
             kept.widths.clear();
-        }
+            return;
+        };
+        let stale: std::collections::HashSet<NodeId> = roots
+            .iter()
+            .flat_map(|&root| document.subtree(root))
+            .collect();
+        forget(&mut kept.boxes, |(node, _), _| stale.contains(node));
+        forget(&mut kept.widths, |(node, ..), _| stale.contains(node));
+        reach = SelectorReach::Siblings;
+    }
+    match reach {
+        SelectorReach::Subtree => {}
+        SelectorReach::Anywhere => {}
         SelectorReach::Siblings => {
             let Some(changes) = document.selector_changes_since(kept.since) else {
                 kept.boxes.clear();
@@ -10554,6 +10565,35 @@ mod tests {
                 <div class="list"><p><span id="w">x</span></p></div><div class="after">tail</div>"#,
                 "class",
                 "hot",
+            ),
+            (
+                r#"<style>.pane:has(.hot) .item { padding: 9px }</style>
+                <div class="pane"><p><span id="w">x</span></p><div class="item">i</div></div><div class="item">o</div>"#,
+                "class",
+                "hot",
+            ),
+            (
+                r#"<style>section:has(> .hot) { padding: 7px } section:has(> .hot) + p { margin: 6px }</style>
+                <section><b id="w">x</b></section><p>y</p>"#,
+                "class",
+                "hot",
+            ),
+            (
+                r#"<style>.pane:has(.hot) { padding: 5px }</style>
+                <div class="pane"><p>x</p></div><div><span id="w">y</span></div>"#,
+                "class",
+                "hot",
+            ),
+            (
+                r#"<style>p:has(+ .hot) { padding: 4px }</style><p>a</p><b id="w">b</b>"#,
+                "class",
+                "hot",
+            ),
+            (
+                r#"<style>.pane:has(.hot) { padding: 3px }</style>
+                <div id="w"><p class="hot">x</p></div>"#,
+                "class",
+                "pane",
             ),
             (
                 r#"<style>.hot ~ div span { margin-left: 12px }</style>

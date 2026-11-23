@@ -2171,6 +2171,9 @@ pub struct Stylesheet {
     // the compounds that carry :hover, or none where one sits inside another pseudo-class
     // and what it restyles is not worked out
     hovers: Option<Vec<HoverUse>>,
+    // the compounds :has() is attached to, or none where one could be any element or sits
+    // beside what it looks at, so a write is checked against the elements above it
+    has_anchors: Option<Vec<HoverUse>>,
     // shadow root style elements, by their text
     shadow_sheets: RefCell<HashMap<String, Rc<Stylesheet>>>,
     // whether a selector reads text nodes or the style attribute, which change without the
@@ -2216,6 +2219,42 @@ fn hover_uses(rules: &[Rule]) -> Option<Vec<HoverUse>> {
         }
     }
     Some(uses)
+}
+
+fn has_anchors(rules: &[Rule]) -> Option<Vec<HoverUse>> {
+    let mut anchors = Vec::new();
+    for selector in rules.iter().flat_map(|rule| &rule.selectors) {
+        for part in &selector.parts {
+            let compound = &part.compound;
+            for class in &compound.pseudo_classes {
+                match class {
+                    PseudoClass::Has(relatives) => {
+                        let beside = relatives.iter().any(|relative| {
+                            matches!(
+                                relative.combinator,
+                                Combinator::NextSibling | Combinator::SubsequentSibling
+                            )
+                        });
+                        let named = compound.tag.is_some()
+                            || compound.id.is_some()
+                            || !compound.classes.is_empty();
+                        if beside || !named {
+                            return None;
+                        }
+                        anchors.push(HoverUse {
+                            tag: compound.tag.clone(),
+                            id: compound.id.clone(),
+                            classes: compound.classes.clone(),
+                            subject: true,
+                        });
+                    }
+                    class if class.inner().into_iter().any(Selector::mentions_has) => return None,
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some(anchors)
 }
 
 fn next_identity() -> u64 {
@@ -2865,6 +2904,7 @@ impl Stylesheet {
         Ok(Self {
             identity: next_identity(),
             hovers: hover_uses(&rules),
+            has_anchors: has_anchors(&rules),
             reads_unversioned: reads_unversioned(&rules),
             reach: selector_reach(&rules),
             sibling_keys: sibling_keys(&rules),
@@ -2893,6 +2933,7 @@ impl Stylesheet {
             Self {
                 identity: next_identity(),
                 hovers: hover_uses(&rules),
+                has_anchors: has_anchors(&rules),
                 reads_unversioned: reads_unversioned(&rules),
                 reach: selector_reach(&rules),
                 sibling_keys: sibling_keys(&rules),
@@ -3896,7 +3937,21 @@ impl Stylesheet {
     ) {
         crate::profile::count("kept: cascades dropped where written");
         let mut siblings = std::collections::HashSet::new();
-        match self.selector_reach() {
+        let mut reach = self.selector_reach();
+        if reach == SelectorReach::Anywhere {
+            let written = document.written_since(since);
+            let Some(roots) = self.has_reach(document, written.iter().copied()) else {
+                entries.clear();
+                return;
+            };
+            let stale: std::collections::HashSet<NodeId> = roots
+                .iter()
+                .flat_map(|&root| document.subtree(root))
+                .collect();
+            entries.retain(|(node, _), _| !stale.contains(node));
+            reach = self.reach_besides_has();
+        }
+        match reach {
             SelectorReach::Subtree => {}
             SelectorReach::Anywhere => {
                 entries.clear();
@@ -3921,6 +3976,53 @@ impl Stylesheet {
                     .chain(std::iter::once(*node))
                     .any(|above| siblings.contains(&above))
         });
+    }
+
+    // where the written elements reach through :has(): the parent of each :has() anchor at or
+    // above one, whose subtree holds the anchor, what follows it and what lies below it. none
+    // when an anchor could be anything or sits beside what it looks at
+    pub(crate) fn has_reach(
+        &self,
+        document: &Document,
+        written: impl Iterator<Item = NodeId>,
+    ) -> Option<Vec<NodeId>> {
+        let sheets = [self, user_agent_sheet()];
+        let anchors: Vec<&HoverUse> = sheets
+            .iter()
+            .map(|sheet| sheet.has_anchors.as_ref())
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut roots = Vec::new();
+        for node in written {
+            for above in std::iter::once(node).chain(document.ancestors(node)) {
+                let Some(element) = document.element(above) else {
+                    continue;
+                };
+                let anchored = anchors.iter().any(|anchor| {
+                    anchor.tag.as_deref().is_none_or(|tag| tag == element.name)
+                        && anchor
+                            .id
+                            .as_deref()
+                            .is_none_or(|id| element.attr("id") == Some(id))
+                        && anchor.classes.iter().all(|class| element.has_class(class))
+                });
+                let root = document.parent(above).unwrap_or(above);
+                if anchored && !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+        }
+        Some(roots)
+    }
+
+    // what a write reaches besides through :has(), once has_reach has accounted for that
+    fn reach_besides_has(&self) -> SelectorReach {
+        match self.selector_reach() {
+            SelectorReach::Anywhere => SelectorReach::Siblings,
+            reach => reach,
+        }
     }
 
     // whether an attribute change the document names so can restyle the element's siblings
@@ -4874,6 +4976,15 @@ impl Selector {
             }) || compound.pseudo_classes.iter().any(|class| {
                 matches!(class, PseudoClass::Empty)
                     || class.inner().into_iter().any(Selector::reads_unversioned)
+            })
+        })
+    }
+
+    fn mentions_has(&self) -> bool {
+        self.parts.iter().any(|part| {
+            part.compound.pseudo_classes.iter().any(|class| {
+                matches!(class, PseudoClass::Has(_))
+                    || class.inner().into_iter().any(Selector::mentions_has)
             })
         })
     }
