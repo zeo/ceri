@@ -16,6 +16,30 @@ pub(crate) struct Image {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) pixels: Vec<Color>,
+    pub(crate) levels: Levels,
+}
+
+// the picture's mip chain, halved down to a pixel the first time a draw shrinks it past half;
+// a picture is no longer written once it is shared, so the chain never goes stale
+#[derive(Default)]
+pub(crate) struct Levels(std::sync::OnceLock<Vec<Image>>);
+
+impl Clone for Levels {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for Levels {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl fmt::Debug for Levels {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Levels")
+    }
 }
 
 impl Image {
@@ -24,7 +48,65 @@ impl Image {
             width,
             height,
             pixels: vec![Color::transparent(); width as usize * height as usize],
+            levels: Levels::default(),
         }
+    }
+
+    // level 0 is the picture itself, and each one after it half the one before, every pixel
+    // the mean of a two by two block in premultiplied alpha, as skia builds its mipmaps
+    pub(crate) fn level(&self, index: usize) -> &Image {
+        if index == 0 {
+            return self;
+        }
+        let chain = self.levels.0.get_or_init(|| {
+            let mut chain: Vec<Image> = Vec::new();
+            while let Some(next) = chain.last().unwrap_or(self).halved() {
+                chain.push(next);
+            }
+            chain
+        });
+        chain.get(index - 1).or(chain.last()).unwrap_or(self)
+    }
+
+    fn halved(&self) -> Option<Image> {
+        if self.width <= 1 && self.height <= 1 {
+            return None;
+        }
+        let (width, height) = ((self.width / 2).max(1), (self.height / 2).max(1));
+        let mut pixels = Vec::with_capacity(width as usize * height as usize);
+        for row in 0..height {
+            for column in 0..width {
+                let mut sum = [0_u32; 4];
+                for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let texel = self.pixel(
+                        (column * 2 + x).min(self.width - 1),
+                        (row * 2 + y).min(self.height - 1),
+                    );
+                    let alpha = u32::from(texel.alpha);
+                    sum[0] += u32::from(texel.red) * alpha;
+                    sum[1] += u32::from(texel.green) * alpha;
+                    sum[2] += u32::from(texel.blue) * alpha;
+                    sum[3] += alpha;
+                }
+                pixels.push(if sum[3] == 0 {
+                    Color::transparent()
+                } else {
+                    let channel = |total: u32| ((total + sum[3] / 2) / sum[3]) as u8;
+                    Color {
+                        red: channel(sum[0]),
+                        green: channel(sum[1]),
+                        blue: channel(sum[2]),
+                        alpha: ((sum[3] + 2) / 4) as u8,
+                    }
+                });
+            }
+        }
+        Some(Image {
+            width,
+            height,
+            pixels,
+            levels: Levels::default(),
+        })
     }
 
     pub(crate) fn pixel(&self, x: u32, y: u32) -> Color {

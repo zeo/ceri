@@ -754,6 +754,7 @@ impl Context {
             }
         }
         crate::image::Image {
+            levels: Default::default(),
             width,
             height,
             pixels,

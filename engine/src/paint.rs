@@ -4980,11 +4980,41 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
             ))
         }
     };
+    let shape = rounded.then_some(&area_device);
+    // a picture shrunk to half or less is drawn from the smallest mip level still as large as
+    // the draw, bilinear from there, as chromium's image decode cache uploads it
+    let level = step.0.min(step.1).log2().floor();
+    if !aligned && video.is_none() && level >= 1.0 {
+        let mip = image.level(level as usize);
+        let ratio = (
+            mip.width as f32 / image.width as f32,
+            mip.height as f32 / image.height as f32,
+        );
+        let columns = (left..right)
+            .map(|pixel_x| {
+                Tap::at(
+                    (pixel_x as f32 + 0.5 - origin.0) * step.0 * ratio.0 - 0.5,
+                    mip.width,
+                    repeat.0,
+                )
+            })
+            .collect::<Vec<_>>();
+        for pixel_y in top..bottom {
+            let row = Tap::at(
+                (pixel_y as f32 + 0.5 - origin.1) * step.1 * ratio.1 - 0.5,
+                mip.height,
+                repeat.1,
+            );
+            for (pixel_x, column) in (left..right).zip(&columns) {
+                let color = blend_taps(mip, *column, row);
+                put_image_pixel(canvas, (pixel_x, pixel_y), color, plain, opacity, shape);
+            }
+        }
+        return;
+    }
     let columns = (left..right)
         .map(|pixel_x| taps(pixel_x, origin.0, step.0, image.width, repeat.0))
         .collect::<Vec<_>>();
-    // with nothing to scale a pixel by, an opaque one is stored as it is
-    let stride = canvas.bytes_per_row();
     for pixel_y in top..bottom {
         let Some(row) = taps(pixel_y, origin.1, step.1, image.height, repeat.1) else {
             continue;
@@ -4994,33 +5024,38 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
                 continue;
             };
             let color = blend_taps(image, column, row);
-            if plain && color.alpha == 255 {
-                let at = pixel_y as usize * stride + pixel_x as usize * 4;
-                canvas.pixels[at..at + 4].copy_from_slice(&[
-                    color.red,
-                    color.green,
-                    color.blue,
-                    255,
-                ]);
-                continue;
-            }
-            let coverage = if rounded {
-                area_device.coverage((pixel_x as f32 + 0.5, pixel_y as f32 + 0.5))
-            } else {
-                1.0
-            };
-            if coverage <= 0.0 || color.alpha == 0 {
-                continue;
-            }
-            let factor = opacity * coverage;
-            let color = if factor >= 1.0 {
-                color
-            } else {
-                color.scale_alpha(factor)
-            };
-            canvas.blend_pixel(pixel_x, pixel_y, color);
+            put_image_pixel(canvas, (pixel_x, pixel_y), color, plain, opacity, shape);
         }
     }
+}
+
+// with nothing to scale a pixel by, an opaque one is stored as it is
+fn put_image_pixel(
+    canvas: &mut Canvas,
+    (pixel_x, pixel_y): (u32, u32),
+    color: Color,
+    plain: bool,
+    opacity: f32,
+    shape: Option<&Shape>,
+) {
+    if plain && color.alpha == 255 {
+        let at = pixel_y as usize * canvas.bytes_per_row() + pixel_x as usize * 4;
+        canvas.pixels[at..at + 4].copy_from_slice(&[color.red, color.green, color.blue, 255]);
+        return;
+    }
+    let coverage = shape.map_or(1.0, |shape| {
+        shape.coverage((pixel_x as f32 + 0.5, pixel_y as f32 + 0.5))
+    });
+    if coverage <= 0.0 || color.alpha == 0 {
+        return;
+    }
+    let factor = opacity * coverage;
+    let color = if factor >= 1.0 {
+        color
+    } else {
+        color.scale_alpha(factor)
+    };
+    canvas.blend_pixel(pixel_x, pixel_y, color);
 }
 
 fn wrap_or_none(position: f32, size: u32, repeat: bool) -> Option<u32> {
@@ -6674,6 +6709,43 @@ mod tests {
             0,
             "a border-box background fills its box"
         );
+    }
+
+    #[test]
+    fn images_shrunk_past_half_sample_their_mipmaps() {
+        // every fourth column white, four times smaller, is a quarter grey; bilinear taps
+        // at the texel centres would only find the black columns
+        let mut board = Image::new(64, 64);
+        for (index, pixel) in board.pixels.iter_mut().enumerate() {
+            let shade = if index % 4 == 3 { 255 } else { 0 };
+            *pixel = Color::opaque(shade, shade, shade);
+        }
+        let mut canvas = Canvas::new(16, 16, Color::opaque(255, 0, 0));
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 16.0,
+            height: 16.0,
+        };
+        paint_image(
+            &mut canvas,
+            ImageDraw {
+                image: &board,
+                placement: rect,
+                area: Shape::from_rect(rect, CornerRadii::default()),
+                clip: None,
+                opacity: 1.0,
+                repeat: (false, false),
+                video: None,
+            },
+        );
+        for pixel in canvas.rgba_pixels().as_chunks::<4>().0 {
+            assert!(
+                pixel[..3].iter().all(|channel| channel.abs_diff(64) <= 2),
+                "{pixel:?}"
+            );
+        }
+        assert_eq!((board.level(2).width, board.level(9).width), (16, 1));
     }
 
     #[test]

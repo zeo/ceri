@@ -350,6 +350,7 @@ fn to_picture(frame: VideoFrame, planed: bool) -> Option<Picture> {
     } = frame;
     let image = match &surface {
         Some(_) if planed && width > 0 && height > 0 => Image {
+            levels: Default::default(),
             width,
             height,
             pixels: Vec::new(),
@@ -386,6 +387,7 @@ fn to_image(width: u32, height: u32, bgra: &[u8]) -> Option<Image> {
         .take(area)
         .collect();
     Some(Image {
+        levels: Default::default(),
         width,
         height,
         pixels,
@@ -418,6 +420,7 @@ mod tests {
         let surface = Arc::new(Flaky(AtomicUsize::new(0)));
         let picture = Picture {
             image: Arc::new(Image {
+                levels: Default::default(),
                 width: 1,
                 height: 1,
                 pixels: Vec::new(),

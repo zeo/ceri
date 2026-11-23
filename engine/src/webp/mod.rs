@@ -185,6 +185,7 @@ fn straight(value: u8, alpha: u8) -> u8 {
 
 fn image_from_rgba(width: u32, height: u32, rgba: &[u8]) -> Image {
     Image {
+        levels: Default::default(),
         width,
         height,
         pixels: rgba

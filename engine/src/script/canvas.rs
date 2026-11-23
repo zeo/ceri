@@ -1200,6 +1200,7 @@ impl Bitmap {
 
     fn to_image(&self) -> Image {
         Image {
+            levels: Default::default(),
             width: self.width,
             height: self.height,
             pixels: self

@@ -199,6 +199,7 @@ impl Animation {
             self.compose(self.index + 1);
         }
         self.current = Arc::new(Image {
+            levels: Default::default(),
             width: self.width,
             height: self.height,
             pixels: self
