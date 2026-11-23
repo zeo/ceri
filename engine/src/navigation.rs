@@ -3271,6 +3271,7 @@ impl Browser {
             painted.behind.clear();
         }
         crate::layout::forget_kept_answers();
+        crate::release_memory();
     }
 
     pub fn paint_scaled(
@@ -12043,7 +12044,11 @@ A</div>
         assert_eq!(at(&browser, 300.0), Color::opaque(255, 0, 0));
         crate::profile::enable(true);
         assert_eq!(at(&browser, 350.0), Color::opaque(255, 0, 0));
-        let dropped = |name: &str| crate::profile::phases().iter().any(|(phase, ..)| *phase == name);
+        let dropped = |name: &str| {
+            crate::profile::phases()
+                .iter()
+                .any(|(phase, ..)| *phase == name)
+        };
         assert!(!dropped("kept: all cascades dropped"));
         assert_eq!(at(&browser, 600.0), Color::opaque(0, 0, 255));
         assert!(dropped("kept: cascades dropped by a media query"));

@@ -2,8 +2,9 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-// hands freed memory back to the system at once instead of after a delay, so a page that
-// peaks while it loads settles back down as it would on the system allocator
+// hands freed memory back to the system a few milliseconds after it is freed, so a page that
+// peaks while it loads settles back down as it would on the system allocator without paying
+// for a release on every free
 pub(crate) fn settle_allocator() {
     #[cfg(feature = "mimalloc")]
     {
@@ -11,7 +12,17 @@ pub(crate) fn settle_allocator() {
         const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
         static SETTLED: std::sync::Once = std::sync::Once::new();
         // SAFETY: setting an option is a plain call that mimalloc allows at any time
-        SETTLED.call_once(|| unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, 0) });
+        SETTLED.call_once(|| unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, 25) });
+    }
+}
+
+// hands back what is still held for later once the page rests, as a thread that stops
+// allocating never reaches its delayed release
+pub(crate) fn release_memory() {
+    #[cfg(feature = "mimalloc")]
+    // SAFETY: a collection is a plain call on the calling thread's own heap
+    unsafe {
+        libmimalloc_sys::mi_collect(true);
     }
 }
 
