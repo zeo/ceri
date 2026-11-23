@@ -882,6 +882,74 @@ impl StyleState {
 }
 
 impl Matching {
+    // names in the profile what moved, so a page whose cascades keep going can be told apart
+    fn count_differences(&self, other: &Self) {
+        let moved = [
+            (
+                self.document != other.document,
+                "kept: cascades dropped by document",
+            ),
+            (
+                self.selector_version != other.selector_version,
+                "kept: cascades dropped by selector version",
+            ),
+            (
+                self.hovered_part != other.hovered_part,
+                "kept: cascades dropped by hovered part",
+            ),
+            (
+                self.focused != other.focused,
+                "kept: cascades dropped by focus",
+            ),
+            (
+                self.focus_visible != other.focus_visible,
+                "kept: cascades dropped by focus visible",
+            ),
+            (
+                self.active != other.active,
+                "kept: cascades dropped by active",
+            ),
+            (
+                self.checked != other.checked || self.unchecked != other.unchecked,
+                "kept: cascades dropped by checked",
+            ),
+            (
+                self.disabled != other.disabled,
+                "kept: cascades dropped by disabled",
+            ),
+            (
+                self.control_values != other.control_values,
+                "kept: cascades dropped by control values",
+            ),
+            (
+                self.viewport != other.viewport,
+                "kept: cascades dropped by viewport",
+            ),
+            (
+                self.color_scheme != other.color_scheme
+                    || self.forced_colors != other.forced_colors
+                    || self.reduced_motion != other.reduced_motion,
+                "preferences",
+            ),
+            (self.root != other.root, "kept: cascades dropped by root"),
+            (
+                self.container_sizes != other.container_sizes,
+                "kept: cascades dropped by container sizes",
+            ),
+            (
+                self.top_layer != other.top_layer,
+                "kept: cascades dropped by top layer",
+            ),
+            (
+                self.forced != other.forced,
+                "kept: cascades dropped by forced pseudo-classes",
+            ),
+        ];
+        for (_, name) in moved.into_iter().filter(|(differs, _)| *differs) {
+            crate::profile::count(name);
+        }
+    }
+
     fn of(document: &Document, state: &StyleState) -> Self {
         Self {
             document: document.identity(),
@@ -2902,6 +2970,7 @@ impl Stylesheet {
             state.root = root;
             return;
         }
+        crate::profile::count("style: custom properties worked out again");
         self.populate_custom_properties_afresh(document, state);
         CUSTOM_PROPERTY_PASSES.with(|passes| {
             let mut passes = passes.borrow_mut();
@@ -3818,10 +3887,16 @@ impl Stylesheet {
             )
         };
         // a shadow tree's sheet is its style elements' text, which no version follows
-        if !self.follows_versions()
-            || document.has_shadow_roots()
-            || !STYLE_MEMO.with(|memo| memo.borrow().is_some())
-        {
+        if !self.follows_versions() {
+            crate::profile::count("style: cascade unkept, sheet reads unversioned state");
+            return cascade();
+        }
+        if document.has_shadow_roots() {
+            crate::profile::count("style: cascade unkept, shadow roots");
+            return cascade();
+        }
+        if !STYLE_MEMO.with(|memo| memo.borrow().is_some()) {
+            crate::profile::count("style: cascade unkept, outside a style pass");
             return cascade();
         }
         let inline = document
@@ -3836,6 +3911,9 @@ impl Stylesheet {
                 let matching = Matching::of(document, state);
                 if cascades.matching.as_ref() != Some(&matching) {
                     crate::profile::count("kept: all cascades dropped");
+                    if let Some(kept) = &cascades.matching {
+                        kept.count_differences(&matching);
+                    }
                     cascades.entries.clear();
                     cascades.matching = Some(matching);
                 } else if cascades.hovered != state.hovered {
