@@ -1004,6 +1004,37 @@ struct Cascades {
     // the style pass the matching was last checked in
     pass: u64,
     entries: HashMap<(NodeId, Option<PseudoElement>), KeptCascade>,
+    // the distinct cascades kept, by a hash of their declarations, so the many elements a
+    // page styles alike hold one between them
+    shared: HashMap<u64, Vec<std::rc::Weak<Cascade>>>,
+}
+
+// one cascade for every element whose declarations come out the same
+fn share_cascade(
+    shared: &mut HashMap<u64, Vec<std::rc::Weak<Cascade>>>,
+    cascade: Cascade,
+) -> Rc<Cascade> {
+    use std::hash::{Hash, Hasher};
+    // the declarations in any order give the same hash
+    let hash = cascade
+        .iter()
+        .fold(0u64, |sum, (property, (_, order, value))| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (property, order, value).hash(&mut hasher);
+            sum.wrapping_add(hasher.finish())
+        });
+    let alike = shared.entry(hash).or_default();
+    alike.retain(|kept| kept.strong_count() > 0);
+    if let Some(found) = alike
+        .iter()
+        .filter_map(std::rc::Weak::upgrade)
+        .find(|kept| **kept == cascade)
+    {
+        return found;
+    }
+    let cascade = Rc::new(cascade);
+    alike.push(Rc::downgrade(&cascade));
+    cascade
 }
 
 thread_local! {
@@ -4019,9 +4050,10 @@ impl Stylesheet {
                 return values.clone();
             }
         }
-        let values = cascade();
-        self.cascades
-            .borrow_mut()
+        let fresh = Rc::try_unwrap(cascade()).unwrap_or_else(|shared| (*shared).clone());
+        let mut cascades = self.cascades.borrow_mut();
+        let values = share_cascade(&mut cascades.shared, fresh);
+        cascades
             .entries
             .insert(key, (inline.map(str::to_string), values.clone()));
         values
