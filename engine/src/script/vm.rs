@@ -884,6 +884,9 @@ impl ScriptRuntime {
         let below = self.debugger.calls.len();
         loop {
             self.steps += 1;
+            if self.steps.is_multiple_of(1024) && crate::profile::enabled() {
+                self.sample_script(&frames);
+            }
             if self.step_limit.is_some_and(|limit| self.steps > limit) {
                 self.interrupted = true;
             }
@@ -912,6 +915,41 @@ impl ScriptRuntime {
                 }
             }
         }
+    }
+
+    // notes the functions running for the profile, each by its name and the line it starts on:
+    // the runs outside this one first, then this run's frames
+    fn sample_script(&mut self, frames: &[Frame]) {
+        thread_local! {
+            static LABELS: RefCell<HashMap<usize, Rc<str>>> = RefCell::new(HashMap::new());
+        }
+        let label = |code: &Rc<Code>| {
+            LABELS.with(|labels| {
+                labels
+                    .borrow_mut()
+                    .entry(Rc::as_ptr(code) as usize)
+                    .or_insert_with(|| {
+                        let start = code.source.as_ref().map_or(0, |(_, start, _)| *start);
+                        let before = code.text.get(..start).unwrap_or_default();
+                        let line = before.matches('\n').count() + 1;
+                        let column = before.len() - before.rfind('\n').map_or(0, |at| at + 1) + 1;
+                        let name = if code.name.is_empty() {
+                            "(anonymous)"
+                        } else {
+                            &code.name
+                        };
+                        format!("{name} {line}:{column}").into()
+                    })
+                    .clone()
+            })
+        };
+        let below = self.debugger.calls.len().saturating_sub(frames.len());
+        let stack: Vec<Rc<str>> = self.debugger.calls[..below]
+            .iter()
+            .map(|(code, _)| label(code))
+            .chain(frames.iter().map(|frame| label(&frame.code)))
+            .collect();
+        crate::profile::sample(&stack);
     }
 
     // keeps the code and op of every running frame, for an error made now to name: the top

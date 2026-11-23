@@ -18,6 +18,31 @@ thread_local! {
     static PHASES: RefCell<Vec<Phase>> = const { RefCell::new(Vec::new()) };
     // the nested time of each open scope, innermost last
     static OPEN: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    // script functions seen running at each sample: how often each was the innermost, and how
+    // often anywhere on the stack
+    static SAMPLES: RefCell<std::collections::HashMap<std::rc::Rc<str>, (u64, u64)>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+pub fn enabled() -> bool {
+    ENABLED.with(Cell::get)
+}
+
+// one sample of the script stack, outermost first, each function named once however deep
+// it recurses
+pub fn sample(stack: &[std::rc::Rc<str>]) {
+    SAMPLES.with(|samples| {
+        let mut samples = samples.borrow_mut();
+        for (depth, name) in stack.iter().enumerate() {
+            if stack[..depth].contains(name) {
+                continue;
+            }
+            samples.entry(name.clone()).or_default().1 += 1;
+        }
+        if let Some(innermost) = stack.last() {
+            samples.entry(innermost.clone()).or_default().0 += 1;
+        }
+    });
 }
 
 pub struct Scope {
@@ -90,6 +115,7 @@ pub fn enable(on: bool) {
     ENABLED.with(|enabled| enabled.set(on));
     PHASES.with(|phases| phases.borrow_mut().clear());
     OPEN.with(|open| open.borrow_mut().clear());
+    SAMPLES.with(|samples| samples.borrow_mut().clear());
 }
 
 // what each phase has added up since collecting began, the most time of its own first: its
@@ -128,6 +154,29 @@ pub fn report(frames: usize) -> String {
             calls as f64 / frames
         ));
     }
+    let mut samples: Vec<_> = SAMPLES.with(|samples| {
+        samples
+            .borrow()
+            .iter()
+            .map(|(name, counts)| (name.clone(), *counts))
+            .collect()
+    });
+    if !samples.is_empty() {
+        let all = samples.iter().map(|(_, (own, _))| own).sum::<u64>().max(1) as f64;
+        samples.sort_by_key(|(_, (own, total))| std::cmp::Reverse((*own, *total)));
+        lines.push(format!(
+            "{:<52} {:>7} {:>7}",
+            "script, by samples of its ops", "self %", "total %"
+        ));
+        for (name, (own, total)) in samples.into_iter().take(30) {
+            lines.push(format!(
+                "{:<52} {:>7.1} {:>7.1}",
+                name.chars().take(52).collect::<String>(),
+                own as f64 * 100.0 / all,
+                total as f64 * 100.0 / all
+            ));
+        }
+    }
     lines.join("\n")
 }
 
@@ -156,5 +205,20 @@ mod tests {
         enable(false);
         drop(scope("ignored"));
         assert!(PHASES.with(|phases| phases.borrow().is_empty()));
+    }
+
+    #[test]
+    fn script_samples_count_the_innermost_once_and_each_caller_once() {
+        enable(true);
+        let (outer, inner): (std::rc::Rc<str>, std::rc::Rc<str>) =
+            ("outer 1:1".into(), "inner 1:9".into());
+        sample(&[outer.clone(), inner.clone(), inner.clone()]);
+        sample(std::slice::from_ref(&outer));
+        let counts = |name: &std::rc::Rc<str>| SAMPLES.with(|samples| samples.borrow()[name]);
+        assert_eq!(counts(&outer), (1, 2));
+        assert_eq!(counts(&inner), (1, 1));
+        assert!(report(1).contains("outer 1:1"));
+        enable(false);
+        assert!(SAMPLES.with(|samples| samples.borrow().is_empty()));
     }
 }

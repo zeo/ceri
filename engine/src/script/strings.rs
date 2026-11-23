@@ -779,22 +779,20 @@ impl ScriptRuntime {
 // a locale-insensitive collation: letters compare case-insensitively first, then lowercase
 // before uppercase, as the root collation orders them
 pub(super) fn locale_compare(left: &str, right: &str) -> std::cmp::Ordering {
-    let fold = |text: &str| {
-        text.chars()
-            .flat_map(char::to_lowercase)
-            .collect::<Vec<char>>()
-    };
-    fold(left).cmp(&fold(right)).then_with(|| {
-        left.chars()
-            .zip(right.chars())
-            .find(|(a, b)| a != b)
-            .map(|(a, b)| match (a.is_lowercase(), b.is_lowercase()) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.cmp(&b),
-            })
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
+    let folded = left.chars().flat_map(char::to_lowercase);
+    folded
+        .cmp(right.chars().flat_map(char::to_lowercase))
+        .then_with(|| {
+            left.chars()
+                .zip(right.chars())
+                .find(|(a, b)| a != b)
+                .map(|(a, b)| match (a.is_lowercase(), b.is_lowercase()) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.cmp(&b),
+                })
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
 }
 
 // CSS.escape, the cssom's serialization of an identifier
