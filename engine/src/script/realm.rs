@@ -674,11 +674,20 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
             1,
         ))),
     );
-    build.value(
-        &function_prototype,
-        "name",
-        Value::String(String::new().into()),
-    );
+    // a function's length and name, which Function.prototype has as 0 and the empty string,
+    // read-only but configurable
+    for (key, value) in [
+        ("length", Value::Number(0.0)),
+        ("name", Value::String(String::new().into())),
+    ] {
+        function_prototype.borrow_mut().define(
+            key.to_string(),
+            Property {
+                writable: false,
+                ..Property::hidden(value)
+            },
+        );
+    }
     let function = build.constructor(
         Native::FunctionConstructor,
         "Function",

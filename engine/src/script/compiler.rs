@@ -287,6 +287,8 @@ pub(super) struct Code {
     pub(super) eval_context: EvalContext,
     // one per name, for reads of a property by that name
     pub(super) property_caches: Box<[super::object::PropertyCache]>,
+    // what each closure of this code starts as, when it has no prototype of its own
+    pub(super) function_template: std::cell::RefCell<Option<super::object::ObjectTemplate>>,
 }
 
 #[derive(Debug)]
@@ -1407,6 +1409,7 @@ impl Compiler {
             simple_params,
             eval_context: EvalContext::default(),
             property_caches,
+            function_template: std::cell::RefCell::new(None),
         }
     }
 

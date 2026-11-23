@@ -288,11 +288,67 @@ impl std::fmt::Debug for PropertyCache {
         formatter.write_str("PropertyCache")
     }
 }
+// an object's property values, or ones it holds in common with others made alike until it
+// changes them, as the many closures of one function do with their length and name
+#[derive(Clone)]
+enum Properties {
+    Own(Vec<Property>),
+    Shared(Rc<[Property]>),
+}
+
+impl Default for Properties {
+    fn default() -> Self {
+        Self::Own(Vec::new())
+    }
+}
+
+impl std::ops::Deref for Properties {
+    type Target = [Property];
+
+    fn deref(&self) -> &[Property] {
+        match self {
+            Self::Own(own) => own,
+            Self::Shared(shared) => shared,
+        }
+    }
+}
+
+impl Properties {
+    fn own(&mut self) -> &mut Vec<Property> {
+        if let Self::Shared(shared) = self {
+            *self = Self::Own(shared.to_vec());
+        }
+        match self {
+            Self::Own(own) => own,
+            Self::Shared(_) => unreachable!("made its own just above"),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Own(own) => own.capacity(),
+            Self::Shared(shared) => shared.len(),
+        }
+    }
+}
+
+// the keys and values objects made alike start with, which each takes without copying
+pub(super) struct ObjectTemplate {
+    shape: Rc<Shape>,
+    properties: Rc<[Property]>,
+}
+
+impl std::fmt::Debug for ObjectTemplate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ObjectTemplate")
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct JsObject {
     shape: Rc<Shape>,
     // the values of the shape's keys, in the same order
-    properties: Vec<Property>,
+    properties: Properties,
     prototype: Option<ObjectHandle>,
     // objects built by host code without a realm at hand inherit from Object.prototype
     orphan: bool,
@@ -333,7 +389,7 @@ impl JsObject {
     pub(super) fn new() -> Self {
         Self {
             shape: Shape::root(),
-            properties: Vec::new(),
+            properties: Properties::default(),
             prototype: None,
             orphan: true,
             extensible: true,
@@ -356,7 +412,7 @@ impl JsObject {
         debug_assert_eq!(template.properties.len(), properties.len());
         Self {
             shape: template.shape.clone(),
-            properties,
+            properties: Properties::Own(properties),
             prototype: template.prototype.clone(),
             orphan: template.orphan,
             extensible: template.extensible,
@@ -388,6 +444,38 @@ impl JsObject {
             *cache.0.borrow_mut() = Some((Rc::downgrade(&self.shape), index));
         }
     }
+    // the keys and values this object has, for others made alike to start from; it then holds
+    // its values in common with them, and an object with a shape of its own makes none
+    pub(super) fn template(&mut self) -> Option<ObjectTemplate> {
+        if self.shape.own {
+            return None;
+        }
+        let shared: Rc<[Property]> = match &self.properties {
+            Properties::Shared(shared) => shared.clone(),
+            Properties::Own(own) => Rc::from(own.as_slice()),
+        };
+        self.properties = Properties::Shared(shared.clone());
+        Some(ObjectTemplate {
+            shape: self.shape.clone(),
+            properties: shared,
+        })
+    }
+
+    pub(super) fn from_template(
+        template: &ObjectTemplate,
+        prototype: Option<ObjectHandle>,
+        class: ObjectClass,
+    ) -> Self {
+        Self {
+            shape: template.shape.clone(),
+            properties: Properties::Shared(template.properties.clone()),
+            prototype,
+            orphan: false,
+            extensible: true,
+            class,
+        }
+    }
+
     // whether the object's own keys are these, in this order
     pub(super) fn has_keys<'a>(&self, keys: impl ExactSizeIterator<Item = &'a str>) -> bool {
         keys.len() == self.shape.keys.len()
@@ -395,7 +483,7 @@ impl JsObject {
     }
     // room for exactly this many properties, for objects whose properties are known when made
     pub(super) fn reserve(&mut self, properties: usize) {
-        self.properties.reserve_exact(properties);
+        self.properties.own().reserve_exact(properties);
     }
 
     // the prototype, defaulting host-built objects to the intrinsic their class implies
@@ -461,13 +549,13 @@ impl JsObject {
 
     pub(super) fn property_mut(&mut self, key: &str) -> Option<&mut Property> {
         self.position(key)
-            .map(move |position| &mut self.properties[position])
+            .map(move |position| &mut self.properties.own()[position])
     }
 
     // defines or replaces a property with exact attributes
     pub(super) fn define(&mut self, key: String, property: Property) {
         if let Some(position) = self.position(&key) {
-            self.properties[position] = property;
+            self.properties.own()[position] = property;
             return;
         }
         if self.shape.own || self.properties.len() >= SHARED_KEYS {
@@ -480,10 +568,10 @@ impl JsObject {
                 // ever saves room
                 let doubled = (length * 2).max(4);
                 let wanted = self.shape.longest.get().clamp(length + 1, doubled);
-                self.properties.reserve_exact(wanted - length);
+                self.properties.own().reserve_exact(wanted - length);
             }
         }
-        self.properties.push(property);
+        self.properties.own().push(property);
     }
 
     // the data value of an own property; accessors read as absent for host code
@@ -508,7 +596,7 @@ impl JsObject {
 
     pub(super) fn remove(&mut self, key: &str) -> Option<Value> {
         let position = self.position(key)?;
-        let property = self.properties.remove(position);
+        let property = self.properties.own().remove(position);
         let shape = self.own_shape();
         shape.keys.remove(position);
         shape.reindex();
@@ -562,7 +650,7 @@ impl JsObject {
     // empties an object the cycle collector found unreachable: what it held, and its class
     pub(super) fn take_for_collection(&mut self) -> (Vec<Value>, ObjectClass) {
         let mut values = Vec::new();
-        for property in self.properties.drain(..) {
+        for property in std::mem::take(&mut self.properties).iter().cloned() {
             match property.slot {
                 Slot::Data(value) => values.push(value),
                 Slot::Accessor(accessors) => {
@@ -582,7 +670,7 @@ impl JsObject {
 
     pub(super) fn freeze(&mut self, writable: bool) {
         self.extensible = false;
-        for property in &mut self.properties {
+        for property in self.properties.own() {
             property.configurable = false;
             if !writable && matches!(property.slot, Slot::Data(_)) {
                 property.writable = false;

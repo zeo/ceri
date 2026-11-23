@@ -7145,6 +7145,31 @@ mod tests {
     }
 
     #[test]
+    fn closures_of_one_function_keep_their_own_properties_apart() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id="status">idle</p><script>
+                const make = () => (a, b) => a + b;
+                const [first, second, third] = [make(), make(), make()];
+                Object.defineProperty(first, "name", { value: "renamed" });
+                delete second.length;
+                third.extra = 1;
+                document.getElementById("status").textContent = [
+                    first.name, second.name, third.name, first.length, second.length, third.length,
+                    Object.getOwnPropertyNames(third).join("+"), "extra" in first,
+                    Object.getOwnPropertyNames(make()).join("+"),
+                ].join("|");
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("closure page should load");
+        assert_eq!(
+            element_text(&browser, "status"),
+            "renamed|||2|0|2|length+name+extra|false|length+name"
+        );
+    }
+
+    #[test]
     fn property_reads_follow_each_object_past_what_they_found_last() {
         let mut browser = Browser::new(bundle(
             r#"<p id="status">idle</p><script>

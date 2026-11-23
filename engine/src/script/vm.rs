@@ -285,15 +285,24 @@ impl ScriptRuntime {
         } else {
             self.intrinsics.function_prototype.clone()
         };
-        let mut object = JsObject::with_prototype(Some(prototype), ObjectClass::Function(closure));
         let constructible = matches!(
             code.kind,
             FunctionKind::Normal
                 | FunctionKind::ClassConstructor
                 | FunctionKind::DerivedConstructor
         );
+        let own_prototype = code.is_generator || (constructible && !code.is_async);
+        // the closures of one arrow or method share their length and name until one changes
+        if !own_prototype && let Some(template) = code.function_template.borrow().as_ref() {
+            return Value::Object(new_object(JsObject::from_template(
+                template,
+                Some(prototype),
+                ObjectClass::Function(closure),
+            )));
+        }
+        let mut object = JsObject::with_prototype(Some(prototype), ObjectClass::Function(closure));
         // length, name, and a prototype for what can be constructed or is a generator
-        object.reserve(2 + usize::from(code.is_generator || (constructible && !code.is_async)));
+        object.reserve(2 + usize::from(own_prototype));
         object.define(
             "length".to_string(),
             Property {
@@ -312,6 +321,9 @@ impl ScriptRuntime {
                 configurable: true,
             },
         );
+        if !own_prototype {
+            *code.function_template.borrow_mut() = object.template();
+        }
         let handle = new_object(object);
         if code.is_generator {
             let proto = if code.is_async {
