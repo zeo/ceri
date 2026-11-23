@@ -8,6 +8,40 @@ use std::rc::{Rc, Weak};
 
 pub(super) type ObjectHandle = Rc<RefCell<JsObject>>;
 
+// a property key hash a word at a time, far quicker than the standard one on the short keys
+// scripts use, and seeded once per process so a page cannot line its keys up on purpose
+#[derive(Clone, Copy)]
+pub(super) struct KeyHasher(u64);
+
+impl Default for KeyHasher {
+    fn default() -> Self {
+        static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        Self(*SEED.get_or_init(|| {
+            use std::hash::{BuildHasher, Hasher};
+            std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish()
+        }))
+    }
+}
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word))
+                .wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+}
+
+pub(super) type KeyMap<V> = HashMap<Rc<str>, V, std::hash::BuildHasherDefault<KeyHasher>>;
+
 #[derive(Clone)]
 pub(super) enum Slot {
     Data(Value),
@@ -168,9 +202,9 @@ pub(super) enum ObjectClass {
 struct Shape {
     keys: Vec<Rc<str>>,
     // built once a shape grows past a handful of keys
-    index: Option<HashMap<Rc<str>, usize>>,
+    index: Option<KeyMap<usize>>,
     // the shapes one key longer, while some object still has them
-    transitions: RefCell<HashMap<Rc<str>, Weak<Shape>>>,
+    transitions: RefCell<KeyMap<Weak<Shape>>>,
     // the shape one key shorter, kept alive so the next object to take the same keys finds
     // the same path
     _parent: Option<Rc<Shape>>,

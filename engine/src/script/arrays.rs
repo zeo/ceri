@@ -472,8 +472,7 @@ impl ScriptRuntime {
             .find(|(_, candidate, _)| {
                 std::mem::discriminant(candidate) == std::mem::discriminant(&method)
             })
-            .map_or("", |(name, _, _)| name)
-            .to_string();
+            .map_or("", |(name, _, _)| *name);
         let mutates = matches!(
             method,
             M::Push
@@ -487,7 +486,7 @@ impl ScriptRuntime {
                 | M::CopyWithin
         );
         if mutates && !matches!(this, Value::Array(_)) {
-            return self.mutate_array_like(method, this, arguments, &name);
+            return self.mutate_array_like(method, this, arguments, name);
         }
         if mutates
             && let Value::Array(array) = &this
@@ -497,8 +496,8 @@ impl ScriptRuntime {
         }
         match method {
             M::ForEach | M::Map | M::Filter | M::Some | M::Every | M::Find | M::FindIndex => {
-                let (values, object) = self.callback_receiver(&this, &name)?;
-                let callback = self.callback(&arguments, &name)?;
+                let (values, object) = self.callback_receiver(&this, name)?;
+                let callback = self.callback(&arguments, name)?;
                 let receiver = argument(&arguments, 1);
                 let length = values.len();
                 let mut mapped = Vec::new();
@@ -548,8 +547,8 @@ impl ScriptRuntime {
                 })
             }
             M::FindLast | M::FindLastIndex => {
-                let (values, object) = self.callback_receiver(&this, &name)?;
-                let callback = self.callback(&arguments, &name)?;
+                let (values, object) = self.callback_receiver(&this, name)?;
+                let callback = self.callback(&arguments, name)?;
                 let receiver = argument(&arguments, 1);
                 for index in (0..values.len()).rev() {
                     let value = Self::element(&this, &values, index)
@@ -573,8 +572,8 @@ impl ScriptRuntime {
                 })
             }
             M::Reduce | M::ReduceRight => {
-                let (values, object) = self.callback_receiver(&this, &name)?;
-                let callback = self.callback(&arguments, &name)?;
+                let (values, object) = self.callback_receiver(&this, name)?;
+                let callback = self.callback(&arguments, name)?;
                 // each index is looked at when its turn comes, since the callback may fill or
                 // delete what was there when the method began
                 let indices: Vec<usize> = if matches!(method, M::Reduce) {
@@ -629,7 +628,7 @@ impl ScriptRuntime {
                 Ok(accumulator)
             }
             M::Includes | M::IndexOf | M::LastIndexOf => {
-                let mut values = self.receiver_values(&this, &name)?;
+                let mut values = self.receiver_values(&this, name)?;
                 // an index nothing was put at is searched as what a prototype has there
                 for (index, value) in values.iter_mut().enumerate() {
                     if matches!(value, Value::Uninitialized)
@@ -696,14 +695,14 @@ impl ScriptRuntime {
                         Ok(Value::String(self.join_array(&array, &separator)?.into()))
                     }
                     _ => {
-                        let values = self.receiver_values(&this, &name)?;
+                        let values = self.receiver_values(&this, name)?;
                         let array: ArrayHandle = Rc::new(RefCell::new(values.into()));
                         Ok(Value::String(self.join_array(&array, &separator)?.into()))
                     }
                 }
             }
             M::At => {
-                let values = self.receiver_values(&this, &name)?;
+                let values = self.receiver_values(&this, name)?;
                 let index = self.integer(argument(&arguments, 0), 0.0)?;
                 let index = if index < 0.0 {
                     values.len() as f64 + index
@@ -716,7 +715,7 @@ impl ScriptRuntime {
                 Ok(values[index as usize].clone().filled())
             }
             M::Concat => {
-                let mut result = self.receiver_values(&this, &name)?;
+                let mut result = self.receiver_values(&this, name)?;
                 for value in arguments {
                     match value {
                         Value::Array(array) => result.extend(array.borrow().iter().cloned()),
@@ -727,7 +726,7 @@ impl ScriptRuntime {
                 self.array_species(&this, result, true)
             }
             M::Slice => {
-                let values = self.receiver_values(&this, &name)?;
+                let values = self.receiver_values(&this, name)?;
                 let length = values.len();
                 let start = self.integer(argument(&arguments, 0), 0.0)?;
                 let end = self.integer(argument(&arguments, 1), length as f64)?;
@@ -741,9 +740,9 @@ impl ScriptRuntime {
                 self.array_species(&this, picked, true)
             }
             M::Flat | M::FlatMap => {
-                let (values, object) = self.callback_receiver(&this, &name)?;
+                let (values, object) = self.callback_receiver(&this, name)?;
                 let (depth, mapper) = if matches!(method, M::FlatMap) {
-                    (1.0, Some(self.callback(&arguments, &name)?))
+                    (1.0, Some(self.callback(&arguments, name)?))
                 } else {
                     (self.integer(argument(&arguments, 0), 1.0)?, None)
                 };
@@ -762,19 +761,19 @@ impl ScriptRuntime {
                 self.array_species(&this, result, false)
             }
             M::Push => {
-                let array = self.receiver_array(&this, &name)?;
+                let array = self.receiver_array(&this, name)?;
                 let mut array = array.borrow_mut();
                 check_length(array.len().saturating_add(arguments.len()))?;
                 array.extend(arguments);
                 Ok(Value::Number(array.len() as f64))
             }
             M::Pop => {
-                let array = self.receiver_array(&this, &name)?;
+                let array = self.receiver_array(&this, name)?;
                 let value = array.borrow_mut().pop();
                 Ok(value.unwrap_or(Value::Undefined))
             }
             M::Shift => {
-                let array = self.receiver_array(&this, &name)?;
+                let array = self.receiver_array(&this, name)?;
                 let mut array = array.borrow_mut();
                 Ok(if array.is_empty() {
                     Value::Undefined
@@ -783,24 +782,24 @@ impl ScriptRuntime {
                 })
             }
             M::Unshift => {
-                let array = self.receiver_array(&this, &name)?;
+                let array = self.receiver_array(&this, name)?;
                 let mut array = array.borrow_mut();
                 check_length(array.len().saturating_add(arguments.len()))?;
                 array.splice(0..0, arguments);
                 Ok(Value::Number(array.len() as f64))
             }
             M::Reverse => {
-                let array = self.receiver_array(&this, &name)?;
+                let array = self.receiver_array(&this, name)?;
                 array.borrow_mut().reverse();
                 Ok(this)
             }
             M::ToReversed => {
-                let mut values = self.receiver_values(&this, &name)?;
+                let mut values = self.receiver_values(&this, name)?;
                 values.reverse();
                 Ok(Self::new_array(values))
             }
             M::Fill => {
-                let array = self.receiver_array(&this, &name)?;
+                let array = self.receiver_array(&this, name)?;
                 let length = array.borrow().len();
                 let value = argument(&arguments, 0);
                 let start = self.integer(argument(&arguments, 1), 0.0)?;
@@ -812,7 +811,7 @@ impl ScriptRuntime {
                 Ok(this)
             }
             M::CopyWithin => {
-                let array = self.receiver_array(&this, &name)?;
+                let array = self.receiver_array(&this, name)?;
                 let length = array.borrow().len();
                 let target = self.integer(argument(&arguments, 0), 0.0)?;
                 let start = self.integer(argument(&arguments, 1), 0.0)?;
@@ -845,9 +844,9 @@ impl ScriptRuntime {
             }
             M::Splice | M::ToSpliced => {
                 let mut values = if matches!(method, M::Splice) {
-                    self.receiver_array(&this, &name)?.borrow().to_vec()
+                    self.receiver_array(&this, name)?.borrow().to_vec()
                 } else {
-                    self.receiver_values(&this, &name)?
+                    self.receiver_values(&this, name)?
                 };
                 let length = values.len();
                 let start = self.integer(argument(&arguments, 0), 0.0)?;
@@ -864,7 +863,7 @@ impl ScriptRuntime {
                 check_length(length - delete + insert.len())?;
                 let removed: Vec<Value> = values.splice(start..start + delete, insert).collect();
                 if matches!(method, M::Splice) {
-                    let array = self.receiver_array(&this, &name)?;
+                    let array = self.receiver_array(&this, name)?;
                     **array.borrow_mut() = values;
                     self.array_species(&this, removed, true)
                 } else {
@@ -872,7 +871,7 @@ impl ScriptRuntime {
                 }
             }
             M::With => {
-                let mut values = self.receiver_values(&this, &name)?;
+                let mut values = self.receiver_values(&this, name)?;
                 let index = self.integer(argument(&arguments, 0), 0.0)?;
                 let index = if index < 0.0 {
                     values.len() as f64 + index
@@ -893,13 +892,13 @@ impl ScriptRuntime {
                     ));
                 }
                 let values = if matches!(method, M::Sort) {
-                    self.receiver_array(&this, &name)?.borrow().to_vec()
+                    self.receiver_array(&this, name)?.borrow().to_vec()
                 } else {
-                    self.receiver_values(&this, &name)?
+                    self.receiver_values(&this, name)?
                 };
                 let sorted = self.sort_values(values, &comparator)?;
                 if matches!(method, M::Sort) {
-                    let array = self.receiver_array(&this, &name)?;
+                    let array = self.receiver_array(&this, name)?;
                     **array.borrow_mut() = sorted;
                     Ok(this)
                 } else {
