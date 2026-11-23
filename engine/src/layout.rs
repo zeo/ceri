@@ -2762,14 +2762,14 @@ fn intersect_rect(parent: Option<Rect>, rect: Rect) -> Option<Rect> {
 
 // everything an element's layout is decided by besides the document, stylesheet and state,
 // compared bit for bit
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct BoxInputs {
     numbers: [u32; 11],
     heights: (Option<u32>, Option<u32>, Option<u32>),
     list_ordinal: i32,
     color: Color,
     weight: FontWeight,
-    text: InheritedText,
+    text: SharedText,
     mode: LayoutMode,
     zero_font: (crate::font::FontStack, crate::font::FontStyle),
     environment: crate::css::LayoutEnvironment,
@@ -2870,11 +2870,45 @@ fn keep_answer<Key: Eq + std::hash::Hash, Inputs: PartialEq, Answer>(
     key: Key,
     answer: Kept<Inputs, Answer>,
 ) {
-    let answers = map.entry(key).or_default();
+    // a node keeps one answer or a few, so its list grows one at a time instead of by four
+    let answers = map.entry(key).or_insert_with(|| Vec::with_capacity(1));
     match answers.iter_mut().find(|kept| kept.inputs == answer.inputs) {
         Some(kept) => *kept = answer,
-        None => answers.push(answer),
+        None => {
+            answers.reserve_exact(1);
+            answers.push(answer);
+        }
     }
+}
+
+// inherited text settings as a kept answer holds them: one copy of each value lately seen,
+// compared by pointer before by content, instead of a copy in every answer
+#[derive(Clone)]
+struct SharedText(Rc<InheritedText>);
+
+impl PartialEq for SharedText {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+fn shared_text(text: &InheritedText) -> SharedText {
+    // a page sets text a few dozen ways, and the latest asked for comes first
+    const KEPT_TEXTS: usize = 64;
+    thread_local! {
+        static TEXTS: std::cell::RefCell<Vec<Rc<InheritedText>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    TEXTS.with(|texts| {
+        let mut texts = texts.borrow_mut();
+        let shared = match texts.iter().position(|known| **known == *text) {
+            Some(at) => texts.remove(at),
+            None => Rc::new(*text),
+        };
+        texts.truncate(KEPT_TEXTS - 1);
+        texts.insert(0, shared.clone());
+        SharedText(shared)
+    })
 }
 
 struct KeptPass {
@@ -3100,7 +3134,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         list_ordinal: input.list_ordinal,
         color: input.parent.color,
         weight: input.parent.weight,
-        text: input.parent.text,
+        text: shared_text(&input.parent.text),
         mode: input.context.mode,
         zero_font: crate::css::zero_font(),
         environment: crate::css::layout_environment(),
@@ -7040,13 +7074,13 @@ fn max_content_width(input: MaxContentInput<'_>) -> f32 {
 }
 
 // what an intrinsic width was measured under, beyond the element and which width it was
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct IntrinsicInputs {
     containing_width: u32,
     definite: bool,
     font_size: u32,
     weight: FontWeight,
-    text: InheritedText,
+    text: SharedText,
     zero_font: (crate::font::FontStack, crate::font::FontStyle),
     environment: crate::css::LayoutEnvironment,
 }
@@ -7067,7 +7101,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         definite: input.definite,
         font_size: input.parent.font_size.to_bits(),
         weight: input.parent.weight,
-        text: input.parent.text,
+        text: shared_text(&input.parent.text),
         zero_font: crate::css::zero_font(),
         environment: crate::css::layout_environment(),
     };
