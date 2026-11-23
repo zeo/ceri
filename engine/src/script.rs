@@ -693,6 +693,9 @@ impl Default for ViewportMetrics {
 // the selector version the lists were found at, then the options and the form controls
 type ControlLists = (u64, Rc<[Vec<NodeId>; 4]>);
 
+// the document and selector versions a disabled set was found at, and the set
+type DisabledControls = ((u64, u64), BTreeSet<NodeId>);
+
 pub struct ScriptRuntime {
     document: Rc<RefCell<Document>>,
     resources: Option<ResourceBundle>,
@@ -747,6 +750,9 @@ pub struct ScriptRuntime {
     // elements or attributes change: the style state is built from them for every layout and
     // measure
     controls: RefCell<Option<ControlLists>>,
+    // which of those controls are disabled, which reads only the document and is asked for by every
+    // computed style script reads, so it is found again only once the document changes
+    disabled_controls: RefCell<Option<DisabledControls>>,
     // milliseconds from an animation frame request to its callback
     frame_interval: u64,
     // whether the page's window shows; a hidden page runs no animation frames
@@ -1956,6 +1962,7 @@ impl ScriptRuntime {
             measured: RefCell::new(None),
             measure_pinned: Cell::new(false),
             controls: RefCell::new(None),
+            disabled_controls: RefCell::new(None),
             frame_interval: crate::navigation::FRAME_INTERVAL,
             visible: true,
             media_queries: Vec::new(),
@@ -3549,6 +3556,26 @@ impl ScriptRuntime {
         }
     }
 
+    fn disabled_controls(&self, controls: &[NodeId]) -> BTreeSet<NodeId> {
+        let version = {
+            let document = self.document.borrow();
+            (document.version(), document.selector_version())
+        };
+        let mut cached = self.disabled_controls.borrow_mut();
+        match cached.as_ref() {
+            Some((found_at, disabled)) if *found_at == version => disabled.clone(),
+            _ => {
+                let disabled: BTreeSet<NodeId> = controls
+                    .iter()
+                    .copied()
+                    .filter(|&control| self.is_disabled(control))
+                    .collect();
+                *cached = Some((version, disabled.clone()));
+                disabled
+            }
+        }
+    }
+
     pub(crate) fn style_state(&self, hovered_path: Option<NodeId>) -> StyleState {
         StyleState {
             scroll_offsets: self.scroll_offsets.clone(),
@@ -3603,11 +3630,7 @@ impl ScriptRuntime {
                 state.unchecked.insert(option);
             }
         }
-        for &control in &controls[1] {
-            if self.is_disabled(control) {
-                state.disabled.insert(control);
-            }
-        }
+        state.disabled = self.disabled_controls(&controls[1]);
         state
     }
 

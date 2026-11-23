@@ -599,6 +599,16 @@ static INTERFACES: &[Interface] = &[
         ],
     },
     Interface {
+        name: "HTMLOptGroupElement",
+        parent: "HTMLElement",
+        members: &[("label", Attr("label")), ("disabled", Flag("disabled"))],
+    },
+    Interface {
+        name: "HTMLFieldSetElement",
+        parent: "HTMLElement",
+        members: &[("name", Attr("name")), ("disabled", Flag("disabled"))],
+    },
+    Interface {
         name: "HTMLButtonElement",
         parent: "HTMLElement",
         members: &[
@@ -1054,6 +1064,8 @@ pub(super) fn interface_of(document: &Document, node: NodeId) -> &'static str {
                 "head" => "HTMLHeadElement",
                 "html" => "HTMLHtmlElement",
                 "table" => "HTMLTableElement",
+                "fieldset" => "HTMLFieldSetElement",
+                "optgroup" => "HTMLOptGroupElement",
                 "slot" => "HTMLSlotElement",
                 name if is_known_html_element(name) || name.contains('-') => "HTMLElement",
                 _ => "HTMLUnknownElement",

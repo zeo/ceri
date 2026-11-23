@@ -894,7 +894,16 @@ thread_local! {
     static STYLE_PASS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STYLE_MEMO: RefCell<Option<StyleMemo>> = const { RefCell::new(None) };
     static CONTENT_MEMO: RefCell<Option<ContentMemo>> = const { RefCell::new(None) };
+    static CUSTOM_PROPERTY_PASSES: RefCell<Vec<CustomPropertyPass>> = const { RefCell::new(Vec::new()) };
 }
+
+// the sheet, document and version a custom property pass read, with the state it read, and
+// what it found
+type CustomPropertyPass = (
+    (u64, u64, u64, StyleState),
+    HashMap<NodeId, BTreeMap<String, String>>,
+    Option<NodeId>,
+);
 
 pub(crate) struct MemoizedStyles {
     previous: (Option<StyleMemo>, Option<ContentMemo>),
@@ -2757,7 +2766,44 @@ impl Stylesheet {
         values
     }
 
+    // a pass over the whole document, which script asks for on every computed style and box
+    // size it reads, so the last two are kept by the sheet, the document version and the state
+    // they read; layout and transition sampling read different states
     pub(crate) fn populate_custom_properties(&self, document: &Document, state: &mut StyleState) {
+        let key = (
+            self.identity,
+            document.identity(),
+            document.version(),
+            StyleState {
+                clock: 0,
+                transitions: BTreeMap::new(),
+                animation_starts: BTreeMap::new(),
+                custom_properties: Default::default(),
+                root: None,
+                ..state.clone()
+            },
+        );
+        let known = CUSTOM_PROPERTY_PASSES.with(|passes| {
+            passes
+                .borrow()
+                .iter()
+                .find(|(read, _, _)| *read == key)
+                .map(|(_, properties, root)| (properties.clone(), *root))
+        });
+        if let Some((properties, root)) = known {
+            state.custom_properties = properties;
+            state.root = root;
+            return;
+        }
+        self.populate_custom_properties_afresh(document, state);
+        CUSTOM_PROPERTY_PASSES.with(|passes| {
+            let mut passes = passes.borrow_mut();
+            passes.insert(0, (key, state.custom_properties.clone(), state.root));
+            passes.truncate(2);
+        });
+    }
+
+    fn populate_custom_properties_afresh(&self, document: &Document, state: &mut StyleState) {
         let _profile = crate::profile::scope("style: custom properties");
         state.custom_properties.clear();
         let top = document

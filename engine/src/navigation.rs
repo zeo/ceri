@@ -997,46 +997,16 @@ struct Page {
     animation_wake: Cell<Option<u64>>,
     // the animated images of the document, each playing from when it was first decoded
     animated: RefCell<Vec<crate::animated::Animation>>,
-    // the last custom property passes, each keyed by the document version and the state it read
-    custom_properties: RefCell<Vec<(u64, StyleState, StyleState)>>,
     // decoded once per document and shared by every frame; failures are remembered too
 }
 
 impl Page {
-    // a pass over the whole document, which frames that only move the clock can skip; layout and
-    // transition sampling read different states, so the last two passes are kept
     fn populate_custom_properties(&self, document: &Document, state: &mut StyleState) {
-        let key = StyleState {
-            clock: 0,
-            transitions: BTreeMap::new(),
-            animation_starts: BTreeMap::new(),
-            custom_properties: Default::default(),
-            root: None,
-            ..state.clone()
-        };
-        let mut passes = self.custom_properties.borrow_mut();
-        if let Some((_, _, populated)) = passes
-            .iter()
-            .find(|(version, read, _)| *version == document.version() && *read == key)
-        {
-            state
-                .custom_properties
-                .clone_from(&populated.custom_properties);
-            state.root = populated.root;
-            return;
-        }
         self.layout_inputs
             .borrow()
             .stylesheet
             .clone()
             .populate_custom_properties(document, state);
-        let populated = StyleState {
-            custom_properties: state.custom_properties.clone(),
-            root: state.root,
-            ..StyleState::default()
-        };
-        passes.insert(0, (document.version(), key, populated));
-        passes.truncate(2);
     }
 }
 
@@ -1812,7 +1782,6 @@ impl Browser {
             layout_inputs,
             animation_wake: Cell::new(None),
             animated: RefCell::default(),
-            custom_properties: RefCell::default(),
         });
         self.last_navigation_failure = None;
         self.hovered_node = None;
@@ -3737,7 +3706,6 @@ impl Browser {
             layout_inputs,
             animation_wake: Cell::new(None),
             animated: RefCell::default(),
-            custom_properties: RefCell::default(),
         });
     }
 }
@@ -6955,6 +6923,30 @@ mod tests {
         // left alone, a paste goes into the field as before
         assert!(browser.key_down_with_modifiers("v", control).unwrap());
         assert_eq!(element_text(&browser, "value"), "keptset by the page");
+    }
+
+    #[test]
+    fn computed_style_follows_custom_properties_and_disabled_state_written_between_reads() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>:root { --tint: rgb(1, 2, 3) } input { color: var(--tint) } input:disabled { color: rgb(9, 9, 9) }</style><fieldset id="set"><input id="field"></fieldset><p id="status">idle</p><script>
+                const field = document.getElementById("field");
+                const read = () => getComputedStyle(field).color;
+                const before = read();
+                document.documentElement.style.setProperty("--tint", "rgb(4, 5, 6)");
+                const tinted = read();
+                document.getElementById("set").disabled = true;
+                const disabled = read();
+                document.getElementById("set").disabled = false;
+                document.getElementById("status").textContent = [before, tinted, disabled, read()].join("|");
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("computed style page should load");
+        assert_eq!(
+            element_text(&browser, "status"),
+            "rgb(1, 2, 3)|rgb(4, 5, 6)|rgb(9, 9, 9)|rgb(4, 5, 6)"
+        );
     }
 
     #[test]
