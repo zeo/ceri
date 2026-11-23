@@ -3122,6 +3122,18 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     }
     let block = input.context.containing_block;
     let bits = f32::to_bits;
+    // a box reads the height it is laid out within only for a percentage height of its own,
+    // as its children get its own height to resolve theirs against, so without one the flex
+    // and grid passes that differ in nothing else share one answer
+    let style = input.context.stylesheet.style_for(
+        input
+            .node
+            .style_context(input.parent, input.context.style_state),
+    );
+    let reads_height = [style.height, style.min_height, style.max_height]
+        .into_iter()
+        .any(Length::has_percent);
+    let containing_height = input.containing_height.filter(|_| reads_height);
     let inputs = BoxInputs {
         numbers: [
             input.containing_x,
@@ -3138,7 +3150,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         ]
         .map(bits),
         heights: (
-            input.containing_height.map(bits),
+            containing_height.map(bits),
             input.size_override.0.map(bits),
             input.size_override.1.map(bits),
         ),
@@ -3171,13 +3183,13 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         )
     });
     if let Some((layout, earlier)) = known {
-        if cfg!(feature = "recheck") && earlier {
+        if cfg!(feature = "recheck") {
             let reported = crate::css::moment_reports();
             let fresh = layout_element_fresh(input);
             assert!(fresh == layout, "a kept box went stale: {node:?}");
-            assert_eq!(
-                reported,
-                crate::css::moment_reports(),
+            // an answer for one moment stands within its own pass
+            assert!(
+                !earlier || reported == crate::css::moment_reports(),
                 "a kept box stands for one moment only: {node:?}"
             );
         }
