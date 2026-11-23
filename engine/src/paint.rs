@@ -650,7 +650,7 @@ impl Canvas {
                 if coverage <= 0.0 {
                     continue;
                 }
-                let color = paint.color_at(center);
+                let color = paint.pixel_color(steady, center);
                 if color.alpha == 0 {
                     continue;
                 }
@@ -689,7 +689,7 @@ impl Canvas {
                 }
                 Steady::Nowhere => {
                     for pixel_x in whole {
-                        let color = color_at(pixel_x);
+                        let color = paint.pixel_color(steady, (pixel_x as f32 + 0.5, row));
                         if color.alpha != 0 {
                             self.blend_pixel(pixel_x, pixel_y, color);
                         }
@@ -1793,6 +1793,15 @@ impl Paint {
         }
     }
 
+    // a paint asked at every pixel takes its colors from a table, one asked once a row or a
+    // column works each out
+    fn pixel_color(&self, steady: Steady, point: (f32, f32)) -> Color {
+        match (self, steady) {
+            (Self::Ramp(ramp), Steady::Nowhere) => ramp.tabled_color_at(point),
+            _ => self.color_at(point),
+        }
+    }
+
     fn steady(&self) -> Steady {
         match self {
             Self::Solid(_) => Steady::AlongRows,
@@ -1825,6 +1834,48 @@ struct Ramp {
     shape: RampShape,
     repeating: bool,
     stops: Vec<(f32, [f32; 4])>,
+    // the length of the gradient line or ray in device pixels
+    reach: f32,
+    // the colors a few times a device pixel apart along it, made when a fill first asks for
+    // one at every pixel
+    table: std::cell::OnceCell<Option<RampTable>>,
+}
+
+// a ramp's colors at even steps between its first and last stop, each as at its step's middle,
+// or none where a stop falls inside the step and the color is worked out exactly
+struct RampTable {
+    steps_per_offset: f32,
+    colors: Box<[Option<Color>]>,
+}
+
+impl RampTable {
+    // a quarter of a device pixel moves no smooth ramp a whole level of any channel
+    const STEPS_PER_PIXEL: f32 = 4.0;
+    const MOST_STEPS: f32 = 65_536.0;
+
+    fn new(ramp: &Ramp) -> Option<Self> {
+        let (first, last) = (ramp.stops[0].0, ramp.stops[ramp.stops.len() - 1].0);
+        let span = last - first;
+        let count = (span * ramp.reach * Self::STEPS_PER_PIXEL).ceil();
+        if !(1.0..=Self::MOST_STEPS).contains(&count) {
+            return None;
+        }
+        let steps_per_offset = count / span;
+        let colors = (0..count as usize)
+            .map(|step| {
+                let (low, high) = (
+                    first + step as f32 / steps_per_offset,
+                    first + (step + 1) as f32 / steps_per_offset,
+                );
+                let inside = ramp.stops.iter().any(|stop| low < stop.0 && stop.0 < high);
+                (!inside).then(|| ramp.sample(first + (step as f32 + 0.5) / steps_per_offset))
+            })
+            .collect();
+        Some(Self {
+            steps_per_offset,
+            colors,
+        })
+    }
 }
 
 enum RampShape {
@@ -1883,6 +1934,11 @@ impl Ramp {
             repeating = false;
         }
         let device = canvas.device_shape(Shape::square(tile));
+        // an ellipse's ramp runs fastest along its longer radius
+        let reach = match shape {
+            RampShape::Radial(_, radii) => radii.0.max(radii.1),
+            RampShape::Linear(..) => length,
+        } * canvas.scale;
         Some(Self {
             corner: (device.x, device.y),
             scale: canvas.scale,
@@ -1891,29 +1947,65 @@ impl Ramp {
             shape,
             repeating,
             stops,
+            reach,
+            table: std::cell::OnceCell::new(),
         })
     }
 
     fn color_at(&self, point: (f32, f32)) -> Color {
+        self.offset_at(point)
+            .map_or(Color::transparent(), |offset| self.sample(offset))
+    }
+
+    // as color_at, from the table of the ramp's colors where it has one
+    fn tabled_color_at(&self, point: (f32, f32)) -> Color {
+        let Some(offset) = self.offset_at(point) else {
+            return Color::transparent();
+        };
+        let (first, last) = (self.stops[0].0, self.stops[self.stops.len() - 1].0);
+        let offset = if self.repeating {
+            first + (offset - first).rem_euclid(last - first)
+        } else {
+            offset
+        };
+        let table = self.table.get_or_init(|| RampTable::new(self));
+        match table {
+            Some(table) if (first..last).contains(&offset) => {
+                let step = ((offset - first) * table.steps_per_offset) as usize;
+                table
+                    .colors
+                    .get(step)
+                    .copied()
+                    .flatten()
+                    .unwrap_or_else(|| self.sample(offset))
+            }
+            _ => self.sample(offset),
+        }
+    }
+
+    // where along the ramp a point lies, or none outside a tile that does not repeat
+    fn offset_at(&self, point: (f32, f32)) -> Option<f32> {
         let mut x = (point.0 - self.corner.0) / self.scale;
         let mut y = (point.1 - self.corner.1) / self.scale;
         if self.repeat.0 {
             x = x.rem_euclid(self.size.0);
         } else if !(0.0..self.size.0).contains(&x) {
-            return Color::transparent();
+            return None;
         }
         if self.repeat.1 {
             y = y.rem_euclid(self.size.1);
         } else if !(0.0..self.size.1).contains(&y) {
-            return Color::transparent();
+            return None;
         }
-        let offset = match self.shape {
+        Some(match self.shape {
             RampShape::Linear(start, axis) => (x - start.0) * axis.0 + (y - start.1) * axis.1,
+            // hypot's guard against overflow costs more than the rest of the pixel, and a
+            // tile is far too small to need it
             RampShape::Radial(center, radii) => {
-                ((x - center.0) / radii.0).hypot((y - center.1) / radii.1)
+                let (dx, dy) = ((x - center.0) / radii.0, (y - center.1) / radii.1);
+                (dx * dx + dy * dy).sqrt()
             }
-        };
-        self.sample(offset)
+        })
     }
 
     fn sample(&self, offset: f32) -> Color {
@@ -2768,23 +2860,30 @@ pub(crate) fn damage(
     if !changed_area(&old.root, &new.root, ((0.0, 0.0), (0.0, 0.0)), 0, &mut area) {
         return Damage::Everything;
     }
-    let old_layers = old.images.iter().chain(old_canvases);
-    let new_layers = new.images.iter().chain(new_canvases);
-    if old_layers.clone().count() != new_layers.clone().count() {
-        return Damage::Everything;
-    }
+    // a layer draws over its node's box wherever it sits in the list, and a box that came,
+    // went or moved is in the changed area already, so what is left is a node whose picture
+    // is new, changed or gone
+    let old_layers = old.images.iter().chain(old_canvases).collect::<Vec<_>>();
+    let new_layers = new.images.iter().chain(new_canvases).collect::<Vec<_>>();
+    let same = |a: &ImageLayer, b: &ImageLayer| a.node == b.node && a.background == b.background;
     let mut redrawn = Vec::new();
-    for (before, after) in old_layers.zip(new_layers) {
-        if before.node != after.node || before.background != after.background {
-            return Damage::Everything;
-        }
+    for after in &new_layers {
         let shown = planes.iter().any(|plane| {
             plane.node == after.node && plane.size == (after.image.width, after.image.height)
         });
-        if !std::sync::Arc::ptr_eq(&before.image, &after.image) && !shown {
+        let kept = old_layers.iter().any(|before| {
+            same(before, after) && std::sync::Arc::ptr_eq(&before.image, &after.image)
+        });
+        if !kept && !shown {
             redrawn.push(after.node);
         }
     }
+    redrawn.extend(
+        old_layers
+            .iter()
+            .filter(|before| !new_layers.iter().any(|after| same(before, after)))
+            .map(|before| before.node),
+    );
     if !redrawn.is_empty() && !node_area(&new.root, (0.0, 0.0), &redrawn, &mut area) {
         return Damage::Everything;
     }
@@ -6001,6 +6100,48 @@ mod tests {
         }
     }
 
+    // a ramp's table keeps every pixel within a level of its exact color, and a hard stop
+    // exactly where it falls
+    #[test]
+    fn a_tabled_ramp_matches_the_exact_one_to_a_level() {
+        let ramp = |repeating: bool| Ramp {
+            corner: (4.0, 2.0),
+            scale: 1.5,
+            size: (300.0, 200.0),
+            repeat: (false, false),
+            shape: RampShape::Radial((120.0, 60.0), (150.0, 90.0)),
+            repeating,
+            stops: vec![
+                (0.0, [250.0, 240.0, 230.0, 1.0]),
+                (0.5317, [10.0, 120.0, 40.0, 0.7]),
+                (0.5317, [200.0, 0.0, 90.0, 0.9]),
+                (0.8, [0.0, 0.0, 0.0, 0.0]),
+            ],
+            reach: 225.0,
+            table: std::cell::OnceCell::new(),
+        };
+        for repeating in [false, true] {
+            let ramp = ramp(repeating);
+            for y in [2.5, 60.25, 93.0, 150.5] {
+                // finer than the table, so some points fall in the step a stop splits
+                for x in (0..45_000).map(|x| x as f32 / 100.0) {
+                    let (exact, tabled) = (ramp.color_at((x, y)), ramp.tabled_color_at((x, y)));
+                    let apart = [
+                        exact.red.abs_diff(tabled.red),
+                        exact.green.abs_diff(tabled.green),
+                        exact.blue.abs_diff(tabled.blue),
+                        exact.alpha.abs_diff(tabled.alpha),
+                    ];
+                    assert!(
+                        apart.iter().all(|&apart| apart <= 1),
+                        "at {x}, {y}: {exact:?} {tabled:?}"
+                    );
+                }
+            }
+            assert!(ramp.table.get().is_some_and(Option::is_some));
+        }
+    }
+
     // a shape filled by whole runs and by steady rows or columns of its paint must come out
     // as it does asking every pixel for its coverage and color
     #[test]
@@ -6012,7 +6153,7 @@ mod tests {
                 for pixel_x in 0..canvas.width {
                     let center = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
                     let coverage = device.coverage(center);
-                    let color = paint.color_at(center);
+                    let color = paint.pixel_color(paint.steady(), center);
                     if clip.is_some_and(|clip| clip.coverage(center) <= 0.0)
                         || coverage <= 0.0
                         || color.alpha == 0
@@ -6037,6 +6178,8 @@ mod tests {
                     (0.6, [5.0, 60.0, 110.0, 0.5]),
                     (1.0, [0.0, 0.0, 0.0, 0.0]),
                 ],
+                reach: 60.0,
+                table: std::cell::OnceCell::new(),
             })
         };
         let paints = [
@@ -6363,6 +6506,70 @@ mod tests {
         }
         assert!(region.rects.len() <= Region::LIMIT);
     }
+    // canvases that trade places in the layer list, one drawn anew and one gone, repaint
+    // their own boxes only
+    #[test]
+    fn layers_that_reorder_come_or_go_repaint_only_their_boxes() {
+        let document = Document::parse_markup(
+            "<html><body><canvas id='a' width='10' height='10'></canvas><p>between</p><canvas id='b' width='10' height='10'></canvas><canvas id='c' width='10' height='10'></canvas></body></html>",
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(
+            "html, body { margin: 0; background: #123 } canvas { display: block; margin: 4px }",
+        )
+        .expect("stylesheet should parse");
+        let layout = crate::layout::layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 80.0,
+                height: 120.0,
+            },
+        );
+        let filled = |red: u8| {
+            let mut image = Image::new(10, 10);
+            image.pixels.fill(Color {
+                red,
+                green: 40,
+                blue: 90,
+                alpha: 255,
+            });
+            std::sync::Arc::new(image)
+        };
+        let layer = |id: &str, image: &std::sync::Arc<Image>| ImageLayer {
+            node: document.find_element_by_id(id).expect("canvas"),
+            image: image.clone(),
+            background: None,
+        };
+        let (red, blue, green) = (filled(220), filled(30), filled(120));
+        let before = [layer("a", &red), layer("b", &blue), layer("c", &green)];
+        let after = [layer("b", &blue), layer("a", &green)];
+        let Damage::Areas(areas) = damage((&layout, &before), (&layout, &after), &[]) else {
+            panic!("a reordered layer list should damage areas");
+        };
+        let mut canvas = paint_with_canvases(&layout, &before, 1.0, false);
+        for &area in &areas {
+            repaint(&mut canvas, &layout, &after, area);
+        }
+        let whole = paint_with_canvases(&layout, &after, 1.0, false);
+        assert!(canvas.rgba_pixels() == whole.rgba_pixels());
+        let b = document.find_element_by_id("b").expect("canvas");
+        let mut unmoved = Region::default();
+        assert!(node_area(&layout.root, (0.0, 0.0), &[b], &mut unmoved));
+        let apart = |a: &Rect, b: &Rect| {
+            a.x + a.width <= b.x
+                || b.x + b.width <= a.x
+                || a.y + a.height <= b.y
+                || b.y + b.height <= a.y
+        };
+        assert!(
+            areas
+                .iter()
+                .all(|area| unmoved.rects.iter().all(|kept| apart(area, kept))),
+            "the canvas whose picture held is left alone"
+        );
+    }
+
     #[test]
     fn damage_falls_back_to_the_whole_frame_where_it_cannot_bound_a_change() {
         let base = damage_layout("", 0.0);

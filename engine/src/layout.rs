@@ -2858,6 +2858,9 @@ fn kept_answer<Key: Eq + std::hash::Hash, Inputs: PartialEq, Answer: Clone>(
     }
     kept.pass = pass;
     kept.used = works;
+    if kept.refers {
+        crate::svg::note_reference_read();
+    }
     Some((kept.answer.clone(), earlier))
 }
 
@@ -10486,6 +10489,13 @@ mod tests {
             (
                 r##"<div><svg width="40" height="40"><defs><rect id="w" width="10" height="10"/></defs></svg></div>
                 <div><svg width="40" height="40"><use href="#w"/></svg></div>"##,
+                "width",
+                "30",
+            ),
+            // the item lays out twice and takes the drawing whole the second time
+            (
+                r##"<div style="display: flex; flex-direction: column; height: 200px"><div style="flex: 1"><svg width="40" height="40"><use href="#w"/></svg></div><p>x</p></div>
+                <svg width="40" height="40"><defs><rect id="w" width="10" height="10"/></defs></svg>"##,
                 "width",
                 "30",
             ),

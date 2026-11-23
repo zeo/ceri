@@ -1291,6 +1291,11 @@ pub(crate) fn reference_reads() -> u64 {
     REFERENCE_READS.with(std::cell::Cell::get)
 }
 
+// a kept answer that drew by reference reads by reference wherever it is taken
+pub(crate) fn note_reference_read() {
+    REFERENCE_READS.with(|reads| reads.set(reads.get() + 1));
+}
+
 fn render_use(
     walk: &mut Walk<'_>,
     element: &Element,
@@ -1299,7 +1304,7 @@ fn render_use(
     items: &mut Vec<Item>,
 ) -> Option<Extent> {
     let document = walk.document;
-    REFERENCE_READS.with(|reads| reads.set(reads.get() + 1));
+    note_reference_read();
     let target = element
         .attr("href")
         .or_else(|| element.attr("xlink:href"))
