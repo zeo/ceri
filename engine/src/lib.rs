@@ -1,3 +1,20 @@
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// hands freed memory back to the system at once instead of after a delay, so a page that
+// peaks while it loads settles back down as it would on the system allocator
+pub(crate) fn settle_allocator() {
+    #[cfg(feature = "mimalloc")]
+    {
+        // mi_option_purge_delay in the mimalloc v3 header the crate builds
+        const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+        static SETTLED: std::sync::Once = std::sync::Once::new();
+        // SAFETY: setting an option is a plain call that mimalloc allows at any time
+        SETTLED.call_once(|| unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, 0) });
+    }
+}
+
 mod animated;
 mod audio;
 mod autohint;

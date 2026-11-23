@@ -1315,6 +1315,7 @@ fn script_error(error: crate::script::ScriptError) -> NavigationError {
 
 impl Browser {
     pub fn new(resources: ResourceBundle) -> Self {
+        crate::settle_allocator();
         Self {
             resources,
             resource_provider: None,
