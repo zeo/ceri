@@ -481,7 +481,7 @@ impl ScriptRuntime {
         });
         if stale {
             let mut state = state;
-            let reported = crate::css::moment_reports();
+            let reported = crate::css::clock_reads();
             let mut layout = self.run_layout(&inputs, &state);
             // container queries read sizes from a layout, so a change in them lays out again
             if inputs.stylesheet.has_container_queries() {
@@ -494,7 +494,7 @@ impl ScriptRuntime {
             *self.measured.borrow_mut() = Some(MeasuredLayout {
                 version,
                 stylesheet,
-                timeless: crate::css::moment_reports() == reported && state.transitions.is_empty(),
+                timeless: crate::css::clock_reads() == reported && state.transitions.is_empty(),
                 state,
                 boxes: layout.box_index(),
                 layout,

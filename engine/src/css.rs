@@ -805,9 +805,43 @@ struct StyleInputs {
     zero_font: (crate::font::FontStack, crate::font::FontStyle),
 }
 
-// each style with the animation wake its cascade noted and whether it reported motion
-type StyleMemo =
-    HashMap<(NodeId, Option<PseudoElement>), Vec<(StyleInputs, Style, Option<u64>, bool)>>;
+// a style worked out under some inputs, with when it next changes and whether it moves
+type MemoizedStyle = (StyleInputs, Rc<Style>, Option<u64>, bool);
+
+#[derive(Default)]
+struct StyleMemo {
+    entries: HashMap<(NodeId, Option<PseudoElement>), Vec<MemoizedStyle>>,
+    // the distinct styles of the pass by a hash of a few fields, so the many elements a page
+    // styles alike hold one style between them
+    shared: HashMap<u64, Vec<Rc<Style>>>,
+}
+
+impl StyleMemo {
+    fn share(&mut self, style: Style) -> Rc<Style> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::mem::discriminant(&style.display).hash(&mut hasher);
+        std::mem::discriminant(&style.position).hash(&mut hasher);
+        for color in [style.color, style.background] {
+            [color.red, color.green, color.blue, color.alpha].hash(&mut hasher);
+        }
+        style.font_weight.0.hash(&mut hasher);
+        style.opacity.to_bits().hash(&mut hasher);
+        for length in [style.width, style.height, style.font_size] {
+            length
+                .resolve(1000.0, 16.0)
+                .map(f32::to_bits)
+                .hash(&mut hasher);
+        }
+        let alike = self.shared.entry(hasher.finish()).or_default();
+        if let Some(known) = alike.iter().find(|known| ***known == style) {
+            return known.clone();
+        }
+        let style = Rc::new(style);
+        alike.push(style.clone());
+        style
+    }
+}
 
 // the content string of each generated box asked about, which layout asks on every visit
 type ContentMemo = HashMap<(NodeId, Option<PseudoElement>), Option<String>>;
@@ -922,7 +956,7 @@ pub(crate) fn memoize_styles() -> MemoizedStyles {
     STYLE_PASS.with(|pass| pass.set(pass.get() + 1));
     MemoizedStyles {
         previous: (
-            STYLE_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::new())),
+            STYLE_MEMO.with(|memo| memo.borrow_mut().replace(StyleMemo::default())),
             CONTENT_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::new())),
         ),
     }
@@ -932,18 +966,30 @@ thread_local! {
     // counts the reports that a style or a layout stands for this moment only: it sampled
     // motion, or it wrote down a query container's size
     static MOMENT_REPORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // the part of those that read the clock, which a later moment with the same state but
+    // another time cannot reuse; a query container's size is the same at any time
+    static CLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) fn report_moment() {
     MOMENT_REPORTS.with(|reports| reports.set(reports.get() + 1));
 }
 
+fn report_clock_read() {
+    report_moment();
+    CLOCK_READS.with(|reads| reads.set(reads.get() + 1));
+}
+
 pub(crate) fn moment_reports() -> u64 {
     MOMENT_REPORTS.with(std::cell::Cell::get)
 }
 
+pub(crate) fn clock_reads() -> u64 {
+    CLOCK_READS.with(std::cell::Cell::get)
+}
+
 fn note_animation_wake(delay: u64) {
-    report_moment();
+    report_clock_read();
     ANIMATION_WAKE
         .with(|wake| wake.set(Some(wake.get().map_or(delay, |soonest| soonest.min(delay)))));
 }
@@ -984,7 +1030,7 @@ pub(crate) fn take_motion() -> Option<BTreeSet<NodeId>> {
 }
 
 fn note_motion<'a>(node: Option<NodeId>, mut properties: impl Iterator<Item = &'a str>) {
-    report_moment();
+    report_clock_read();
     MOTION.with(|motion| {
         if let Some(motion) = motion.borrow_mut().as_mut() {
             match node {
@@ -2938,17 +2984,19 @@ impl Stylesheet {
         let known = STYLE_MEMO.with(|memo| {
             memo.borrow()
                 .as_ref()?
+                .entries
                 .get(&key)?
                 .iter()
                 .find(|(seen, _, _, _)| *seen == inputs)
-                .map(|&(_, style, wake, moving)| (style, wake, moving))
+                .map(|(_, style, wake, moving)| (**style, *wake, *moving))
         });
         if let Some((style, wake, moving)) = known {
             if let Some(delay) = wake {
                 note_animation_wake(delay);
             }
+            // a style is only moving through what it sampled of motion, which reads the clock
             if moving {
-                report_moment();
+                report_clock_read();
             }
             return style;
         }
@@ -2962,9 +3010,11 @@ impl Stylesheet {
         }
         STYLE_MEMO.with(|memo| {
             if let Some(memo) = memo.borrow_mut().as_mut() {
-                memo.entry(key)
+                let shared = memo.share(style);
+                memo.entries
+                    .entry(key)
                     .or_default()
-                    .push((inputs, style, wake, moving));
+                    .push((inputs, shared, wake, moving));
             }
         });
         style
@@ -3121,15 +3171,17 @@ impl Stylesheet {
                 .keyframes
                 .iter()
                 .find(|frames| frames.name == animation.name);
-            note_motion(
-                own,
-                keyframes
-                    .into_iter()
-                    .flat_map(|frames| &frames.stops)
-                    .flat_map(|stop| &stop.declarations)
-                    .map(|declaration| declaration.property.as_str()),
-            );
+            // a finished animation holds its values whatever the time, so the style stops
+            // reading the clock and a layout of it can stand from one frame to the next
             if let Some(delay) = animation.next_change(now) {
+                note_motion(
+                    own,
+                    keyframes
+                        .into_iter()
+                        .flat_map(|frames| &frames.stops)
+                        .flat_map(|stop| &stop.declarations)
+                        .map(|declaration| declaration.property.as_str()),
+                );
                 note_animation_wake(delay);
             }
             for (property, value) in self.animated_values(&animation, now, &base_values) {
@@ -9201,6 +9253,29 @@ mod tests {
                 .resolve(200.0, 16.0),
             Some(180.0)
         );
+    }
+
+    #[test]
+    fn a_finished_animation_stops_reading_the_clock() {
+        let stylesheet = Stylesheet::parse(
+            "@keyframes view-in { from { opacity: 0 } to { opacity: 1 } } .view { animation: view-in 200ms ease-out }",
+        )
+        .expect("stylesheet should parse");
+        let mut view = Element::new("div");
+        view.attrs.insert("class".to_string(), "view".to_string());
+        let reads_at = |clock: u64| {
+            let before = clock_reads();
+            stylesheet.style_for(context(
+                &placed(&view, &[]),
+                &StyleState {
+                    clock,
+                    ..StyleState::default()
+                },
+            ));
+            clock_reads() != before
+        };
+        assert!(reads_at(100));
+        assert!(!reads_at(5000));
     }
 
     #[test]

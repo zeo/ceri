@@ -1058,6 +1058,9 @@ pub struct Browser {
     // each element's running keyframe animation, so it plays from when it was applied
     animations: BTreeMap<NodeId, AnimationRun>,
     motion_clock: Option<u64>,
+    // what the last motion sample read: document version, sheet, state without the clock and
+    // viewport, so a frame that changed none of them and has nothing moving skips the scan
+    motion_read: Option<(u64, SheetIdentity, StyleState, Size)>,
     host_runtime_info: Option<HostRuntimeInfo>,
     host_bridge: Option<crate::script::HostBridge>,
     waker: Option<crate::bridge::Waker>,
@@ -1234,6 +1237,7 @@ impl Browser {
             declared: BTreeMap::new(),
             animations: BTreeMap::new(),
             motion_clock: None,
+            motion_read: None,
             host_runtime_info: None,
             host_bridge: None,
             waker: None,
@@ -1844,7 +1848,20 @@ impl Browser {
         state.color_scheme = self.preferences.color_scheme;
         state.reduced_motion = self.preferences.reduced_motion;
         state.forced_colors = self.preferences.forced_colors;
+        let read = (
+            document.version(),
+            SheetIdentity::of(&stylesheet),
+            state.clone(),
+            viewport,
+        );
         state.clock = clock;
+        // the declared values can only differ when something they read did, and a frame with
+        // nothing in motion has no event to fire either
+        let settled = self.transitions.is_empty() && self.animations.values().all(|run| run.ended);
+        if settled && self.motion_read.as_ref() == Some(&read) {
+            return Ok(false);
+        }
+        self.motion_read = Some(read);
 
         let mut seen = BTreeSet::new();
         let mut seen_animations = BTreeSet::new();
