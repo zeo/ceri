@@ -2905,11 +2905,10 @@ impl Browser {
             .map(|(node, run)| (*node, run.started))
             .collect();
         let _fonts = crate::font::use_fonts(self.fonts.clone(), self.viewport.device_pixel_ratio);
+        // found once per change to the document's elements, not walked for on every frame
+        let lists = page.runtime.element_lists();
         if let Some(base) = self.current_url.as_ref() {
-            for node in document
-                .find_elements_by_selector("img")
-                .unwrap_or_default()
-            {
+            for &node in &lists[4] {
                 let image = document
                     .attribute(node, "src")
                     .and_then(|source| self.image_for(page, base, source));
@@ -2920,17 +2919,11 @@ impl Browser {
                 }
             }
         }
-        for node in document
-            .find_elements_by_selector("canvas")
-            .unwrap_or_default()
-        {
+        for &node in &lists[2] {
             let size = crate::script::canvas_size(&document, node);
             style_state.image_sizes.insert(node, size);
         }
-        for node in document
-            .find_elements_by_selector("video")
-            .unwrap_or_default()
-        {
+        for &node in &lists[3] {
             style_state
                 .image_sizes
                 .insert(node, page.runtime.video_size(node));

@@ -691,7 +691,7 @@ impl Default for ViewportMetrics {
 }
 
 // the selector version the lists were found at, then the options and the form controls
-type ControlLists = (u64, Rc<[Vec<NodeId>; 4]>);
+type ControlLists = (u64, Rc<[Vec<NodeId>; 5]>);
 
 // the document and selector versions a disabled set was found at, and the set
 type DisabledControls = ((u64, u64), BTreeSet<NodeId>);
@@ -3529,8 +3529,8 @@ impl ScriptRuntime {
         Ok(dispatch)
     }
 
-    // the options, form controls, canvases and videos, in that order
-    pub(crate) fn element_lists(&self) -> Rc<[Vec<NodeId>; 4]> {
+    // the options, form controls, canvases, videos and images, in that order
+    pub(crate) fn element_lists(&self) -> Rc<[Vec<NodeId>; 5]> {
         let document = self.document.borrow();
         let version = document.selector_version();
         let mut controls = self.controls.borrow_mut();
@@ -3543,6 +3543,7 @@ impl ScriptRuntime {
                         "button, input, select, textarea, optgroup, option, fieldset",
                         "canvas",
                         "video",
+                        "img",
                     ]
                     .map(|selector| {
                         document
