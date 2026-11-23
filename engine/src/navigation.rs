@@ -678,7 +678,8 @@ pub trait ScriptDialogs {
 
 #[derive(Clone, Debug, Default)]
 pub struct ResourceBundle {
-    resources: BTreeMap<String, Resource>,
+    // shared, as the bundle is every asset of the app and is handed to whatever loads one
+    resources: Arc<BTreeMap<String, Resource>>,
 }
 
 impl ResourceBundle {
@@ -709,8 +710,7 @@ impl ResourceBundle {
             ));
         }
         let path = normalize_resource_path(path)?;
-        self.resources
-            .insert(path, Resource::new(mime_type.trim(), body));
+        Arc::make_mut(&mut self.resources).insert(path, Resource::new(mime_type.trim(), body));
         Ok(())
     }
 

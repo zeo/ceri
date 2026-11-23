@@ -447,9 +447,12 @@ impl ScriptRuntime {
         let Some(inputs) = &self.layout_inputs else {
             return;
         };
-        let resources = self.resources.clone().unwrap_or_default();
+        // borrowed, as the bundle holds every asset of the app and this runs on each read of
+        // a box or a style
+        let empty = crate::navigation::ResourceBundle::default();
+        let resources = self.resources.as_ref().unwrap_or(&empty);
         let provider = self.resource_provider.as_deref();
-        let load = |url: &AppUrl| match resolve_runtime_resource(&resources, provider, url) {
+        let load = |url: &AppUrl| match resolve_runtime_resource(resources, provider, url) {
             Ok(Some(resource)) => Ok(resource),
             Ok(None) => Err(NavigationError::ResourceNotFound(url.path().to_string())),
             Err(error) => Err(NavigationError::ResourceProvider(error.message)),
