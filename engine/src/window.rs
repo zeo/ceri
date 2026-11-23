@@ -628,6 +628,9 @@ struct AppWindow {
     navigation_pending: bool,
     render_request: Option<u64>,
     latest_frame: Option<Frame>,
+    // input the worker's queue had no room for, in order, sent as it frees up; pressing,
+    // releasing and typing are never dropped while a long task keeps the page busy
+    backlog: std::collections::VecDeque<InputEvent>,
     applied_title: Option<String>,
     // the fullscreen the page last asked for, so only its changes move the window
     page_fullscreen: bool,
@@ -723,6 +726,7 @@ where
             navigation_pending: true,
             render_request: None,
             latest_frame: None,
+            backlog: std::collections::VecDeque::new(),
             applied_title: None,
             page_fullscreen: false,
             applied_cursor: None,
@@ -1444,6 +1448,41 @@ impl AppWindow {
     }
 
     fn submit(&mut self, event: InputEvent) -> bool {
+        if !self.backlog.is_empty() {
+            wait_in_backlog(&mut self.backlog, event);
+            return self.send_backlog();
+        }
+        self.send(event)
+    }
+
+    // sends what waited, oldest first, until the queue is full again
+    fn send_backlog(&mut self) -> bool {
+        while let Some(event) = self.backlog.pop_front() {
+            match self.send_input(event) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(event) => {
+                    self.backlog.push_front(event);
+                    return true;
+                }
+            }
+        }
+        true
+    }
+
+    fn send(&mut self, event: InputEvent) -> bool {
+        match self.send_input(event) {
+            Ok(going) => going,
+            Err(event) => {
+                self.backlog.push_back(event);
+                true
+            }
+        }
+    }
+
+    // one event to the worker, whether the window goes on, or the event back when the
+    // worker's queue is full
+    fn send_input(&mut self, event: InputEvent) -> Result<bool, InputEvent> {
         let resize = match &event {
             InputEvent::Resize(viewport) => Some(*viewport),
             _ => None,
@@ -1452,7 +1491,7 @@ impl AppWindow {
             InputEvent::ScaleChanged(scale) => Some(*scale),
             _ => None,
         };
-        match self.worker.input(event) {
+        match self.worker.input(event.clone()) {
             Ok(_) => {
                 if let Some(viewport) = resize {
                     self.viewport = viewport;
@@ -1461,14 +1500,17 @@ impl AppWindow {
                     self.scale = scale;
                 }
                 self.request_redraw();
-                true
+                Ok(true)
             }
-            Err(error) if error == "engine worker queue is full" => true,
-            Err(error) => self.recover(&error),
+            Err(error) if error == "engine worker queue is full" => Err(event),
+            Err(error) => Ok(self.recover(&error)),
         }
     }
 
     fn poll_worker(&mut self) -> bool {
+        if !self.backlog.is_empty() {
+            self.send_backlog();
+        }
         let mut request_redraw = false;
         for event in self.worker.poll() {
             match event {
@@ -2040,6 +2082,16 @@ fn layout_viewport(width: u32, height: u32, scale: f32) -> Size {
     }
 }
 
+// queues input behind what already waits; a run of moves waiting only needs its newest
+fn wait_in_backlog(backlog: &mut std::collections::VecDeque<InputEvent>, event: InputEvent) {
+    if matches!(event, InputEvent::PointerMove { .. })
+        && matches!(backlog.back(), Some(InputEvent::PointerMove { .. }))
+    {
+        backlog.pop_back();
+    }
+    backlog.push_back(event);
+}
+
 // copies the left, top, right and bottom box of the canvas into a surface buffer
 fn present_frame(
     frame: &Frame,
@@ -2200,6 +2252,29 @@ mod tests {
         assert_eq!((placed.x, placed.y), (1920 + 470, 195));
         let huge = centred(&monitor, (4000, 3000));
         assert_eq!((huge.x, huge.y), (1920, 0));
+    }
+
+    #[test]
+    fn waiting_input_keeps_every_press_and_only_the_newest_of_a_run_of_moves() {
+        use super::{InputEvent, wait_in_backlog};
+        use crate::host::PointerButton;
+        let mut backlog = std::collections::VecDeque::new();
+        let moved = |x: f32| InputEvent::PointerMove { x, y: 0.0 };
+        let pressed = InputEvent::PointerDown {
+            x: 2.0,
+            y: 0.0,
+            button: PointerButton::Primary,
+        };
+        for event in [
+            moved(1.0),
+            moved(2.0),
+            pressed.clone(),
+            moved(3.0),
+            moved(4.0),
+        ] {
+            wait_in_backlog(&mut backlog, event);
+        }
+        assert_eq!(Vec::from(backlog), vec![moved(2.0), pressed, moved(4.0)]);
     }
 
     #[test]
