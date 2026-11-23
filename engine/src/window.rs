@@ -72,13 +72,16 @@ impl Output {
     ) -> Result<(), String> {
         match self {
             #[cfg(target_os = "windows")]
-            Self::Composition(presenter) => presenter.present(
-                frame.canvas.rgba_pixels(),
-                (frame.canvas.width(), frame.canvas.height()),
-                (width.get(), height.get()),
-                Some(frame.canvas.revision()),
-                &frame.planes,
-            ),
+            Self::Composition(presenter) => {
+                presenter.set_edge(frame.background);
+                presenter.present(
+                    frame.canvas.rgba_pixels(),
+                    (frame.canvas.width(), frame.canvas.height()),
+                    (width.get(), height.get()),
+                    Some(frame.canvas.revision()),
+                    &frame.planes,
+                )
+            }
             Self::Software(surface, shown) => {
                 let revision = frame.canvas.revision();
                 let size = (width.get(), height.get());
@@ -122,8 +125,7 @@ impl Output {
     }
 
     // a frame laid out for an earlier size, shown while the new size's frame is made: its
-    // pixels where they fall inside the window, and past its edges the colour of its bottom
-    // right corner, which is the page's own background far more often than not
+    // pixels where they fall inside the window, and past its edges the page's canvas colour
     fn present_stale(
         &mut self,
         frame: &Frame,
@@ -135,13 +137,8 @@ impl Output {
         let pixels = canvas.rgba_pixels();
         let stride = canvas.bytes_per_row();
         let (canvas_columns, canvas_rows) = (canvas.width() as usize, canvas.height() as usize);
-        let corner = match (canvas_columns, canvas_rows) {
-            (0, _) | (_, 0) => [0, 0, 0, 255],
-            _ => {
-                let at = (canvas_rows - 1) * stride + (canvas_columns - 1) * 4;
-                [pixels[at], pixels[at + 1], pixels[at + 2], 255]
-            }
-        };
+        let [red, green, blue] = frame.background;
+        let corner = [red, green, blue, 255];
         let mut padded = vec![0u8; columns * rows * 4];
         for (row, target) in padded.chunks_exact_mut(columns * 4).enumerate() {
             let shared = if row < canvas_rows {
@@ -2145,6 +2142,7 @@ mod tests {
             scale: 1.0,
             title: None,
             fullscreen: false,
+            background: [255, 255, 255],
             canvas: std::sync::Arc::new(crate::paint::Canvas::new(
                 4,
                 3,

@@ -64,8 +64,8 @@ pub(crate) struct Presenter {
     // a back buffer comes back holding the frame before the last, so the box the last present
     // changed is copied again along with the new one
     last_box: [u32; 4],
-    // the bottom right pixel of the last frame, swizzled, which fills the window past a frame
-    // made for a smaller size
+    // the page's canvas colour, swizzled, which fills the window past a frame made for a
+    // smaller size
     edge: [u8; 4],
     // the uploaded box swizzled to BGRA, kept to avoid an allocation per frame
     staging: Vec<u8>,
@@ -233,9 +233,6 @@ impl Presenter {
             _ => vec![whole],
         };
         self.shown = revision.map(|revision| revision.id);
-        let corner =
-            &rgba[((height - 1) as usize * width as usize + width as usize - 1) * 4..][..4];
-        self.edge = [corner[2], corner[1], corner[0], 255];
         let Some(upload) = uploads.iter().copied().reduce(|all, next| {
             [
                 all[0].min(next[0]),
@@ -332,6 +329,11 @@ impl Presenter {
                 .ok()
                 .map_err(|error| format!("the frame could not be presented: {error}"))
         }
+    }
+
+    // the colour the window takes past a frame of an earlier size: the page's canvas colour
+    pub(crate) fn set_edge(&mut self, [red, green, blue]: [u8; 3]) {
+        self.edge = [blue, green, red, 255];
     }
 
     // keeps the window covered as it resizes, before a frame of the new size is made: the

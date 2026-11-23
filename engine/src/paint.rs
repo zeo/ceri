@@ -3631,6 +3631,18 @@ fn paint_document(
     );
 }
 
+// the colour the canvas shows where nothing else paints: the root background's, over white
+pub(crate) fn canvas_color(root: &LayoutBox) -> [u8; 3] {
+    let Some(color) = canvas_background(root).map(|root| root.background) else {
+        return [255, 255, 255];
+    };
+    let over_white = |channel: u8| {
+        let alpha = u32::from(color.alpha);
+        ((u32::from(channel) * alpha + 255 * (255 - alpha)) / 255) as u8
+    };
+    [color.red, color.green, color.blue].map(over_white)
+}
+
 fn canvas_background(root: &LayoutBox) -> Option<&LayoutBox> {
     let mut candidates = Vec::new();
     collect_root_boxes(root, 0, &mut candidates);
@@ -6509,6 +6521,26 @@ mod tests {
         // a css pixel is a pixel and a half at 1.5x
         assert!(scroll_repaint(&canvas, &old, &scroll_layout(1.0, 0.0)).is_none());
         assert!(scroll_repaint(&canvas, &old, &scroll_layout(6.0, 12.0)).is_none());
+    }
+
+    #[test]
+    fn the_canvas_color_is_the_root_background_over_white() {
+        let color = |css: &str| {
+            let document = Document::parse_markup("<html><body><p>x</p></body></html>")
+                .expect("document should parse");
+            let stylesheet = Stylesheet::parse(css).expect("stylesheet should parse");
+            let size = Size {
+                width: 20.0,
+                height: 20.0,
+            };
+            canvas_color(&crate::layout::layout(&document, &stylesheet, size).root)
+        };
+        assert_eq!(color(""), [255, 255, 255]);
+        assert_eq!(color("html { background-color: #141414 }"), [20, 20, 20]);
+        assert_eq!(
+            color("body { background-color: rgba(0, 0, 0, 0.5) }"),
+            [127, 127, 127]
+        );
     }
 
     #[test]

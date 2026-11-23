@@ -3283,6 +3283,17 @@ impl Browser {
 
     // with planes, a video a presenter can show under the canvas comes back as its frame and
     // where it goes, and the canvas leaves its box transparent
+    // the canvas colour of the layout last made, for the window to show past a frame of an
+    // earlier size
+    pub(crate) fn canvas_color(&self) -> [u8; 3] {
+        self.layout_cache
+            .borrow()
+            .as_ref()
+            .map_or([255, 255, 255], |cached| {
+                crate::paint::canvas_color(&cached.layout.root)
+            })
+    }
+
     pub(crate) fn paint_planes(
         &self,
         viewport: Size,

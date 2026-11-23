@@ -133,6 +133,9 @@ pub struct Frame {
     // whether the page asked for fullscreen through requestFullscreen
     pub fullscreen: bool,
     pub canvas: std::sync::Arc<Canvas>,
+    // the page's canvas colour, which fills the window past this frame while one of a new
+    // size is made
+    pub background: [u8; 3],
     // video frames to show under the canvas where it leaves them transparent
     #[cfg_attr(
         not(all(feature = "windowed", target_os = "windows")),
@@ -1157,6 +1160,7 @@ impl EngineHost {
             title: self.browser.title(),
             fullscreen: self.browser.fullscreen(),
             canvas,
+            background: self.browser.canvas_color(),
             planes,
         };
         self.next_frame = self.next_frame.saturating_add(1);
