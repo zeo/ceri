@@ -2160,6 +2160,8 @@ impl Compiler {
         body: &Stmt,
     ) -> Result<(), ScriptError> {
         let mut lexical = false;
+        // a function made in the head keeps the first copy of the bindings too
+        let head = self.here();
         match init {
             Some(ForInit::Declaration { kind, declarators }) if *kind != DeclarationKind::Var => {
                 let binding = if *kind == DeclarationKind::Const {
@@ -2202,12 +2204,24 @@ impl Compiler {
         self.compile_statement(body)?;
         let continue_at = self.here();
         // each iteration gets its own copy of the loop bindings, so closures keep their value
-        if lexical {
-            self.emit(Op::CloneScope);
-        }
+        let clone = lexical.then(|| self.emit(Op::CloneScope));
         if let Some(update) = update {
             self.compile_expression(update)?;
             self.emit(Op::Pop);
+        }
+        // the copy only shows to a function made in the loop or code a direct eval runs there,
+        // so a loop with neither keeps one scope and spares a copy per iteration
+        if let Some(clone) = clone {
+            let ops = &self.state().ops[head as usize..];
+            let captures = ops.iter().any(|op| {
+                matches!(
+                    op,
+                    Op::Closure(_) | Op::Class { .. } | Op::CallEval(_) | Op::CallEvalSpread
+                )
+            });
+            if !captures {
+                self.state().ops[clone] = Op::Nop;
+            }
         }
         self.emit(Op::Jump(start));
         if let Some(exit) = exit {

@@ -7074,6 +7074,32 @@ mod tests {
     }
 
     #[test]
+    fn for_let_loops_copy_their_bindings_only_where_a_function_can_see_them() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id="status">idle</p><script>
+                const bodies = [];
+                for (let i = 0; i < 3; i++) bodies.push(() => i);
+                const updates = [];
+                for (let i = 0; i < 3; updates.push(() => i), i++);
+                let first;
+                for (let i = 0, f = () => i; i < 3; i++) first = f;
+                let plain = 0;
+                for (let i = 0; i < 1000; i++) plain += i;
+                const evals = [];
+                for (let i = 0; i < 2; i++) eval("evals.push(() => i)");
+                document.getElementById("status").textContent = [
+                    bodies.map((f) => f()).join(","), updates.map((f) => f()).join(","),
+                    first(), plain, evals.map((f) => f()).join(","),
+                ].join("|");
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("loop page should load");
+        assert_eq!(element_text(&browser, "status"), "0,1,2|1,2,3|0|499500|0,1");
+    }
+
+    #[test]
     fn computed_style_objects_made_alike_stay_apart() {
         let mut browser = Browser::new(bundle(
             r#"<style>#a { color: rgb(1, 2, 3) } #b { color: rgb(4, 5, 6) }</style><p id="a">a</p><p id="b">b</p><p id="status">idle</p><script>
