@@ -4240,7 +4240,6 @@ test/language/statements/for-of/decl-fun.js
 test/language/statements/for-of/decl-gen.js
 test/language/statements/for-of/float32array-mutate.js
 test/language/statements/for-of/float64array-mutate.js
-test/language/statements/for-of/generator-close-via-continue.js
 test/language/statements/for-of/generator-close-via-return.js
 test/language/statements/for-of/head-await-using-bound-names-fordecl-tdz.js
 test/language/statements/for-of/head-const-bound-names-dup.js
@@ -4258,7 +4257,6 @@ test/language/statements/for-of/int32array-mutate.js
 test/language/statements/for-of/int8array-mutate.js
 test/language/statements/for-of/iterator-close-throw-get-method-abrupt.js
 test/language/statements/for-of/iterator-close-throw-get-method-non-callable.js
-test/language/statements/for-of/iterator-close-via-continue.js
 test/language/statements/for-of/iterator-close-via-return.js
 test/language/statements/for-of/labelled-fn-stmt-const.js
 test/language/statements/for-of/labelled-fn-stmt-let.js

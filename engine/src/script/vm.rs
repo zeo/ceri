@@ -1633,6 +1633,14 @@ impl ScriptRuntime {
                     frame.scope = Some(scope);
                     frame.scopes += 1;
                 }
+                Op::Uninitialize { index, count } => {
+                    if let Some(scope) = &frame.scope {
+                        let mut scope = scope.borrow_mut();
+                        let range = index as usize
+                            ..(index as usize + count as usize).min(scope.slots.len());
+                        scope.slots[range].fill(Value::Uninitialized);
+                    }
+                }
                 Op::PopScope => {
                     Self::restore_scopes(frame, frame.scopes.saturating_sub(1));
                 }

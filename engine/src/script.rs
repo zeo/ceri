@@ -20142,6 +20142,50 @@ mod tests {
         );
     }
     #[test]
+    fn blocks_nothing_captures_keep_their_scoping_rules() {
+        let document = document(r#"<main><p id="status">idle</p></main>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const out = [];
+                function run() {
+                    let x = "outer";
+                    for (let i = 0; i < 3; i++) {
+                        try { out.push(late); } catch (error) { out.push(error.name); }
+                        let late = i;
+                        { let x = "inner" + i; out.push(x); }
+                        if (i === 1) continue;
+                        try { if (i === 2) break; } finally { out.push("finally" + i); }
+                    }
+                    out.push(x);
+                    try { throw "thrown"; } catch (caught) { let x = caught; out.push(x); }
+                    const kept = [];
+                    for (let j = 0; j < 2; j++) { const v = j * 10; kept.push(() => v); }
+                    out.push(kept.map((read) => read()).join("+"));
+                    label: for (const a of [1, 2]) { for (const b of [1, 2]) { if (b === 2) continue label; out.push(a + "" + b); } }
+                    return out.join(",");
+                }
+                function* numbers(tag) { try { yield 1; yield 2; } finally { out.push("closed" + tag); } }
+                function exits() {
+                    l1: for (const a of numbers("a")) { for (const b of numbers("b" + a)) { try { if (b === 2) continue l1; } finally { out.push("finally" + a + b); } out.push(a + "" + b); } }
+                    l2: for (const a in { x: 1, y: 2 }) { for (const b of [1, 2]) { if (b === 2) break l2; out.push(a + b); } }
+                }
+                const first = run();
+                out.length = 0;
+                exits();
+                document.getElementById("status").textContent = first + "|" + out.join(",");
+                "#,
+            )
+            .expect("script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(
+                "ReferenceError,inner0,finally0,ReferenceError,inner1,ReferenceError,inner2,finally2,outer,thrown,0+10,11,21|finally11,11,finally12,closedb1,finally21,21,finally22,closedb2,closeda,x1"
+            )
+        );
+    }
+    #[test]
     fn index_keys_keep_their_meaning_on_arrays_and_objects() {
         let document = document(r#"<main><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());

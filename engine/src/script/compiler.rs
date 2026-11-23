@@ -191,6 +191,12 @@ pub(super) enum Op {
     TypeOf,
     ToNumeric,
     ToPropertyKey,
+    // puts slots of the innermost scope back in their temporal dead zone, as a block whose
+    // bindings live there is entered
+    Uninitialize {
+        index: u16,
+        count: u16,
+    },
     // ToPropertyKey ahead of GetIndex or SetIndex, which take an array index as the number it is
     ToIndexKey,
     Increment,
@@ -370,6 +376,9 @@ struct ScopeInfo {
     role: ScopeRole,
     grows: bool,
     overflowed: bool,
+    // where a materialized block's PushScope sits, and how many scopes were open around it
+    start: usize,
+    level: u16,
 }
 
 impl ScopeInfo {
@@ -384,6 +393,8 @@ impl ScopeInfo {
             role: ScopeRole::Block,
             grows: false,
             overflowed: false,
+            start: 0,
+            level: 0,
         }
     }
 
@@ -433,6 +444,10 @@ struct LoopTarget {
     continues: Vec<usize>,
     handlers: u16,
     scopes: u16,
+    // a for-in or for-of loop's iterator sits on the stack under its body: whether leaving
+    // closes it, and the exits to loops outside that pass out through it
+    iterator: Option<bool>,
+    outward: Vec<(usize, Option<Name>, bool)>,
 }
 
 struct FunctionState {
@@ -475,6 +490,79 @@ struct FunctionState {
 }
 
 impl FunctionState {
+    // a block nothing can capture keeps its bindings in hidden slots of the scope around it,
+    // instead of a scope made and dropped each time it is entered: its ops are rewritten to
+    // reach them there, one scope shallower, and its entry puts them back in their temporal
+    // dead zone. false when something in it could hold or name its scope
+    fn hoist_block(&mut self, block: &ScopeInfo) -> bool {
+        if self.is_global || block.kind != ScopeKind::Block || block.overflowed {
+            return false;
+        }
+        let captures = self.ops[block.start..].iter().any(|op| {
+            matches!(
+                op,
+                Op::Closure(_)
+                    | Op::Class { .. }
+                    | Op::CallEval(_)
+                    | Op::CallEvalSpread
+                    | Op::CloneScope
+                    | Op::GetName { .. }
+                    | Op::SetName { .. }
+                    | Op::DeleteName { .. }
+                    | Op::TypeofName { .. }
+                    | Op::CalleeName { .. }
+            )
+        });
+        let Some(host) = self
+            .scopes
+            .iter_mut()
+            .rev()
+            .find(|scope| scope.materialized)
+        else {
+            return false;
+        };
+        if captures || host.kind == ScopeKind::Outer || host.with_object.is_some() {
+            return false;
+        }
+        let mut kinds = vec![BindingKind::Hidden; block.size as usize];
+        for binding in block.bindings.values() {
+            kinds[binding.index as usize] = binding.kind;
+        }
+        let first = host.size;
+        for (slot, kind) in kinds.into_iter().enumerate() {
+            host.declare(format!("%block {}:{slot}", block.start).into(), kind);
+        }
+        if host.overflowed {
+            return false;
+        }
+        let moved = |index: u16| first + index;
+        let mut nested = 0u16;
+        for op in &mut self.ops[block.start + 1..] {
+            match op {
+                Op::PushScope(_) | Op::PushVarScope(_) => nested += 1,
+                Op::PopScope => nested = nested.saturating_sub(1),
+                Op::GetLocal { depth, index, .. }
+                | Op::SetLocal { depth, index, .. }
+                | Op::InitLocal { depth, index } => {
+                    if *depth == nested {
+                        *index = moved(*index);
+                    } else if *depth > nested && *depth != GLOBAL {
+                        *depth -= 1;
+                    }
+                }
+                // an inner block hoisted here already clears its slots in this one
+                Op::Uninitialize { index, .. } if nested == 0 => *index = moved(*index),
+                Op::Exit { scopes, .. } if *scopes > block.level => *scopes -= 1,
+                _ => {}
+            }
+        }
+        self.ops[block.start] = Op::Uninitialize {
+            index: first,
+            count: block.size,
+        };
+        true
+    }
+
     fn new(is_arrow: bool, is_global: bool, strict: bool) -> Self {
         Self {
             ops: Vec::new(),
@@ -1463,6 +1551,8 @@ impl Compiler {
             let state = self.state();
             scope.block = state.next_block();
             state.blocks.push(scope.layout());
+            scope.start = state.ops.len();
+            scope.level = state.runtime_scopes;
             state.emit(Op::PushScope(scope.block));
             state.runtime_scopes += 1;
         }
@@ -1474,7 +1564,9 @@ impl Compiler {
         let state = self.state();
         let scope = state.scopes.pop().expect("a block scope is open");
         state.overflowed |= scope.overflowed;
-        if scope.materialized {
+        if scope.materialized && state.hoist_block(&scope) {
+            state.runtime_scopes -= 1;
+        } else if scope.materialized {
             // a block scope can grow after it was opened, as temporaries are added
             state.blocks[scope.block as usize] = scope.layout();
             state.emit(Op::PopScope);
@@ -2119,7 +2211,15 @@ impl Compiler {
             continues: Vec::new(),
             handlers,
             scopes,
+            iterator: None,
+            outward: Vec::new(),
         });
+    }
+
+    fn mark_iterator(&mut self, close: bool) {
+        if let Some(target) = self.state().targets.last_mut() {
+            target.iterator = Some(close);
+        }
     }
 
     fn pop_target(&mut self, continue_at: Option<u32>) {
@@ -2151,6 +2251,24 @@ impl Compiler {
                 None => "break outside a loop or switch".to_string(),
             }));
         };
+        // a loop in between whose iterator is on the stack is left first, at a landing that
+        // closes it and goes on outward, after any finally blocks on the way have run
+        if let Some(between) = (position + 1..state.targets.len())
+            .rev()
+            .find(|&inner| state.targets[inner].iterator.is_some())
+        {
+            let inner = &state.targets[between];
+            let (handlers, scopes) = (inner.handlers, inner.scopes);
+            let at = state.emit(Op::Exit {
+                target: 0,
+                handlers,
+                scopes,
+            });
+            state.targets[between]
+                .outward
+                .push((at, label.cloned(), is_continue));
+            return Ok(());
+        }
         let target = &state.targets[position];
         let handlers = target.handlers;
         let scopes = target.scopes;
@@ -2288,6 +2406,7 @@ impl Compiler {
         self.compile_expression(right)?;
         self.emit(Op::ForInPrepare);
         self.push_target(labels, TargetKind::Loop);
+        self.mark_iterator(false);
         // the key iterator stays on the stack under every iteration
         let start = self.here();
         let exit = self.emit(Op::ForInNext(0));
@@ -2327,6 +2446,11 @@ impl Compiler {
         for at in target.continues {
             self.state().patch(at, continue_at);
         }
+        for (at, label, is_continue) in target.outward {
+            self.patch_here(at);
+            self.emit(if close { Op::IterClose } else { Op::Pop });
+            self.compile_exit(label.as_ref(), is_continue)?;
+        }
         Ok(())
     }
 
@@ -2346,6 +2470,7 @@ impl Compiler {
         };
         self.emit(op);
         self.push_target(labels, TargetKind::Loop);
+        self.mark_iterator(true);
         let start = self.here();
         let exit = if is_await {
             self.emit(Op::AsyncIterNext);
