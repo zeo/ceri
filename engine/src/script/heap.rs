@@ -163,8 +163,11 @@ impl Node {
                         {
                             out.push(Rc::as_ptr(home) as *const u8 as usize);
                         }
-                        for fields in [&closure.fields, &closure.static_fields] {
-                            let fields = fields.try_borrow().ok()?;
+                        let class = closure.class.try_borrow().ok()?;
+                        for fields in class
+                            .iter()
+                            .flat_map(|class| [&class.fields, &class.statics])
+                        {
                             for field in fields.iter() {
                                 match &field.kind {
                                     FieldKind::Field(Some(value))

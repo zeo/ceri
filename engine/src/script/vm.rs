@@ -50,13 +50,21 @@ pub(super) struct FieldDefinition {
     pub(super) kind: FieldKind,
 }
 
+// the instance fields and private methods a class constructor installs on each instance,
+// and the static ones it installs on itself
+#[derive(Default)]
+pub(super) struct ClassFields {
+    pub(super) fields: Vec<FieldDefinition>,
+    pub(super) statics: Vec<FieldDefinition>,
+}
+
 pub(super) struct Closure {
     pub(super) code: Rc<Code>,
     pub(super) scope: Option<ScopeRef>,
     pub(super) home: RefCell<Option<ObjectHandle>>,
     // instance fields and private methods a class constructor installs on each instance
-    pub(super) fields: RefCell<Vec<FieldDefinition>>,
-    pub(super) static_fields: RefCell<Vec<FieldDefinition>>,
+    // what only a class constructor has, boxed so every other closure stays small
+    pub(super) class: RefCell<Option<Box<ClassFields>>>,
     // the module a closure was made in, shared by every closure made there
     pub(super) url: Option<Rc<AppUrl>>,
 }
@@ -216,8 +224,7 @@ impl ScriptRuntime {
             code: code.clone(),
             scope: None,
             home: RefCell::new(None),
-            fields: RefCell::new(Vec::new()),
-            static_fields: RefCell::new(Vec::new()),
+            class: RefCell::new(None),
             url: Some(Rc::new(url)),
         });
         let mut frame = Frame::new(
@@ -258,8 +265,7 @@ impl ScriptRuntime {
             code,
             scope,
             home: RefCell::new(None),
-            fields: RefCell::new(Vec::new()),
-            static_fields: RefCell::new(Vec::new()),
+            class: RefCell::new(None),
             url,
         });
         self.function_object(closure)
@@ -615,7 +621,12 @@ impl ScriptRuntime {
         closure: &Rc<Closure>,
         instance: &Value,
     ) -> Result<(), ScriptError> {
-        let fields = closure.fields.borrow().clone();
+        let fields = closure
+            .class
+            .borrow()
+            .as_ref()
+            .map(|class| class.fields.clone())
+            .unwrap_or_default();
         for field in fields {
             self.install_field(&field, instance)?;
         }
@@ -2069,16 +2080,23 @@ impl ScriptRuntime {
                     FieldKind::Field(Some(initializer))
                 };
                 let definition = FieldDefinition { key, private, kind };
+                let mut class = closure.class.borrow_mut();
+                let class = class.get_or_insert_with(Default::default);
                 if is_static {
-                    closure.static_fields.borrow_mut().push(definition);
+                    class.statics.push(definition);
                 } else {
-                    closure.fields.borrow_mut().push(definition);
+                    class.fields.push(definition);
                 }
             }
             Op::RunStaticInit => {
                 let constructor = frame.stack.last().cloned().unwrap_or(Value::Undefined);
                 if let Some(closure) = Self::closure_of(&constructor) {
-                    let statics = std::mem::take(&mut *closure.static_fields.borrow_mut());
+                    let statics = closure
+                        .class
+                        .borrow_mut()
+                        .as_mut()
+                        .map(|class| std::mem::take(&mut class.statics))
+                        .unwrap_or_default();
                     for field in statics {
                         self.install_field(&field, &constructor)?;
                     }
@@ -2513,7 +2531,8 @@ impl ScriptRuntime {
                 } else if let Some(closure) = Self::closure_of(&Value::Object(constructor.clone()))
                 {
                     // methods come before fields, so they exist when initializers run
-                    let mut fields = closure.fields.borrow_mut();
+                    let mut class = closure.class.borrow_mut();
+                    let fields = &mut class.get_or_insert_with(Default::default).fields;
                     let position = fields
                         .iter()
                         .position(|field| matches!(field.kind, FieldKind::Field(_)))
