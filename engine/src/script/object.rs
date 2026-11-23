@@ -315,7 +315,21 @@ pub(super) struct BoundFunction {
 // through the same code skips the search; it holds the shape weakly, which keeps its address
 // from going to another shape while the entry stands
 #[derive(Default)]
-pub(super) struct PropertyCache(RefCell<Option<(Weak<Shape>, usize)>>);
+pub(super) struct PropertyCache(RefCell<Option<Cached>>);
+
+enum Cached {
+    // an own data property of objects of one shared shape
+    Own(Weak<Shape>, usize),
+    // a data property of the prototype one step up: the shape of the objects it was read
+    // through, none for an array with nothing of its own, then the prototype, its shape, and
+    // where the property sits on it
+    Inherited {
+        receiver: Option<Weak<Shape>>,
+        holder: Weak<RefCell<JsObject>>,
+        shape: Weak<Shape>,
+        index: usize,
+    },
+}
 
 impl std::fmt::Debug for PropertyCache {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -455,27 +469,108 @@ impl JsObject {
     }
 
     // the own data value the cache points at, when the object still has the shape it saw
-    pub(super) fn cached_value(&self, cache: &PropertyCache) -> Option<&Value> {
+    pub(super) fn cached_value(&self, cache: &PropertyCache) -> Option<Value> {
         // a proxy answers through its traps, never from what it holds
         if matches!(self.class, ObjectClass::Proxy(_)) {
             return None;
         }
         let cached = cache.0.borrow();
-        let (shape, index) = cached.as_ref()?;
-        if !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&self.shape)) {
-            return None;
+        match cached.as_ref()? {
+            Cached::Own(shape, index) => {
+                if !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&self.shape)) {
+                    return None;
+                }
+                self.properties.get(*index)?.value().map(Value::resolve)
+            }
+            Cached::Inherited {
+                receiver: Some(receiver),
+                holder,
+                shape,
+                index,
+            } => {
+                // the same shape has the same own keys, so the read still passes through to
+                // the prototype, if that is still the one noted
+                if !std::ptr::eq(receiver.as_ptr(), Rc::as_ptr(&self.shape)) {
+                    return None;
+                }
+                let prototype = self.prototype.as_ref()?;
+                if !std::ptr::eq(Rc::as_ptr(prototype), holder.as_ptr()) {
+                    return None;
+                }
+                Self::held(prototype, shape, *index)
+            }
+            Cached::Inherited { receiver: None, .. } => None,
         }
-        self.properties.get(*index)?.value()
     }
 
-    // notes where the key sits on this object's shape; an own shape changes in place and is
-    // never noted
+    // a method read off Array.prototype through an array with no prototype or property of
+    // its own
+    pub(super) fn cached_array_method(
+        prototype: &ObjectHandle,
+        cache: &PropertyCache,
+    ) -> Option<Value> {
+        match cache.0.borrow().as_ref()? {
+            Cached::Inherited {
+                receiver: None,
+                holder,
+                shape,
+                index,
+            } if std::ptr::eq(Rc::as_ptr(prototype), holder.as_ptr()) => {
+                Self::held(prototype, shape, *index)
+            }
+            _ => None,
+        }
+    }
+
+    fn held(holder: &ObjectHandle, shape: &Weak<Shape>, index: usize) -> Option<Value> {
+        let holder = holder.try_borrow().ok()?;
+        if matches!(holder.class, ObjectClass::Proxy(_))
+            || !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&holder.shape))
+        {
+            return None;
+        }
+        holder.properties.get(index)?.value().map(Value::resolve)
+    }
+
+    // notes where the key sits on this object's shape, or on its prototype's when it has none
+    // of its own; an own shape changes in place and is never noted
     pub(super) fn note_position(&self, key: &str, cache: &PropertyCache) {
         if self.shape.own || matches!(self.class, ObjectClass::Proxy(_)) {
             return;
         }
         if let Some(index) = self.shape.position(key) {
-            *cache.0.borrow_mut() = Some((Rc::downgrade(&self.shape), index));
+            *cache.0.borrow_mut() = Some(Cached::Own(Rc::downgrade(&self.shape), index));
+        } else if let Some(prototype) = &self.prototype {
+            Self::note_inherited(Some(Rc::downgrade(&self.shape)), prototype, key, cache);
+        }
+    }
+
+    // notes where a method sits on Array.prototype, for arrays with nothing of their own
+    pub(super) fn note_array_method(prototype: &ObjectHandle, key: &str, cache: &PropertyCache) {
+        Self::note_inherited(None, prototype, key, cache);
+    }
+
+    fn note_inherited(
+        receiver: Option<Weak<Shape>>,
+        holder: &ObjectHandle,
+        key: &str,
+        cache: &PropertyCache,
+    ) {
+        let Ok(object) = holder.try_borrow() else {
+            return;
+        };
+        if matches!(object.class, ObjectClass::Proxy(_)) {
+            return;
+        }
+        if let Some(index) = object.shape.position(key)
+            && object.properties[index].value().is_some()
+        {
+            *cache.0.borrow_mut() = Some(Cached::Inherited {
+                receiver,
+                holder: Rc::downgrade(holder),
+                shape: Rc::downgrade(&object.shape),
+                index,
+            });
         }
     }
     // the keys and values this object has, for others made alike to start from; it then holds
@@ -569,8 +664,10 @@ impl JsObject {
 
     // the object's own shape, made from the shared one the first time it is changed in place
     fn own_shape(&mut self) -> &mut Shape {
-        // a cloned object holds the same own shape until one of the two changes it
-        if !self.shape.own || Rc::strong_count(&self.shape) > 1 {
+        // a cloned object holds the same own shape until one of the two changes it, and one a
+        // cache has noted changes into a copy at a new address, so the cache sees it is not
+        // the shape it noted
+        if !self.shape.own || Rc::strong_count(&self.shape) > 1 || Rc::weak_count(&self.shape) > 0 {
             self.shape = Rc::new(self.shape.own_copy());
         }
         Rc::get_mut(&mut self.shape).expect("an own shape has no other holder")

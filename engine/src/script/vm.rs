@@ -1827,12 +1827,20 @@ impl ScriptRuntime {
                 Op::GetProp(name) => {
                     let object = Self::pop(frame);
                     let cache = &frame.code.property_caches[name as usize];
-                    // an own data property found where it was last time is read straight off
+                    // a data property found where it was last time, on the object or the
+                    // prototype above it, is read straight off
+                    let plain_array = |array: &ArrayHandle| {
+                        let array = array.borrow();
+                        array.prototype.is_none() && array.properties.is_empty()
+                    };
                     let cached = match &object {
                         Value::Object(handle) => handle
                             .try_borrow()
                             .ok()
-                            .and_then(|object| object.cached_value(cache).map(Value::resolve)),
+                            .and_then(|object| object.cached_value(cache)),
+                        Value::Array(array) if plain_array(array) => {
+                            JsObject::cached_array_method(&self.intrinsics.array_prototype, cache)
+                        }
                         _ => None,
                     };
                     let value = match cached {
@@ -1840,10 +1848,24 @@ impl ScriptRuntime {
                         None => {
                             let key = frame.code.names[name as usize].clone();
                             let value = self.get_property(&object, &key)?;
-                            if let Value::Object(handle) = &object
-                                && let Ok(object) = handle.try_borrow()
-                            {
-                                object.note_position(&key, cache);
+                            match &object {
+                                Value::Object(handle) => {
+                                    if let Ok(object) = handle.try_borrow() {
+                                        object.note_position(&key, cache);
+                                    }
+                                }
+                                Value::Array(array)
+                                    if plain_array(array)
+                                        && &*key != "length"
+                                        && key.parse::<usize>().is_err() =>
+                                {
+                                    JsObject::note_array_method(
+                                        &self.intrinsics.array_prototype,
+                                        &key,
+                                        cache,
+                                    );
+                                }
+                                _ => {}
                             }
                             value
                         }

@@ -20142,6 +20142,44 @@ mod tests {
         );
     }
     #[test]
+    fn reads_through_a_prototype_follow_every_change_to_it() {
+        let document = document(r#"<main><p id="status">idle</p></main>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const out = [];
+                const proto = { greet() { return "a"; }, n: 1 };
+                const read = (object) => object.greet() + object.n;
+                const one = Object.create(proto);
+                for (let i = 0; i < 3; i++) read(one);
+                out.push(read(one));
+                proto.greet = () => "b"; out.push(read(one));
+                one.greet = () => "own"; out.push(read(one)); delete one.greet; out.push(read(one));
+                delete proto.n; out.push(read(one)); proto.n = 2; out.push(read(one));
+                Object.setPrototypeOf(one, { greet: () => "c", n: 3 }); out.push(read(one));
+                Object.defineProperty(proto, "n", { get: () => 4 }); out.push(read(Object.create(proto)));
+                const big = {}; for (let k = 0; k < 80; k++) big["k" + k] = k; big.greet = () => "d"; big.n = 5;
+                const two = Object.create(big); out.push(read(two)); delete big.k3; big.n = 6; out.push(read(two));
+                delete big.n; out.push(read(two)); big.n = 7; out.push(read(two));
+                const list = [1, 2];
+                const push = (array, value) => array.push(value);
+                push(list, 3); push(list, 4); out.push(list.length);
+                const saved = Array.prototype.push;
+                Array.prototype.push = function () { return "patched"; }; out.push(push(list, 5));
+                Array.prototype.push = saved; out.push(push(list, 5));
+                list.push = () => "own push"; out.push(push(list, 6)); delete list.push;
+                Object.setPrototypeOf(list, { push: () => "other" }); out.push(push(list, 7));
+                document.getElementById("status").textContent = out.join(",");
+                "#,
+            )
+            .expect("script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some("a1,b1,own1,b1,bundefined,b2,c3,b4,d5,d6,dundefined,d7,4,5,own push,other")
+        );
+    }
+    #[test]
     fn blocks_nothing_captures_keep_their_scoping_rules() {
         let document = document(r#"<main><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());
