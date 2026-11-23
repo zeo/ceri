@@ -546,12 +546,13 @@ impl ScriptRuntime {
     ) -> Option<LayoutDocument> {
         let measured = self.measured.borrow();
         let measured = measured.as_ref()?;
-        // custom properties follow from the document and sheet, and a layout that read no clock
-        // holds at any time
+        // custom properties and the root element they hang from follow from the document and
+        // sheet, and a layout that read no clock holds at any time
         let same = measured.state
             == StyleState {
                 clock: measured.state.clock,
                 custom_properties: measured.state.custom_properties.clone(),
+                root: measured.state.root,
                 ..state.clone()
             };
         (measured.version == version

@@ -3210,14 +3210,19 @@ impl Browser {
             SheetIdentity::of(stylesheet),
             &style_state,
         );
+        let reused = measured.is_some();
         let mut layout = match measured {
-            Some(layout) => layout,
+            Some(layout) => {
+                crate::profile::count("frame: layout taken from a script read");
+                layout
+            }
             None => build_layout(&document, stylesheet, viewport, &style_state),
         };
-        // container queries read sizes from a layout, so a change in them lays out once more
+        // container queries read sizes from a layout, so a change in them lays out once more;
+        // a layout a script read made has settled its sizes already
         if stylesheet.has_container_queries() {
             let measured = crate::layout::take_layout_containers();
-            if measured != style_state.container_sizes {
+            if !reused && measured != style_state.container_sizes {
                 style_state.container_sizes = measured;
                 page.populate_custom_properties(&document, &mut style_state);
                 layout = build_layout(&document, stylesheet, viewport, &style_state);
@@ -11946,6 +11951,61 @@ A</div>
             })
             .expect("page should paint");
         assert!(canvas.non_background_pixels() > 0);
+    }
+
+    #[test]
+    fn a_frame_taking_a_measured_layout_keeps_its_container_queries() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>body { margin: 0 } .box { container-type: inline-size; width: 300px } .inner { width: 50px } @container (min-width: 200px) { .inner { width: 120px } }</style>
+            <div class="box"><div class="inner" id="inner">a</div></div>
+            <script>setTimeout(() => { const inner = document.getElementById("inner"); inner.textContent = "b"; inner.getBoundingClientRect(); }, 10)</script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 600.0,
+            height: 400.0,
+        };
+        browser.set_viewport(viewport, 1.0);
+        let inner_width =
+            |layout: &LayoutDocument| layout.body().children[0].children[0].rect.width;
+        let first = browser.layout(viewport).expect("first layout should build");
+        assert_eq!(inner_width(&first), 120.0);
+        browser.advance_time(50).expect("the timer should run");
+        let second = browser
+            .layout(viewport)
+            .expect("second layout should build");
+        assert_eq!(inner_width(&second), 120.0);
+    }
+
+    #[test]
+    fn a_frame_takes_the_layout_a_script_read_just_made() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>body { margin: 0 } .inner { width: 50px }</style>
+            <div class="box"><div class="inner" id="inner">a</div></div>
+            <script>setTimeout(() => { const inner = document.getElementById("inner"); inner.style.width = "60px"; inner.getBoundingClientRect(); }, 10)</script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 600.0,
+            height: 400.0,
+        };
+        browser.set_viewport(viewport, 1.0);
+        browser.layout(viewport).expect("first layout should build");
+        crate::profile::enable(true);
+        browser.advance_time(50).expect("the timer should run");
+        let layout = browser
+            .layout(viewport)
+            .expect("second layout should build");
+        let taken = crate::profile::phases()
+            .iter()
+            .any(|(name, ..)| *name == "frame: layout taken from a script read");
+        crate::profile::enable(false);
+        assert!(taken, "the frame takes the layout the timer's read made");
+        assert_eq!(layout.body().children[0].children[0].rect.width, 60.0);
     }
 
     #[test]
