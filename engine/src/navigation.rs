@@ -12021,6 +12021,36 @@ A</div>
     }
 
     #[test]
+    fn a_resize_that_flips_no_media_query_keeps_the_cascades() {
+        let mut browser = Browser::new(bundle(
+            "<style>p { color: red; } @media (min-width: 500px) { p { color: blue; } }</style><p>a</p><p>b</p>",
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let at = |browser: &Browser, width: f32| {
+            browser
+                .layout(Size {
+                    width,
+                    height: 200.0,
+                })
+                .expect("layout should build")
+                .body()
+                .children[0]
+                .text[0]
+                .color
+        };
+        assert_eq!(at(&browser, 300.0), Color::opaque(255, 0, 0));
+        crate::profile::enable(true);
+        assert_eq!(at(&browser, 350.0), Color::opaque(255, 0, 0));
+        let dropped = |name: &str| crate::profile::phases().iter().any(|(phase, ..)| *phase == name);
+        assert!(!dropped("kept: all cascades dropped"));
+        assert_eq!(at(&browser, 600.0), Color::opaque(0, 0, 255));
+        assert!(dropped("kept: cascades dropped by a media query"));
+        crate::profile::enable(false);
+    }
+
+    #[test]
     fn media_queries_follow_the_requested_viewport() {
         let mut browser = Browser::new(bundle(
             "<style>p { color: red; } @media screen and (min-width: 500px) { p { color: blue; } } @media (max-height: 100px) { p { color: #42d3b4; } }</style><p>responsive</p>",

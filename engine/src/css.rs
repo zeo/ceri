@@ -869,7 +869,9 @@ struct Matching {
     unchecked: BTreeSet<NodeId>,
     disabled: BTreeSet<NodeId>,
     control_values: BTreeMap<NodeId, String>,
-    viewport: (u32, u32),
+    // what each of the sheets' media query lists answers, which is all of the viewport a
+    // cascade reads
+    media: Vec<bool>,
     color_scheme: ColorScheme,
     forced_colors: Option<SystemColors>,
     reduced_motion: bool,
@@ -927,8 +929,8 @@ impl Matching {
                 "kept: cascades dropped by control values",
             ),
             (
-                self.viewport != other.viewport,
-                "kept: cascades dropped by viewport",
+                self.media != other.media,
+                "kept: cascades dropped by a media query",
             ),
             (
                 self.color_scheme != other.color_scheme
@@ -955,7 +957,7 @@ impl Matching {
         }
     }
 
-    fn of(document: &Document, state: &StyleState) -> Self {
+    fn of(document: &Document, state: &StyleState, sheet: &Stylesheet) -> Self {
         Self {
             document: document.identity(),
             selector_version: document.selector_version(),
@@ -967,10 +969,12 @@ impl Matching {
             unchecked: state.unchecked.clone(),
             disabled: state.disabled.clone(),
             control_values: state.control_values.clone(),
-            viewport: (
-                state.viewport_width.to_bits(),
-                state.viewport_height.to_bits(),
-            ),
+            media: sheet
+                .media
+                .iter()
+                .chain(&user_agent_sheet().media)
+                .map(|list| list.matches(state))
+                .collect(),
             color_scheme: state.color_scheme,
             forced_colors: state.forced_colors,
             reduced_motion: state.reduced_motion,
@@ -2174,6 +2178,9 @@ pub struct Stylesheet {
     // the compounds :has() is attached to, or none where one could be any element or sits
     // beside what it looks at, so a write is checked against the elements above it
     has_anchors: Option<Vec<HoverUse>>,
+    // each media query list the rules are under, once, so a kept cascade can stand while
+    // none of their answers changes, whatever size the viewport takes
+    media: Vec<Rc<crate::media::MediaQueryList>>,
     // shadow root style elements, by their text
     shadow_sheets: RefCell<HashMap<String, Rc<Stylesheet>>>,
     // whether a selector reads text nodes or the style attribute, which change without the
@@ -2219,6 +2226,18 @@ fn hover_uses(rules: &[Rule]) -> Option<Vec<HoverUse>> {
         }
     }
     Some(uses)
+}
+
+fn media_lists(rules: &[Rule]) -> Vec<Rc<crate::media::MediaQueryList>> {
+    let mut lists: Vec<Rc<crate::media::MediaQueryList>> = Vec::new();
+    for condition in rules.iter().flat_map(|rule| &rule.conditions) {
+        if let RuleCondition::Media(list) = condition
+            && !lists.iter().any(|known| Rc::ptr_eq(known, list))
+        {
+            lists.push(list.clone());
+        }
+    }
+    lists
 }
 
 fn has_anchors(rules: &[Rule]) -> Option<Vec<HoverUse>> {
@@ -2905,6 +2924,7 @@ impl Stylesheet {
             identity: next_identity(),
             hovers: hover_uses(&rules),
             has_anchors: has_anchors(&rules),
+            media: media_lists(&rules),
             reads_unversioned: reads_unversioned(&rules),
             reach: selector_reach(&rules),
             sibling_keys: sibling_keys(&rules),
@@ -2934,6 +2954,7 @@ impl Stylesheet {
                 identity: next_identity(),
                 hovers: hover_uses(&rules),
                 has_anchors: has_anchors(&rules),
+                media: media_lists(&rules),
                 reads_unversioned: reads_unversioned(&rules),
                 reach: selector_reach(&rules),
                 sibling_keys: sibling_keys(&rules),
@@ -4104,7 +4125,7 @@ impl Stylesheet {
             let mut cascades = self.cascades.borrow_mut();
             let pass = STYLE_PASS.with(std::cell::Cell::get);
             if cascades.pass != pass {
-                let matching = Matching::of(document, state);
+                let matching = Matching::of(document, state, self);
                 let written_only = cascades.matching.as_ref().is_some_and(|kept| {
                     *kept
                         == Matching {
