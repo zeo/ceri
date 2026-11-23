@@ -132,6 +132,12 @@ Page stylesheets follow CSS error handling. An unsupported rule is dropped and r
 
 See [docs/architecture.md](architecture.md) for the process model and security boundaries.
 
+## Automated runs
+
+An app built with `.devtools(true)` serves the DevTools protocol on `--remote-debugging-port=<port>`. A test drives the page through `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`, `Input.insertText` and `Runtime.evaluate`, and reads frames with `Page.captureScreenshot`. None of these touch the system's cursor, keyboard or screen.
+
+With `CERI_BACKGROUND=1` in its environment, the app's windows open past the edge of every display. They never take focus or a taskbar button, and they stay off-display through `show`, `setFocus`, maximize, fullscreen, position and drag requests. Their pages run as visible, so timers and animation frames keep full rate. The run also leaves the saved window geometry alone. Tests can run this way while the machine is in use.
+
 ## The engine
 
 [engine/](../engine/README.md) holds the engine: HTML parsing and a live DOM, a CSS cascade with the selector, length and media-query surface listed there, block, flex, grid and table layout, positioning, scrolling and clipping, a software paint pass with an sfnt parser and antialiased glyph rasterizer, SVG, a 2D canvas, WebGL 1 and 2 drawn on the CPU with a GLSL ES 1.00 and 3.00 compiler of its own, audio and video through the system's decoders on Windows, its own ES2022 JavaScript engine (parser, bytecode compiler and VM with generators, async functions and an object model with prototypes and descriptors) with modules, promises, workers, fetch, storage, IndexedDB, structured clone and Web Crypto digests, an accessibility tree, and a platform-neutral frame and input boundary that the shared `winit` and `softbuffer` window host drives.

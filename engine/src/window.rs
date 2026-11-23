@@ -776,6 +776,11 @@ impl AppWindow {
         context: &Context<OwnedDisplayHandle>,
         monitors: &[Monitor],
     ) -> Option<WindowId> {
+        let background = background_mode();
+        if background {
+            // the off-display place a run opens at is no place to remember
+            self.config.geometry_path = None;
+        }
         let config = &self.config;
         let remembered = config
             .geometry_path
@@ -797,24 +802,27 @@ impl AppWindow {
             .with_decorations(config.decorations)
             .with_resizable(config.resizable)
             .with_visible(config.visible)
-            .with_active(config.focused)
+            .with_active(config.focused && !background)
             .with_transparent(config.transparent)
-            .with_maximized(config.maximized || remembered.is_some_and(|known| known.maximized))
+            .with_maximized(
+                !background
+                    && (config.maximized || remembered.is_some_and(|known| known.maximized)),
+            )
             .with_content_protected(config.content_protected);
         if let Some((width, height)) = config.maximum_size {
             attributes = attributes.with_max_inner_size(LogicalSize::new(width, height));
         }
-        if config.fullscreen {
+        if config.fullscreen && !background {
             attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
-        if config.always_on_top {
+        if config.always_on_top && !background {
             attributes = attributes.with_window_level(WindowLevel::AlwaysOnTop);
         }
         #[cfg(target_os = "windows")]
         {
             use winit::platform::windows::WindowAttributesExtWindows;
             attributes = attributes
-                .with_skip_taskbar(config.skip_taskbar)
+                .with_skip_taskbar(config.skip_taskbar || background)
                 .with_undecorated_shadow(config.shadow)
                 // with no surface of its own behind the composition, the window is clear
                 // where the frame is
@@ -846,6 +854,11 @@ impl AppWindow {
                 };
                 centred(&monitor_of(&monitor), size).into()
             }),
+        };
+        let position = if background {
+            Some(PhysicalPosition::new(BACKGROUND_ORIGIN.0, BACKGROUND_ORIGIN.1).into())
+        } else {
+            position
         };
         if let Some(position) = position {
             attributes = attributes.with_position::<winit::dpi::Position>(position);
@@ -906,6 +919,26 @@ impl AppWindow {
         let Some(window) = self.window.clone() else {
             return;
         };
+        if background_mode() {
+            match action {
+                WindowAction::Show | WindowAction::Focus | WindowAction::Unminimize => {
+                    show_inactive(&window);
+                    self.show_page(true);
+                    return;
+                }
+                // each of these would bring the window onto a display or into the user's way
+                WindowAction::Maximize
+                | WindowAction::ToggleMaximize
+                | WindowAction::Fullscreen(_)
+                | WindowAction::Position(..)
+                | WindowAction::Center
+                | WindowAction::AlwaysOnTop(_)
+                | WindowAction::RequestAttention
+                | WindowAction::Drag
+                | WindowAction::ResizeDrag(_) => return,
+                _ => {}
+            }
+        }
         match action {
             WindowAction::Show => {
                 window.set_visible(true);
@@ -1100,7 +1133,8 @@ impl AppWindow {
                 self.hovering = false;
                 self.dropped.push(path);
             }
-            WindowEvent::Occluded(occluded) => {
+            // an off-display window reads as covered, and a run wants its page live
+            WindowEvent::Occluded(occluded) if !background_mode() => {
                 self.show_page(!occluded);
                 self.publish();
             }
@@ -1460,7 +1494,9 @@ impl AppWindow {
             return;
         }
         self.page_fullscreen = frame.fullscreen;
-        if let Some(window) = &self.window {
+        if let Some(window) = &self.window
+            && !background_mode()
+        {
             window.set_fullscreen(frame.fullscreen.then_some(Fullscreen::Borderless(None)));
         }
     }
@@ -1857,6 +1893,30 @@ fn resize_direction(size: (f64, f64), at: (f64, f64), scale: f64) -> Option<Resi
         _ if left => ResizeDirection::West,
         _ => ResizeDirection::East,
     })
+}
+
+// where a window opens under CERI_BACKGROUND, far past any display
+const BACKGROUND_ORIGIN: (i32, i32) = (-20000, 0);
+
+// CERI_BACKGROUND=1 is for automated runs beside whatever the user is doing: windows open off
+// every display, never take focus or a taskbar button, never move onto a display, and their
+// pages run as shown
+fn background_mode() -> bool {
+    static BACKGROUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BACKGROUND
+        .get_or_init(|| std::env::var_os("CERI_BACKGROUND").is_some_and(|value| value == "1"))
+}
+
+fn show_inactive(window: &Window) {
+    #[cfg(target_os = "windows")]
+    if let Some(NativeHandle::Win32 { hwnd }) = native_handle(window) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWNOACTIVATE, ShowWindow};
+        // safety: the handle belongs to a live window this thread owns
+        let _ = unsafe { ShowWindow(HWND(hwnd as *mut std::ffi::c_void), SW_SHOWNOACTIVATE) };
+        return;
+    }
+    window.set_visible(true);
 }
 
 // c_ulong is 32 bits on windows, so the xlib conversion only looks useless on linux
