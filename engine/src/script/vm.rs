@@ -964,6 +964,21 @@ impl ScriptRuntime {
         }
     }
 
+    // reads the scope depth levels up without taking a reference to each scope on the way,
+    // which every read of a local would otherwise pay for
+    fn with_scope_at<R>(frame: &Frame, depth: u16, read: impl FnOnce(&Scope) -> R) -> R {
+        let mut scope: *const RefCell<Scope> =
+            Rc::as_ptr(frame.scope.as_ref().expect("a scope is present"));
+        for _ in 0..depth {
+            // safety: the frame holds the innermost scope and every scope holds its parent,
+            // so each pointer stays valid while the frame is borrowed
+            let parent = unsafe { &*scope }.borrow();
+            scope = Rc::as_ptr(parent.parent.as_ref().expect("scope depth is valid"));
+        }
+        // safety: as above
+        read(&unsafe { &*scope }.borrow())
+    }
+
     fn scope_at(frame: &Frame, depth: u16) -> ScopeRef {
         let mut scope = frame.scope.clone().expect("a scope is present");
         for _ in 0..depth {
@@ -1032,11 +1047,10 @@ impl ScriptRuntime {
         index: u16,
         name: u32,
     ) -> Result<Value, ScriptError> {
-        let scope = Self::scope_at(frame, depth);
-        let value = match scope.borrow().slots[index as usize].clone() {
+        let value = Self::with_scope_at(frame, depth, |scope| match &scope.slots[index as usize] {
             Value::Binding(cell, _) => cell.borrow().clone(),
-            value => value,
-        };
+            value => value.clone(),
+        });
         if matches!(value, Value::Uninitialized) {
             let name = frame.code.names[name as usize].clone();
             return Err(self.reference_error(format!("cannot access {name} before initialization")));
@@ -1272,10 +1286,10 @@ impl ScriptRuntime {
                     .expect("the lexer produced decimal digits");
                 frame.stack.push(Value::BigInt(Rc::new(value)));
             }
-            Op::String(index) => {
-                let text = frame.code.names[index as usize].to_string();
-                frame.stack.push(Value::String(text.into()));
-            }
+            // the literal's text is shared, not copied, each time it is read
+            Op::String(index) => frame
+                .stack
+                .push(Value::String(frame.code.names[index as usize].clone())),
             Op::Regex { pattern, flags } => {
                 let pattern = frame.code.names[pattern as usize].to_string();
                 let flags = frame.code.names[flags as usize].to_string();
