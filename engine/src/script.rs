@@ -754,6 +754,8 @@ pub struct ScriptRuntime {
     // computed style script reads, so it is found again only once the document changes
     disabled_controls: RefCell<Option<DisabledControls>>,
     computed_styles: Option<geometry::KeptComputed>,
+    // the last getComputedStyle object, whose keys the next one takes when they match
+    computed_style_template: Option<JsObject>,
     // milliseconds from an animation frame request to its callback
     frame_interval: u64,
     // whether the page's window shows; a hidden page runs no animation frames
@@ -1965,6 +1967,7 @@ impl ScriptRuntime {
             controls: RefCell::new(None),
             disabled_controls: RefCell::new(None),
             computed_styles: None,
+            computed_style_template: None,
             frame_interval: crate::navigation::FRAME_INTERVAL,
             visible: true,
             media_queries: Vec::new(),

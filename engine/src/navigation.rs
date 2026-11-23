@@ -6961,6 +6961,30 @@ mod tests {
     }
 
     #[test]
+    fn computed_style_objects_made_alike_stay_apart() {
+        let mut browser = Browser::new(bundle(
+            r#"<style>#a { color: rgb(1, 2, 3) } #b { color: rgb(4, 5, 6) }</style><p id="a">a</p><p id="b">b</p><p id="status">idle</p><script>
+                const first = getComputedStyle(document.getElementById("a"));
+                const second = getComputedStyle(document.getElementById("b"));
+                const third = getComputedStyle(document.getElementById("a"));
+                second.extra = 1;
+                delete third.color;
+                document.getElementById("status").textContent = [
+                    first.color, second.color, third.color, first.extra,
+                    Object.keys(first).length === Object.keys(second).length - 1,
+                ].join("|");
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("computed style page should load");
+        assert_eq!(
+            element_text(&browser, "status"),
+            "rgb(1, 2, 3)|rgb(4, 5, 6)|||true"
+        );
+    }
+
+    #[test]
     fn computed_style_resolves_times_urls_and_transforms_as_chrome_does() {
         let mut browser = Browser::new(bundle(
             r#"<style>#box { width: 100px; height: 40px; transition-duration: 1s, 250ms; animation-delay: 1500ms; background-image: url("a.png"), none; transform: translate(10px, 50%) rotate(45deg); } #flat { transform: none } #deep { transform: translateZ(5px) }</style><div id="box"></div><div id="flat"></div><div id="deep"></div><p id="status">idle</p><script>

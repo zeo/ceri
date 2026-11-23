@@ -1276,31 +1276,50 @@ impl ScriptRuntime {
 
     fn computed_style_object(&mut self, node: NodeId) -> Value {
         let values = self.computed_snapshot(node);
-        let mut object = JsObject::default();
+        let mut entries = Vec::with_capacity(values.len() * 3 + 2);
         let mut names = Vec::new();
         for (property, value) in &values {
             let value = Value::String(value.clone().into());
-            object.define(property.clone(), Property::data(value.clone()));
+            entries.push((property.clone(), Property::data(value.clone())));
             if property.contains('-') && !property.starts_with("--") {
-                object.define(camel_case(property), Property::data(value));
+                entries.push((camel_case(property), Property::data(value)));
             }
             names.push(Value::String(property.clone().into()));
         }
-        object.define(
+        entries.push((
             "length".to_string(),
             Property::hidden(Value::Number(names.len() as f64)),
-        );
+        ));
         for (index, name) in names.into_iter().enumerate() {
-            object.define(index.to_string(), Property::hidden(name));
+            entries.push((index.to_string(), Property::hidden(name)));
         }
-        object.define(
+        entries.push((
             "getPropertyValue".to_string(),
             Property::hidden(self.native_function(
                 Native::Window(WindowMethod::PropertyValue),
                 "getPropertyValue",
                 1,
             )),
-        );
+        ));
+        // elements read one after another mostly report the same properties, so the object
+        // takes the last one's keys whole instead of adding hundreds of them one at a time
+        let object = match &self.computed_style_template {
+            Some(template) if template.has_keys(entries.iter().map(|(key, _)| key.as_str())) => {
+                JsObject::with_shape_of(
+                    template,
+                    entries.into_iter().map(|(_, property)| property).collect(),
+                )
+            }
+            _ => {
+                let mut object = JsObject::default();
+                object.reserve(entries.len());
+                for (key, property) in entries {
+                    object.define(key, property);
+                }
+                self.computed_style_template = Some(object.clone());
+                object
+            }
+        };
         Value::Object(new_object(object))
     }
 

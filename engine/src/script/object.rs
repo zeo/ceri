@@ -327,6 +327,25 @@ impl JsObject {
         }
     }
 
+    // an object with another's keys, prototype and class and these properties in the same
+    // order, which shares the other's shape instead of building one key by key
+    pub(super) fn with_shape_of(template: &JsObject, properties: Vec<Property>) -> Self {
+        debug_assert_eq!(template.properties.len(), properties.len());
+        Self {
+            shape: template.shape.clone(),
+            properties,
+            prototype: template.prototype.clone(),
+            orphan: template.orphan,
+            extensible: template.extensible,
+            class: template.class.clone(),
+        }
+    }
+
+    // whether the object's own keys are these, in this order
+    pub(super) fn has_keys<'a>(&self, keys: impl ExactSizeIterator<Item = &'a str>) -> bool {
+        keys.len() == self.shape.keys.len()
+            && keys.zip(&self.shape.keys).all(|(key, own)| key == &**own)
+    }
     // room for exactly this many properties, for objects whose properties are known when made
     pub(super) fn reserve(&mut self, properties: usize) {
         self.properties.reserve_exact(properties);
