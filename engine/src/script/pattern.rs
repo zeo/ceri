@@ -1199,7 +1199,9 @@ impl Regex {
         let mut steps = 0u64;
         let mut position = start;
         while position <= subject.len() {
-            if let Some(captures) = self.run(subject, position, &mut steps)? {
+            if self.may_start_at(subject, position)
+                && let Some(captures) = self.run(subject, position, &mut steps)?
+            {
                 return Ok(Some(Match { captures }));
             }
             if sticky {
@@ -1216,6 +1218,21 @@ impl Regex {
             }
         }
         Ok(None)
+    }
+
+    // a program whose first step reads one character can only match where that character
+    // is, so find skips every other start without setting up a run there
+    fn may_start_at(&self, subject: &[u16], position: usize) -> bool {
+        let value = || self.decode(subject, position).map(|(value, _)| value);
+        match self.program.get(1) {
+            Some(Inst::Char(expected)) => value().is_some_and(|value| {
+                value == *expected || self.canonical(value) == self.canonical(*expected)
+            }),
+            Some(Inst::Class(index)) => {
+                value().is_some_and(|value| self.class_matches(&self.classes[*index], value))
+            }
+            _ => true,
+        }
     }
 
     fn run(

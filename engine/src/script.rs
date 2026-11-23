@@ -20119,6 +20119,29 @@ mod tests {
         );
     }
     #[test]
+    fn patterns_that_start_with_one_character_match_wherever_it_is() {
+        let document = document(r#"<main><p id="status">idle</p></main>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const parts = "C:\\Program Files/app\\bin.exe".split(/[\\/]/).join("|");
+                const folded = "xxAbAB".replace(/a/gi, "-");
+                const sticky = /b/y;
+                sticky.lastIndex = 1;
+                const stuck = [sticky.test("abc"), sticky.lastIndex, /b/y.test("abc")].join(",");
+                const empty = "abc".split(/x*/).join("|");
+                const surrogate = "a😀b".match(/[😀]/u)?.index;
+                document.getElementById("status").textContent = [parts, folded, stuck, empty, surrogate].join(" ");
+                "#,
+            )
+            .expect("script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some("C:|Program Files|app|bin.exe xx-b-B true,2,false a|b|c 1")
+        );
+    }
+    #[test]
     fn atob_and_btoa_carry_bytes_one_to_a_character() {
         let document = document(r#"<main><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());
