@@ -2829,7 +2829,8 @@ struct KeptAnswers {
     works: u64,
     worked: bool,
     boxes: KeptMap<(NodeId, Option<PseudoElement>), BoxInputs, Option<LayoutBox>>,
-    widths: KeptMap<IntrinsicKey, IntrinsicInputs, f32>,
+    // each width with whether it read the width it was measured within, through a percentage
+    widths: KeptMap<IntrinsicKey, IntrinsicInputs, (f32, bool)>,
 }
 
 thread_local! {
@@ -7167,31 +7168,40 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         return measure_intrinsic_width(input, minimum);
     };
     let (document, node) = (input.node.document, input.node.node);
+    // a subtree with no percentage in it measures the same within any width, so its answer
+    // is kept for every width at once
+    let anywhere = IntrinsicInputs {
+        containing_width: u32::MAX,
+        definite: false,
+        ..inputs.clone()
+    };
     let known = KEPT.with(|kept| {
-        kept_answer(
-            &mut kept.borrow_mut().widths,
-            (&key, &inputs),
-            (pass, works),
-            |since| document.unwritten_since(node, since),
-        )
+        let widths = &mut kept.borrow_mut().widths;
+        let stands = |since| document.unwritten_since(node, since);
+        kept_answer(widths, (&key, &inputs), (pass, works), stands)
+            .or_else(|| kept_answer(widths, (&key, &anywhere), (pass, works), stands))
     });
-    if let Some((width, earlier)) = known {
-        if cfg!(feature = "recheck") && earlier {
+    if let Some(((width, reads), earlier)) = known {
+        if reads {
+            PERCENT_READS.with(|reads| reads.set(reads.get() + 1));
+        }
+        if cfg!(feature = "recheck") {
             let reported = crate::css::moment_reports();
             let fresh = measure_intrinsic_width(input, minimum);
             assert!(fresh == width, "a kept width went stale: {node:?}");
-            assert_eq!(
-                reported,
-                crate::css::moment_reports(),
+            assert!(
+                !earlier || reported == crate::css::moment_reports(),
                 "a kept width stands for one moment only: {node:?}"
             );
         }
         return width;
     }
     let (reported, looked_up) = (crate::css::moment_reports(), crate::svg::reference_reads());
+    let percents = PERCENT_READS.with(std::cell::Cell::get);
     let width = measure_intrinsic_width(input, minimum);
     let momentary = crate::css::moment_reports() != reported;
     let refers = crate::svg::reference_reads() != looked_up;
+    let reads = PERCENT_READS.with(std::cell::Cell::get) != percents;
     KEPT.with(|kept| {
         let mut kept = kept.borrow_mut();
         kept.worked = true;
@@ -7199,8 +7209,8 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
             &mut kept.widths,
             key,
             Kept {
-                inputs,
-                answer: width,
+                inputs: if reads { inputs } else { anywhere },
+                answer: (width, reads),
                 pass,
                 used: works,
                 stamp,
@@ -7210,6 +7220,12 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         );
     });
     width
+}
+
+thread_local! {
+    // how many measurements so far read the width they were measured within, through a
+    // percentage margin, padding or width
+    static PERCENT_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
@@ -7239,6 +7255,15 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         .unwrap_or(parent.font_size)
         .max(0.0);
     let _zero_font = crate::css::use_zero_font(style.font_family, font_style(&style, font_size));
+    let edges = [style.margin, style.padding];
+    if edges
+        .iter()
+        .flat_map(|edges| [edges.top, edges.right, edges.bottom, edges.left])
+        .chain([style.width, style.min_width, style.max_width])
+        .any(Length::has_percent)
+    {
+        PERCENT_READS.with(|reads| reads.set(reads.get() + 1));
+    }
     let margin = resolve_edges(style.margin, containing_width, font_size);
     let padding = resolve_edges(style.padding, containing_width, font_size);
     let extras = margin.left
