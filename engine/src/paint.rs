@@ -301,8 +301,11 @@ impl Canvas {
         Ok(())
     }
 
+    // a see-through surface keeps its alpha, its premultiplied pixels made straight as png
+    // stores them
     pub fn write_png(&self, path: &Path) -> io::Result<()> {
-        let mut rgb = Vec::with_capacity(self.width as usize * 3 * self.height as usize);
+        let channels = if self.opaque { 3 } else { 4 };
+        let mut bytes = Vec::with_capacity(self.width as usize * channels * self.height as usize);
         for row in 0..self.height as usize {
             let start = row * self.bytes_per_row();
             for pixel in self.pixels[start..start + self.width as usize * 4]
@@ -310,10 +313,24 @@ impl Canvas {
                 .0
                 .iter()
             {
-                rgb.extend_from_slice(&pixel[..3]);
+                if self.opaque {
+                    bytes.extend_from_slice(&pixel[..3]);
+                    continue;
+                }
+                let alpha = u32::from(pixel[3]);
+                let straight = |value: u8| match alpha {
+                    0 => 0,
+                    _ => ((u32::from(value) * 255 + alpha / 2) / alpha).min(255) as u8,
+                };
+                bytes.extend_from_slice(&[
+                    straight(pixel[0]),
+                    straight(pixel[1]),
+                    straight(pixel[2]),
+                    pixel[3],
+                ]);
             }
         }
-        std::fs::write(path, encode_png(self.width, self.height, 3, &rgb))
+        std::fs::write(path, encode_png(self.width, self.height, channels, &bytes))
     }
 
     // a copy with each viewport rectangle filled over it, numbered anew so it uploads whole
@@ -7488,6 +7505,25 @@ mod tests {
         let bytes = std::fs::read(&path).expect("bmp should be readable");
         assert_eq!(&bytes[..2], b"BM");
         std::fs::remove_file(path).expect("test bmp should be removable");
+    }
+
+    // a see-through surface writes its alpha, with colors as they are before the blend
+    #[test]
+    fn a_see_through_canvas_writes_a_png_with_straight_alpha() {
+        let mut canvas = Canvas::new(4, 2, Color::transparent());
+        canvas.fill_rect(0.0, 0.0, 2.0, 2.0, Color::rgba(200, 100, 40, 128));
+        let path =
+            std::env::temp_dir().join(format!("ceri-engine-clear-{}.png", std::process::id()));
+        canvas.write_png(&path).expect("png should write");
+        let image = crate::png::decode_png(&std::fs::read(&path).expect("png should read"))
+            .expect("png should decode");
+        std::fs::remove_file(path).expect("test png should be removable");
+        let (filled, clear) = (image.pixels[0], image.pixels[3]);
+        assert_eq!(clear.alpha, 0);
+        assert_eq!(filled.alpha, 128);
+        for (got, want) in [(filled.red, 200), (filled.green, 100), (filled.blue, 40)] {
+            assert!(got.abs_diff(want) <= 1, "{filled:?}");
+        }
     }
 
     #[test]

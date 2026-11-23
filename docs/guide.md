@@ -36,7 +36,7 @@ Render one frame of the packaged app without opening a window, which is what CI 
 cargo run --bin ceri -- "--ceri-assets=." "--ceri-entry=web/index.html" "--ceri-screenshot=target\app.png"
 ```
 
-Add `--ceri-scale=1.5` to render at a device pixel ratio other than 1.
+Add `--ceri-scale=1.5` to render at a device pixel ratio other than 1, and `--ceri-transparent` to paint the frame over nothing, as a transparent window shows its page: the PNG keeps the see-through pixels, and text over them is antialiased in grayscale.
 
 ## Authoring
 

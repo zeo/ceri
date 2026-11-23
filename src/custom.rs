@@ -34,6 +34,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCREENSHOT_SWITCH: &str = "ceri-screenshot";
 const SCALE_SWITCH: &str = "ceri-scale";
+// a capture painted over nothing, as a transparent window shows its page
+const TRANSPARENT_SWITCH: &str = "--ceri-transparent";
 const ALLOW_ORIGIN_SWITCH: &str = "ceri-allow-origin";
 // chromium's switch, so tools that launch a browser with it can attach
 const DEVTOOLS_SWITCH: &str = "remote-debugging-port";
@@ -660,10 +662,13 @@ fn run_app(
         ..config
     };
     if let Some(path) = launch::switch_value(arguments.clone(), SCREENSHOT_SWITCH) {
-        let config = prepare(windows.first().cloned().unwrap_or_else(|| WindowConfig {
+        let mut config = prepare(windows.first().cloned().unwrap_or_else(|| WindowConfig {
             start_url: launch.initial_url.clone(),
             ..WindowConfig::default()
         }));
+        config.transparent |= arguments
+            .iter()
+            .any(|argument| argument.to_str() == Some(TRANSPARENT_SWITCH));
         let scale = match launch::switch_value(arguments.clone(), SCALE_SWITCH) {
             Some(value) => value
                 .parse::<f32>()
@@ -793,6 +798,7 @@ fn capture(
         },
         scale,
     );
+    host.browser_mut().set_see_through(config.transparent);
     let status = host
         .navigate(&config.start_url)
         .map_err(|error| error.to_string())?;
