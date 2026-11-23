@@ -57,7 +57,8 @@ pub(super) struct Closure {
     // instance fields and private methods a class constructor installs on each instance
     pub(super) fields: RefCell<Vec<FieldDefinition>>,
     pub(super) static_fields: RefCell<Vec<FieldDefinition>>,
-    pub(super) url: Option<AppUrl>,
+    // the module a closure was made in, shared by every closure made there
+    pub(super) url: Option<Rc<AppUrl>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -217,7 +218,7 @@ impl ScriptRuntime {
             home: RefCell::new(None),
             fields: RefCell::new(Vec::new()),
             static_fields: RefCell::new(Vec::new()),
-            url: Some(url),
+            url: Some(Rc::new(url)),
         });
         let mut frame = Frame::new(
             code,
@@ -251,7 +252,7 @@ impl ScriptRuntime {
         &self,
         code: Rc<Code>,
         scope: Option<ScopeRef>,
-        url: Option<AppUrl>,
+        url: Option<Rc<AppUrl>>,
     ) -> Value {
         let closure = Rc::new(Closure {
             code,
@@ -279,6 +280,14 @@ impl ScriptRuntime {
             self.intrinsics.function_prototype.clone()
         };
         let mut object = JsObject::with_prototype(Some(prototype), ObjectClass::Function(closure));
+        let constructible = matches!(
+            code.kind,
+            FunctionKind::Normal
+                | FunctionKind::ClassConstructor
+                | FunctionKind::DerivedConstructor
+        );
+        // length, name, and a prototype for what can be constructed or is a generator
+        object.reserve(2 + usize::from(code.is_generator || (constructible && !code.is_async)));
         object.define(
             "length".to_string(),
             Property {
@@ -296,12 +305,6 @@ impl ScriptRuntime {
                 writable: false,
                 configurable: true,
             },
-        );
-        let constructible = matches!(
-            code.kind,
-            FunctionKind::Normal
-                | FunctionKind::ClassConstructor
-                | FunctionKind::DerivedConstructor
         );
         let handle = new_object(object);
         if code.is_generator {
@@ -455,11 +458,12 @@ impl ScriptRuntime {
                     );
                     return Ok(Prepared::Frame(Box::new(frame)));
                 }
-                ObjectClass::Bound {
-                    target,
-                    this,
-                    arguments: bound,
-                } => {
+                ObjectClass::Bound(bound) => {
+                    let super::object::BoundFunction {
+                        target,
+                        this,
+                        arguments: bound,
+                    } = *bound;
                     let mut all = bound;
                     all.extend(arguments);
                     return self.prepare_call(target, this, all, None);
@@ -535,11 +539,12 @@ impl ScriptRuntime {
                         self.function_frame(&closure, &callee, this, new_target, arguments, true);
                     return Ok(Prepared::Frame(Box::new(frame)));
                 }
-                ObjectClass::Bound {
-                    target,
-                    arguments: bound,
-                    ..
-                } => {
+                ObjectClass::Bound(bound) => {
+                    let super::object::BoundFunction {
+                        target,
+                        arguments: bound,
+                        ..
+                    } = *bound;
                     let mut all = bound;
                     all.extend(arguments);
                     let new_target = if Rc::ptr_eq(
@@ -678,7 +683,7 @@ impl ScriptRuntime {
     ) {
         let mut object = object.borrow_mut();
         let (mut get, mut set) = match object.property(key).map(|property| &property.slot) {
-            Some(Slot::Accessor { get, set }) => (get.clone(), set.clone()),
+            Some(Slot::Accessor(accessors)) => (accessors.get.clone(), accessors.set.clone()),
             _ => (None, None),
         };
         if getter.is_some() {
@@ -690,7 +695,7 @@ impl ScriptRuntime {
         object.define(
             key.to_string(),
             Property {
-                slot: Slot::Accessor { get, set },
+                slot: Slot::accessor(get, set),
                 enumerable,
                 writable: false,
                 configurable: true,
@@ -2439,7 +2444,7 @@ impl ScriptRuntime {
                 let url = frame
                     .closure
                     .as_ref()
-                    .and_then(|closure| closure.url.clone())
+                    .and_then(|closure| closure.url.as_deref().cloned())
                     .or_else(|| self.base_url.clone());
                 let promise = self.dynamic_import_promise(url, specifier, options);
                 frames.last_mut().expect("frame").stack.push(promise);
@@ -2505,7 +2510,7 @@ impl ScriptRuntime {
         template: &Rc<compiler::ClassTemplate>,
         superclass: Option<Value>,
         scope: Option<ScopeRef>,
-        url: Option<AppUrl>,
+        url: Option<Rc<AppUrl>>,
     ) -> Result<(Value, Value), ScriptError> {
         let (prototype_parent, constructor_parent) = match &superclass {
             None => (

@@ -62,10 +62,7 @@ fn define(target: &ObjectHandle, name: &str, get: ObjectHandle, set: Option<Obje
     target.borrow_mut().define(
         name.to_string(),
         Property {
-            slot: Slot::Accessor {
-                get: Some(Value::Object(get)),
-                set: set.map(Value::Object),
-            },
+            slot: Slot::accessor(Some(Value::Object(get)), set.map(Value::Object)),
             enumerable: true,
             writable: false,
             configurable: true,

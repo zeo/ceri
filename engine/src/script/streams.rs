@@ -303,10 +303,7 @@ pub(super) fn create(
         target.borrow_mut().define(
             name.to_string(),
             Property {
-                slot: object::Slot::Accessor {
-                    get: Some(Value::Object(made)),
-                    set: None,
-                },
+                slot: object::Slot::accessor(Some(Value::Object(made)), None),
                 enumerable: true,
                 writable: false,
                 configurable: true,

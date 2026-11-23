@@ -251,10 +251,10 @@ pub(super) fn create(
                     ..Property::data(function(member, key, length))
                 },
                 Member::Accessor(setter) => Property {
-                    slot: Slot::Accessor {
-                        get: Some(function(member, &format!("get {key}"), 0)),
-                        set: setter.map(|setter| function(setter, &format!("set {key}"), 1)),
-                    },
+                    slot: Slot::accessor(
+                        Some(function(member, &format!("get {key}"), 0)),
+                        setter.map(|setter| function(setter, &format!("set {key}"), 1)),
+                    ),
                     enumerable: true,
                     writable: false,
                     configurable: true,

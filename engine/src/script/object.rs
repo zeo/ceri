@@ -4,17 +4,27 @@
 use super::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 pub(super) type ObjectHandle = Rc<RefCell<JsObject>>;
 
 #[derive(Clone)]
 pub(super) enum Slot {
     Data(Value),
-    Accessor {
-        get: Option<Value>,
-        set: Option<Value>,
-    },
+    // boxed, as accessors are rare and a data slot then takes no more room than its value
+    Accessor(Box<Accessors>),
+}
+
+#[derive(Clone)]
+pub(super) struct Accessors {
+    pub(super) get: Option<Value>,
+    pub(super) set: Option<Value>,
+}
+
+impl Slot {
+    pub(super) fn accessor(get: Option<Value>, set: Option<Value>) -> Self {
+        Self::Accessor(Box::new(Accessors { get, set }))
+    }
 }
 
 #[derive(Clone)]
@@ -71,11 +81,8 @@ pub(super) enum ObjectClass {
     #[default]
     Ordinary,
     Function(Rc<super::vm::Closure>),
-    Bound {
-        target: Value,
-        this: Value,
-        arguments: Vec<Value>,
-    },
+    // boxed with the rest of the rare kinds kept small, as every object carries its class
+    Bound(Box<BoundFunction>),
     Arguments,
     // what JSON.rawJSON makes, which JSON.stringify writes out as its text
     RawJson,
@@ -155,11 +162,114 @@ pub(super) enum ObjectClass {
     IteratorHelper(Rc<RefCell<super::iterator_helpers::HelperState>>),
 }
 
+// the keys of an object in insertion order. objects that gained the same keys in the same order
+// share one, so each keeps only its property values, and a key added moves an object to the
+// shape one key longer. an object that loses a key or grows large gets a shape of its own
+struct Shape {
+    keys: Vec<Rc<str>>,
+    // built once a shape grows past a handful of keys
+    index: Option<HashMap<Rc<str>, usize>>,
+    // the shapes one key longer, while some object still has them
+    transitions: RefCell<HashMap<Rc<str>, Weak<Shape>>>,
+    // the shape one key shorter, kept alive so the next object to take the same keys finds
+    // the same path
+    _parent: Option<Rc<Shape>>,
+    // a shape of one object's own, changed in place
+    own: bool,
+}
+
+// keys past which an object stops sharing its shape, so one used as a map makes no chain of
+// shapes as long as itself
+const SHARED_KEYS: usize = 64;
+
+impl Shape {
+    fn root() -> Rc<Self> {
+        thread_local! {
+            static ROOT: Rc<Shape> = Rc::new(Shape {
+                keys: Vec::new(),
+                index: None,
+                transitions: RefCell::default(),
+                _parent: None,
+                own: false,
+            });
+        }
+        ROOT.with(Rc::clone)
+    }
+
+    fn own_copy(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+            index: self.index.clone(),
+            transitions: RefCell::default(),
+            _parent: None,
+            own: true,
+        }
+    }
+
+    fn position(&self, key: &str) -> Option<usize> {
+        match &self.index {
+            Some(index) => index.get(key).copied(),
+            None => self.keys.iter().position(|name| &**name == key),
+        }
+    }
+
+    fn reindex(&mut self) {
+        self.index = (self.keys.len() > INDEX_THRESHOLD).then(|| {
+            self.keys
+                .iter()
+                .enumerate()
+                .map(|(position, key)| (key.clone(), position))
+                .collect()
+        });
+    }
+
+    fn push_own(&mut self, key: Rc<str>) {
+        if let Some(index) = &mut self.index {
+            index.insert(key.clone(), self.keys.len());
+        }
+        self.keys.push(key);
+        if self.index.is_none() && self.keys.len() > INDEX_THRESHOLD {
+            self.reindex();
+        }
+    }
+
+    // the shared shape with one key more, made once and found again by every object after
+    fn with_key(self: &Rc<Self>, key: &str) -> Rc<Self> {
+        let mut transitions = self.transitions.borrow_mut();
+        if let Some(next) = transitions.get(key).and_then(Weak::upgrade) {
+            return next;
+        }
+        if transitions.len() >= 16 {
+            transitions.retain(|_, next| next.strong_count() > 0);
+        }
+        let key: Rc<str> = Rc::from(key);
+        let mut next = Shape {
+            keys: self.keys.clone(),
+            index: self.index.clone(),
+            transitions: RefCell::default(),
+            _parent: Some(self.clone()),
+            own: false,
+        };
+        next.push_own(key.clone());
+        let next = Rc::new(next);
+        transitions.insert(key, Rc::downgrade(&next));
+        next
+    }
+}
+
+// what Function.prototype.bind made
+#[derive(Clone)]
+pub(super) struct BoundFunction {
+    pub(super) target: Value,
+    pub(super) this: Value,
+    pub(super) arguments: Vec<Value>,
+}
+
 #[derive(Clone)]
 pub(super) struct JsObject {
-    entries: Vec<(String, Property)>,
-    // built once an object grows past a handful of properties
-    index: Option<HashMap<String, usize>>,
+    shape: Rc<Shape>,
+    // the values of the shape's keys, in the same order
+    properties: Vec<Property>,
     prototype: Option<ObjectHandle>,
     // objects built by host code without a realm at hand inherit from Object.prototype
     orphan: bool,
@@ -199,8 +309,8 @@ pub(super) fn array_index(key: &str) -> Option<u32> {
 impl JsObject {
     pub(super) fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            index: None,
+            shape: Shape::root(),
+            properties: Vec::new(),
             prototype: None,
             orphan: true,
             extensible: true,
@@ -215,6 +325,11 @@ impl JsObject {
             class,
             ..Self::new()
         }
+    }
+
+    // room for exactly this many properties, for objects whose properties are known when made
+    pub(super) fn reserve(&mut self, properties: usize) {
+        self.properties.reserve_exact(properties);
     }
 
     // the prototype, defaulting host-built objects to the intrinsic their class implies
@@ -261,48 +376,40 @@ impl JsObject {
     }
 
     fn position(&self, key: &str) -> Option<usize> {
-        match &self.index {
-            Some(index) => index.get(key).copied(),
-            None => self.entries.iter().position(|(name, _)| name == key),
-        }
+        self.shape.position(key)
     }
 
-    fn rebuild_index(&mut self) {
-        if self.entries.len() > INDEX_THRESHOLD {
-            self.index = Some(
-                self.entries
-                    .iter()
-                    .enumerate()
-                    .map(|(position, (name, _))| (name.clone(), position))
-                    .collect(),
-            );
-        } else {
-            self.index = None;
+    // the object's own shape, made from the shared one the first time it is changed in place
+    fn own_shape(&mut self) -> &mut Shape {
+        // a cloned object holds the same own shape until one of the two changes it
+        if !self.shape.own || Rc::strong_count(&self.shape) > 1 {
+            self.shape = Rc::new(self.shape.own_copy());
         }
+        Rc::get_mut(&mut self.shape).expect("an own shape has no other holder")
     }
 
     pub(super) fn property(&self, key: &str) -> Option<&Property> {
-        self.position(key).map(|position| &self.entries[position].1)
+        self.position(key)
+            .map(|position| &self.properties[position])
     }
 
     pub(super) fn property_mut(&mut self, key: &str) -> Option<&mut Property> {
         self.position(key)
-            .map(move |position| &mut self.entries[position].1)
+            .map(move |position| &mut self.properties[position])
     }
 
     // defines or replaces a property with exact attributes
     pub(super) fn define(&mut self, key: String, property: Property) {
         if let Some(position) = self.position(&key) {
-            self.entries[position].1 = property;
+            self.properties[position] = property;
             return;
         }
-        if let Some(index) = &mut self.index {
-            index.insert(key.clone(), self.entries.len());
+        if self.shape.own || self.properties.len() >= SHARED_KEYS {
+            self.own_shape().push_own(Rc::from(key));
+        } else {
+            self.shape = self.shape.with_key(&key);
         }
-        self.entries.push((key, property));
-        if self.index.is_none() && self.entries.len() > INDEX_THRESHOLD {
-            self.rebuild_index();
-        }
+        self.properties.push(property);
     }
 
     // the data value of an own property; accessors read as absent for host code
@@ -327,10 +434,10 @@ impl JsObject {
 
     pub(super) fn remove(&mut self, key: &str) -> Option<Value> {
         let position = self.position(key)?;
-        let (_, property) = self.entries.remove(position);
-        if self.index.is_some() {
-            self.rebuild_index();
-        }
+        let property = self.properties.remove(position);
+        let shape = self.own_shape();
+        shape.keys.remove(position);
+        shape.reindex();
         property.value().cloned()
     }
 
@@ -338,10 +445,10 @@ impl JsObject {
     pub(super) fn ordered_keys(&self) -> Vec<String> {
         let mut integers = Vec::new();
         let mut strings = Vec::new();
-        for (key, _) in &self.entries {
+        for key in &self.shape.keys {
             match array_index(key) {
-                Some(index) => integers.push((index, key.clone())),
-                None => strings.push(key.clone()),
+                Some(index) => integers.push((index, key.to_string())),
+                None => strings.push(key.to_string()),
             }
         }
         integers.sort_unstable_by_key(|(index, _)| *index);
@@ -368,8 +475,9 @@ impl JsObject {
         self.iter().map(|(key, _)| key)
     }
 
-    pub(super) fn entries(&self) -> &[(String, Property)] {
-        &self.entries
+    // the own properties in insertion order, without their keys
+    pub(super) fn properties(&self) -> &[Property] {
+        &self.properties
     }
 
     // the prototype set on the object itself, which the cycle collector follows
@@ -380,13 +488,15 @@ impl JsObject {
     // empties an object the cycle collector found unreachable: what it held, and its class
     pub(super) fn take_for_collection(&mut self) -> (Vec<Value>, ObjectClass) {
         let mut values = Vec::new();
-        for (_, property) in self.entries.drain(..) {
+        for property in self.properties.drain(..) {
             match property.slot {
                 Slot::Data(value) => values.push(value),
-                Slot::Accessor { get, set } => values.extend(get.into_iter().chain(set)),
+                Slot::Accessor(accessors) => {
+                    values.extend(accessors.get.into_iter().chain(accessors.set))
+                }
             }
         }
-        self.index = None;
+        self.shape = Shape::root();
         if let Some(prototype) = self.prototype.take() {
             values.push(Value::Object(prototype));
         }
@@ -398,7 +508,7 @@ impl JsObject {
 
     pub(super) fn freeze(&mut self, writable: bool) {
         self.extensible = false;
-        for (_, property) in &mut self.entries {
+        for property in &mut self.properties {
             property.configurable = false;
             if !writable && matches!(property.slot, Slot::Data(_)) {
                 property.writable = false;
@@ -408,7 +518,7 @@ impl JsObject {
 
     pub(super) fn is_callable(&self) -> bool {
         match &self.class {
-            ObjectClass::Function(_) | ObjectClass::Bound { .. } | ObjectClass::Native(_) => true,
+            ObjectClass::Function(_) | ObjectClass::Bound(_) | ObjectClass::Native(_) => true,
             ObjectClass::Proxy(proxy) => proxy.callable,
             _ => false,
         }
@@ -451,6 +561,30 @@ mod tests {
             object.keys().collect::<Vec<_>>(),
             ["1", "2", "10", "b", "01"]
         );
+    }
+
+    #[test]
+    fn an_object_and_a_property_stay_small_enough_for_heaps_of_them() {
+        assert!(std::mem::size_of::<JsObject>() <= 80);
+        assert!(std::mem::size_of::<Property>() <= 40);
+    }
+
+    #[test]
+    fn objects_given_the_same_keys_in_the_same_order_share_one_shape() {
+        let made = || {
+            let mut object = JsObject::new();
+            for key in ["fn", "state", "value"] {
+                object.insert(key.to_string(), Value::Null);
+            }
+            object
+        };
+        let (first, second) = (made(), made());
+        assert!(Rc::ptr_eq(&first.shape, &second.shape));
+        let mut third = made();
+        third.remove("state");
+        assert!(!Rc::ptr_eq(&first.shape, &third.shape));
+        assert_eq!(third.ordered_keys(), ["fn", "value"]);
+        assert_eq!(first.ordered_keys(), ["fn", "state", "value"]);
     }
 
     #[test]

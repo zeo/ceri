@@ -73,10 +73,7 @@ pub(super) fn create(
         rect_read_only.borrow_mut().define(
             name.to_string(),
             Property {
-                slot: Slot::Accessor {
-                    get: Some(Value::Object(get)),
-                    set: None,
-                },
+                slot: Slot::accessor(Some(Value::Object(get)), None),
                 enumerable: true,
                 writable: false,
                 configurable: true,

@@ -101,10 +101,7 @@ pub(super) fn create(
         request.borrow_mut().define(
             name.to_string(),
             Property {
-                slot: Slot::Accessor {
-                    get: Some(get),
-                    set,
-                },
+                slot: Slot::accessor(Some(get), set),
                 enumerable: true,
                 writable: false,
                 configurable: true,

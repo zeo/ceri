@@ -70,10 +70,7 @@ fn define_getter(
     target.borrow_mut().define(
         name.to_string(),
         Property {
-            slot: Slot::Accessor {
-                get: Some(Value::Object(get)),
-                set,
-            },
+            slot: Slot::accessor(Some(Value::Object(get)), set),
             enumerable: true,
             writable: false,
             configurable: true,

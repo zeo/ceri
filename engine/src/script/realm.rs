@@ -548,10 +548,7 @@ impl Builder {
         target.borrow_mut().define(
             key.to_string(),
             Property {
-                slot: Slot::Accessor {
-                    get: Some(get),
-                    set,
-                },
+                slot: Slot::accessor(Some(get), set),
                 enumerable: false,
                 writable: false,
                 configurable: true,
@@ -1986,7 +1983,7 @@ impl ScriptRuntime {
                     ) && !closure.code.is_async
                         && !closure.code.is_generator
                 }
-                ObjectClass::Bound { target, .. } => Self::is_constructor(target),
+                ObjectClass::Bound(bound) => Self::is_constructor(&bound.target),
                 ObjectClass::Native(native) => native.is_constructor(),
                 _ => false,
             },
@@ -2004,9 +2001,11 @@ impl ScriptRuntime {
                     object.insert("value".to_string(), value.resolve());
                     object.insert("writable".to_string(), Value::Bool(property.writable));
                 }
-                Slot::Accessor { get, set } => {
-                    object.insert("get".to_string(), get.clone().unwrap_or(Value::Undefined));
-                    object.insert("set".to_string(), set.clone().unwrap_or(Value::Undefined));
+                Slot::Accessor(accessors) => {
+                    let get = accessors.get.clone().unwrap_or(Value::Undefined);
+                    let set = accessors.set.clone().unwrap_or(Value::Undefined);
+                    object.insert("get".to_string(), get);
+                    object.insert("set".to_string(), set);
                 }
             }
             object.insert("enumerable".to_string(), Value::Bool(property.enumerable));
@@ -2245,10 +2244,10 @@ impl ScriptRuntime {
             ));
         }
         let slot = if is_accessor {
-            Slot::Accessor {
-                get: get.filter(|value| !matches!(value, Value::Undefined)),
-                set: set.filter(|value| !matches!(value, Value::Undefined)),
-            }
+            Slot::accessor(
+                get.filter(|value| !matches!(value, Value::Undefined)),
+                set.filter(|value| !matches!(value, Value::Undefined)),
+            )
         } else {
             Slot::Data(data.unwrap_or(Value::Undefined))
         };
@@ -2321,19 +2320,14 @@ impl ScriptRuntime {
                     if !current.configurable {
                         return Err(self.type_error(format!("Cannot redefine property: {key}")));
                     }
-                    if let (
-                        Slot::Accessor { get, set },
-                        Slot::Accessor {
-                            get: new_get,
-                            set: new_set,
-                        },
-                    ) = (current.slot, &mut property.slot)
+                    if let (Slot::Accessor(old), Slot::Accessor(new)) =
+                        (current.slot, &mut property.slot)
                     {
                         if !present[4] {
-                            *new_get = get;
+                            new.get = old.get;
                         }
                         if !present[5] {
-                            *new_set = set;
+                            new.set = old.set;
                         }
                         if !present[0] {
                             property.enumerable = current.enumerable;
@@ -2385,15 +2379,9 @@ impl ScriptRuntime {
                                     && ((present[3] && property.writable)
                                         || (present[2] && !same_value(old, new)))
                             }
-                            (
-                                Slot::Accessor { get, set },
-                                Slot::Accessor {
-                                    get: new_get,
-                                    set: new_set,
-                                },
-                            ) => {
-                                (present[4] && !same_optional(get, new_get))
-                                    || (present[5] && !same_optional(set, new_set))
+                            (Slot::Accessor(old), Slot::Accessor(new)) => {
+                                (present[4] && !same_optional(&old.get, &new.get))
+                                    || (present[5] && !same_optional(&old.set, &new.set))
                             }
                             _ => false,
                         };
@@ -2416,18 +2404,12 @@ impl ScriptRuntime {
                             property.writable = current.writable;
                         }
                     }
-                    (
-                        Slot::Accessor { get, set },
-                        Slot::Accessor {
-                            get: new_get,
-                            set: new_set,
-                        },
-                    ) => {
+                    (Slot::Accessor(old), Slot::Accessor(new)) => {
                         if !present[4] {
-                            *new_get = get.clone();
+                            new.get = old.get.clone();
                         }
                         if !present[5] {
-                            *new_set = set.clone();
+                            new.set = old.set.clone();
                         }
                     }
                     (Slot::Accessor { .. }, Slot::Data(_)) if !(present[2] || present[3]) => {
@@ -2458,7 +2440,7 @@ impl ScriptRuntime {
                         return source[*start..*end].to_string();
                     }
                 }
-                ObjectClass::Native(_) | ObjectClass::Bound { .. } => {
+                ObjectClass::Native(_) | ObjectClass::Bound(_) => {
                     let name = match borrowed.get("name") {
                         Some(Value::String(name)) => name.to_string(),
                         _ => String::new(),
@@ -2732,7 +2714,7 @@ impl ScriptRuntime {
                     Value::Object(object) => {
                         let object = object.borrow();
                         !object.extensible
-                            && object.entries().iter().all(|(_, property)| {
+                            && object.properties().iter().all(|property| {
                                 !property.configurable
                                     && (!frozen
                                         || !property.writable
@@ -2853,10 +2835,10 @@ impl ScriptRuntime {
                 loop {
                     if let Some(property) = self.own_property_of(&target, &key)? {
                         return Ok(match property.slot {
-                            Slot::Accessor { get, .. } if getter => {
-                                get.unwrap_or(Value::Undefined)
+                            Slot::Accessor(accessors) if getter => {
+                                accessors.get.unwrap_or(Value::Undefined)
                             }
-                            Slot::Accessor { set, .. } => set.unwrap_or(Value::Undefined),
+                            Slot::Accessor(accessors) => accessors.set.unwrap_or(Value::Undefined),
                             _ => Value::Undefined,
                         });
                     }
@@ -2904,11 +2886,11 @@ impl ScriptRuntime {
                 let prototype = self.prototype_of(&this);
                 let mut object = JsObject::with_prototype(
                     prototype,
-                    ObjectClass::Bound {
+                    ObjectClass::Bound(Box::new(super::object::BoundFunction {
                         target: this,
                         this: first,
                         arguments: bound,
-                    },
+                    })),
                 );
                 object.define(
                     "length".to_string(),
@@ -3888,22 +3870,16 @@ impl ScriptRuntime {
                         _ => true,
                     };
                     let same_accessors = match (&current.slot, &property.slot) {
-                        (
-                            Slot::Accessor { get, set },
-                            Slot::Accessor {
-                                get: new_get,
-                                set: new_set,
-                            },
-                        ) => {
+                        (Slot::Accessor(old), Slot::Accessor(new)) => {
                             (!present[4]
                                 || super::operations::same_value(
-                                    get.as_ref().unwrap_or(&Value::Undefined),
-                                    new_get.as_ref().unwrap_or(&Value::Undefined),
+                                    old.get.as_ref().unwrap_or(&Value::Undefined),
+                                    new.get.as_ref().unwrap_or(&Value::Undefined),
                                 ))
                                 && (!present[5]
                                     || super::operations::same_value(
-                                        set.as_ref().unwrap_or(&Value::Undefined),
-                                        new_set.as_ref().unwrap_or(&Value::Undefined),
+                                        old.set.as_ref().unwrap_or(&Value::Undefined),
+                                        new.set.as_ref().unwrap_or(&Value::Undefined),
                                     ))
                         }
                         _ => true,
@@ -3935,18 +3911,12 @@ impl ScriptRuntime {
                             property.writable = current.writable;
                         }
                     }
-                    (
-                        Slot::Accessor { get, set },
-                        Slot::Accessor {
-                            get: new_get,
-                            set: new_set,
-                        },
-                    ) => {
+                    (Slot::Accessor(old), Slot::Accessor(new)) => {
                         if !present[4] {
-                            *new_get = get.clone();
+                            new.get = old.get.clone();
                         }
                         if !present[5] {
-                            *new_set = set.clone();
+                            new.set = old.set.clone();
                         }
                     }
                     _ => {}
@@ -4067,7 +4037,7 @@ impl ScriptRuntime {
             Value::String(_) => "String",
             Value::Error(_) => "Error",
             Value::Object(object) => match &object.borrow().class {
-                ObjectClass::Function(_) | ObjectClass::Bound { .. } | ObjectClass::Native(_) => {
+                ObjectClass::Function(_) | ObjectClass::Bound(_) | ObjectClass::Native(_) => {
                     "Function"
                 }
                 ObjectClass::Error => "Error",

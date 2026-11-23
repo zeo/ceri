@@ -112,14 +112,14 @@ pub(super) fn create(
                     ..Property::data(Value::Object(build.function(native, member, length)))
                 },
                 Get => Property {
-                    slot: Slot::Accessor {
-                        get: Some(Value::Object(build.function(
+                    slot: Slot::accessor(
+                        Some(Value::Object(build.function(
                             native,
                             &format!("get {member}"),
                             0,
                         ))),
-                        set: None,
-                    },
+                        None,
+                    ),
                     enumerable: true,
                     writable: false,
                     configurable: true,

@@ -145,7 +145,7 @@ impl Node {
             }
             Node::Object(object) => {
                 let object = object.try_borrow().ok()?;
-                for (_, property) in object.entries() {
+                for property in object.properties() {
                     slot_edges(&property.slot, out);
                 }
                 if let Some(prototype) = object.own_prototype() {
@@ -177,14 +177,10 @@ impl Node {
                             }
                         }
                     }
-                    ObjectClass::Bound {
-                        target,
-                        this,
-                        arguments,
-                    } => {
-                        value_edge(target, out);
-                        value_edge(this, out);
-                        for value in arguments {
+                    ObjectClass::Bound(bound) => {
+                        value_edge(&bound.target, out);
+                        value_edge(&bound.this, out);
+                        for value in &bound.arguments {
                             value_edge(value, out);
                         }
                     }
@@ -230,8 +226,8 @@ impl Node {
                     for (_, property) in array.properties.drain(..) {
                         match property.slot {
                             Slot::Data(value) => dropped.push(value),
-                            Slot::Accessor { get, set } => {
-                                dropped.extend(get.into_iter().chain(set))
+                            Slot::Accessor(accessors) => {
+                                dropped.extend(accessors.get.into_iter().chain(accessors.set))
                             }
                         }
                     }
@@ -255,8 +251,8 @@ fn value_edge(value: &Value, out: &mut Vec<usize>) {
 fn slot_edges(slot: &Slot, out: &mut Vec<usize>) {
     match slot {
         Slot::Data(value) => value_edge(value, out),
-        Slot::Accessor { get, set } => {
-            for value in get.iter().chain(set.iter()) {
+        Slot::Accessor(accessors) => {
+            for value in accessors.get.iter().chain(accessors.set.iter()) {
                 value_edge(value, out);
             }
         }

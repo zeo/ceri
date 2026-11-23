@@ -151,14 +151,7 @@ pub(super) fn create(
         let set = setter.map(|setter| {
             Value::Object(build.function(Native::Url(setter), &format!("set {name}"), 1))
         });
-        interface_member(
-            &url,
-            name,
-            Slot::Accessor {
-                get: Some(get),
-                set,
-            },
-        );
+        interface_member(&url, name, Slot::accessor(Some(get), set));
     }
     for name in ["toString", "toJSON"] {
         let function = build.function(Native::Url(UrlMember::ToString), name, 0);
@@ -189,10 +182,7 @@ pub(super) fn create(
     interface_member(
         &params,
         "size",
-        Slot::Accessor {
-            get: Some(Value::Object(size)),
-            set: None,
-        },
+        Slot::accessor(Some(Value::Object(size)), None),
     );
     let entries = params.borrow().get("entries").cloned();
     if let Some(entries) = entries {

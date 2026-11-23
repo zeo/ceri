@@ -419,10 +419,7 @@ impl ScriptRuntime {
                 object.define(
                     name.to_string(),
                     object::Property {
-                        slot: object::Slot::Accessor {
-                            get: Some(Value::Builtin(getter)),
-                            set: None,
-                        },
+                        slot: object::Slot::accessor(Some(Value::Builtin(getter)), None),
                         enumerable: true,
                         writable: false,
                         configurable: true,

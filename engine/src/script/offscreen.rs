@@ -45,10 +45,7 @@ pub(super) fn create(
         prototype.borrow_mut().define(
             name.to_string(),
             Property {
-                slot: Slot::Accessor {
-                    get: Some(Value::Object(getter)),
-                    set: Some(Value::Object(setter)),
-                },
+                slot: Slot::accessor(Some(Value::Object(getter)), Some(Value::Object(setter))),
                 enumerable: true,
                 writable: false,
                 configurable: true,

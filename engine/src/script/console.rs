@@ -146,9 +146,7 @@ impl ScriptRuntime {
                 }
                 let class = object.borrow().class.clone();
                 match class {
-                    ObjectClass::Function(_)
-                    | ObjectClass::Bound { .. }
-                    | ObjectClass::Native(_) => {
+                    ObjectClass::Function(_) | ObjectClass::Bound(_) | ObjectClass::Native(_) => {
                         let name = match self.get_property(value, "name") {
                             Ok(Value::String(name)) if !name.is_empty() => name.to_string(),
                             _ => "(anonymous)".to_string(),

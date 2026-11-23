@@ -912,7 +912,7 @@ fn define_member(build: &Builder, prototype: &ObjectHandle, entry: &'static (&'s
     prototype.borrow_mut().define(
         name.to_string(),
         Property {
-            slot: Slot::Accessor { get, set },
+            slot: Slot::accessor(get, set),
             enumerable: true,
             writable: false,
             configurable: true,

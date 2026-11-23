@@ -57,10 +57,7 @@ fn accessor(build: &Builder, target: &ObjectHandle, name: &str, member: NoticeMe
     target.borrow_mut().define(
         name.to_string(),
         Property {
-            slot: Slot::Accessor {
-                get: Some(Value::Object(get)),
-                set: None,
-            },
+            slot: Slot::accessor(Some(Value::Object(get)), None),
             enumerable: true,
             writable: false,
             configurable: true,

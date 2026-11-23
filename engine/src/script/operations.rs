@@ -868,9 +868,9 @@ impl ScriptRuntime {
             return Err(self.type_error("Right-hand side of 'instanceof' is not callable"));
         }
         if let Value::Object(object) = constructor
-            && let ObjectClass::Bound { target, .. } = &object.borrow().class
+            && let ObjectClass::Bound(bound) = &object.borrow().class
         {
-            let target = target.clone();
+            let target = bound.target.clone();
             return self.instance_of(value, &target);
         }
         if !matches!(constructor, Value::Object(_)) {
@@ -1086,8 +1086,8 @@ impl ScriptRuntime {
             };
             match slot {
                 Some(Slot::Data(value)) => return Ok(value.resolve()),
-                Some(Slot::Accessor { get, .. }) => {
-                    return match get {
+                Some(Slot::Accessor(accessors)) => {
+                    return match accessors.get {
                         Some(getter) => self.call_function(getter, receiver.clone(), Vec::new()),
                         None => Ok(Value::Undefined),
                     };
@@ -1205,10 +1205,10 @@ impl ScriptRuntime {
         };
         Ok(Some(match slot {
             Slot::Data(value) => value,
-            Slot::Accessor {
-                get: Some(getter), ..
-            } => self.call_function(getter, receiver.clone(), Vec::new())?,
-            Slot::Accessor { get: None, .. } => Value::Undefined,
+            Slot::Accessor(accessors) => match accessors.get {
+                Some(getter) => self.call_function(getter, receiver.clone(), Vec::new())?,
+                None => Value::Undefined,
+            },
         }))
     }
 
@@ -1228,17 +1228,18 @@ impl ScriptRuntime {
             return Ok(false);
         };
         match slot {
-            Slot::Accessor {
-                set: Some(setter), ..
-            } => {
-                self.call_function(setter, Value::Array(array.clone()), vec![value])?;
-            }
-            Slot::Accessor { set: None, .. } if strict => {
-                return Err(self.type_error(format!(
-                    "Cannot set property {} of [object Array] which has only a getter",
-                    display_key(key)
-                )));
-            }
+            Slot::Accessor(accessors) => match accessors.set {
+                Some(setter) => {
+                    self.call_function(setter, Value::Array(array.clone()), vec![value])?;
+                }
+                None if strict => {
+                    return Err(self.type_error(format!(
+                        "Cannot set property {} of [object Array] which has only a getter",
+                        display_key(key)
+                    )));
+                }
+                None => {}
+            },
             Slot::Data(_) if !writable || array.borrow().integrity == super::Integrity::Frozen => {
                 if strict {
                     return Err(self.type_error(format!(
@@ -1248,7 +1249,6 @@ impl ScriptRuntime {
                 }
             }
             Slot::Data(_) => self.set_array_expando(array, key, value),
-            Slot::Accessor { .. } => {}
         }
         Ok(true)
     }
@@ -1292,8 +1292,8 @@ impl ScriptRuntime {
                 }
             };
             match found {
-                Some((Slot::Accessor { set, .. }, _)) => {
-                    return match set {
+                Some((Slot::Accessor(accessors), _)) => {
+                    return match accessors.set {
                         Some(setter) => self
                             .call_function(setter, receiver.clone(), vec![value])
                             .map(|_| ()),
@@ -1675,13 +1675,13 @@ impl ScriptRuntime {
         };
         match slot {
             Some(Slot::Data(value)) => Ok(value),
-            Some(Slot::Accessor {
-                get: Some(getter), ..
-            }) => self.call_function(getter, object.clone(), Vec::new()),
-            Some(Slot::Accessor { get: None, .. }) => Err(self.type_error(format!(
-                "'{}' was defined without a getter",
-                display_key(key)
-            ))),
+            Some(Slot::Accessor(accessors)) => match accessors.get {
+                Some(getter) => self.call_function(getter, object.clone(), Vec::new()),
+                None => Err(self.type_error(format!(
+                    "'{}' was defined without a getter",
+                    display_key(key)
+                ))),
+            },
             None => Err(self.type_error(format!(
                 "Cannot read private member {} from an object whose class did not declare it",
                 display_key(key)
@@ -1714,18 +1714,15 @@ impl ScriptRuntime {
                 "Private method {} is not writable",
                 display_key(key)
             ))),
-            Some((
-                Slot::Accessor {
-                    set: Some(setter), ..
-                },
-                _,
-            )) => self
-                .call_function(setter, object.clone(), vec![value])
-                .map(|_| ()),
-            Some((Slot::Accessor { set: None, .. }, _)) => Err(self.type_error(format!(
-                "'{}' was defined without a setter",
-                display_key(key)
-            ))),
+            Some((Slot::Accessor(accessors), _)) => match accessors.set {
+                Some(setter) => self
+                    .call_function(setter, object.clone(), vec![value])
+                    .map(|_| ()),
+                None => Err(self.type_error(format!(
+                    "'{}' was defined without a setter",
+                    display_key(key)
+                ))),
+            },
             None => Err(self.type_error(format!(
                 "Cannot write private member {} to an object whose class did not declare it",
                 display_key(key)
@@ -2129,11 +2126,11 @@ impl ScriptRuntime {
     pub(super) fn get_global_accessor(&mut self, name: &str) -> Option<Result<Value, ScriptError>> {
         let property = self.global.borrow().accessors.get(name).cloned()?;
         Some(match property.slot {
-            Slot::Accessor {
-                get: Some(getter), ..
-            } => self.call_function(getter, Value::Window, Vec::new()),
+            Slot::Accessor(accessors) => match accessors.get {
+                Some(getter) => self.call_function(getter, Value::Window, Vec::new()),
+                None => Ok(Value::Undefined),
+            },
             Slot::Data(value) => Ok(value),
-            Slot::Accessor { .. } => Ok(Value::Undefined),
         })
     }
 
@@ -2166,10 +2163,12 @@ impl ScriptRuntime {
         let accessor = self.global.borrow().accessors.get(name).cloned();
         if let Some(property) = accessor {
             return match property.slot {
-                Slot::Accessor {
-                    set: Some(setter), ..
-                } => self
-                    .call_function(setter, Value::Window, vec![value])
+                Slot::Accessor(accessors) if accessors.set.is_some() => self
+                    .call_function(
+                        accessors.set.expect("a setter was just seen"),
+                        Value::Window,
+                        vec![value],
+                    )
                     .map(drop),
                 Slot::Data(_) if property.writable => {
                     let mut global = self.global.borrow_mut();

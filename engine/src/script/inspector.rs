@@ -750,9 +750,9 @@ impl ScriptRuntime {
                         descriptor["value"] = self.remote_object(&value.resolve(), &group, preview);
                         descriptor["writable"] = property.writable.into();
                     }
-                    Slot::Accessor { get, set } => {
-                        let get = get.clone().unwrap_or(Value::Undefined);
-                        let set = set.clone().unwrap_or(Value::Undefined);
+                    Slot::Accessor(accessors) => {
+                        let get = accessors.get.clone().unwrap_or(Value::Undefined);
+                        let set = accessors.set.clone().unwrap_or(Value::Undefined);
                         descriptor["get"] = self.remote_object(&get, &group, false);
                         descriptor["set"] = self.remote_object(&set, &group, false);
                     }
