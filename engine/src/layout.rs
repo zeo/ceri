@@ -133,7 +133,7 @@ pub struct LayoutBox {
     // in the top layer, as a modal dialog and its backdrop are
     pub(crate) top_layer: bool,
     // the CSS transform about its origin, in coordinates relative to the border box corner
-    pub(crate) transform: Option<crate::transform::Matrix>,
+    pub(crate) transform: Option<Box<crate::transform::Matrix>>,
     pub(crate) backface_hidden: bool,
     // relative to the border box corner
     pub(crate) clip_path: Option<Box<crate::clip_path::ClipRegion>>,
@@ -1436,7 +1436,7 @@ fn collect_prose_runs(
 ) {
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let box_rect = visual_rect_for(layout_box, ancestor_offset);
-    if let Some(transform) = layout_box.transform {
+    if let Some(transform) = layout_box.transform.as_deref() {
         transforms.push(transform.about(box_rect.x, box_rect.y));
     }
     for run in layout_box
@@ -2172,7 +2172,7 @@ fn index_boxes(
 ) {
     let offset = visual_offset_for(layout, ancestor_offset);
     let own = translate_rect(layout.rect, offset);
-    let transform = match (transform, layout.transform) {
+    let transform = match (transform, layout.transform.as_deref().copied()) {
         (Some(outer), Some(inner)) => Some(outer.multiply(&inner.about(own.x, own.y))),
         (outer, inner) => outer.or(inner.map(|inner| inner.about(own.x, own.y))),
     };
@@ -2537,7 +2537,7 @@ fn local_point(
     x: f32,
     y: f32,
 ) -> Option<(f32, f32)> {
-    let Some(transform) = layout.transform else {
+    let Some(transform) = layout.transform.as_deref().copied() else {
         return Some((x, y));
     };
     let rect = visual_rect_for(layout, ancestor_offset);
@@ -8150,7 +8150,7 @@ fn apply_transform(layout: &mut LayoutBox, style: &Style, font_size: f32) {
                 .1
                 .resolve(height, font_size)
                 .unwrap_or(height / 2.0);
-            layout.transform = Some(matrix.about(origin_x, origin_y));
+            layout.transform = Some(Box::new(matrix.about(origin_x, origin_y)));
         }
     }
     if let Some(distance) = style.perspective {
@@ -8166,16 +8166,16 @@ fn apply_transform(layout: &mut LayoutBox, style: &Style, font_size: f32) {
             .unwrap_or(height / 2.0);
         let (corner_x, corner_y) = (layout.rect.x, layout.rect.y);
         for child in &mut layout.children {
-            let Some(transform) = child.transform else {
+            let Some(transform) = child.transform.as_deref().copied() else {
                 continue;
             };
             let relative_x = corner_x + origin_x - child.rect.x;
             let relative_y = corner_y + origin_y - child.rect.y;
-            child.transform = Some(
+            child.transform = Some(Box::new(
                 Matrix::perspective(distance)
                     .about(relative_x, relative_y)
                     .multiply(&transform),
-            );
+            ));
         }
     }
 }
@@ -10268,7 +10268,7 @@ mod tests {
 
     #[test]
     fn a_layout_box_stays_small_enough_to_keep_many_copies() {
-        assert!(std::mem::size_of::<LayoutBox>() <= 600);
+        assert!(std::mem::size_of::<LayoutBox>() <= 536);
     }
 
     // a few hundred seeded writes of every kind, each followed by a layout that takes what it

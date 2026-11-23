@@ -3556,7 +3556,7 @@ fn paint_context(
     if opacity <= 0.0 || misses(layout_box, ancestor_offset, clip) {
         return;
     }
-    if let Some(transform) = layout_box.transform {
+    if let Some(transform) = layout_box.transform.as_deref() {
         let rect = visual_rect_for(layout_box, ancestor_offset);
         // the stored transform is relative to the border box corner
         let full = transform.about(rect.x, rect.y);
