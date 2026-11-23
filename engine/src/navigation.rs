@@ -1949,6 +1949,11 @@ impl Browser {
         state.color_scheme = self.preferences.color_scheme;
         state.reduced_motion = self.preferences.reduced_motion;
         state.forced_colors = self.preferences.forced_colors;
+        // what selectors read matches a frame's layout, so the two share kept cascades
+        state.hovered_part = self
+            .hovered_thumb
+            .map(|node| (node, crate::css::PseudoElement::ScrollbarThumb));
+        state.container_sizes = self.container_sizes.borrow().clone();
         let read = (
             document.selector_version(),
             SheetIdentity::of(&stylesheet),
@@ -1982,6 +1987,8 @@ impl Browser {
         } else {
             collect_motion_candidates(&stylesheet, &state, &document)
         };
+        // the scan reads cascades through the ones kept from layout to layout
+        let styles = crate::css::memoize_styles();
         // custom properties cost a document-wide pass, so only pages with moving elements pay it
         if !candidates.is_empty() {
             page.populate_custom_properties(&document, &mut state);
@@ -2118,6 +2125,8 @@ impl Browser {
         events.extend(removed);
         self.animations
             .retain(|node, _| seen_animations.contains(node));
+        // events run script, which may write what the memo assumed fixed
+        drop(styles);
         drop(document);
         if events.is_empty() {
             return Ok(changed);
@@ -7071,6 +7080,36 @@ mod tests {
             element_text(&browser, "status"),
             "rgb(1, 2, 3)|rgb(4, 5, 6)|rgb(9, 9, 9)|rgb(4, 5, 6)"
         );
+    }
+
+    #[test]
+    fn property_reads_follow_each_object_past_what_they_found_last() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id="status">idle</p><script>
+                const read = (o) => o.x;
+                const seen = [];
+                const a = { x: 1, y: 2 };
+                seen.push(read(a), read(a));
+                seen.push(read({ x: 3, y: 4 }));
+                seen.push(read({ y: 5, x: 6 }));
+                delete a.x;
+                seen.push(read(a));
+                const b = { x: 7 };
+                read(b);
+                Object.defineProperty(b, "x", { get() { return 8; } });
+                seen.push(read(b));
+                const c = { x: 9 };
+                read(c);
+                seen.push(read(new Proxy(c, { get() { return 10; } })));
+                c.x = 11;
+                seen.push(read(c));
+                document.getElementById("status").textContent = seen.join(",");
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("property page should load");
+        assert_eq!(element_text(&browser, "status"), "1,1,3,6,,8,10,11");
     }
 
     #[test]

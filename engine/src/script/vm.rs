@@ -1724,8 +1724,28 @@ impl ScriptRuntime {
             }
             Op::GetProp(name) => {
                 let object = Self::pop(frame);
-                let key = frame.code.names[name as usize].clone();
-                let value = self.get_property(&object, &key)?;
+                let cache = &frame.code.property_caches[name as usize];
+                // an own data property found where it was last time is read straight off
+                let cached = match &object {
+                    Value::Object(handle) => handle
+                        .try_borrow()
+                        .ok()
+                        .and_then(|object| object.cached_value(cache).map(Value::resolve)),
+                    _ => None,
+                };
+                let value = match cached {
+                    Some(value) => value,
+                    None => {
+                        let key = frame.code.names[name as usize].clone();
+                        let value = self.get_property(&object, &key)?;
+                        if let Value::Object(handle) = &object
+                            && let Ok(object) = handle.try_borrow()
+                        {
+                            object.note_position(&key, cache);
+                        }
+                        value
+                    }
+                };
                 frames.last_mut().expect("frame").stack.push(value);
             }
             Op::GetIndex => {

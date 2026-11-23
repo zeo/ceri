@@ -985,6 +985,8 @@ type KeptCascade = (Option<String>, Rc<Cascade>);
 #[derive(Clone, Debug, Default)]
 struct Cascades {
     matching: Option<Matching>,
+    // the document's change stamp when the matching was last checked
+    since: u64,
     hovered: Option<NodeId>,
     // the style pass the matching was last checked in
     pass: u64,
@@ -3829,6 +3831,44 @@ impl Stylesheet {
         self.reach.max(user_agent_sheet().reach)
     }
 
+    // drops the kept cascades a write since the stamp can reach: the written element, what lies
+    // below it and what it inherits into, its siblings where a sibling selector can see the
+    // change, and everything where :has() can
+    fn drop_reached_cascades(
+        &self,
+        entries: &mut HashMap<(NodeId, Option<PseudoElement>), KeptCascade>,
+        document: &Document,
+        since: u64,
+    ) {
+        crate::profile::count("kept: cascades dropped where written");
+        let mut siblings = std::collections::HashSet::new();
+        match self.selector_reach() {
+            SelectorReach::Subtree => {}
+            SelectorReach::Anywhere => {
+                entries.clear();
+                return;
+            }
+            SelectorReach::Siblings => {
+                let Some(changes) = document.selector_changes_since(since) else {
+                    entries.clear();
+                    return;
+                };
+                for (node, _) in changes.filter(|(_, changed)| self.reaches_siblings(changed)) {
+                    if let Some(parent) = document.parent(node) {
+                        siblings.extend(document.children(parent).iter().copied());
+                    }
+                }
+            }
+        }
+        entries.retain(|(node, _), _| {
+            document.unwritten_since(*node, since)
+                && !document
+                    .ancestors(*node)
+                    .chain(std::iter::once(*node))
+                    .any(|above| siblings.contains(&above))
+        });
+    }
+
     // whether an attribute change the document names so can restyle the element's siblings
     pub(crate) fn reaches_siblings(&self, changed: &[String]) -> bool {
         [self, user_agent_sheet()].iter().any(|sheet| {
@@ -3909,14 +3949,27 @@ impl Stylesheet {
             let pass = STYLE_PASS.with(std::cell::Cell::get);
             if cascades.pass != pass {
                 let matching = Matching::of(document, state);
-                if cascades.matching.as_ref() != Some(&matching) {
+                let written_only = cascades.matching.as_ref().is_some_and(|kept| {
+                    *kept
+                        == Matching {
+                            selector_version: kept.selector_version,
+                            ..matching.clone()
+                        }
+                });
+                if written_only && cascades.matching.as_ref() != Some(&matching) {
+                    // writes to the tree restyle what they reach, not the whole document
+                    let since = cascades.since;
+                    self.drop_reached_cascades(&mut cascades.entries, document, since);
+                    cascades.matching = Some(matching);
+                } else if cascades.matching.as_ref() != Some(&matching) {
                     crate::profile::count("kept: all cascades dropped");
                     if let Some(kept) = &cascades.matching {
                         kept.count_differences(&matching);
                     }
                     cascades.entries.clear();
                     cascades.matching = Some(matching);
-                } else if cascades.hovered != state.hovered {
+                }
+                if cascades.hovered != state.hovered {
                     match self.hover_reach(document, cascades.hovered, state.hovered) {
                         Some(roots) => {
                             let restyled = roots
@@ -3932,6 +3985,7 @@ impl Stylesheet {
                 }
                 cascades.hovered = state.hovered;
                 cascades.pass = pass;
+                cascades.since = document.change_stamp();
             }
             if let Some((kept, values)) = cascades.entries.get(&key)
                 && kept.as_deref() == inline

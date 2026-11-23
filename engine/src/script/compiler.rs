@@ -285,6 +285,8 @@ pub(super) struct Code {
     pub(super) simple_params: bool,
     // what a direct eval this code makes may use
     pub(super) eval_context: EvalContext,
+    // one per name, for reads of a property by that name
+    pub(super) property_caches: Box<[super::object::PropertyCache]>,
 }
 
 #[derive(Debug)]
@@ -1381,6 +1383,7 @@ impl Compiler {
                 ops[3] = Op::InitHomeSlot(slot);
             }
         }
+        let property_caches = (0..state.names.len()).map(|_| Default::default()).collect();
         Code {
             ops,
             names: state.names,
@@ -1403,6 +1406,7 @@ impl Compiler {
             self_scope,
             simple_params,
             eval_context: EvalContext::default(),
+            property_caches,
         }
     }
 

@@ -277,6 +277,17 @@ pub(super) struct BoundFunction {
     pub(super) arguments: Vec<Value>,
 }
 
+// where a property name was last found on objects of one shared shape, so the next read of it
+// through the same code skips the search; it holds the shape weakly, which keeps its address
+// from going to another shape while the entry stands
+#[derive(Default)]
+pub(super) struct PropertyCache(RefCell<Option<(Weak<Shape>, usize)>>);
+
+impl std::fmt::Debug for PropertyCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PropertyCache")
+    }
+}
 #[derive(Clone)]
 pub(super) struct JsObject {
     shape: Rc<Shape>,
@@ -353,6 +364,30 @@ impl JsObject {
         }
     }
 
+    // the own data value the cache points at, when the object still has the shape it saw
+    pub(super) fn cached_value(&self, cache: &PropertyCache) -> Option<&Value> {
+        // a proxy answers through its traps, never from what it holds
+        if matches!(self.class, ObjectClass::Proxy(_)) {
+            return None;
+        }
+        let cached = cache.0.borrow();
+        let (shape, index) = cached.as_ref()?;
+        if !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&self.shape)) {
+            return None;
+        }
+        self.properties.get(*index)?.value()
+    }
+
+    // notes where the key sits on this object's shape; an own shape changes in place and is
+    // never noted
+    pub(super) fn note_position(&self, key: &str, cache: &PropertyCache) {
+        if self.shape.own || matches!(self.class, ObjectClass::Proxy(_)) {
+            return;
+        }
+        if let Some(index) = self.shape.position(key) {
+            *cache.0.borrow_mut() = Some((Rc::downgrade(&self.shape), index));
+        }
+    }
     // whether the object's own keys are these, in this order
     pub(super) fn has_keys<'a>(&self, keys: impl ExactSizeIterator<Item = &'a str>) -> bool {
         keys.len() == self.shape.keys.len()
