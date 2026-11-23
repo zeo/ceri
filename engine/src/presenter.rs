@@ -64,6 +64,9 @@ pub(crate) struct Presenter {
     // a back buffer comes back holding the frame before the last, so the box the last present
     // changed is copied again along with the new one
     last_box: [u32; 4],
+    // the bottom right pixel of the last frame, swizzled, which fills the window past a frame
+    // made for a smaller size
+    edge: [u8; 4],
     // the uploaded box swizzled to BGRA, kept to avoid an allocation per frame
     staging: Vec<u8>,
     // decoder surfaces opened on this device, kept while the decoder's pool keeps them
@@ -160,6 +163,7 @@ impl Presenter {
                 frame: None,
                 shown: None,
                 last_box: [0, 0, width, height],
+                edge: [0, 0, 0, 255],
                 staging: Vec::new(),
                 opened: Vec::new(),
                 outputs: CreateDXGIFactory1().map_err(failed("no DXGI factory"))?,
@@ -229,6 +233,9 @@ impl Presenter {
             _ => vec![whole],
         };
         self.shown = revision.map(|revision| revision.id);
+        let corner =
+            &rgba[((height - 1) as usize * width as usize + width as usize - 1) * 4..][..4];
+        self.edge = [corner[2], corner[1], corner[0], 255];
         let Some(upload) = uploads.iter().copied().reduce(|all, next| {
             [
                 all[0].min(next[0]),
@@ -325,6 +332,99 @@ impl Presenter {
                 .ok()
                 .map_err(|error| format!("the frame could not be presented: {error}"))
         }
+    }
+
+    // keeps the window covered as it resizes, before a frame of the new size is made: the
+    // last frame stays where it was and the rest takes its edge colour, where the window
+    // would otherwise show through blank
+    pub(crate) fn extend(&mut self, surface: (u32, u32)) -> Result<(), String> {
+        let surface = (surface.0.max(1), surface.1.max(1));
+        let Some(old) = self.frame.clone() else {
+            return Ok(());
+        };
+        if surface == self.size {
+            return Ok(());
+        }
+        let kept = [0, 0, self.size.0.min(surface.0), self.size.1.min(surface.1)];
+        let frame = self.frame_texture(surface)?;
+        let (columns, rows) = surface;
+        // SAFETY: no back buffer reference is held across the resize, every box lies inside
+        // the textures it names, and the staging rows hold the boxes they are copied into
+        unsafe {
+            self.context.CopySubresourceRegion(
+                &frame,
+                0,
+                0,
+                0,
+                0,
+                &old,
+                0,
+                Some(&D3D11_BOX {
+                    left: 0,
+                    top: 0,
+                    front: 0,
+                    right: kept[2],
+                    bottom: kept[3],
+                    back: 1,
+                }),
+            );
+            for [left, top, right, bottom] in
+                [[kept[2], 0, columns, rows], [0, kept[3], kept[2], rows]]
+            {
+                if left >= right || top >= bottom {
+                    continue;
+                }
+                let row_bytes = (right - left) as usize * 4;
+                self.staging.clear();
+                self.staging.extend(
+                    std::iter::repeat_n(self.edge, row_bytes / 4 * (bottom - top) as usize)
+                        .flatten(),
+                );
+                self.context.UpdateSubresource(
+                    &frame,
+                    0,
+                    Some(&D3D11_BOX {
+                        left,
+                        top,
+                        front: 0,
+                        right,
+                        bottom,
+                        back: 1,
+                    }),
+                    self.staging.as_ptr().cast(),
+                    row_bytes as u32,
+                    0,
+                );
+            }
+            self.swapchain
+                .ResizeBuffers(
+                    BUFFER_COUNT,
+                    columns,
+                    rows,
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    DXGI_SWAP_CHAIN_FLAG(0),
+                )
+                .map_err(|error| format!("the swapchain could not resize: {error}"))?;
+            let buffer: ID3D11Texture2D = self
+                .swapchain
+                .GetBuffer(0)
+                .map_err(|error| format!("no back buffer: {error}"))?;
+            self.context.CopyResource(&buffer, &frame);
+            drop(buffer);
+            self.swapchain
+                .Present(1, DXGI_PRESENT(0))
+                .ok()
+                .map_err(|error| format!("the frame could not be presented: {error}"))?;
+        }
+        self.size = surface;
+        self.frame = Some(frame);
+        // the frame no longer holds any canvas revision, and both back buffers need it whole
+        self.shown = None;
+        self.last_box = [0, 0, columns, rows];
+        if self.staging.capacity() > STAGING_KEPT {
+            self.staging = Vec::new();
+        }
+        Ok(())
     }
 
     // the visuals follow the planes, each new frame is uploaded whole and presented, and the

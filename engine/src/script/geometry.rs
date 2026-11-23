@@ -536,6 +536,31 @@ impl ScriptRuntime {
         std::cell::Ref::filter_map(self.measured.borrow(), Option::as_ref).ok()
     }
 
+    // the layout a script's read of a box last made, when the frame about to be laid out is
+    // that same layout: the same document, sheet and state
+    pub(crate) fn measured_layout(
+        &self,
+        version: u64,
+        stylesheet: crate::navigation::SheetIdentity,
+        state: &StyleState,
+    ) -> Option<LayoutDocument> {
+        let measured = self.measured.borrow();
+        let measured = measured.as_ref()?;
+        // custom properties follow from the document and sheet, and a layout that read no clock
+        // holds at any time
+        let same = measured.state
+            == StyleState {
+                clock: measured.state.clock,
+                custom_properties: measured.state.custom_properties.clone(),
+                ..state.clone()
+            };
+        (measured.version == version
+            && measured.stylesheet == stylesheet
+            && measured.timeless
+            && same)
+            .then(|| measured.layout.clone())
+    }
+
     // reads boxes through one measurement taken at the start, for a pass that runs no script
     pub(super) fn with_pinned_measure<T>(&mut self, pass: impl FnOnce(&mut Self) -> T) -> T {
         drop(self.measure());

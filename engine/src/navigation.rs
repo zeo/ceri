@@ -3204,7 +3204,16 @@ impl Browser {
         }
         crate::css::take_animation_wake();
         crate::css::record_motion();
-        let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
+        // a script that read a box since the document last changed has made this layout already
+        let measured = page.runtime.measured_layout(
+            document.version(),
+            SheetIdentity::of(stylesheet),
+            &style_state,
+        );
+        let mut layout = match measured {
+            Some(layout) => layout,
+            None => build_layout(&document, stylesheet, viewport, &style_state),
+        };
         // container queries read sizes from a layout, so a change in them lays out once more
         if stylesheet.has_container_queries() {
             let measured = crate::layout::take_layout_containers();

@@ -521,6 +521,18 @@ fn run_live_engine_worker(
                 }
                 Some(command)
             }
+            // a drag resizes many times a frame and each size lays the page out again, so a
+            // resize with a newer one already waiting gives way to it
+            Some(command) if is_resize(&command) => {
+                while let Ok(next) = commands.try_recv() {
+                    queued.borrow_mut().push_back(next);
+                }
+                let newer = held.iter().chain(queued.borrow().iter()).any(is_resize);
+                if newer {
+                    continue;
+                }
+                Some(command)
+            }
             other => other,
         };
         let elapsed = last_tick.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -676,6 +688,16 @@ impl PauseSource for PausedQueue {
             .borrow_mut()
             .push_back(EngineWorkerCommand::Inspector(message));
     }
+}
+
+fn is_resize(command: &EngineWorkerCommand) -> bool {
+    matches!(
+        command,
+        EngineWorkerCommand::Input {
+            event: InputEvent::Resize(_),
+            ..
+        }
+    )
 }
 
 fn is_pointer_move(command: &EngineWorkerCommand) -> bool {

@@ -121,6 +121,80 @@ impl Output {
         }
     }
 
+    // a frame laid out for an earlier size, shown while the new size's frame is made: its
+    // pixels where they fall inside the window, and past its edges the colour of its bottom
+    // right corner, which is the page's own background far more often than not
+    fn present_stale(
+        &mut self,
+        frame: &Frame,
+        width: NonZeroU32,
+        height: NonZeroU32,
+    ) -> Result<(), String> {
+        let (columns, rows) = (width.get() as usize, height.get() as usize);
+        let canvas = &frame.canvas;
+        let pixels = canvas.rgba_pixels();
+        let stride = canvas.bytes_per_row();
+        let (canvas_columns, canvas_rows) = (canvas.width() as usize, canvas.height() as usize);
+        let corner = match (canvas_columns, canvas_rows) {
+            (0, _) | (_, 0) => [0, 0, 0, 255],
+            _ => {
+                let at = (canvas_rows - 1) * stride + (canvas_columns - 1) * 4;
+                [pixels[at], pixels[at + 1], pixels[at + 2], 255]
+            }
+        };
+        let mut padded = vec![0u8; columns * rows * 4];
+        for (row, target) in padded.chunks_exact_mut(columns * 4).enumerate() {
+            let shared = if row < canvas_rows {
+                columns.min(canvas_columns)
+            } else {
+                0
+            };
+            if shared > 0 {
+                let source = &pixels[row * stride..row * stride + shared * 4];
+                target[..shared * 4].copy_from_slice(source);
+            }
+            for pixel in target[shared * 4..].as_chunks_mut::<4>().0 {
+                *pixel = corner;
+            }
+        }
+        match self {
+            #[cfg(target_os = "windows")]
+            Self::Composition(presenter) => presenter.present(
+                &padded,
+                (width.get(), height.get()),
+                (width.get(), height.get()),
+                None,
+                &frame.planes,
+            ),
+            Self::Software(surface, shown) => {
+                *shown = None;
+                surface
+                    .resize(width, height)
+                    .map_err(|error| format!("window surface resize failed: {error}"))?;
+                let mut buffer = surface
+                    .buffer_mut()
+                    .map_err(|error| format!("window surface buffer failed: {error}"))?;
+                for (pixel, rgba) in buffer.iter_mut().zip(padded.as_chunks::<4>().0) {
+                    *pixel =
+                        u32::from(rgba[0]) << 16 | u32::from(rgba[1]) << 8 | u32::from(rgba[2]);
+                }
+                buffer
+                    .present()
+                    .map_err(|error| format!("window surface present failed: {error}"))
+            }
+        }
+    }
+
+    // covers a window grown past its last frame until a frame of the new size comes; a
+    // software surface has nothing kept to extend
+    #[cfg(target_os = "windows")]
+    fn extend(&mut self, width: u32, height: u32) -> Result<(), String> {
+        match self {
+            Self::Composition(presenter) => presenter.extend((width, height)),
+            Self::Software(..) => Ok(()),
+        }
+    }
+
     // one colour over the whole window until its page paints
     fn fill(&mut self, rgb: [u8; 3], width: NonZeroU32, height: NonZeroU32) -> Result<(), String> {
         match self {
@@ -1144,6 +1218,12 @@ impl AppWindow {
                 }
             }
             WindowEvent::Resized(size) => {
+                #[cfg(target_os = "windows")]
+                if let Some(output) = &mut self.output
+                    && let Err(error) = output.extend(size.width, size.height)
+                {
+                    eprintln!("ceri: {error}");
+                }
                 let viewport = layout_viewport(size.width, size.height, self.window_scale());
                 self.submit(InputEvent::Resize(viewport));
                 self.publish();
@@ -1552,6 +1632,11 @@ impl AppWindow {
             return;
         };
         if frame.viewport != viewport {
+            if let Some(output) = &mut self.output
+                && let Err(error) = output.present_stale(&frame, width, height)
+            {
+                eprintln!("ceri: {error}");
+            }
             return;
         }
         self.apply_title(&frame);
