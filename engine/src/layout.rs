@@ -3201,24 +3201,56 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
 
 fn layout_element_fresh(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     let _profile = crate::profile::scope("layout: element");
-    let layout = layout_element_with_gutter(input.clone(), 0.0)?;
     // a vertical scrollbar sits between the border and the padding, so the content box gives
-    // up its width and the content lays out again
-    let gutter = scrollbar_metrics(&layout).vertical_track.map_or_else(
+    // up its width and the content lays out again. a box lays out first with the scrollbar it
+    // had last time, as chromium keeps a scroller's bars from one layout to the next, so a
+    // scroller that still overflows is laid out once instead of twice
+    let node = (input.node.document.identity(), input.node.node);
+    let last = GUTTERS.with(|gutters| gutters.borrow().get(&node).copied());
+    if let Some(last) = last {
+        let layout = layout_element_with_gutter(input.clone(), last)?;
+        if wanted_gutter(&layout) == Some(last) {
+            return Some(layout);
+        }
+    }
+    let layout = layout_element_with_gutter(input.clone(), 0.0)?;
+    let (gutter, layout) = match wanted_gutter(&layout) {
+        Some(gutter) => (Some(gutter), layout_element_with_gutter(input, gutter)?),
+        None => (None, layout),
+    };
+    GUTTERS.with(|gutters| {
+        let mut gutters = gutters.borrow_mut();
+        match gutter {
+            Some(gutter) => {
+                // a page holds a handful of scrollers, so a map grown past that is stale
+                if gutters.len() >= 4096 {
+                    gutters.clear();
+                }
+                gutters.insert(node, gutter);
+            }
+            None => {
+                gutters.remove(&node);
+            }
+        }
+    });
+    Some(layout)
+}
+
+thread_local! {
+    // the scrollbar each scroller was last laid out with
+    static GUTTERS: std::cell::RefCell<HashMap<(u64, NodeId), f32>> = std::cell::RefCell::new(HashMap::new());
+}
+
+// the scrollbar gutter a laid out box asks for, if it scrolls vertically and has room for one
+fn wanted_gutter(layout: &LayoutBox) -> Option<f32> {
+    let gutter = scrollbar_metrics(layout).vertical_track.map_or_else(
         || {
             (layout.stable_gutter && layout.overflow == Overflow::Auto)
                 .then(|| layout.scrollbar.thickness().0)
         },
         |bar| Some(bar.width),
-    );
-    if user_scroll_axes(&layout)[1]
-        && let Some(gutter) = gutter
-        && gutter > 0.0
-        && layout.rect.width > gutter
-    {
-        return layout_element_with_gutter(input, gutter);
-    }
-    Some(layout)
+    )?;
+    (user_scroll_axes(layout)[1] && gutter > 0.0 && layout.rect.width > gutter).then_some(gutter)
 }
 
 fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) -> Option<LayoutBox> {
@@ -12827,6 +12859,44 @@ mod tests {
         );
         // spaces between items are no item
         assert_eq!(width("8px", "<i></i> <i></i>"), 68.0);
+    }
+
+    #[test]
+    fn a_scroller_laid_out_again_starts_from_the_scrollbar_it_had() {
+        let port = |rows: usize| {
+            let markup = format!(
+                "<style>* {{ margin: 0; }} #port {{ width: 50px; height: 20px; overflow: auto; }} #port > p {{ height: 10px; }}</style><div id='port'>{}</div>",
+                "<p></p>".repeat(rows)
+            );
+            Document::parse_markup(&markup).expect("document should parse")
+        };
+        let shown = |document: &Document| {
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let size = Size {
+                width: 200.0,
+                height: 100.0,
+            };
+            let result = layout(document, &stylesheet, size);
+            let port = &result.root.children[0];
+            (
+                port.children[0].rect.width,
+                scrollbar_metrics(port).vertical_track.is_some(),
+            )
+        };
+        let tall = port(8);
+        let first = shown(&tall);
+        assert_eq!(first, (50.0 - SCROLLBAR_THICKNESS, true));
+        assert_eq!(shown(&tall), first);
+        // the same nodes holding content that fits give the scrollbar up again
+        let mut short = tall;
+        let rows: Vec<_> = short
+            .find_element_by_id("port")
+            .map(|port| short.children(port).iter().skip(1).copied().collect())
+            .unwrap_or_default();
+        for row in rows {
+            short.remove(row);
+        }
+        assert_eq!(shown(&short), (50.0, false));
     }
 
     #[test]
