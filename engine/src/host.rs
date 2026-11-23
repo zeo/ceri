@@ -3192,6 +3192,32 @@ mod tests {
     }
 
     #[test]
+    fn script_reads_a_stepping_box_as_it_stands_at_each_step() {
+        let browser = Browser::new(bundle(
+            r#"<style>@keyframes grow { from { width: 10px } to { width: 110px } } #box { height: 10px; animation: grow 100ms steps(2, end) infinite; }</style><div id="box"></div><p id="status"></p><script>
+                const widths = new Set();
+                setInterval(() => {
+                    widths.add(document.getElementById("box").getBoundingClientRect().width);
+                    document.getElementById("status").textContent = [...widths].sort((a, b) => a - b).join(",");
+                }, 10);
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 120.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        for _ in 0..20 {
+            host.input(InputEvent::AdvanceTime(10)).expect("tick");
+        }
+        assert_eq!(status_text(&host), "10,60");
+    }
+
+    #[test]
     fn a_transition_starts_when_only_a_custom_property_it_reads_changed() {
         let browser = Browser::new(bundle(
             r#"<style>#wrap { --size: 40px } #wrap.wide { --size: 200px } #box { height: 10px; width: var(--size); transition: width 100ms linear; } #other { transition: color 1s }</style><div id="wrap"><div id="box"></div></div><p id="other">x</p><p id="status"></p><script>

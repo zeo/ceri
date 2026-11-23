@@ -38,6 +38,8 @@ pub(super) struct MeasuredLayout {
     state: StyleState,
     // nothing in it sampled motion, so it holds at any clock time
     timeless: bool,
+    // the clock time an animation in it next changes what it shows, when it steps or waits
+    holds_until: Option<u64>,
     boxes: HashMap<NodeId, Vec<BoxGeometry>>,
     layout: LayoutDocument,
 }
@@ -472,15 +474,18 @@ impl ScriptRuntime {
         let version = self.document.borrow().version();
         let stylesheet = crate::navigation::SheetIdentity::of(&inputs.stylesheet);
         let stale = self.measured.borrow().as_ref().is_none_or(|measured| {
+            let only_the_clock = measured.state
+                == StyleState {
+                    clock: measured.state.clock,
+                    ..state.clone()
+                };
+            // a stepping animation shows the same thing until its next step
+            let held = measured
+                .holds_until
+                .is_some_and(|until| (measured.state.clock..until).contains(&state.clock));
             measured.version != version
                 || measured.stylesheet != stylesheet
-                || (measured.state != state
-                    && !(measured.timeless
-                        && measured.state
-                            == StyleState {
-                                clock: measured.state.clock,
-                                ..state.clone()
-                            }))
+                || (measured.state != state && !(only_the_clock && (measured.timeless || held)))
         });
         if stale && let Some(measured) = self.measured.borrow().as_ref() {
             crate::profile::count(if measured.version != version {
@@ -501,6 +506,7 @@ impl ScriptRuntime {
         if stale {
             let mut state = state;
             let reported = crate::css::clock_reads();
+            let outer_wake = crate::css::take_animation_wake();
             let mut layout = self.run_layout(&inputs, &state);
             // container queries read sizes from a layout, so a change in them lays out again
             if inputs.stylesheet.has_container_queries() {
@@ -510,10 +516,18 @@ impl ScriptRuntime {
                     layout = self.run_layout(&inputs, &state);
                 }
             }
+            let wake = crate::css::take_animation_wake();
+            crate::css::restore_animation_wake(match (outer_wake, wake) {
+                (Some(outer), Some(own)) => Some(outer.min(own)),
+                (outer, own) => outer.or(own),
+            });
             *self.measured.borrow_mut() = Some(MeasuredLayout {
                 version,
                 stylesheet,
                 timeless: crate::css::clock_reads() == reported && state.transitions.is_empty(),
+                holds_until: wake
+                    .filter(|_| state.transitions.is_empty())
+                    .map(|delay| state.clock.saturating_add(delay)),
                 state,
                 boxes: layout.box_index(),
                 layout,

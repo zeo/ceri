@@ -794,6 +794,11 @@ pub(crate) fn take_animation_wake() -> Option<u64> {
     ANIMATION_WAKE.with(std::cell::Cell::take)
 }
 
+// puts back what a caller took to read on its own, so a layout run in between adds to it
+pub(crate) fn restore_animation_wake(wake: Option<u64>) {
+    ANIMATION_WAKE.with(|current| current.set(wake));
+}
+
 // everything a cascade reads besides the element, so a layout pass computes each style once
 #[derive(PartialEq)]
 struct StyleInputs {
