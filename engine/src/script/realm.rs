@@ -730,9 +730,10 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         "dispose",
         "asyncDispose",
     ] {
-        symbol
-            .borrow_mut()
-            .define(name.to_string(), fixed(Value::Symbol(format!("@@{name}"))));
+        symbol.borrow_mut().define(
+            name.to_string(),
+            fixed(Value::Symbol(format!("@@{name}").into())),
+        );
     }
     globals.push(("Symbol", Value::Object(symbol)));
 
@@ -2489,7 +2490,7 @@ impl ScriptRuntime {
 
     fn this_symbol(&mut self, this: &Value) -> Result<String, ScriptError> {
         match this {
-            Value::Symbol(key) => Ok(key.clone()),
+            Value::Symbol(key) => Ok(key.to_string()),
             Value::Object(object) => match &object.borrow().class {
                 ObjectClass::Symbol(key) => Ok(key.clone()),
                 _ => Err(runtime_error("not a symbol")),
@@ -2601,7 +2602,7 @@ impl ScriptRuntime {
                     .into_iter()
                     .map(|key| {
                         if symbols {
-                            Value::Symbol(key)
+                            Value::Symbol(key.into())
                         } else {
                             Value::String(key.into())
                         }
@@ -2950,12 +2951,12 @@ impl ScriptRuntime {
                         format!("{SYMBOL_PREFIX}{}:{description}", self.symbol_counter)
                     }
                 };
-                Ok(Value::Symbol(key))
+                Ok(Value::Symbol(key.into()))
             }
             Native::SymbolFor => {
                 let description = self.coerce_string(first)?;
                 let key = format!("{SYMBOL_PREFIX}for:{description}");
-                Ok(Value::Symbol(key))
+                Ok(Value::Symbol(key.into()))
             }
             Native::SymbolKeyFor => match first {
                 Value::Symbol(key) => Ok(key
@@ -2971,7 +2972,7 @@ impl ScriptRuntime {
                     format!("Symbol({})", symbol_description(&key).unwrap_or_default()).into(),
                 ))
             }
-            Native::SymbolValueOf => Ok(Value::Symbol(self.this_symbol(&this)?)),
+            Native::SymbolValueOf => Ok(Value::Symbol(self.this_symbol(&this)?.into())),
             Native::SymbolDescription => {
                 let key = self.this_symbol(&this)?;
                 Ok(symbol_description(&key)

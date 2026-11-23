@@ -759,7 +759,7 @@ impl ScriptRuntime {
                 }
                 if is_symbol_key(&key) {
                     descriptor["symbol"] =
-                        self.remote_object(&Value::Symbol(key.clone()), &group, false);
+                        self.remote_object(&Value::Symbol(key.as_str().into()), &group, false);
                 }
                 result.push(descriptor);
             }

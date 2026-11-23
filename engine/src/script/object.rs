@@ -728,7 +728,8 @@ mod tests {
     #[test]
     fn an_object_and_a_property_stay_small_enough_for_heaps_of_them() {
         assert!(std::mem::size_of::<JsObject>() <= 80);
-        assert!(std::mem::size_of::<Property>() <= 40);
+        assert!(std::mem::size_of::<Property>() <= 32);
+        assert!(std::mem::size_of::<Value>() <= 24);
     }
 
     #[test]

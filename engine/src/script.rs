@@ -299,7 +299,7 @@ enum Value {
     Bool(bool),
     Number(f64),
     String(Rc<str>),
-    Symbol(String),
+    Symbol(Rc<str>),
     BigInt(Rc<bigint::BigInt>),
     Binding(Rc<RefCell<Value>>, bool),
     Object(ObjectHandle),
@@ -436,7 +436,7 @@ enum Builtin {
     ElementReportValidity(ElementHandle),
     ElementSetCustomValidity(ElementHandle),
     CanvasGetContext(ElementHandle),
-    CanvasMethod(CanvasContextHandle, &'static str),
+    CanvasMethod(Box<(CanvasContextHandle, &'static str)>),
     StorageClear(StorageHandle),
     StorageGetItem(StorageHandle),
     StorageKey(StorageHandle),
@@ -563,7 +563,7 @@ enum Builtin {
     ElementClassListToString(ElementHandle),
     ElementClassListForEach(ElementHandle),
     // an iterator over the tokens: their indexes, the tokens, or pairs of both
-    ElementClassListWalk(ElementHandle, &'static str),
+    ElementClassListWalk(Box<(ElementHandle, &'static str)>),
     StyleGetPropertyValue(ElementHandle),
     StyleSetProperty(ElementHandle),
     StyleRemoveProperty(ElementHandle),
@@ -604,14 +604,14 @@ enum Builtin {
     ClipboardTypes(clipboard::TransferHandle),
     ClipboardItems(clipboard::TransferHandle),
     // an item's text for its callback, and its file; none where the item is of the other kind
-    ClipboardItemString(Option<Rc<str>>),
+    ClipboardItemString(Box<Option<Rc<str>>>),
     ClipboardItemFile(Option<FileHandle>),
     ClipboardItemConstructor,
     ClipboardItemGetType(clipboard::ItemHandle),
     ClipboardRead,
     ClipboardWrite,
     // one promised piece of a clipboard write arrives, or fails
-    ClipboardWriteStep(clipboard::WriteHandle, usize),
+    ClipboardWriteStep(Box<(clipboard::WriteHandle, usize)>),
     ClipboardWriteFailed(clipboard::WriteHandle),
     AbortSignalRemoveEventListener(AbortSignalHandle),
     // the statics: a signal already aborted, one a timer aborts, one that follows others
@@ -620,7 +620,7 @@ enum Builtin {
     AbortSignalAny,
     AbortSignalHasInstance,
     // aborts the second signal with the first one's reason
-    AbortSignalFollow(AbortSignalHandle, AbortSignalHandle),
+    AbortSignalFollow(Box<(AbortSignalHandle, AbortSignalHandle)>),
     // aborts the signal with the reason it is called with
     AbortSignalAbortWith(AbortSignalHandle),
     WorkerPostMessage(WorkerHandle),
@@ -4781,14 +4781,14 @@ impl ScriptRuntime {
                         .into(),
                 )),
                 "forEach" => Ok(Value::Builtin(Builtin::ElementClassListForEach(handle))),
-                "keys" => Ok(Value::Builtin(Builtin::ElementClassListWalk(
+                "keys" => Ok(Value::Builtin(Builtin::ElementClassListWalk(Box::new((
                     handle, "keys",
-                ))),
-                "entries" => Ok(Value::Builtin(Builtin::ElementClassListWalk(
+                ))))),
+                "entries" => Ok(Value::Builtin(Builtin::ElementClassListWalk(Box::new((
                     handle, "entries",
-                ))),
+                ))))),
                 "values" | "@@iterator" => Ok(Value::Builtin(Builtin::ElementClassListWalk(
-                    handle, "values",
+                    Box::new((handle, "values")),
                 ))),
                 _ => Ok(property
                     .parse::<usize>()
@@ -8593,7 +8593,8 @@ impl ScriptRuntime {
                     _ => Ok(Value::Null),
                 }
             }
-            Builtin::CanvasMethod(context, name) => {
+            Builtin::CanvasMethod(method) => {
+                let (context, name) = *method;
                 self.call_canvas_method(&context, name, &arguments)
             }
             Builtin::StorageKey(storage) => {
@@ -9515,7 +9516,8 @@ impl ScriptRuntime {
                 self.abort_signal(signal, reason)?;
                 Ok(Value::Undefined)
             }
-            Builtin::AbortSignalFollow(source, signal) => {
+            Builtin::AbortSignalFollow(follow) => {
+                let (source, signal) = *follow;
                 let reason = source.borrow().reason.clone();
                 self.abort_signal(signal, reason.unwrap_or_else(abort_error_value))?;
                 Ok(Value::Undefined)
@@ -9553,7 +9555,8 @@ impl ScriptRuntime {
                         self.abort_signal(signal.clone(), reason.unwrap_or_else(abort_error_value))?;
                         break;
                     }
-                    let follow = Builtin::AbortSignalFollow(source.clone(), signal.clone());
+                    let follow =
+                        Builtin::AbortSignalFollow(Box::new((source.clone(), signal.clone())));
                     source.borrow_mut().listeners.push(Value::Builtin(follow));
                 }
                 Ok(Value::AbortSignal(signal))
@@ -10001,7 +10004,9 @@ impl ScriptRuntime {
                 }
                 Ok(Value::Undefined)
             }
-            Builtin::ElementClassListWalk(handle, kind) => Ok(iterator_value(
+            Builtin::ElementClassListWalk(walk) => {
+                let (handle, kind) = *walk;
+                Ok(iterator_value(
                 self.class_tokens(&handle)
                     .into_iter()
                     .enumerate()
@@ -10014,7 +10019,8 @@ impl ScriptRuntime {
                         ].into()))),
                     })
                     .collect(),
-            )),
+            ))
+            }
             Builtin::ElementClassListSupports => Err(self.type_error(
                 "Failed to execute 'supports' on 'DOMTokenList': DOMTokenList has no supported tokens.",
             )),
@@ -11812,7 +11818,7 @@ impl Value {
 
     fn property_key(&self) -> String {
         match self.resolve() {
-            Self::Symbol(value) => value.clone(),
+            Self::Symbol(value) => value.to_string(),
             _ => self.string_value(),
         }
     }

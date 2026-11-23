@@ -143,7 +143,7 @@ impl ScriptRuntime {
                 Value::Undefined
             }
             Builtin::ClipboardItemString(text) => {
-                if let Some(text) = text
+                if let Some(text) = *text
                     && is_callable(&first)
                 {
                     self.call(first, vec![Value::String(text.to_string().into())])?;
@@ -213,7 +213,8 @@ impl ScriptRuntime {
                 Value::Promise(self.fulfilled_promise(Self::new_array(items)))
             }
             Builtin::ClipboardWrite => self.write_clipboard(&first)?,
-            Builtin::ClipboardWriteStep(write, index) => {
+            Builtin::ClipboardWriteStep(step) => {
+                let (write, index) = *step;
                 let bytes = match first.resolve() {
                     Value::Blob(blob) => blob.bytes.clone(),
                     Value::File(file) => file.bytes.clone(),
@@ -287,10 +288,10 @@ impl ScriptRuntime {
             let promise = self.promise_resolve(piece)?;
             self.promise_then(
                 promise,
-                Some(&Value::Builtin(Builtin::ClipboardWriteStep(
+                Some(&Value::Builtin(Builtin::ClipboardWriteStep(Box::new((
                     write.clone(),
                     index,
-                ))),
+                ))))),
                 Some(&Value::Builtin(Builtin::ClipboardWriteFailed(
                     write.clone(),
                 ))),
@@ -358,7 +359,7 @@ pub(super) fn transfer_items(handle: &TransferHandle) -> (Vec<Value>, Vec<Value>
             ("type".to_string(), text(mime)),
             (
                 "getAsString".to_string(),
-                Value::Builtin(Builtin::ClipboardItemString(string.map(Rc::from))),
+                Value::Builtin(Builtin::ClipboardItemString(Box::new(string.map(Rc::from)))),
             ),
             (
                 "getAsFile".to_string(),

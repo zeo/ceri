@@ -293,6 +293,7 @@ impl ScriptRuntime {
 
     // an event from the host reaches the page's listeners for its name as { event, payload }
     pub fn dispatch_host_event(&mut self, name: &str, payload: &str) -> Result<usize, ScriptError> {
+        let _profile = crate::profile::scope("script: host event");
         if name == super::broadcast::RELAYED {
             return self.receive_broadcast(payload);
         }

@@ -605,12 +605,12 @@ impl ScriptRuntime {
     pub(super) fn coerce_key(&mut self, value: Value) -> Result<String, ScriptError> {
         match value {
             Value::String(text) => Ok(text.to_string()),
-            Value::Symbol(key) => Ok(key),
+            Value::Symbol(key) => Ok(key.to_string()),
             Value::Number(number) => Ok(number_to_string(number)),
             other => {
                 let primitive = self.coerce_primitive(other, Hint::String)?;
                 match primitive {
-                    Value::Symbol(key) => Ok(key),
+                    Value::Symbol(key) => Ok(key.to_string()),
                     other => self.coerce_string(other),
                 }
             }
@@ -645,7 +645,7 @@ impl ScriptRuntime {
             ),
             Value::Symbol(value) => (
                 self.intrinsics.symbol_prototype.clone(),
-                ObjectClass::Symbol(value.clone()),
+                ObjectClass::Symbol(value.to_string()),
             ),
             Value::BigInt(value) => (
                 self.intrinsics.bigint_prototype.clone(),

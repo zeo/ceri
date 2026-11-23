@@ -39,7 +39,7 @@ pub(super) fn key_id(value: &Value) -> KeyId {
             KeyId::Number(normalized.to_bits())
         }
         Value::String(text) => KeyId::String(text.clone()),
-        Value::Symbol(key) => KeyId::Symbol(key.clone()),
+        Value::Symbol(key) => KeyId::Symbol(key.to_string()),
         Value::BigInt(value) => KeyId::BigInt(value.clone()),
         Value::Binding(cell, _) => key_id(&cell.borrow()),
         // a node and its style, dataset and class list views share one handle

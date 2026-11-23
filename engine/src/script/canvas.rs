@@ -1744,7 +1744,10 @@ impl ScriptRuntime {
         property: &str,
     ) -> Result<Value, ScriptError> {
         if let Some(&name) = METHODS.iter().find(|&&name| name == property) {
-            return Ok(Value::Builtin(Builtin::CanvasMethod(context.clone(), name)));
+            return Ok(Value::Builtin(Builtin::CanvasMethod(Box::new((
+                context.clone(),
+                name,
+            )))));
         }
         Ok(match property {
             "canvas" => {

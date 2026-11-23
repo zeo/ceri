@@ -58,7 +58,7 @@ fn argument(arguments: &[Value], index: usize) -> Value {
 // a property key as a trap receives it: symbols as symbols, everything else as strings
 pub(super) fn key_value(key: &str) -> Value {
     if is_symbol_key(key) {
-        Value::Symbol(key.to_string())
+        Value::Symbol(key.into())
     } else {
         Value::String(key.into())
     }
@@ -224,7 +224,7 @@ impl ScriptRuntime {
                 for value in values {
                     match value {
                         Value::String(text) => keys.push(text.to_string()),
-                        Value::Symbol(key) => keys.push(key),
+                        Value::Symbol(key) => keys.push(key.to_string()),
                         _ => return Err(self.type_error("proxy ownKeys trap returned a non-key")),
                     }
                 }
