@@ -3011,9 +3011,10 @@ impl Stylesheet {
         STYLE_MEMO.with(|memo| {
             if let Some(memo) = memo.borrow_mut().as_mut() {
                 let shared = memo.share(style);
+                // most elements are styled under one set of inputs a pass
                 memo.entries
                     .entry(key)
-                    .or_default()
+                    .or_insert_with(|| Vec::with_capacity(1))
                     .push((inputs, shared, wake, moving));
             }
         });

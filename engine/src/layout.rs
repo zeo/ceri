@@ -129,14 +129,14 @@ pub struct LayoutBox {
     // the backgrounds show only through the glyphs of the box and its subtree
     pub(crate) background_clip_text: bool,
     pub(crate) object_fit: crate::css::ObjectFit,
-    pub(crate) object_position: Option<(crate::css::Length, crate::css::Length)>,
+    pub(crate) object_position: Option<Box<(crate::css::Length, crate::css::Length)>>,
     // in the top layer, as a modal dialog and its backdrop are
     pub(crate) top_layer: bool,
     // the CSS transform about its origin, in coordinates relative to the border box corner
     pub(crate) transform: Option<crate::transform::Matrix>,
     pub(crate) backface_hidden: bool,
     // relative to the border box corner
-    pub(crate) clip_path: Option<crate::clip_path::ClipRegion>,
+    pub(crate) clip_path: Option<Box<crate::clip_path::ClipRegion>>,
     pub(crate) radii: CornerRadii,
     pub opacity: f32,
     // first on top, as declared
@@ -154,7 +154,8 @@ pub struct LayoutBox {
     pub(crate) visual_offset: (f32, f32),
     pub(crate) z_index: i32,
     pub(crate) creates_stacking_context: bool,
-    pub(crate) sticky_inset: Edges,
+    // a sticky box's insets, boxed as the rest have none
+    pub(crate) sticky_inset: Option<Box<Edges>>,
     pub(crate) font_size: f32,
     pub(crate) overflow: Overflow,
     // the x and y axes, after a scrolling axis has settled the other
@@ -1017,7 +1018,7 @@ pub fn layout_with_state(
         visual_offset: (0.0, 0.0),
         z_index: 0,
         creates_stacking_context: true,
-        sticky_inset: Edges::auto(),
+        sticky_inset: None,
         font_size: 16.0,
         overflow: Overflow::Visible,
         overflow_axes: [Overflow::Visible; 2],
@@ -2333,7 +2334,7 @@ fn hit_test_context(
 // a clip-path hides its box and everything in it from the pointer outside the shape
 fn inside_clip_path(layout: &LayoutBox, rect: Rect, x: f32, y: f32) -> bool {
     use crate::clip_path::{ClipRegion, polygon_contains};
-    match &layout.clip_path {
+    match layout.clip_path.as_deref() {
         None => true,
         Some(ClipRegion::Rounded(clip, radii)) => {
             let clip = translate_rect(*clip, (rect.x, rect.y));
@@ -3920,7 +3921,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         masks: style.mask_layers(),
         background_clip_text: style.background_clip_text,
         object_fit: style.object_fit,
-        object_position: style.object_position,
+        object_position: style.object_position.map(Box::new),
         top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -3951,7 +3952,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         z_index: positioned_z_index(style),
         creates_stacking_context: creates_stacking_context(style)
             || style.opacity * parent.opacity < 1.0,
-        sticky_inset: style.inset,
+        sticky_inset: (style.position == Position::Sticky).then(|| Box::new(style.inset)),
         font_size,
         overflow: style.overflow,
         overflow_axes: style.overflow_axes(),
@@ -4131,7 +4132,7 @@ fn anonymous_box(
         visual_offset: (0.0, 0.0),
         z_index: 0,
         creates_stacking_context: false,
-        sticky_inset: Edges::auto(),
+        sticky_inset: None,
         font_size,
         overflow: Overflow::Visible,
         overflow_axes: [Overflow::Visible; 2],
@@ -5188,7 +5189,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         masks: style.mask_layers(),
         background_clip_text: style.background_clip_text,
         object_fit: style.object_fit,
-        object_position: style.object_position,
+        object_position: style.object_position.map(Box::new),
         top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -5209,7 +5210,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
         creates_stacking_context: creates_stacking_context(style) || box_opacity < 1.0,
-        sticky_inset: style.inset,
+        sticky_inset: (style.position == Position::Sticky).then(|| Box::new(style.inset)),
         font_size,
         overflow: style.overflow,
         overflow_axes: style.overflow_axes(),
@@ -5741,7 +5742,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         masks: style.mask_layers(),
         background_clip_text: style.background_clip_text,
         object_fit: style.object_fit,
-        object_position: style.object_position,
+        object_position: style.object_position.map(Box::new),
         top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -5762,7 +5763,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
         creates_stacking_context: creates_stacking_context(style) || box_opacity < 1.0,
-        sticky_inset: style.inset,
+        sticky_inset: (style.position == Position::Sticky).then(|| Box::new(style.inset)),
         font_size,
         overflow: style.overflow,
         overflow_axes: style.overflow_axes(),
@@ -6594,7 +6595,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         masks: style.mask_layers(),
         background_clip_text: style.background_clip_text,
         object_fit: style.object_fit,
-        object_position: style.object_position,
+        object_position: style.object_position.map(Box::new),
         top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
@@ -6615,7 +6616,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
         creates_stacking_context: creates_stacking_context(style) || box_opacity < 1.0,
-        sticky_inset: style.inset,
+        sticky_inset: (style.position == Position::Sticky).then(|| Box::new(style.inset)),
         font_size,
         overflow: style.overflow,
         overflow_axes: style.overflow_axes(),
@@ -8039,7 +8040,8 @@ fn apply_transform(layout: &mut LayoutBox, style: &Style, font_size: f32) {
     let (width, height) = (layout.rect.width, layout.rect.height);
     layout.clip_path = style
         .clip_path
-        .and_then(|path| path.resolve(width, height, font_size));
+        .and_then(|path| path.resolve(width, height, font_size))
+        .map(Box::new);
     if style.has_transform() {
         let matrix = [
             style.translate_property,
@@ -8233,14 +8235,14 @@ fn apply_sticky_descendants(
 ) {
     for child in children {
         let child_rect = visual_rect_for(child, ancestor_offset);
-        if child.position == Position::Sticky {
-            let top = child
-                .sticky_inset
+        if let Some(inset) = child.sticky_inset.as_deref()
+            && child.position == Position::Sticky
+        {
+            let top = inset
                 .top
                 .resolve(scrollport.height, child.font_size)
                 .map(|value| value.max(0.0));
-            let bottom = child
-                .sticky_inset
+            let bottom = inset
                 .bottom
                 .resolve(scrollport.height, child.font_size)
                 .map(|value| value.max(0.0));
@@ -10178,6 +10180,11 @@ fn describe_box(layout_box: &LayoutBox, depth: usize, lines: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_layout_box_stays_small_enough_to_keep_many_copies() {
+        assert!(std::mem::size_of::<LayoutBox>() <= 600);
+    }
 
     // a few hundred seeded writes of every kind, each followed by a layout that takes what it
     // can from the one before and by one that takes nothing; the two must not differ
