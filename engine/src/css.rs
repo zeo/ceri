@@ -951,6 +951,29 @@ impl Drop for MemoizedStyles {
     }
 }
 
+// the styles one caller worked out, kept by it between calls while the document, sheet and
+// state it styled stay the same
+#[derive(Default)]
+pub(crate) struct KeptStyles(StyleMemo, ContentMemo);
+
+// runs with the kept styles as the memo and keeps what the run adds; the caller drops them
+// whenever the document, sheet or state changes, and hands the same state each run, as the
+// memo knows a state by its address
+pub(crate) fn with_kept_styles<R>(kept: &mut KeptStyles, run: impl FnOnce() -> R) -> R {
+    let guard = memoize_styles();
+    STYLE_MEMO.with(|memo| *memo.borrow_mut() = Some(std::mem::take(&mut kept.0)));
+    CONTENT_MEMO.with(|memo| *memo.borrow_mut() = Some(std::mem::take(&mut kept.1)));
+    let result = run();
+    kept.0 = STYLE_MEMO
+        .with(|memo| memo.borrow_mut().take())
+        .unwrap_or_default();
+    kept.1 = CONTENT_MEMO
+        .with(|memo| memo.borrow_mut().take())
+        .unwrap_or_default();
+    drop(guard);
+    result
+}
+
 // the document, stylesheet and state must stay unchanged while the guard lives
 pub(crate) fn memoize_styles() -> MemoizedStyles {
     STYLE_PASS.with(|pass| pass.set(pass.get() + 1));
@@ -4555,7 +4578,12 @@ impl Selector {
 // the keys a compound's matching reads from attributes; a pseudo-class that is not structural
 // may read any of them
 fn compound_keys(compound: &CompoundSelector, keys: &mut std::collections::BTreeSet<String>) {
-    keys.extend(compound.classes.iter().map(|class| format!("class:{class}")));
+    keys.extend(
+        compound
+            .classes
+            .iter()
+            .map(|class| format!("class:{class}")),
+    );
     keys.extend(compound.id.iter().map(|id| format!("#{id}")));
     for attribute in &compound.attributes {
         let (AttributeSelector::Exists(name) | AttributeSelector::Match { name, .. }) = attribute;

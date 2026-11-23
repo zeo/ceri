@@ -753,6 +753,7 @@ pub struct ScriptRuntime {
     // which of those controls are disabled, which reads only the document and is asked for by every
     // computed style script reads, so it is found again only once the document changes
     disabled_controls: RefCell<Option<DisabledControls>>,
+    computed_styles: Option<geometry::KeptComputed>,
     // milliseconds from an animation frame request to its callback
     frame_interval: u64,
     // whether the page's window shows; a hidden page runs no animation frames
@@ -1963,6 +1964,7 @@ impl ScriptRuntime {
             measure_pinned: Cell::new(false),
             controls: RefCell::new(None),
             disabled_controls: RefCell::new(None),
+            computed_styles: None,
             frame_interval: crate::navigation::FRAME_INTERVAL,
             visible: true,
             media_queries: Vec::new(),

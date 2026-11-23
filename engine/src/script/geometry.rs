@@ -1090,40 +1090,62 @@ impl ScriptRuntime {
         inputs
             .stylesheet
             .populate_custom_properties(&document, &mut state);
-        let Some((style, font_size)) = inputs.stylesheet.computed_style(&document, node, &state)
-        else {
+        // script often reads the computed styles of many elements between two changes, and
+        // each one cascades its ancestors, so the styles worked out stay for the next read
+        let (version, sheet) = (
+            document.version(),
+            crate::navigation::SheetIdentity::of(&inputs.stylesheet),
+        );
+        let mut kept = self
+            .computed_styles
+            .take()
+            .filter(|kept| kept.version == version && kept.sheet == sheet && *kept.state == state)
+            .unwrap_or_else(|| KeptComputed {
+                version,
+                sheet,
+                state: Box::new(state),
+                styles: crate::css::KeptStyles::default(),
+            });
+        let KeptComputed { state, styles, .. } = &mut kept;
+        let state: &StyleState = state;
+        let worked_out = crate::css::with_kept_styles(styles, || {
+            let (style, font_size) = inputs.stylesheet.computed_style(&document, node, state)?;
+            let declared = |target: NodeId| {
+                inputs.stylesheet.declared_values(crate::css::StyleContext {
+                    document: &document,
+                    node: target,
+                    pseudo: None,
+                    parent_font_size: 16.0,
+                    parent_color: crate::Color::BLACK,
+                    parent_weight: FontWeight::NORMAL,
+                    parent_text: crate::css::InheritedText::default(),
+                    state,
+                })
+            };
+            let own = declared(node);
+            let ancestors = document
+                .ancestors(node)
+                .filter(|&ancestor| document.element(ancestor).is_some())
+                .map(declared)
+                .collect::<Vec<_>>();
+            let item = document
+                .parent_element(node)
+                .and_then(|parent| inputs.stylesheet.computed_style(&document, parent, state))
+                .is_some_and(|(parent, _)| {
+                    matches!(
+                        parent.display,
+                        crate::Display::Flex
+                            | crate::Display::InlineFlex
+                            | crate::Display::Grid
+                            | crate::Display::InlineGrid
+                    )
+                });
+            Some((style, font_size, own, ancestors, item))
+        });
+        self.computed_styles = Some(kept);
+        let Some((style, font_size, own, ancestors, item)) = worked_out else {
             return values;
         };
-        let declared = |target: NodeId| {
-            inputs.stylesheet.declared_values(crate::css::StyleContext {
-                document: &document,
-                node: target,
-                pseudo: None,
-                parent_font_size: 16.0,
-                parent_color: crate::Color::BLACK,
-                parent_weight: FontWeight::NORMAL,
-                parent_text: crate::css::InheritedText::default(),
-                state: &state,
-            })
-        };
-        let own = declared(node);
-        let ancestors = document
-            .ancestors(node)
-            .filter(|&ancestor| document.element(ancestor).is_some())
-            .map(declared)
-            .collect::<Vec<_>>();
-        let item = document
-            .parent_element(node)
-            .and_then(|parent| inputs.stylesheet.computed_style(&document, parent, &state))
-            .is_some_and(|(parent, _)| {
-                matches!(
-                    parent.display,
-                    crate::Display::Flex
-                        | crate::Display::InlineFlex
-                        | crate::Display::Grid
-                        | crate::Display::InlineGrid
-                )
-            });
         let blockified = item
             || style.float != crate::css::Float::None
             || style.position.is_out_of_flow()
@@ -1904,6 +1926,15 @@ fn align_delta(start: f32, size: f32, port: f32, port_size: f32, alignment: &str
         _ if (start < port) == (size <= port_size) => start - port,
         _ => end - port_end,
     }
+}
+
+// the styles getComputedStyle worked out, kept for the next read while the document version,
+// sheet and state they were worked out under stand
+pub(super) struct KeptComputed {
+    version: u64,
+    sheet: crate::navigation::SheetIdentity,
+    state: Box<StyleState>,
+    styles: crate::css::KeptStyles,
 }
 
 #[cfg(test)]
