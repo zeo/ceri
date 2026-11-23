@@ -977,6 +977,14 @@ impl Matching {
     }
 }
 
+// a cascade compared by identity, held so its address is not taken by another
+pub(crate) struct CascadeIdentity(Rc<Cascade>);
+
+impl PartialEq for CascadeIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
 // a cascade and the inline style it was made with
 type KeptCascade = (Option<String>, Rc<Cascade>);
 
@@ -3550,6 +3558,16 @@ impl Stylesheet {
     }
 
     // declared values after custom property substitution, from one cascade
+    // the kept cascade of an element, which stays the same object while nothing a selector
+    // reads of it has changed, so a caller can tell an unchanged element by it
+    pub(crate) fn cascade_identity(&self, context: StyleContext<'_>) -> CascadeIdentity {
+        CascadeIdentity(self.cascaded_values(
+            context.document,
+            context.node,
+            context.pseudo,
+            context.state,
+        ))
+    }
     pub(crate) fn declared_values(&self, context: StyleContext<'_>) -> BTreeMap<String, String> {
         let values = self.cascaded_values(
             context.document,

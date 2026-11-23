@@ -16,6 +16,7 @@ use crate::script::{
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -1062,6 +1063,10 @@ pub struct Browser {
     // leave alone as they change no declared value, the sheet, the state without the clock
     // and the viewport, so a frame that changed none of them and has nothing moving skips
     motion_read: Option<(u64, SheetIdentity, StyleState, Size)>,
+    // each motion candidate's kept cascade at the last scan and the transitions it declared,
+    // with the custom properties that scan read, so an element neither changed is not read again
+    motion_nodes: HashMap<NodeId, MotionNode>,
+    motion_custom: HashMap<NodeId, BTreeMap<String, String>>,
     host_runtime_info: Option<HostRuntimeInfo>,
     host_bridge: Option<crate::script::HostBridge>,
     waker: Option<crate::bridge::Waker>,
@@ -1211,6 +1216,12 @@ pub struct UserPreferences {
     pub forced_colors: Option<crate::css::SystemColors>,
 }
 
+// a motion candidate as the last scan read it
+struct MotionNode {
+    cascade: crate::css::CascadeIdentity,
+    keys: Vec<(NodeId, AnimatableProperty)>,
+}
+
 struct AnimationRun {
     name: String,
     started: u64,
@@ -1339,6 +1350,8 @@ impl Browser {
             animations: BTreeMap::new(),
             motion_clock: None,
             motion_read: None,
+            motion_nodes: HashMap::new(),
+            motion_custom: HashMap::new(),
             host_runtime_info: None,
             host_bridge: None,
             waker: None,
@@ -1993,8 +2006,10 @@ impl Browser {
         if !candidates.is_empty() {
             page.populate_custom_properties(&document, &mut state);
         }
+        let custom_unchanged = self.motion_custom == state.custom_properties;
+        let mut scanned = HashMap::new();
         for node in candidates {
-            let values = stylesheet.declared_values(StyleContext {
+            let context = StyleContext {
                 document: &document,
                 node,
                 pseudo: None,
@@ -2003,7 +2018,23 @@ impl Browser {
                 parent_weight: crate::css::FontWeight::NORMAL,
                 parent_text: Default::default(),
                 state: &state,
-            });
+            };
+            let identity = stylesheet.cascade_identity(context);
+            // the same kept cascade under the same custom properties declares the same values
+            if custom_unchanged
+                && let Some(last) = self.motion_nodes.remove(&node)
+                && last.cascade == identity
+            {
+                seen.extend(last.keys.iter().copied());
+                if let Some(run) = self.animations.get_mut(&node) {
+                    seen_animations.insert(node);
+                    run.advance(node, clock, &mut events);
+                }
+                scanned.insert(node, last);
+                continue;
+            }
+            let mut keys = Vec::new();
+            let values = stylesheet.declared_values(context);
             for transition in crate::css::transitions_from(&values).into_iter().flatten() {
                 for property in transition.property.expand() {
                     let Some(value) = values.get(property.name()) else {
@@ -2011,6 +2042,7 @@ impl Browser {
                     };
                     let key = (node, property);
                     seen.insert(key);
+                    keys.push(key);
                     match self.declared.get(&key) {
                         Some(previous) if previous == value => {}
                         Some(previous) => {
@@ -2087,6 +2119,17 @@ impl Browser {
                 run.animation = animation;
                 run.advance(node, clock, &mut events);
             }
+            scanned.insert(
+                node,
+                MotionNode {
+                    cascade: identity,
+                    keys,
+                },
+            );
+        }
+        if !unchanged {
+            self.motion_nodes = scanned;
+            self.motion_custom = state.custom_properties.clone();
         }
         // starts after a delay and ends are noticed as the clock passes them
         for (key, active) in &self.transitions {

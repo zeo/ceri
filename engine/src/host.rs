@@ -3192,6 +3192,38 @@ mod tests {
     }
 
     #[test]
+    fn a_transition_starts_when_only_a_custom_property_it_reads_changed() {
+        let browser = Browser::new(bundle(
+            r#"<style>#wrap { --size: 40px } #wrap.wide { --size: 200px } #box { height: 10px; width: var(--size); transition: width 100ms linear; } #other { transition: color 1s }</style><div id="wrap"><div id="box"></div></div><p id="other">x</p><p id="status"></p><script>
+                document.getElementById("box").addEventListener("transitionrun", () => {
+                    document.getElementById("status").textContent = "run";
+                });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 120.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        for _ in 0..3 {
+            host.input(InputEvent::AdvanceTime(16)).expect("tick");
+        }
+        let document = host.browser().document().expect("document");
+        let wrap = document.borrow().find_element_by_id("wrap").expect("wrap");
+        assert!(
+            document
+                .borrow_mut()
+                .set_attribute(wrap, "class", "wide".to_string())
+        );
+        host.input(InputEvent::AdvanceTime(16)).expect("tick");
+        assert_eq!(status_text(&host), "run");
+    }
+
+    #[test]
     fn a_transition_starts_after_frames_that_only_changed_text() {
         let browser = Browser::new(bundle(
             r#"<style>#box { width: 40px; height: 20px; transition: width 100ms linear; } #box.wide { width: 200px; }</style><div id="box"></div><p id="tick">0</p><p id="status"></p><script>
