@@ -2773,7 +2773,7 @@ impl ScriptRuntime {
             }
             GeneratorState::Suspended(frame) => frame,
         };
-        let started = frame.pc > 0;
+        let started = frame.pc > frame.code.entry;
         if !started {
             match mode {
                 ResumeMode::Next => {}
@@ -2944,7 +2944,7 @@ impl ScriptRuntime {
                 value: Value::Undefined,
                 promise: request.promise.clone(),
             });
-            let started = frame.pc > 0;
+            let started = frame.pc > frame.code.entry;
             let resume = if started {
                 Some((request.mode, request.value))
             } else if request.mode != ResumeMode::Next {
@@ -3071,9 +3071,9 @@ impl Frame {
         arguments: Vec<Value>,
     ) -> Self {
         Frame {
+            pc: code.entry,
             code,
             closure,
-            pc: 0,
             stack: Vec::with_capacity(16),
             scope,
             scopes: 0,

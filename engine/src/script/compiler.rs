@@ -289,6 +289,8 @@ pub(super) struct Code {
     pub(super) property_caches: Box<[super::object::PropertyCache]>,
     // what each closure of this code starts as, when it has no prototype of its own
     pub(super) function_template: std::cell::RefCell<Option<super::object::ObjectTemplate>>,
+    // where a run starts: past the prologue slots no arrow needed, which would only be stepped over
+    pub(super) entry: usize,
 }
 
 #[derive(Debug)]
@@ -1386,8 +1388,14 @@ impl Compiler {
             }
         }
         let property_caches = (0..state.names.len()).map(|_| Default::default()).collect();
+        let entry = ops
+            .iter()
+            .take(4)
+            .take_while(|op| matches!(op, Op::Nop))
+            .count();
         Code {
             ops,
+            entry,
             names: state.names,
             children: state.children,
             classes: state.classes,
