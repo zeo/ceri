@@ -1157,6 +1157,45 @@ struct AnimationRun {
     iteration: u64,
     began: bool,
     ended: bool,
+    // the timing it runs by, so a frame that rescans nothing can still move it on
+    animation: crate::css::Animation,
+}
+
+impl AnimationRun {
+    // the start, iteration and end it has passed by the clock time
+    fn advance(&mut self, node: NodeId, clock: u64, events: &mut Vec<MotionEvent>) {
+        let elapsed = clock.saturating_sub(self.started);
+        if !self.began && elapsed >= self.animation.delay {
+            self.began = true;
+            events.push(MotionEvent::animation(
+                &node,
+                self,
+                "animationstart",
+                self.started + self.delay,
+            ));
+        }
+        let (duration, delay) = (self.animation.duration, self.animation.delay);
+        if self.began && !self.ended && duration > 0 {
+            let active = elapsed.saturating_sub(delay);
+            let current = active / duration;
+            let finished = self
+                .animation
+                .iterations
+                .is_some_and(|iterations| active as f32 >= iterations * duration as f32);
+            if finished {
+                self.ended = true;
+                events.push(MotionEvent::animation(&node, self, "animationend", clock));
+            } else if current > self.iteration {
+                self.iteration = current;
+                events.push(MotionEvent::animation(
+                    &node,
+                    self,
+                    "animationiteration",
+                    clock,
+                ));
+            }
+        }
+    }
 }
 
 // a transition or animation event waiting for dispatch once sampling releases the document
@@ -1858,8 +1897,9 @@ impl Browser {
         state.clock = clock;
         // the declared values can only differ when something they read did, and a frame with
         // nothing in motion has no event to fire either
+        let unchanged = self.motion_read.as_ref() == Some(&read);
         let settled = self.transitions.is_empty() && self.animations.values().all(|run| run.ended);
-        if settled && self.motion_read.as_ref() == Some(&read) {
+        if settled && unchanged {
             return Ok(false);
         }
         self.motion_read = Some(read);
@@ -1868,7 +1908,19 @@ impl Browser {
         let mut seen_animations = BTreeSet::new();
         let mut events = Vec::new();
         let mut changed = false;
-        let candidates = collect_motion_candidates(&stylesheet, &state, &document);
+        // with nothing they read changed, the declared values are the last scan's, and only the
+        // clock moves what runs: a looping animation costs its own timing, not a cascade of
+        // every element that declares motion
+        let candidates = if unchanged {
+            seen.extend(self.declared.keys().cloned());
+            seen_animations.extend(self.animations.keys().copied());
+            for (node, run) in &mut self.animations {
+                run.advance(*node, clock, &mut events);
+            }
+            Vec::new()
+        } else {
+            collect_motion_candidates(&stylesheet, &state, &document)
+        };
         // custom properties cost a document-wide pass, so only pages with moving elements pay it
         if !candidates.is_empty() {
             page.populate_custom_properties(&document, &mut state);
@@ -1962,36 +2014,10 @@ impl Browser {
                     iteration: 0,
                     began: false,
                     ended: false,
+                    animation: animation.clone(),
                 });
-                let elapsed = clock.saturating_sub(run.started);
-                if !run.began && elapsed >= animation.delay {
-                    run.began = true;
-                    events.push(MotionEvent::animation(
-                        &node,
-                        run,
-                        "animationstart",
-                        run.started + run.delay,
-                    ));
-                }
-                if run.began && !run.ended && animation.duration > 0 {
-                    let active = elapsed.saturating_sub(animation.delay);
-                    let current = active / animation.duration;
-                    let finished = animation.iterations.is_some_and(|iterations| {
-                        active as f32 >= iterations * animation.duration as f32
-                    });
-                    if finished {
-                        run.ended = true;
-                        events.push(MotionEvent::animation(&node, run, "animationend", clock));
-                    } else if current > run.iteration {
-                        run.iteration = current;
-                        events.push(MotionEvent::animation(
-                            &node,
-                            run,
-                            "animationiteration",
-                            clock,
-                        ));
-                    }
-                }
+                run.animation = animation;
+                run.advance(node, clock, &mut events);
             }
         }
         // starts after a delay and ends are noticed as the clock passes them
@@ -2974,6 +3000,29 @@ impl Browser {
                 motion,
                 generation,
             });
+            return Ok(layout);
+        }
+        // an animation that steps, or one waiting out its delay, shows the same values until the
+        // time it said it next changes, so the last layout stands until then
+        let unchanged_until_wake = self.layout_cache.borrow().as_ref().and_then(|cached| {
+            let last = &cached.key;
+            let wake = page.animation_wake.get()?;
+            let clock = last.state.clock;
+            let same_but_clock = last.document == key.document
+                && last.stylesheet == key.stylesheet
+                && last.viewport == key.viewport
+                && last.scale == key.scale
+                && last.selections == key.selections
+                && key.state.transitions.is_empty()
+                && last.state
+                    == StyleState {
+                        clock,
+                        ..key.state.clone()
+                    };
+            (same_but_clock && clock <= key.state.clock && key.state.clock < wake)
+                .then(|| cached.layout.clone())
+        });
+        if let Some(layout) = unchanged_until_wake {
             return Ok(layout);
         }
         page.populate_custom_properties(&document, &mut style_state);

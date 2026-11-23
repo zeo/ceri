@@ -3153,6 +3153,42 @@ mod tests {
     }
 
     #[test]
+    fn a_stepping_animation_moves_on_its_steps_and_keeps_counting_iterations() {
+        let browser = Browser::new(bundle(
+            r#"<style>@keyframes grow { from { width: 10px } to { width: 110px } } #box { height: 10px; animation: grow 100ms steps(2, end) infinite; } .row { transition: color 1s }</style><div id="box"></div><p class="row">a</p><p id="status"></p><script>
+                let iterations = 0;
+                document.getElementById("box").addEventListener("animationiteration", () => {
+                    document.getElementById("status").textContent = String(++iterations);
+                });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 120.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let width = |host: &EngineHost| {
+            let layout = host.browser().layout(host.viewport()).expect("layout");
+            layout.body().children[0].rect.width
+        };
+        host.input(InputEvent::AdvanceTime(10)).expect("tick");
+        let first = width(&host);
+        host.input(InputEvent::AdvanceTime(10)).expect("tick");
+        assert_eq!(width(&host), first, "a step holds its value");
+        host.input(InputEvent::AdvanceTime(50)).expect("tick");
+        assert_ne!(width(&host), first, "the next step moves it");
+        for _ in 0..20 {
+            host.input(InputEvent::AdvanceTime(16)).expect("tick");
+        }
+        let counted: u32 = status_text(&host).parse().expect("iterations counted");
+        assert!(counted >= 3, "{counted}");
+    }
+
+    #[test]
     fn a_transition_starts_after_frames_that_only_changed_text() {
         let browser = Browser::new(bundle(
             r#"<style>#box { width: 40px; height: 20px; transition: width 100ms linear; } #box.wide { width: 200px; }</style><div id="box"></div><p id="tick">0</p><p id="status"></p><script>
