@@ -174,6 +174,9 @@ struct Shape {
     // the shape one key shorter, kept alive so the next object to take the same keys finds
     // the same path
     _parent: Option<Rc<Shape>>,
+    // the most keys any shape grown from this one has, so an object that must grow its
+    // properties can make room for as many as objects made like it ended up with
+    longest: std::cell::Cell<usize>,
     // a shape of one object's own, changed in place
     own: bool,
 }
@@ -190,6 +193,7 @@ impl Shape {
                 index: None,
                 transitions: RefCell::default(),
                 _parent: None,
+                longest: std::cell::Cell::new(0),
                 own: false,
             });
         }
@@ -202,6 +206,7 @@ impl Shape {
             index: self.index.clone(),
             transitions: RefCell::default(),
             _parent: None,
+            longest: std::cell::Cell::new(self.keys.len()),
             own: true,
         }
     }
@@ -248,11 +253,18 @@ impl Shape {
             index: self.index.clone(),
             transitions: RefCell::default(),
             _parent: Some(self.clone()),
+            longest: std::cell::Cell::new(self.keys.len() + 1),
             own: false,
         };
         next.push_own(key.clone());
         let next = Rc::new(next);
         transitions.insert(key, Rc::downgrade(&next));
+        let length = next.keys.len();
+        let mut shape = Some(self);
+        while let Some(ancestor) = shape {
+            ancestor.longest.set(ancestor.longest.get().max(length));
+            shape = ancestor._parent.as_ref();
+        }
         next
     }
 }
@@ -427,6 +439,14 @@ impl JsObject {
             self.own_shape().push_own(Rc::from(key));
         } else {
             self.shape = self.shape.with_key(&key);
+            let length = self.properties.len();
+            if length == self.properties.capacity() {
+                // never more than doubling would take, so a shape shared by unlike objects only
+                // ever saves room
+                let doubled = (length * 2).max(4);
+                let wanted = self.shape.longest.get().clamp(length + 1, doubled);
+                self.properties.reserve_exact(wanted - length);
+            }
         }
         self.properties.push(property);
     }
@@ -586,6 +606,33 @@ mod tests {
     fn an_object_and_a_property_stay_small_enough_for_heaps_of_them() {
         assert!(std::mem::size_of::<JsObject>() <= 80);
         assert!(std::mem::size_of::<Property>() <= 40);
+    }
+
+    #[test]
+    fn an_object_made_like_others_takes_room_for_exactly_their_keys() {
+        let made = || {
+            let mut object = JsObject::new();
+            for key in [
+                "fn",
+                "state",
+                "updatedAt",
+                "owned",
+                "sources",
+                "sourceSlots",
+            ] {
+                object.insert(key.to_string(), Value::Null);
+            }
+            for key in ["cleanups", "value", "owner", "context", "pure"] {
+                object.insert(key.to_string(), Value::Null);
+            }
+            object
+        };
+        let _first = made();
+        let second = made();
+        assert_eq!(second.properties.capacity(), 11);
+        let mut small = JsObject::new();
+        small.insert("fn".to_string(), Value::Null);
+        assert!(small.properties.capacity() <= 4);
     }
 
     #[test]
