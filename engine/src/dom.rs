@@ -247,6 +247,27 @@ impl Clone for Identity {
 }
 
 // a number no other change to any document has had, so two documents never share one
+// what a selector can tell of an attribute going from one value to another
+fn attribute_change(name: &str, old: Option<&str>, new: Option<&str>) -> Box<[String]> {
+    let mut changed = vec![format!("[{name}]")];
+    match name {
+        "class" => {
+            let tokens = |value: Option<&str>| -> HashSet<String> {
+                value
+                    .unwrap_or_default()
+                    .split_ascii_whitespace()
+                    .map(str::to_string)
+                    .collect()
+            };
+            let (old, new) = (tokens(old), tokens(new));
+            changed.extend(old.symmetric_difference(&new).map(|token| format!("class:{token}")));
+        }
+        "id" => changed.extend([old, new].into_iter().flatten().map(|id| format!("#{id}"))),
+        _ => {}
+    }
+    changed.into_boxed_slice()
+}
+
 fn next_stamp() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -266,6 +287,15 @@ pub struct Document {
     // renewed by every change a selector can see unless it reads text or the style attribute:
     // to the elements of the tree, or to an attribute other than style
     selector_version: u64,
+    // renewed with the selector version where no node is written for the change: which sheets
+    // and style attributes apply
+    rules_version: u64,
+    // the attribute changes a selector can see, newest last, each with its write stamp, its
+    // element and what it changed: "class:name" for a class token, "#id" for an id, "[name]"
+    // for an attribute, "*" for anything. bounded, so changes older than the oldest kept
+    // after the stamp in `changes_lost` are unknown
+    selector_changes: std::collections::VecDeque<(u64, NodeId, Box<[String]>)>,
+    changes_lost: u64,
     // nodes that were created or lost their parent, so their owner can decide whether to free them
     orphans: Vec<NodeId>,
     // script elements that were prepared already, which inserting again never runs: every
@@ -424,6 +454,9 @@ impl Document {
             stamp: next_stamp(),
             stamp_read: std::cell::Cell::new(false),
             selector_version: next_stamp(),
+            rules_version: 0,
+            selector_changes: std::collections::VecDeque::new(),
+            changes_lost: 0,
             orphans: Vec::new(),
             started_scripts: std::collections::HashSet::new(),
             template_contents: HashMap::new(),
@@ -747,6 +780,51 @@ impl Document {
         self.selector_version
     }
 
+    pub(crate) fn rules_version(&self) -> u64 {
+        self.rules_version
+    }
+
+    fn note_selector_change(&mut self, id: NodeId, changed: Box<[String]>) {
+        const KEPT_CHANGES: usize = 1024;
+        if self.selector_changes.len() == KEPT_CHANGES
+            && let Some((stamp, ..)) = self.selector_changes.pop_front()
+        {
+            self.changes_lost = stamp;
+        }
+        self.selector_changes.push_back((self.stamp, id, changed));
+    }
+
+    // the attribute changes written after the stamp, or none where some are no longer known
+    pub(crate) fn selector_changes_since(
+        &self,
+        stamp: u64,
+    ) -> Option<impl Iterator<Item = (NodeId, &[String])>> {
+        (self.changes_lost <= stamp).then(|| {
+            self.selector_changes
+                .iter()
+                .rev()
+                .take_while(move |(written, ..)| *written > stamp)
+                .map(|(_, node, changed)| (*node, &changed[..]))
+        })
+    }
+
+    // the nodes in the tree written after the stamp, in tree order, found by following only
+    // the chains stamped as holding a write
+    pub(crate) fn written_since(&self, stamp: u64) -> Vec<NodeId> {
+        let mut written = Vec::new();
+        let mut pending = vec![self.root];
+        while let Some(node) = pending.pop() {
+            let Some(data) = self.data(node).filter(|data| data.written_within > stamp) else {
+                continue;
+            };
+            if data.written > stamp {
+                written.push(node);
+            }
+            pending.extend(data.children.iter().rev().copied());
+        }
+        written
+    }
+
     pub(crate) fn identity(&self) -> u64 {
         self.identity.0
     }
@@ -776,6 +854,8 @@ impl Document {
     pub fn element_mut(&mut self, id: NodeId) -> Option<&mut Element> {
         self.version += 1;
         self.selector_version = next_stamp();
+        self.mark_written(id)?;
+        self.note_selector_change(id, Box::new(["*".to_string()]));
         match &mut self.data_mut(id)?.kind {
             NodeKind::Element(element) => Some(element),
             _ => None,
@@ -943,10 +1023,13 @@ impl Document {
         // must not cost the styles and boxes kept for the page
         if unblocked || element.attr(attribute) != old.as_deref() {
             self.version += 1;
-            if attribute != "style" {
-                self.selector_version = next_stamp();
-            }
+            let changed = (attribute != "style")
+                .then(|| attribute_change(attribute, old.as_deref(), element.attr(attribute)));
             self.mark_written(id);
+            if let Some(changed) = changed {
+                self.selector_version = next_stamp();
+                self.note_selector_change(id, changed);
+            }
         }
         Some(result)
     }
@@ -975,6 +1058,7 @@ impl Document {
         self.content_security_policy = policies;
         // which style attributes apply is no node's own write
         self.selector_version = next_stamp();
+        self.rules_version += 1;
     }
 
     pub(crate) fn style_blocked(&self, node: NodeId) -> bool {
@@ -1371,6 +1455,7 @@ impl Document {
         self.sheet_rules.insert(node, (text, rules));
         self.version += 1;
         self.selector_version = next_stamp();
+        self.rules_version += 1;
     }
 
     pub(crate) fn set_adopted_sheets(&mut self, root: NodeId, sheets: Vec<String>) {
@@ -1381,6 +1466,7 @@ impl Document {
         }
         self.version += 1;
         self.selector_version = next_stamp();
+        self.rules_version += 1;
     }
 
     pub(crate) fn set_sheet_disabled(&mut self, node: NodeId, disabled: bool) {
@@ -1392,6 +1478,7 @@ impl Document {
         if changed {
             self.version += 1;
             self.selector_version = next_stamp();
+            self.rules_version += 1;
         }
     }
 

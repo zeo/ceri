@@ -1281,6 +1281,16 @@ fn nested_viewport(
     render_children(walk, node, style, frame, items)
 }
 
+thread_local! {
+    static REFERENCE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// how many times a drawing has looked an element up by id, so a box kept from one layout to
+// the next can tell it reads past its own subtree
+pub(crate) fn reference_reads() -> u64 {
+    REFERENCE_READS.with(std::cell::Cell::get)
+}
+
 fn render_use(
     walk: &mut Walk<'_>,
     element: &Element,
@@ -1289,6 +1299,7 @@ fn render_use(
     items: &mut Vec<Item>,
 ) -> Option<Extent> {
     let document = walk.document;
+    REFERENCE_READS.with(|reads| reads.set(reads.get() + 1));
     let target = element
         .attr("href")
         .or_else(|| element.attr("xlink:href"))

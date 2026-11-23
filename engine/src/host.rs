@@ -468,7 +468,8 @@ fn run_live_engine_worker(
     let mut fine_timer = false;
     // whether a frame has been made since the page last rested
     let mut reserved = false;
-    const REST_AFTER: Duration = Duration::from_secs(1);
+    // longer than the second a live readout or a clock waits between its frames
+    const REST_AFTER: Duration = Duration::from_secs(5);
     loop {
         let frame = Duration::from_millis(host.browser.frame_interval());
         // timers, frame callbacks, css animations and the window asking again as each frame

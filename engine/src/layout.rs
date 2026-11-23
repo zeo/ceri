@@ -2772,6 +2772,8 @@ struct BoxInputs {
     mode: LayoutMode,
     zero_font: (crate::font::FontStack, crate::font::FontStyle),
     environment: crate::css::LayoutEnvironment,
+    // laid out inside a block formatting context's float area, which it found empty
+    among_floats: bool,
 }
 
 // an answer worked out for a node under some inputs: a box or an intrinsic width
@@ -2786,6 +2788,8 @@ struct Kept<Inputs, Answer> {
     stamp: u64,
     // it sampled motion or sized a query container, so it stands in its own pass only
     momentary: bool,
+    // it drew an element it looked up by id, which can lie anywhere in the document
+    refers: bool,
 }
 
 type KeptMap<Key, Inputs, Answer> = HashMap<Key, Vec<Kept<Inputs, Answer>>>;
@@ -2795,7 +2799,8 @@ type KeptMap<Key, Inputs, Answer> = HashMap<Key, Vec<Kept<Inputs, Answer>>>;
 struct KeptUnder {
     stylesheet: u64,
     document: u64,
-    selector_version: u64,
+    // a change to the sheets, unlike one to an element, leaves no node written
+    rules_version: u64,
     fonts: (*const crate::font::FontSet, u64),
     scale: u32,
     // without the clock, which only motion reads, the custom properties, which follow from
@@ -2817,6 +2822,8 @@ struct KeptAnswers {
     passes: u64,
     // the number of the pass in progress and the document's change stamp at its start
     pass: Option<(u64, u64)>,
+    // the change stamp at the start of the last pass
+    since: u64,
     // how many passes have worked an answer out, and whether the one in progress has
     works: u64,
     worked: bool,
@@ -2925,7 +2932,7 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
         let under = lasting.then(|| KeptUnder {
             stylesheet: stylesheet.identity(),
             document: document.identity(),
-            selector_version: document.selector_version(),
+            rules_version: document.rules_version(),
             fonts: (Rc::as_ptr(&fonts), fonts.web_face_changes()),
             scale: crate::font::device_scale().to_bits(),
             state: StyleState {
@@ -2958,11 +2965,69 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
                 }
             }
         }
+        if kept.under.is_some() {
+            drop_reached_answers(&mut kept, document, stylesheet);
+        }
         kept.hovered = state.hovered;
         kept.passes += 1;
-        kept.pass = Some((kept.passes, document.change_stamp()));
+        let stamp = document.change_stamp();
+        kept.since = stamp;
+        kept.pass = Some((kept.passes, stamp));
         KeptPass { outer }
     })
+}
+
+// a kept answer stands while its node's subtree and its ancestors are unwritten, which covers
+// what a written element restyles through descendant and child selectors. sibling selectors
+// reach the written element's siblings too, :has() can reach anything, and an element drawn
+// by reference, as through svg's <use>, can be written anywhere
+fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet: &Stylesheet) {
+    use crate::css::SelectorReach;
+    let written = document.written_since(kept.since);
+    if written.is_empty() {
+        return;
+    }
+    fn forget<Key, Inputs, Answer>(
+        map: &mut KeptMap<Key, Inputs, Answer>,
+        stale: impl Fn(&Key, &Kept<Inputs, Answer>) -> bool,
+    ) {
+        map.retain(|key, answers| {
+            answers.retain(|kept| !stale(key, kept));
+            !answers.is_empty()
+        });
+    }
+    forget(&mut kept.boxes, |_, kept| kept.refers);
+    forget(&mut kept.widths, |_, kept| kept.refers);
+    let elements = || written.iter().copied().filter(|&node| document.element(node).is_some());
+    match stylesheet.selector_reach() {
+        SelectorReach::Subtree => {}
+        SelectorReach::Anywhere if elements().next().is_none() => {}
+        SelectorReach::Anywhere => {
+            crate::profile::count("kept: all answers reached");
+            kept.boxes.clear();
+            kept.widths.clear();
+        }
+        SelectorReach::Siblings => {
+            let Some(changes) = document.selector_changes_since(kept.since) else {
+                kept.boxes.clear();
+                kept.widths.clear();
+                return;
+            };
+            let mut stale = std::collections::HashSet::new();
+            for (node, _) in changes.filter(|(_, changed)| stylesheet.reaches_siblings(changed)) {
+                let Some(parent) = document.parent(node) else {
+                    continue;
+                };
+                for &sibling in document.children(parent) {
+                    if sibling != node {
+                        stale.extend(document.subtree(sibling));
+                    }
+                }
+            }
+            forget(&mut kept.boxes, |(node, _), _| stale.contains(node));
+            forget(&mut kept.widths, |(node, ..), _| stale.contains(node));
+        }
+    }
 }
 
 // drops the answers kept for the next layout
@@ -2990,8 +3055,11 @@ fn layout_afresh(
 }
 
 fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
-    // floats are shared state the layout writes to, so a box among them is laid out each time
-    if input.floats.is_some() {
+    // floats are shared state the layout writes to, so a box that meets one is laid out each
+    // time, and one that meets none keeps its answer only while it places none either
+    let floats = input.floats.clone();
+    let placed = || floats.as_ref().map_or(0, |floats| floats.placed.borrow().len());
+    if placed() > 0 {
         return layout_element_fresh(input);
     }
     let block = input.context.containing_block;
@@ -3023,6 +3091,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         mode: input.context.mode,
         zero_font: crate::css::zero_font(),
         environment: crate::css::layout_environment(),
+        among_floats: floats.is_some(),
     };
     let key = (
         input.node.node,
@@ -3056,9 +3125,13 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
         }
         return layout;
     }
-    let reported = crate::css::moment_reports();
+    let (reported, looked_up) = (crate::css::moment_reports(), crate::svg::reference_reads());
     let layout = layout_element_fresh(input);
     let momentary = crate::css::moment_reports() != reported;
+    let refers = crate::svg::reference_reads() != looked_up;
+    if placed() > 0 {
+        return layout;
+    }
     KEPT.with(|kept| {
         let mut kept = kept.borrow_mut();
         kept.worked = true;
@@ -3072,6 +3145,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
                 used: works,
                 stamp,
                 momentary,
+                refers,
             },
         );
     });
@@ -7012,9 +7086,10 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
         }
         return width;
     }
-    let reported = crate::css::moment_reports();
+    let (reported, looked_up) = (crate::css::moment_reports(), crate::svg::reference_reads());
     let width = measure_intrinsic_width(input, minimum);
     let momentary = crate::css::moment_reports() != reported;
+    let refers = crate::svg::reference_reads() != looked_up;
     KEPT.with(|kept| {
         let mut kept = kept.borrow_mut();
         kept.worked = true;
@@ -7028,6 +7103,7 @@ fn intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
                 used: works,
                 stamp,
                 momentary,
+                refers,
             },
         );
     });
@@ -10198,6 +10274,9 @@ mod tests {
             .wide { width: 80% } .tall { height: 40px } .hot { color: red; font-size: 18px }
             .wide > .tall { margin-left: 10px }
             p + div { padding: 3px }
+            .hot + div { padding-left: 5px } .wide ~ p { margin-top: 3px }
+            li:nth-child(odd of .hot) { font-size: 20px }
+            .side { float: left; width: 40px; height: 20px } .clear { clear: both }
             div:hover { border: 2px solid black }
             .row:hover > span { margin-left: 6px }
             p:hover + div { height: 9px }
@@ -10239,7 +10318,9 @@ mod tests {
             ("left", ["auto", "5px", "30px", "10%"]),
             ("flex-grow", ["0", "1", "2", "0"]),
         ];
-        const CLASSES: [&str; 8] = ["row", "grid", "wide", "tall", "hot", "abs", "spin", ""];
+        const CLASSES: [&str; 10] = [
+            "row", "grid", "wide", "tall", "hot", "abs", "spin", "side", "clear", "",
+        ];
         const TEXTS: [&str; 4] = [
             "a",
             "longer words here to wrap around the line",
@@ -10278,7 +10359,7 @@ mod tests {
                     document.set_style_property(element, property, values[pick(4)].to_string());
                 }
                 2 => {
-                    document.set_attribute(element, "class", CLASSES[pick(8)].to_string());
+                    document.set_attribute(element, "class", CLASSES[pick(10)].to_string());
                 }
                 3 if !texts.is_empty() => {
                     let text = texts[pick(texts.len())];
@@ -10320,6 +10401,95 @@ mod tests {
                 let again = layout_with_state(&document, &stylesheet, viewport, &state);
                 assert!(again.root == fresh.root, "again after step {step}");
             }
+        }
+    }
+
+    // a live table rewrites one row's class each tick; the rows beside it stand, a sibling
+    // selector that reads another class notwithstanding
+    #[test]
+    fn a_class_written_on_one_row_keeps_the_boxes_of_the_rows_beside_it() {
+        let mut document = Document::parse_markup(
+            r#"<style>.row { display: flex } .hot { color: red } .set + .set { margin-top: 4px }</style>
+            <div id="list"><div class="row" id="a"><span>one</span></div><div class="row" id="b"><span>two</span></div></div>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let (a, b) = (
+            document.find_element_by_id("a").expect("a"),
+            document.find_element_by_id("b").expect("b"),
+        );
+        let viewport = Size {
+            width: 400.0,
+            height: 300.0,
+        };
+        let state = StyleState::default();
+        layout_with_state(&document, &stylesheet, viewport, &state);
+        let before = KEPT.with(|kept| kept.borrow().boxes.get(&(b, None)).map(|kept| kept[0].pass));
+        document.set_attribute(a, "class", "row hot".to_string());
+        let kept = layout_with_state(&document, &stylesheet, viewport, &state);
+        assert!(kept.root == layout_afresh(&document, &stylesheet, viewport, &state).root);
+        let taken = KEPT.with(|kept| kept.borrow().boxes.get(&(b, None)).map(|kept| kept[0].pass));
+        assert!(before.is_some() && taken > before, "the row beside was asked for again");
+        assert!(KEPT.with(|kept| kept.borrow().boxes[&(b, None)][0].stamp) < document.change_stamp());
+    }
+
+    // a box that places a float lays out each time, so the text after it still wraps around it
+    #[test]
+    fn a_box_placing_a_float_is_laid_out_again_for_the_boxes_after_it() {
+        let mut document = Document::parse_markup(
+            r#"<div style="width: 200px"><div><div style="float: left; width: 80px; height: 40px"></div></div><p>words that wrap beside the float</p><p id="w">x</p></div>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse("").expect("css should parse");
+        let text = document.children(document.find_element_by_id("w").expect("w"))[0];
+        let viewport = Size {
+            width: 400.0,
+            height: 300.0,
+        };
+        let state = StyleState::default();
+        layout_with_state(&document, &stylesheet, viewport, &state);
+        document.set_character_data(text, "y".to_string());
+        let kept = layout_with_state(&document, &stylesheet, viewport, &state);
+        assert!(kept.root == layout_afresh(&document, &stylesheet, viewport, &state).root);
+    }
+
+    // writes that restyle or redraw past the written element's own chain
+    #[test]
+    fn a_write_reaching_past_its_own_chain_lays_out_what_it_reaches() {
+        let cases = [
+            (
+                r#"<style>.list:has(.hot) + .after { padding: 9px }</style>
+                <div class="list"><p><span id="w">x</span></p></div><div class="after">tail</div>"#,
+                "class",
+                "hot",
+            ),
+            (
+                r#"<style>.hot ~ div span { margin-left: 12px }</style>
+                <p id="w">x</p><b>y</b><div><span>tail</span></div>"#,
+                "class",
+                "hot",
+            ),
+            (
+                r##"<div><svg width="40" height="40"><defs><rect id="w" width="10" height="10"/></defs></svg></div>
+                <div><svg width="40" height="40"><use href="#w"/></svg></div>"##,
+                "width",
+                "30",
+            ),
+        ];
+        for (markup, name, value) in cases {
+            let mut document = Document::parse_markup(markup).expect("document should parse");
+            let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+            let written = document.find_element_by_id("w").expect("written element");
+            let viewport = Size {
+                width: 400.0,
+                height: 300.0,
+            };
+            let state = StyleState::default();
+            layout_with_state(&document, &stylesheet, viewport, &state);
+            document.set_attribute(written, name, value.to_string());
+            let kept = layout_with_state(&document, &stylesheet, viewport, &state);
+            let fresh = layout_afresh(&document, &stylesheet, viewport, &state);
+            assert!(kept.root == fresh.root, "{markup}");
         }
     }
 

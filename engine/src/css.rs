@@ -2039,6 +2039,10 @@ pub struct Stylesheet {
     // whether a selector reads text nodes or the style attribute, which change without the
     // document's selector version moving
     reads_unversioned: bool,
+    reach: SelectorReach,
+    // what an attribute change must touch for a sibling selector to see it, as the document
+    // names its changes
+    sibling_keys: std::collections::BTreeSet<String>,
     cascades: RefCell<Cascades>,
     // the pseudo-elements some rule styles, so the rest are not cascaded for nothing
     styled_pseudo_elements: Vec<PseudoElement>,
@@ -2087,6 +2091,36 @@ fn reads_unversioned(rules: &[Rule]) -> bool {
         .iter()
         .flat_map(|rule| &rule.selectors)
         .any(Selector::reads_unversioned)
+}
+
+// how far past an element's own subtree a change to its attributes can restyle, so a layout
+// can tell which kept boxes such a change leaves standing
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SelectorReach {
+    // the element and what lies below it
+    #[default]
+    Subtree,
+    // and its siblings with what lies below them, through + and ~ or an :nth-child() of S
+    Siblings,
+    // :has() can restyle an ancestor's sibling, so a change can reach anything
+    Anywhere,
+}
+
+fn selector_reach(rules: &[Rule]) -> SelectorReach {
+    rules
+        .iter()
+        .flat_map(|rule| &rule.selectors)
+        .map(Selector::reach)
+        .max()
+        .unwrap_or_default()
+}
+
+fn sibling_keys(rules: &[Rule]) -> std::collections::BTreeSet<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    for selector in rules.iter().flat_map(|rule| &rule.selectors) {
+        selector.sibling_keys(&mut keys);
+    }
+    keys
 }
 
 fn styled_pseudo_elements(rules: &[Rule]) -> Vec<PseudoElement> {
@@ -2695,6 +2729,8 @@ impl Stylesheet {
             identity: next_identity(),
             hovers: hover_uses(&rules),
             reads_unversioned: reads_unversioned(&rules),
+            reach: selector_reach(&rules),
+            sibling_keys: sibling_keys(&rules),
             cascades: RefCell::default(),
             rules,
             keyframes,
@@ -2721,6 +2757,8 @@ impl Stylesheet {
                 identity: next_identity(),
                 hovers: hover_uses(&rules),
                 reads_unversioned: reads_unversioned(&rules),
+                reach: selector_reach(&rules),
+                sibling_keys: sibling_keys(&rules),
                 cascades: RefCell::default(),
                 rules,
                 keyframes,
@@ -3695,6 +3733,21 @@ impl Stylesheet {
         Some(roots)
     }
 
+    pub(crate) fn selector_reach(&self) -> SelectorReach {
+        self.reach.max(user_agent_sheet().reach)
+    }
+
+    // whether an attribute change the document names so can restyle the element's siblings
+    pub(crate) fn reaches_siblings(&self, changed: &[String]) -> bool {
+        [self, user_agent_sheet()].iter().any(|sheet| {
+            let keys = &sheet.sibling_keys;
+            keys.contains("*")
+                || changed
+                    .iter()
+                    .any(|change| change == "*" && !keys.is_empty() || keys.contains(change))
+        })
+    }
+
     // whether everything its selectors read moves the document's selector version, with the
     // user agent's sheet beside it
     pub(crate) fn follows_versions(&self) -> bool {
@@ -4499,7 +4552,102 @@ impl Selector {
     }
 }
 
+// the keys a compound's matching reads from attributes; a pseudo-class that is not structural
+// may read any of them
+fn compound_keys(compound: &CompoundSelector, keys: &mut std::collections::BTreeSet<String>) {
+    keys.extend(compound.classes.iter().map(|class| format!("class:{class}")));
+    keys.extend(compound.id.iter().map(|id| format!("#{id}")));
+    for attribute in &compound.attributes {
+        let (AttributeSelector::Exists(name) | AttributeSelector::Match { name, .. }) = attribute;
+        keys.insert(format!("[{}]", name.to_ascii_lowercase()));
+    }
+    for class in &compound.pseudo_classes {
+        match class {
+            PseudoClass::Root
+            | PseudoClass::FirstChild
+            | PseudoClass::LastChild
+            | PseudoClass::OnlyChild
+            | PseudoClass::FirstOfType
+            | PseudoClass::LastOfType
+            | PseudoClass::OnlyOfType => {}
+            PseudoClass::NthChild(_, of)
+            | PseudoClass::NthLastChild(_, of)
+            | PseudoClass::Not(of)
+            | PseudoClass::Is(of)
+            | PseudoClass::Where(of) => {
+                for part in of.iter().flat_map(|selector| &selector.parts) {
+                    compound_keys(&part.compound, keys);
+                }
+            }
+            _ => {
+                keys.insert("*".to_string());
+            }
+        }
+    }
+}
+
 impl Selector {
+    // the keys of the compounds a sibling's match hangs on: each one before a + or ~, and
+    // each one an :nth-child() of S counts
+    fn sibling_keys(&self, keys: &mut std::collections::BTreeSet<String>) {
+        for (index, part) in self.parts.iter().enumerate() {
+            if index > 0
+                && matches!(
+                    part.combinator,
+                    Some(Combinator::NextSibling | Combinator::SubsequentSibling)
+                )
+            {
+                compound_keys(&self.parts[index - 1].compound, keys);
+            }
+            for class in &part.compound.pseudo_classes {
+                if let PseudoClass::NthChild(_, of) | PseudoClass::NthLastChild(_, of) = class {
+                    for part in of.iter().flat_map(|selector| &selector.parts) {
+                        compound_keys(&part.compound, keys);
+                    }
+                }
+                for inner in class.inner() {
+                    inner.sibling_keys(keys);
+                }
+            }
+        }
+    }
+
+    fn reach(&self) -> SelectorReach {
+        self.parts
+            .iter()
+            .map(|part| {
+                let sideways = matches!(
+                    part.combinator,
+                    Some(Combinator::NextSibling | Combinator::SubsequentSibling)
+                );
+                let own = if sideways {
+                    SelectorReach::Siblings
+                } else {
+                    SelectorReach::Subtree
+                };
+                part.compound
+                    .pseudo_classes
+                    .iter()
+                    .map(|class| match class {
+                        PseudoClass::Has(_) => SelectorReach::Anywhere,
+                        PseudoClass::NthChild(_, of) | PseudoClass::NthLastChild(_, of)
+                            if !of.is_empty() =>
+                        {
+                            SelectorReach::Siblings
+                        }
+                        class => class
+                            .inner()
+                            .into_iter()
+                            .map(Selector::reach)
+                            .max()
+                            .unwrap_or_default(),
+                    })
+                    .fold(own, Ord::max)
+            })
+            .max()
+            .unwrap_or_default()
+    }
+
     // whether matching reads text nodes or the style attribute
     fn reads_unversioned(&self) -> bool {
         self.parts.iter().any(|part| {
