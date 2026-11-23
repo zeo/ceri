@@ -756,6 +756,8 @@ pub struct ScriptRuntime {
     computed_styles: Option<geometry::KeptComputed>,
     // the last getComputedStyle object, whose keys the next one takes when they match
     computed_style_template: Option<JsObject>,
+    // the length and name a bound function starts with, by its target's name and its length
+    bound_templates: HashMap<(Rc<str>, u64), object::ObjectTemplate>,
     // milliseconds from an animation frame request to its callback
     frame_interval: u64,
     // whether the page's window shows; a hidden page runs no animation frames
@@ -1968,6 +1970,7 @@ impl ScriptRuntime {
             disabled_controls: RefCell::new(None),
             computed_styles: None,
             computed_style_template: None,
+            bound_templates: HashMap::new(),
             frame_interval: crate::navigation::FRAME_INTERVAL,
             visible: true,
             media_queries: Vec::new(),

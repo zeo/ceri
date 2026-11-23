@@ -2887,20 +2887,27 @@ impl ScriptRuntime {
                     Value::Number(length) if length.is_finite() => length.max(0.0),
                     _ => 0.0,
                 };
-                let target_name = match self.get_property(&this, "name")? {
-                    Value::String(name) => name.to_string(),
-                    _ => String::new(),
+                let target_name: Rc<str> = match self.get_property(&this, "name")? {
+                    Value::String(name) => name,
+                    _ => Rc::from(""),
                 };
                 let length = (target_length - bound.len() as f64).max(0.0);
                 let prototype = self.prototype_of(&this);
-                let mut object = JsObject::with_prototype(
-                    prototype,
-                    ObjectClass::Bound(Box::new(super::object::BoundFunction {
-                        target: this,
-                        this: first,
-                        arguments: bound,
-                    })),
-                );
+                let class = ObjectClass::Bound(Box::new(super::object::BoundFunction {
+                    target: this,
+                    this: first,
+                    arguments: bound,
+                }));
+                // binds of one function with as many arguments come out with the same length
+                // and name, which they hold in common until one changes them
+                let key = (target_name, length.to_bits());
+                if let Some(template) = self.bound_templates.get(&key) {
+                    return Ok(Value::Object(new_object(JsObject::from_template(
+                        template, prototype, class,
+                    ))));
+                }
+                let target_name = &key.0;
+                let mut object = JsObject::with_prototype(prototype, class);
                 object.define(
                     "length".to_string(),
                     Property {
@@ -2915,6 +2922,12 @@ impl ScriptRuntime {
                         ..Property::hidden(Value::String(format!("bound {target_name}").into()))
                     },
                 );
+                if self.bound_templates.len() >= 4096 {
+                    self.bound_templates.clear();
+                }
+                if let Some(template) = object.template() {
+                    self.bound_templates.insert(key, template);
+                }
                 Ok(Value::Object(new_object(object)))
             }
             Native::FunctionToString => {

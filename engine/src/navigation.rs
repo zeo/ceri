@@ -7145,6 +7145,31 @@ mod tests {
     }
 
     #[test]
+    fn bound_functions_made_alike_keep_their_own_properties_apart() {
+        let mut browser = Browser::new(bundle(
+            r#"<p id="status">idle</p><script>
+                function add(a, b, c) { return a + b + c; }
+                const first = add.bind(null, 1);
+                const second = add.bind(null, 2);
+                Object.defineProperty(first, "name", { value: "mine" });
+                second.extra = 1;
+                const third = add.bind(null, 3);
+                document.getElementById("status").textContent = [
+                    first.name, second.name, third.name, first.length, add.bind(null, 1, 2).length,
+                    "extra" in third, second(1, 1), third(0, 0),
+                ].join("|");
+            </script>"#,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("bind page should load");
+        assert_eq!(
+            element_text(&browser, "status"),
+            "mine|bound add|bound add|2|1|false|4|3"
+        );
+    }
+
+    #[test]
     fn closures_of_one_function_keep_their_own_properties_apart() {
         let mut browser = Browser::new(bundle(
             r#"<p id="status">idle</p><script>
