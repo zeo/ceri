@@ -1058,8 +1058,9 @@ pub struct Browser {
     // each element's running keyframe animation, so it plays from when it was applied
     animations: BTreeMap<NodeId, AnimationRun>,
     motion_clock: Option<u64>,
-    // what the last motion sample read: document version, sheet, state without the clock and
-    // viewport, so a frame that changed none of them and has nothing moving skips the scan
+    // what the last motion sample read: the document's selector version, which text edits
+    // leave alone as they change no declared value, the sheet, the state without the clock
+    // and the viewport, so a frame that changed none of them and has nothing moving skips
     motion_read: Option<(u64, SheetIdentity, StyleState, Size)>,
     host_runtime_info: Option<HostRuntimeInfo>,
     host_bridge: Option<crate::script::HostBridge>,
@@ -1849,7 +1850,7 @@ impl Browser {
         state.reduced_motion = self.preferences.reduced_motion;
         state.forced_colors = self.preferences.forced_colors;
         let read = (
-            document.version(),
+            document.selector_version(),
             SheetIdentity::of(&stylesheet),
             state.clone(),
             viewport,

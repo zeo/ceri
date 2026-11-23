@@ -3152,6 +3152,40 @@ mod tests {
     }
 
     #[test]
+    fn a_transition_starts_after_frames_that_only_changed_text() {
+        let browser = Browser::new(bundle(
+            r#"<style>#box { width: 40px; height: 20px; transition: width 100ms linear; } #box.wide { width: 200px; }</style><div id="box"></div><p id="tick">0</p><p id="status"></p><script>
+                const box = document.getElementById("box");
+                box.addEventListener("transitionrun", () => { document.getElementById("status").textContent = "run"; });
+                let ticks = 0;
+                setInterval(() => { document.getElementById("tick").textContent = String(++ticks); }, 10);
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 120.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        for _ in 0..5 {
+            host.input(InputEvent::AdvanceTime(16)).expect("tick");
+        }
+        assert_eq!(status_text(&host), "");
+        let document = host.browser().document().expect("document");
+        let path = document.borrow().find_element_by_id("box").expect("box");
+        assert!(
+            document
+                .borrow_mut()
+                .set_attribute(path, "class", "wide".to_string())
+        );
+        host.input(InputEvent::AdvanceTime(16)).expect("tick");
+        assert_eq!(status_text(&host), "run");
+    }
+
+    #[test]
     fn transitions_report_run_start_end_and_cancel_in_order() {
         let browser = Browser::new(bundle(
             r#"<style>#box { width: 40px; height: 20px; background: #000000; transition: all 100ms linear; } #box.wide { width: 200px; transform: rotate(10deg); }</style><div id="box"></div><p id="status"></p><script>
