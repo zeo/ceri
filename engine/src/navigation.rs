@@ -1938,6 +1938,25 @@ impl Browser {
         images || animating || !self.transitions.is_empty()
     }
 
+    // whether what moves on the page shows something new by now: a transition runs, an
+    // animation has reached its next change, or an animated image plays. a stepping animation
+    // between its steps asks for no frame, so the host sleeps until next_wake instead
+    pub fn motion_due(&self) -> bool {
+        let Some(page) = self.page.as_ref() else {
+            return false;
+        };
+        let now = page.runtime.now();
+        let images = page
+            .animated
+            .borrow()
+            .iter()
+            .any(|animated| animated.shown.get() && animated.next_change(now).is_some());
+        if self.preferences.reduced_motion {
+            return images;
+        }
+        let stepped = page.animation_wake.get().is_some_and(|at| at <= now);
+        images || stepped || !self.transitions.is_empty()
+    }
     // records which animatable values changed, so layout can blend from the old ones
     pub fn sample_transitions(&mut self, viewport: Size) -> Result<bool, NavigationError> {
         let _profile = crate::profile::scope("frame: motion");

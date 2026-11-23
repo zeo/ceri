@@ -1101,7 +1101,7 @@ impl EngineHost {
                 let tasks_run = self.browser.advance_time(milliseconds)?;
                 InputResult {
                     tasks_run,
-                    frame_requested: self.browser.has_active_animations(),
+                    frame_requested: self.browser.motion_due(),
                     ..InputResult::default()
                 }
             }
@@ -1113,7 +1113,7 @@ impl EngineHost {
             || result.handled
             || result.tasks_run > 0
             || transitioning
-            || self.browser.has_active_animations();
+            || self.browser.motion_due();
         Ok(InputResult {
             frame_requested: self.dirty,
             ..result
@@ -3189,6 +3189,33 @@ mod tests {
         }
         let counted: u32 = status_text(&host).parse().expect("iterations counted");
         assert!(counted >= 3, "{counted}");
+    }
+
+    #[test]
+    fn a_stepping_animation_asks_for_frames_only_at_its_steps() {
+        let browser = Browser::new(bundle(
+            r#"<style>@keyframes pulse { 50% { opacity: .3 } } #dot { animation: 1600ms steps(2, end) infinite pulse; }</style><div id="dot">x</div>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 320.0,
+                height: 120.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        host.input(InputEvent::AdvanceTime(16)).expect("tick");
+        host.render().expect("frame");
+        let quiet = host.input(InputEvent::AdvanceTime(16)).expect("tick");
+        assert!(!quiet.frame_requested, "nothing changes between steps");
+        assert!(host.render().expect("frame").is_none());
+        let wake = host.next_wake().expect("the next step is due");
+        assert!(wake > 500, "{wake}");
+        let step = host
+            .input(InputEvent::AdvanceTime(wake))
+            .expect("tick to the step");
+        assert!(step.frame_requested, "the step shows something new");
     }
 
     #[test]
