@@ -665,7 +665,12 @@ impl LengthTerms {
             + self.percent * containing / 100.0
             + self.viewport_width * environment.viewport.width / 100.0
             + self.viewport_height * environment.viewport.height / 100.0
-            + self.zero_width * zero_advance(font_size)
+            // the width of a zero is a font lookup, made only for a length that has ch in it
+            + if self.zero_width == 0.0 {
+                0.0
+            } else {
+                self.zero_width * zero_advance(font_size)
+            }
     }
 
     fn is_finite(self) -> bool {
