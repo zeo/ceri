@@ -964,19 +964,27 @@ impl ScriptRuntime {
         }
     }
 
-    // reads the scope depth levels up without taking a reference to each scope on the way,
-    // which every read of a local would otherwise pay for
-    fn with_scope_at<R>(frame: &Frame, depth: u16, read: impl FnOnce(&Scope) -> R) -> R {
-        let mut scope: *const RefCell<Scope> =
-            Rc::as_ptr(frame.scope.as_ref().expect("a scope is present"));
+    // the scope depth levels up, found without taking a reference to each scope on the way,
+    // which every read and write of a local would otherwise pay for
+    fn scope_cell_at(frame: &Frame, depth: u16) -> &RefCell<Scope> {
+        let mut scope: &RefCell<Scope> = frame.scope.as_ref().expect("a scope is present");
         for _ in 0..depth {
+            let parent: *const RefCell<Scope> = Rc::as_ptr(
+                scope
+                    .borrow()
+                    .parent
+                    .as_ref()
+                    .expect("scope depth is valid"),
+            );
             // safety: the frame holds the innermost scope and every scope holds its parent,
-            // so each pointer stays valid while the frame is borrowed
-            let parent = unsafe { &*scope }.borrow();
-            scope = Rc::as_ptr(parent.parent.as_ref().expect("scope depth is valid"));
+            // so each one lives at least as long as the frame is borrowed
+            scope = unsafe { &*parent };
         }
-        // safety: as above
-        read(&unsafe { &*scope }.borrow())
+        scope
+    }
+
+    fn with_scope_at<R>(frame: &Frame, depth: u16, read: impl FnOnce(&Scope) -> R) -> R {
+        read(&Self::scope_cell_at(frame, depth).borrow())
     }
 
     fn scope_at(frame: &Frame, depth: u16) -> ScopeRef {
@@ -1066,8 +1074,7 @@ impl ScriptRuntime {
         name: u32,
         value: Value,
     ) -> Result<(), ScriptError> {
-        let scope = Self::scope_at(frame, depth);
-        let mut scope = scope.borrow_mut();
+        let mut scope = Self::scope_cell_at(frame, depth).borrow_mut();
         match &mut scope.slots[index as usize] {
             Value::Binding(cell, true) if !matches!(*cell.borrow(), Value::Uninitialized) => {
                 *cell.borrow_mut() = value;
@@ -1384,8 +1391,7 @@ impl ScriptRuntime {
             }
             Op::InitLocal { depth, index } => {
                 let value = Self::pop(frame);
-                let scope = Self::scope_at(frame, depth);
-                let mut scope = scope.borrow_mut();
+                let mut scope = Self::scope_cell_at(frame, depth).borrow_mut();
                 match &scope.slots[index as usize] {
                     Value::Binding(cell, _) => *cell.borrow_mut() = value,
                     _ => scope.slots[index as usize] = value,
