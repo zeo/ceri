@@ -771,8 +771,9 @@ pub struct ScriptRuntime {
     generation: u32,
     // scopes of returned calls nothing else held, emptied for the next call to take
     spare_scopes: Vec<vm::ScopeRef>,
-    // the emptied stacks and argument lists of returned calls, for the next calls to fill
-    spare_values: Vec<Vec<Value>>,
+    // the emptied frames of returned calls, boxed, for the next calls to fill
+    #[allow(clippy::vec_box)]
+    spare_frames: Vec<Box<vm::Frame>>,
     // the length and name a bound function starts with, by its target's name and its length
     bound_templates: HashMap<(JsStr, u64), object::ObjectTemplate>,
     // milliseconds from an animation frame request to its callback
@@ -1992,7 +1993,7 @@ impl ScriptRuntime {
             computed_style_template: None,
             generation,
             spare_scopes: Vec::new(),
-            spare_values: Vec::new(),
+            spare_frames: Vec::new(),
             bound_templates: HashMap::new(),
             frame_interval: crate::navigation::FRAME_INTERVAL,
             visible: true,

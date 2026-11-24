@@ -1,6 +1,8 @@
 // the bytecode interpreter: frames run in a loop without recursing on the Rust stack for
 // JavaScript-to-JavaScript calls; generators and async functions suspend their frame and
 // resume it later, and exceptions unwind through try handlers and finally blocks
+// frames are boxed on their stack so a call moves a pointer and a returned call's box is reused
+#![allow(clippy::vec_box)]
 
 use super::ast::{FunctionKind, Name};
 use super::compiler::{self, BindingKind, Code, GLOBAL, Layout, NO_TARGET, Op, ScopeRole};
@@ -503,7 +505,7 @@ impl ScriptRuntime {
                         arguments,
                         false,
                     );
-                    return Ok(Prepared::Frame(Box::new(frame)));
+                    return Ok(Prepared::Frame(self.boxed(frame)));
                 }
                 ObjectClass::Bound(bound) => {
                     let super::object::BoundFunction {
@@ -588,7 +590,7 @@ impl ScriptRuntime {
                     };
                     let frame =
                         self.function_frame(&closure, &callee, this, new_target, arguments, true);
-                    return Ok(Prepared::Frame(Box::new(frame)));
+                    return Ok(Prepared::Frame(self.boxed(frame)));
                 }
                 ObjectClass::Bound(bound) => {
                     let super::object::BoundFunction {
@@ -812,8 +814,7 @@ impl ScriptRuntime {
             closure.scope.clone()
         };
         let scope = self.new_scope(code.layout.clone(), parent);
-        let mut stack = self.spare_values.pop().unwrap_or_default();
-        stack.reserve(16);
+        let stack = Vec::with_capacity(16);
         // TDZ: lexical bindings start uninitialized; params and vars start undefined
         let mut frame = Frame::new(
             code.clone(),
@@ -955,7 +956,7 @@ impl ScriptRuntime {
 
     // base is how many frames of the runs around this one a debugger sees
     fn run_frames(&mut self, entry: Frame, base: usize) -> Result<RunResult, ScriptError> {
-        let mut frames = vec![entry];
+        let mut frames = vec![self.boxed(entry)];
         let below = self.debugger.calls.len();
         loop {
             self.steps += 1;
@@ -994,7 +995,7 @@ impl ScriptRuntime {
 
     // notes the functions running for the profile, each by its name and the line it starts on:
     // the runs outside this one first, then this run's frames
-    fn sample_script(&mut self, frames: &[Frame]) {
+    fn sample_script(&mut self, frames: &[Box<Frame>]) {
         thread_local! {
             static LABELS: RefCell<HashMap<usize, Rc<str>>> = RefCell::new(HashMap::new());
         }
@@ -1030,11 +1031,17 @@ impl ScriptRuntime {
     // keeps the code and op of every running frame, for an error made now to name: the top
     // frame's op moves in place, and a call or a return leaves the frames below as they were
     #[inline]
-    fn note_frames(&mut self, frames: &[Frame], below: usize) {
+    fn note_frames(&mut self, frames: &[Box<Frame>], below: usize) {
         let calls = &mut self.debugger.calls;
         let top = frames.last().expect("a frame is running");
         let depth = below + frames.len();
         if calls.len() == depth && Rc::ptr_eq(&calls[depth - 1].0, &top.code) {
+            calls[depth - 1].1 = top.pc;
+            return;
+        }
+        // a return leaves its caller's entry standing under the one that goes
+        if calls.len() == depth + 1 && Rc::ptr_eq(&calls[depth - 1].0, &top.code) {
+            calls.truncate(depth);
             calls[depth - 1].1 = top.pc;
             return;
         }
@@ -1050,7 +1057,7 @@ impl ScriptRuntime {
     // throws a value inside the frame stack: the nearest handler takes it, or the run ends
     fn unwind(
         &mut self,
-        frames: &mut Vec<Frame>,
+        frames: &mut Vec<Box<Frame>>,
         thrown: Value,
     ) -> Result<Option<RunResult>, ScriptError> {
         loop {
@@ -1286,7 +1293,7 @@ impl ScriptRuntime {
     // caller's this, new.target, function and home object
     fn direct_eval(
         &mut self,
-        frames: &mut Vec<Frame>,
+        frames: &mut Vec<Box<Frame>>,
         source: &str,
     ) -> Result<Option<RunResult>, ScriptError> {
         let frame = frames.last().expect("a frame is running");
@@ -1316,14 +1323,14 @@ impl ScriptRuntime {
             Vec::new(),
         );
         frame.eval = true;
-        frames.push(frame);
+        frames.push(self.boxed(frame));
         Ok(None)
     }
 
     // returns from the top frame, running finally blocks on the way out
     fn do_return(
         &mut self,
-        frames: &mut Vec<Frame>,
+        frames: &mut Vec<Box<Frame>>,
         value: Value,
     ) -> Result<Option<RunResult>, ScriptError> {
         let frame = frames.last_mut().expect("a frame is running");
@@ -1339,8 +1346,6 @@ impl ScriptRuntime {
         }
         let mut finished = frames.pop().expect("a frame is running");
         self.recycle_scopes(finished.scope.take());
-        self.keep_values(std::mem::take(&mut finished.stack));
-        self.keep_values(std::mem::take(&mut finished.arguments));
         let value = if finished.construct {
             match value {
                 // host objects such as nodes count as objects, so a custom element's
@@ -1359,12 +1364,13 @@ impl ScriptRuntime {
                             self.reference_error("must call super constructor before returning")
                         );
                     }
-                    finished.this
+                    std::mem::replace(&mut finished.this, Value::Undefined)
                 }
             }
         } else {
             value
         };
+        self.keep_frame(finished);
         match frames.last_mut() {
             Some(caller) => {
                 caller.stack.push(value);
@@ -1372,6 +1378,140 @@ impl ScriptRuntime {
             }
             None => Ok(Some(RunResult::Return(value))),
         }
+    }
+
+    // the ordinary call, done in place: a plain function with a simple parameter list and no
+    // arguments object takes its arguments straight off the caller's stack into its slots and
+    // runs in the frame a returned call left; false leaves everything as it was for the
+    // general call to handle
+    fn call_plain(&mut self, frames: &mut Vec<Box<Frame>>, count: usize, method: bool) -> bool {
+        if frames.len() >= MAX_FRAMES {
+            return false;
+        }
+        let caller = frames.last_mut().expect("a frame is running");
+        let Some(callee_at) = caller
+            .stack
+            .len()
+            .checked_sub(count + 1 + usize::from(method))
+            .map(|base| base + usize::from(method))
+        else {
+            return false;
+        };
+        let closure = {
+            let Value::Object(object) = &caller.stack[callee_at] else {
+                return false;
+            };
+            let Ok(object) = object.try_borrow() else {
+                return false;
+            };
+            let ObjectClass::Function(closure) = &object.class else {
+                return false;
+            };
+            closure.clone()
+        };
+        let code = closure.code.clone();
+        if !code.simple_params
+            || code.reads_arguments
+            || code.self_scope.is_some()
+            || code.is_generator
+            || code.is_async
+            || matches!(
+                code.kind,
+                FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor
+            )
+        {
+            return false;
+        }
+        let scope = self.new_scope(code.layout.clone(), closure.scope.clone());
+        let caller = frames.last_mut().expect("a frame is running");
+        {
+            let mut slots = scope.borrow_mut();
+            for (position, slot) in code.param_slots.iter().enumerate().take(count) {
+                if let Some(slot) = slot {
+                    slots.slots[*slot as usize] = std::mem::replace(
+                        &mut caller.stack[callee_at + 1 + position],
+                        Value::Undefined,
+                    );
+                }
+            }
+        }
+        caller.stack.truncate(callee_at + 1);
+        let function = Self::pop(caller);
+        let this = if method {
+            Self::pop(caller)
+        } else {
+            Value::Undefined
+        };
+        let this = if code.strict || code.kind == FunctionKind::Arrow {
+            this
+        } else if matches!(this, Value::Undefined | Value::Null) {
+            Value::Window
+        } else {
+            this
+        };
+        let frame = match self.spare_frames.pop() {
+            Some(mut frame) => {
+                frame.pc = code.entry;
+                frame.code = code;
+                frame.closure = Some(closure);
+                frame.scope = Some(scope);
+                frame.scopes = 0;
+                frame.this = this;
+                frame.function = function;
+                frame.construct = false;
+                frame.eval = false;
+                frame.delegate_mode = ResumeMode::Next;
+                frame.delegate_last = ResumeMode::Next;
+                frame
+            }
+            None => {
+                let mut frame = Frame::new(
+                    code,
+                    Some(closure),
+                    Some(scope),
+                    this,
+                    Value::Undefined,
+                    function,
+                    Vec::new(),
+                );
+                frame.stack.reserve(16);
+                Box::new(frame)
+            }
+        };
+        frames.push(frame);
+        true
+    }
+
+    // a frame in the box a returned call's frame left, when one waits
+    pub(super) fn boxed(&mut self, frame: Frame) -> Box<Frame> {
+        match self.spare_frames.pop() {
+            Some(mut spare) => {
+                *spare = frame;
+                spare
+            }
+            None => Box::new(frame),
+        }
+    }
+
+    // keeps a returned call's box, emptied of what would hold its values alive
+    fn keep_frame(&mut self, mut frame: Box<Frame>) {
+        const KEPT: usize = 64;
+        if self.spare_frames.len() >= KEPT {
+            return;
+        }
+        // its stack and argument list stay with it, emptied, for the call that takes the box
+        frame.stack.clear();
+        frame.arguments.clear();
+        frame.closure = None;
+        frame.scope = None;
+        frame.this = Value::Undefined;
+        frame.new_target = Value::Undefined;
+        frame.function = Value::Undefined;
+        frame.resume = None;
+        frame.handlers.clear();
+        frame.pending.clear();
+        frame.chains.clear();
+        self.spare_frames.push(frame);
     }
 
     // leaves try regions down to a depth, running each finally block before the jump lands
@@ -1401,17 +1541,7 @@ impl ScriptRuntime {
 
     fn pop_arguments(&mut self, frame: &mut Frame, count: usize) -> Vec<Value> {
         let start = frame.stack.len().saturating_sub(count);
-        let mut arguments = self.spare_values.pop().unwrap_or_default();
-        arguments.extend(frame.stack.drain(start..));
-        arguments
-    }
-
-    fn keep_values(&mut self, mut values: Vec<Value>) {
-        const KEPT: usize = 64;
-        if (1..=256).contains(&values.capacity()) && self.spare_values.len() < KEPT {
-            values.clear();
-            self.spare_values.push(values);
-        }
+        frame.stack.split_off(start)
     }
 
     // runs the ops ahead that touch only the frame's stack and plain slots of its scopes, with
@@ -1602,7 +1732,7 @@ impl ScriptRuntime {
     // one instruction; Some ends this run with a result
     fn step(
         &mut self,
-        frames: &mut Vec<Frame>,
+        frames: &mut Vec<Box<Frame>>,
         below: usize,
     ) -> Result<Option<RunResult>, ScriptError> {
         // ops that leave the same frame on top run on here, sparing each a trip through the run loop
@@ -2342,15 +2472,19 @@ impl ScriptRuntime {
                     frame.stack.push(Value::String(key.into()));
                 }
                 Op::Call(count) | Op::CallMethod(count) => {
-                    let arguments = self.pop_arguments(frame, count as usize);
-                    let callee = Self::pop(frame);
-                    let this = if matches!(op, Op::CallMethod(_)) {
-                        Self::pop(frame)
-                    } else {
-                        Value::Undefined
-                    };
+                    let method = matches!(op, Op::CallMethod(_));
                     // the callee's frame, when it has one, runs on here
-                    self.call_in_loop(frames, callee, this, arguments)?;
+                    if !self.call_plain(frames, count as usize, method) {
+                        let frame = frames.last_mut().expect("a frame is running");
+                        let arguments = self.pop_arguments(frame, count as usize);
+                        let callee = Self::pop(frame);
+                        let this = if method {
+                            Self::pop(frame)
+                        } else {
+                            Value::Undefined
+                        };
+                        self.call_in_loop(frames, callee, this, arguments)?;
+                    }
                 }
                 Op::CallEval(_) | Op::CallEvalSpread => {
                     let arguments = match op {
@@ -2896,7 +3030,7 @@ impl ScriptRuntime {
                         return Err(runtime_error("yield outside a resumable frame"));
                     }
                     let frame = frames.pop().expect("generator frame");
-                    return Ok(Some(RunResult::Yield(value, Box::new(frame))));
+                    return Ok(Some(RunResult::Yield(value, frame)));
                 }
                 Op::DelegateCall => {
                     let sent = Self::pop(frame);
@@ -2960,7 +3094,7 @@ impl ScriptRuntime {
                         return Err(runtime_error("await outside a resumable frame"));
                     }
                     let frame = frames.pop().expect("async frame");
-                    return Ok(Some(RunResult::Await(value, Box::new(frame))));
+                    return Ok(Some(RunResult::Await(value, frame)));
                 }
                 Op::DynamicImport => {
                     let options = Self::pop(frame);
@@ -3122,7 +3256,7 @@ impl ScriptRuntime {
     // super(...) in a derived constructor: construct the parent with this frame's new.target
     fn super_call(
         &mut self,
-        frames: &mut [Frame],
+        frames: &mut [Box<Frame>],
         arguments: Vec<Value>,
     ) -> Result<Option<RunResult>, ScriptError> {
         let frame = frames.last_mut().expect("frame");
@@ -3158,7 +3292,7 @@ impl ScriptRuntime {
 
     fn call_in_loop(
         &mut self,
-        frames: &mut Vec<Frame>,
+        frames: &mut Vec<Box<Frame>>,
         callee: Value,
         this: Value,
         arguments: Vec<Value>,
@@ -3169,7 +3303,7 @@ impl ScriptRuntime {
                 if frames.len() >= MAX_FRAMES {
                     return Err(self.range_error("Maximum call stack size exceeded"));
                 }
-                frames.push(*frame);
+                frames.push(frame);
             }
         }
         Ok(None)
@@ -3177,7 +3311,7 @@ impl ScriptRuntime {
 
     fn construct_in_loop(
         &mut self,
-        frames: &mut Vec<Frame>,
+        frames: &mut Vec<Box<Frame>>,
         callee: Value,
         arguments: Vec<Value>,
         new_target: Option<Value>,
@@ -3189,7 +3323,7 @@ impl ScriptRuntime {
                 if frames.len() >= MAX_FRAMES {
                     return Err(self.range_error("Maximum call stack size exceeded"));
                 }
-                frames.push(*frame);
+                frames.push(frame);
             }
         }
         Ok(None)
