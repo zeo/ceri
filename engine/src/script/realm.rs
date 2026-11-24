@@ -1883,7 +1883,7 @@ impl ScriptRuntime {
                 let scope = scope.borrow();
                 CallerScope {
                     layout: scope.layout.clone(),
-                    extra: scope.extra.clone(),
+                    extra: scope.extra.to_vec(),
                 }
             })
             .collect();

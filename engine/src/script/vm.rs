@@ -18,7 +18,36 @@ pub(super) struct Scope {
     pub(super) parent: Option<ScopeRef>,
     pub(super) layout: Rc<Layout>,
     // names a direct eval added past the compiled layout, one per grown slot
-    pub(super) extra: Vec<Name>,
+    pub(super) extra: Grown,
+}
+
+// boxed and absent until an eval grows the scope, as nearly every scope never is
+#[derive(Clone, Default)]
+#[allow(clippy::box_collection)]
+pub(super) struct Grown(Option<Box<Vec<Name>>>);
+
+impl Grown {
+    pub(super) fn push(&mut self, name: Name) {
+        self.0.get_or_insert_with(Box::default).push(name);
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl std::ops::Deref for Grown {
+    type Target = [Name];
+
+    fn deref(&self) -> &[Name] {
+        self.0.as_deref().map_or(&[], Vec::as_slice)
+    }
+}
+
+impl std::ops::DerefMut for Grown {
+    fn deref_mut(&mut self) -> &mut [Name] {
+        self.0.as_deref_mut().map_or(&mut [], Vec::as_mut_slice)
+    }
 }
 
 impl Scope {
@@ -27,7 +56,7 @@ impl Scope {
             slots: vec![Value::Undefined; layout.names.len()],
             parent,
             layout,
-            extra: Vec::new(),
+            extra: Grown::default(),
         }));
         super::heap::register_scope(&scope);
         scope
@@ -3298,4 +3327,10 @@ impl PartialEq for AsyncResumeHandle {
     fn eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_scope_keeps_no_room_for_eval_names_until_an_eval_adds_one() {
+    assert_eq!(std::mem::size_of::<Scope>(), 48);
 }
