@@ -73,6 +73,9 @@ impl Output {
         match self {
             #[cfg(target_os = "windows")]
             Self::Composition(presenter) => {
+                if !frame.planes.is_empty() {
+                    presenter.show_video();
+                }
                 presenter.set_edge(frame.background);
                 presenter.present(
                     frame.canvas.rgba_pixels(),

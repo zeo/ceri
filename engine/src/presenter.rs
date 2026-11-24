@@ -12,7 +12,7 @@ use crate::video::VideoSurface;
 use std::sync::{Arc, Weak};
 use windows::Win32::Foundation::{HANDLE, HMODULE, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BOX, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11DeviceContext,
@@ -52,7 +52,11 @@ pub(crate) struct Presenter {
     swapchain: IDXGISwapChain1,
     composition: IDCompositionDevice,
     // the target keeps the tree on the window; its root holds the planes under the canvas
-    _target: IDCompositionTarget,
+    target: Option<IDCompositionTarget>,
+    // a window starts on WARP and may move to the GPU's own device once, with its first
+    // video, so a process that shows none never loads the vendor's driver, which stays
+    // loaded and holds its memory once it has been
+    may_move: bool,
     root: IDCompositionVisual,
     _canvas: IDCompositionVisual,
     planes: Vec<ShownPlane>,
@@ -92,6 +96,51 @@ struct ShownPlane {
 
 impl Presenter {
     pub(crate) fn new(hwnd: isize, width: u32, height: u32) -> Result<Self, String> {
+        Self::on_device(hwnd, width, height, true)
+            .or_else(|_| Self::on_device(hwnd, width, height, false))
+    }
+
+    // a decoder's frames are shared with the GPU's own device without a copy, so a window
+    // moves there the first time it shows video and stays; if it cannot, it stays on WARP
+    pub(crate) fn show_video(&mut self) {
+        if !self.may_move {
+            return;
+        }
+        self.may_move = false;
+        // a window takes one composition target, so this one goes before the next is made
+        self.target = None;
+        match Self::on_device(self.hwnd, self.size.0, self.size.1, false) {
+            Ok(moved) => {
+                let edge = self.edge;
+                *self = moved;
+                self.edge = edge;
+            }
+            Err(error) => {
+                eprintln!("ceri: video stays on the software device, {error}");
+                self.target = self.attach().ok();
+            }
+        }
+    }
+
+    // puts the visual tree on the window
+    fn attach(&self) -> Result<IDCompositionTarget, String> {
+        // SAFETY: plain COM calls on interfaces this presenter owns
+        unsafe {
+            let target = self
+                .composition
+                .CreateTargetForHwnd(HWND(self.hwnd as *mut _), true)
+                .map_err(failed("the window refused a composition target"))?;
+            target
+                .SetRoot(&self.root)
+                .map_err(failed("the visual could not be attached"))?;
+            self.composition
+                .Commit()
+                .map_err(failed("the composition could not be committed"))?;
+            Ok(target)
+        }
+    }
+
+    fn on_device(hwnd: isize, width: u32, height: u32, warp: bool) -> Result<Self, String> {
         let (width, height) = (width.max(1), height.max(1));
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
@@ -99,7 +148,11 @@ impl Presenter {
         unsafe {
             D3D11CreateDevice(
                 None,
-                D3D_DRIVER_TYPE_HARDWARE,
+                if warp {
+                    D3D_DRIVER_TYPE_WARP
+                } else {
+                    D3D_DRIVER_TYPE_HARDWARE
+                },
                 HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 None,
@@ -128,9 +181,6 @@ impl Presenter {
             )?;
             let composition: IDCompositionDevice =
                 DCompositionCreateDevice(&dxgi).map_err(failed("no composition device"))?;
-            let target = composition
-                .CreateTargetForHwnd(HWND(hwnd as *mut _), true)
-                .map_err(failed("the window refused a composition target"))?;
             let root = composition
                 .CreateVisual()
                 .map_err(failed("no composition visual"))?;
@@ -142,20 +192,15 @@ impl Presenter {
                 .map_err(failed("the swapchain could not be shown"))?;
             root.AddVisual(&canvas, false, None)
                 .map_err(failed("the canvas visual could not be attached"))?;
-            target
-                .SetRoot(&root)
-                .map_err(failed("the visual could not be attached"))?;
-            composition
-                .Commit()
-                .map_err(failed("the composition could not be committed"))?;
-            Ok(Self {
+            let mut presenter = Self {
                 hwnd,
                 device,
                 context,
                 factory,
                 swapchain,
                 composition,
-                _target: target,
+                target: None,
+                may_move: warp,
                 root,
                 _canvas: canvas,
                 planes: Vec::new(),
@@ -169,7 +214,9 @@ impl Presenter {
                 outputs: CreateDXGIFactory1().map_err(failed("no DXGI factory"))?,
                 display: None,
                 sdr_only: false,
-            })
+            };
+            presenter.target = Some(presenter.attach()?);
+            Ok(presenter)
         }
     }
 
