@@ -154,6 +154,8 @@ pub(super) struct Regex {
     pub(super) names: Vec<(String, usize)>,
     marks: usize,
     pub(super) flags: Flags,
+    // which ascii units a one-character pattern matches, worked out on the first split by it
+    ascii_units: std::cell::OnceCell<Option<u128>>,
 }
 
 // the start and end of each group, group 0 first
@@ -1186,6 +1188,18 @@ impl Regex {
             names,
             marks,
             flags,
+            ascii_units: std::cell::OnceCell::new(),
+        })
+    }
+
+    // the ascii units a pattern of one character or one class matches, a bit each, so a scan
+    // tests a unit with a shift; none for any other pattern
+    pub(super) fn ascii_units(&self) -> Option<u128> {
+        *self.ascii_units.get_or_init(|| {
+            self.unit_match(0)?;
+            Some((0..128u16).fold(0u128, |bits, unit| {
+                bits | (u128::from(self.unit_match(unit) == Some(true)) << unit)
+            }))
         })
     }
 

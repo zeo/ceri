@@ -535,10 +535,14 @@ impl ScriptRuntime {
                 }
                 // a pattern of one character or class splits at each unit it matches, with no
                 // match run for each position
-                if data.regex.unit_match(0).is_some() {
+                if let Some(ascii) = data.regex.ascii_units() {
                     let mut previous = 0;
                     for (position, &unit) in subject.iter().enumerate() {
-                        if data.regex.unit_match(unit) == Some(true) {
+                        let found = match unit < 128 {
+                            true => ascii >> unit & 1 == 1,
+                            false => data.regex.unit_match(unit) == Some(true),
+                        };
+                        if found {
                             parts.push(Value::String(
                                 from_units(&subject[previous..position]).into(),
                             ));
