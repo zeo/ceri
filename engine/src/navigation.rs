@@ -2807,7 +2807,16 @@ impl Browser {
         };
         let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
         page.runtime.set_pointer_position(x, y);
+        let hit = node;
         let node = page.runtime.pointer_target(node).map_err(script_error)?;
+        // a press that reaches no element is dropped, so the profile says why, for a lost click
+        if event == "pointerdown" {
+            crate::profile::count(match (hit, node) {
+                (None, _) => "input: press hit no box",
+                (Some(_), None) => "input: press target given up",
+                _ => "input: press reached an element",
+            });
+        }
         let hover_changed = if event == "pointermove" && self.hovered_node != node {
             let previous = std::mem::replace(&mut self.hovered_node, node);
             page.runtime
