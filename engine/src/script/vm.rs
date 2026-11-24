@@ -726,6 +726,39 @@ impl ScriptRuntime {
         );
     }
 
+    // a scope for a call or a block, taken from a returned call's when one waits
+    fn new_scope(&mut self, layout: Rc<Layout>, parent: Option<ScopeRef>) -> ScopeRef {
+        let Some(scope) = self.spare_scopes.pop() else {
+            return Scope::new(layout, parent);
+        };
+        {
+            let mut spare = scope.borrow_mut();
+            spare.slots.resize(layout.names.len(), Value::Undefined);
+            spare.parent = parent;
+            spare.layout = layout;
+        }
+        scope
+    }
+
+    // keeps the scopes a returning call made that nothing else holds, innermost first, until
+    // one is held elsewhere, as a closure's is
+    fn recycle_scopes(&mut self, mut scope: Option<ScopeRef>) {
+        const KEPT: usize = 64;
+        while let Some(current) = scope {
+            if Rc::strong_count(&current) != 1 || self.spare_scopes.len() >= KEPT {
+                return;
+            }
+            let Ok(mut spare) = current.try_borrow_mut() else {
+                return;
+            };
+            scope = spare.parent.take();
+            spare.slots.clear();
+            spare.extra.clear();
+            drop(spare);
+            self.spare_scopes.push(current);
+        }
+    }
+
     fn function_frame(
         &mut self,
         closure: &Rc<Closure>,
@@ -737,13 +770,13 @@ impl ScriptRuntime {
     ) -> Frame {
         let code = closure.code.clone();
         let parent = if let Some(layout) = &code.self_scope {
-            let scope = Scope::new(layout.clone(), closure.scope.clone());
+            let scope = self.new_scope(layout.clone(), closure.scope.clone());
             scope.borrow_mut().slots[0] = function.clone();
             Some(scope)
         } else {
             closure.scope.clone()
         };
-        let scope = Scope::new(code.layout.clone(), parent);
+        let scope = self.new_scope(code.layout.clone(), parent);
         // TDZ: lexical bindings start uninitialized; params and vars start undefined
         let mut frame = Frame::new(
             code.clone(),
@@ -1262,7 +1295,8 @@ impl ScriptRuntime {
                 return Ok(None);
             }
         }
-        let finished = frames.pop().expect("a frame is running");
+        let mut finished = frames.pop().expect("a frame is running");
+        self.recycle_scopes(finished.scope.take());
         let value = if finished.construct {
             match value {
                 // host objects such as nodes count as objects, so a custom element's
@@ -1618,7 +1652,7 @@ impl ScriptRuntime {
                 }
                 Op::PushScope(block) => {
                     let layout = frame.code.blocks[block as usize].clone();
-                    let scope = Scope::new(layout, frame.scope.clone());
+                    let scope = self.new_scope(layout, frame.scope.clone());
                     // lexical bindings in a block start in their temporal dead zone
                     for slot in scope.borrow_mut().slots.iter_mut() {
                         *slot = Value::Uninitialized;
@@ -1629,7 +1663,7 @@ impl ScriptRuntime {
                 Op::PushVarScope(block) => {
                     let layout = frame.code.blocks[block as usize].clone();
                     // a function's variable environment, whose bindings start undefined
-                    let scope = Scope::new(layout, frame.scope.clone());
+                    let scope = self.new_scope(layout, frame.scope.clone());
                     frame.scope = Some(scope);
                     frame.scopes += 1;
                 }

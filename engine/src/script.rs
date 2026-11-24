@@ -758,6 +758,8 @@ pub struct ScriptRuntime {
     computed_style_template: Option<JsObject>,
     // the heap generation its nodes are made in, cleared together once its page is gone
     generation: u32,
+    // scopes of returned calls nothing else held, emptied for the next call to take
+    spare_scopes: Vec<vm::ScopeRef>,
     // the length and name a bound function starts with, by its target's name and its length
     bound_templates: HashMap<(Rc<str>, u64), object::ObjectTemplate>,
     // milliseconds from an animation frame request to its callback
@@ -1975,6 +1977,7 @@ impl ScriptRuntime {
             computed_styles: None,
             computed_style_template: None,
             generation,
+            spare_scopes: Vec::new(),
             bound_templates: HashMap::new(),
             frame_interval: crate::navigation::FRAME_INTERVAL,
             visible: true,
