@@ -292,7 +292,6 @@ impl fmt::Display for ScriptError {
 
 impl std::error::Error for ScriptError {}
 
-#[derive(Clone)]
 enum Value {
     Undefined,
     // a lexical binding read before its declaration ran, or an array index nothing was put
@@ -781,9 +780,10 @@ pub struct ScriptRuntime {
     generation: u32,
     // scopes of returned calls nothing else held, emptied for the next call to take
     spare_scopes: Vec<vm::ScopeRef>,
-    // the emptied frames of returned calls, boxed, for the next calls to fill
-    #[allow(clippy::vec_box)]
-    spare_frames: Vec<Box<vm::Frame>>,
+    // active call frames across all nested runs, outermost first
+    frames: Vec<vm::Frame>,
+    // shared runtime value stack holding registers and operands of active frames
+    vm_stack: Vec<Value>,
     // the length and name a bound function starts with, by its target's name and its length
     bound_templates: HashMap<(JsStr, u64), object::ObjectTemplate>,
     // milliseconds from an animation frame request to its callback
@@ -2005,7 +2005,8 @@ impl ScriptRuntime {
             computed_style_template: None,
             generation,
             spare_scopes: Vec::new(),
-            spare_frames: Vec::new(),
+            frames: Vec::new(),
+            vm_stack: Vec::new(),
             bound_templates: HashMap::default(),
             frame_interval: crate::navigation::FRAME_INTERVAL,
             visible: true,
@@ -2292,7 +2293,25 @@ impl ScriptRuntime {
         {
             let mut document = self.document.borrow_mut();
             let handles = self.node_handles.borrow();
-            let ranged = document.range_nodes().into_iter().collect::<HashSet<_>>();
+            let mut busy = document.range_nodes().into_iter().collect::<HashSet<_>>();
+            // keep detached nodes alive while a scheduled task still targets them
+            for task in &self.tasks {
+                if let Value::Builtin(Builtin::Native(native)) = &task.callback {
+                    match &**native {
+                        Native::ImageDeliver(node, _)
+                        | Native::MediaLoad(node, _)
+                        | Native::DialogClose(node)
+                        | Native::PopoverToggle(node)
+                        | Native::ScriptElement(node) => {
+                            busy.insert(*node);
+                        }
+                        Native::MediaCue(cue) => {
+                            busy.insert(cue.0);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             for root in candidates {
                 if !document.contains(root)
                     || root == document.root()
@@ -2301,7 +2320,7 @@ impl ScriptRuntime {
                     continue;
                 }
                 let reachable = document.subtree(root).into_iter().any(|node| {
-                    ranged.contains(&node)
+                    busy.contains(&node)
                         || handles
                             .get(&node)
                             .is_some_and(|handle| Rc::strong_count(handle) > 1)
@@ -11810,7 +11829,113 @@ fn delay_milliseconds(value: f64) -> u64 {
     }
 }
 
+// inline fast path for the common variants so hot VM loops avoid out-of-line clone calls
+impl Clone for Value {
+    #[inline]
+    fn clone(&self) -> Self {
+        match self {
+            Self::Undefined => Self::Undefined,
+            Self::Uninitialized => Self::Uninitialized,
+            Self::Null => Self::Null,
+            Self::Bool(flag) => Self::Bool(*flag),
+            Self::Number(number) => Self::Number(*number),
+            Self::String(text) => Self::String(text.clone()),
+            Self::Object(object) => Self::Object(object.clone()),
+            Self::Array(array) => Self::Array(array.clone()),
+            other => other.clone_slow(),
+        }
+    }
+}
+
 impl Value {
+    #[cold]
+    #[inline(never)]
+    fn clone_slow(&self) -> Self {
+        match self {
+            Self::Undefined
+            | Self::Uninitialized
+            | Self::Null
+            | Self::Bool(_)
+            | Self::Number(_)
+            | Self::String(_)
+            | Self::Object(_)
+            | Self::Array(_) => unreachable!("handled in Clone::clone"),
+            Self::Symbol(symbol) => Self::Symbol(symbol.clone()),
+            Self::BigInt(value) => Self::BigInt(value.clone()),
+            Self::Binding(cell) => Self::Binding(cell.clone()),
+            Self::ConstBinding(cell) => Self::ConstBinding(cell.clone()),
+            Self::NodeList(list) => Self::NodeList(list.clone()),
+            Self::Iterator(iterator) => Self::Iterator(iterator.clone()),
+            Self::Element(element) => Self::Element(element.clone()),
+            Self::Validity(validity) => Self::Validity(validity.clone()),
+            Self::Range(range) => Self::Range(range.clone()),
+            Self::Selection(selection) => Self::Selection(selection.clone()),
+            Self::Dataset(dataset) => Self::Dataset(dataset.clone()),
+            Self::Error(error) => Self::Error(error.clone()),
+            Self::Style(style) => Self::Style(style.clone()),
+            Self::ClassList(list) => Self::ClassList(list.clone()),
+            Self::AnimatedClass(class) => Self::AnimatedClass(class.clone()),
+            Self::Event(event) => Self::Event(event.clone()),
+            Self::Response(response) => Self::Response(response.clone()),
+            Self::ResponseConstructor => Self::ResponseConstructor,
+            Self::Bytes(bytes) => Self::Bytes(bytes.clone()),
+            Self::TypedArray(array) => Self::TypedArray(array.clone()),
+            Self::Headers(headers) => Self::Headers(headers.clone()),
+            Self::Promise(promise) => Self::Promise(promise.clone()),
+            Self::Document => Self::Document,
+            Self::Window => Self::Window,
+            Self::Location(location) => Self::Location(location.clone()),
+            Self::Navigator => Self::Navigator,
+            Self::Clipboard => Self::Clipboard,
+            Self::Crypto => Self::Crypto,
+            Self::SubtleCrypto => Self::SubtleCrypto,
+            Self::History(history) => Self::History(history.clone()),
+            Self::Storage(storage) => Self::Storage(storage.clone()),
+            Self::FormData(data) => Self::FormData(data.clone()),
+            Self::Blob(blob) => Self::Blob(blob.clone()),
+            Self::File(file) => Self::File(file.clone()),
+            Self::FileList(list) => Self::FileList(list.clone()),
+            Self::CanvasContext(context) => Self::CanvasContext(context.clone()),
+            Self::AbortController(controller) => Self::AbortController(controller.clone()),
+            Self::AbortSignal(signal) => Self::AbortSignal(signal.clone()),
+            Self::Worker(worker) => Self::Worker(worker.clone()),
+            Self::WebAssemblyNamespace => Self::WebAssemblyNamespace,
+            Self::Request(request) => Self::Request(request.clone()),
+            Self::HeadersConstructor => Self::HeadersConstructor,
+            Self::RequestConstructor => Self::RequestConstructor,
+            Self::FormDataConstructor => Self::FormDataConstructor,
+            Self::BlobConstructor => Self::BlobConstructor,
+            Self::FileConstructor => Self::FileConstructor,
+            Self::AbortControllerConstructor => Self::AbortControllerConstructor,
+            Self::WorkerConstructor => Self::WorkerConstructor,
+            Self::CacheStorage(storage) => Self::CacheStorage(storage.clone()),
+            Self::Cache(cache) => Self::Cache(cache.clone()),
+            Self::IndexedDbFactory(factory) => Self::IndexedDbFactory(factory.clone()),
+            Self::IndexedDbRequest(request) => Self::IndexedDbRequest(request.clone()),
+            Self::IndexedDbDatabase(db) => Self::IndexedDbDatabase(db.clone()),
+            Self::IndexedDbTransaction(tx) => Self::IndexedDbTransaction(tx.clone()),
+            Self::IndexedDbObjectStore(store) => Self::IndexedDbObjectStore(store.clone()),
+            Self::IndexedDbNameList(list) => Self::IndexedDbNameList(list.clone()),
+            Self::VmIterator(iterator) => Self::VmIterator(iterator.clone()),
+            Self::Builtin(builtin) => Self::Builtin(builtin.clone()),
+        }
+    }
+
+    #[inline(always)]
+    fn fast_drop(self) {
+        match self {
+            Self::Undefined
+            | Self::Uninitialized
+            | Self::Null
+            | Self::Bool(_)
+            | Self::Number(_) => {
+                std::mem::forget(self);
+            }
+            other => drop_value_slow(other),
+        }
+    }
+
+    #[inline]
     fn resolve(&self) -> Value {
         match self {
             Self::Binding(binding) | Self::ConstBinding(binding) => binding.borrow().resolve(),
@@ -11818,7 +11943,16 @@ impl Value {
         }
     }
 
+    #[inline]
+    fn resolve_owned(self) -> Value {
+        match self {
+            Self::Binding(binding) | Self::ConstBinding(binding) => binding.borrow().resolve(),
+            other => other,
+        }
+    }
+
     // an array slot nothing was put at reads as undefined
+    #[inline]
     fn filled(self) -> Self {
         match self {
             Self::Uninitialized => Self::Undefined,
@@ -11826,26 +11960,27 @@ impl Value {
         }
     }
 
+    #[inline]
     fn truthy(&self) -> bool {
-        let value = self.resolve();
-        match &value {
+        match self {
             Self::Undefined | Self::Null => false,
             Self::Bool(value) => *value,
             Self::Number(value) => *value != 0.0 && !value.is_nan(),
             Self::String(value) => !value.is_empty(),
+            Self::Binding(binding) | Self::ConstBinding(binding) => binding.borrow().truthy(),
             _ => true,
         }
     }
 
     fn number(&self) -> Result<f64, ScriptError> {
-        let value = self.resolve();
-        match &value {
+        match self {
             Self::Number(value) => Ok(*value),
             Self::String(value) => Ok(operations::string_to_number(value)),
             Self::Bool(value) => Ok(f64::from(*value as u8)),
             // as ToNumber has them, so clearTimeout(undefined) is a call like any other
             Self::Undefined => Ok(f64::NAN),
             Self::Null => Ok(0.0),
+            Self::Binding(binding) | Self::ConstBinding(binding) => binding.borrow().number(),
             _ => Err(runtime_error("value is not numeric")),
         }
     }
@@ -15490,22 +15625,34 @@ fn sha512_digest(data: &[u8], initial_state: [u64; 8], output_words: usize) -> V
     digest
 }
 
+#[inline(never)]
+fn drop_value_slow(value: Value) {
+    drop(value);
+}
+
+#[inline]
 fn values_equal(left: &Value, right: &Value) -> bool {
-    let left = left.resolve();
-    let right = right.resolve();
-    match (&left, &right) {
+    match (left, right) {
         (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
         (Value::Bool(left), Value::Bool(right)) => left == right,
         (Value::Number(left), Value::Number(right)) => left == right,
         (Value::String(left), Value::String(right)) => left == right,
-        (Value::Symbol(left), Value::Symbol(right)) => left == right,
-        (Value::BigInt(left), Value::BigInt(right)) => left == right,
-        (Value::Binding(_) | Value::ConstBinding(_), _)
-        | (_, Value::Binding(_) | Value::ConstBinding(_)) => {
-            unreachable!("binding values resolve before comparison")
-        }
         (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
         (Value::Array(left), Value::Array(right)) => Rc::ptr_eq(left, right),
+        (Value::Binding(_) | Value::ConstBinding(_), _)
+        | (_, Value::Binding(_) | Value::ConstBinding(_)) => {
+            values_equal(&left.resolve(), &right.resolve())
+        }
+        _ => values_equal_slow(left, right),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn values_equal_slow(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::BigInt(left), Value::BigInt(right)) => left == right,
         (Value::Iterator(left), Value::Iterator(right)) => Rc::ptr_eq(left, right),
         (Value::Promise(left), Value::Promise(right)) => Rc::ptr_eq(left, right),
         (Value::Element(left), Value::Element(right))

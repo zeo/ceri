@@ -1,14 +1,12 @@
 // the devtools protocol's Debugger domain for a page: the scripts it compiled and where each came
 // from, breakpoints on their statements, and a pause that holds the engine thread while the
 // sessions look at the stack
-// it reads the interpreter's frames, boxed there
-#![allow(clippy::vec_box)]
 
 use super::compiler::{Code, Op};
 use super::inspector::frame_id;
 use super::object::new_object;
 use super::operations::same_value;
-use super::vm::{Frame, ScopeRef};
+use super::vm::{Scope, ScopeRef};
 use super::*;
 use serde_json::{Value as Json, json};
 use std::fmt::Write;
@@ -202,6 +200,8 @@ pub(super) struct Snapshot {
     scope: Option<ScopeRef>,
     this: Value,
     catches: bool,
+    // when the mirrored frame kept its locals in vm_stack registers, remember where to write back
+    reg_base: Option<usize>,
 }
 
 #[derive(Default)]
@@ -212,9 +212,6 @@ pub(super) struct Debugger {
     origin: Option<(String, u32, u32)>,
     // the scripts still alive, by the address of their text
     origins: HashMap<usize, Origin>,
-    // every running frame, outermost first, as of its last op, kept whether or not a session
-    // is debugging
-    pub(super) calls: Vec<Site>,
     // the last value thrown and not caught since, with the frames it was thrown in
     thrown: Option<(Value, Vec<Site>)>,
     // the breakpoints in compiled ops, by the code's address and op index; the code is held so
@@ -402,8 +399,9 @@ impl ScriptRuntime {
 
     // the running frames innermost first, one line each as v8 writes an error's stack
     pub(super) fn write_stack(&self, stack: &mut String) {
-        for (code, pc) in self.debugger.calls.iter().rev().take(STACK_FRAMES) {
-            let offset = statement_offset(code, *pc);
+        for frame in self.frames.iter().rev().take(STACK_FRAMES) {
+            let code = &frame.code;
+            let offset = statement_offset(code, frame.pc.saturating_sub(1));
             let (url, (line, column)) = match self.debugger.origins.get(&text_address(&code.text)) {
                 Some(origin) => (
                     origin.url.as_str(),
@@ -431,17 +429,23 @@ impl ScriptRuntime {
 
     // a value thrown inside the running frames, on its way to a handler
     pub(super) fn note_thrown(&mut self, thrown: &Value) {
-        let debugger = &mut self.debugger;
         // a value thrown out of a nested run is thrown again in the run around it
-        if debugger
+        if self
+            .debugger
             .thrown
             .as_ref()
             .is_some_and(|(last, _)| same_value(last, thrown))
         {
             return;
         }
-        let frames = debugger.calls.iter().rev().take(STACK_FRAMES);
-        debugger.thrown = Some((thrown.clone(), frames.cloned().collect()));
+        let frames: Vec<Site> = self
+            .frames
+            .iter()
+            .rev()
+            .take(STACK_FRAMES)
+            .map(|frame| (frame.code.clone(), frame.pc.saturating_sub(1)))
+            .collect();
+        self.debugger.thrown = Some((thrown.clone(), frames));
     }
 
     pub(super) fn note_caught(&mut self) {
@@ -741,28 +745,39 @@ impl ScriptRuntime {
         self.debugger.paused
     }
 
-    fn mirror_frames(&mut self, frames: &[Box<Frame>], base: usize) {
+    fn mirror_frames(&mut self) {
+        let total = self.frames.len();
         let mirror = &mut self.debugger.mirror;
-        let keep = mirror
-            .len()
-            .min((base + frames.len()).saturating_sub(1))
-            .max(base);
-        mirror.truncate(keep);
-        for frame in &frames[keep - base..] {
+        mirror.clear();
+        mirror.reserve(total);
+        for frame in &self.frames {
+            let (scope, reg_base) = if frame.code.uses_regs {
+                let reg_count = frame.code.registers as usize;
+                let slots = self.vm_stack[frame.reg_base..frame.reg_base + reg_count].to_vec();
+                let synthetic = Scope::new_with_slots(
+                    frame.code.layout.clone(),
+                    frame.scope.clone(),
+                    slots,
+                );
+                (Some(synthetic), Some(frame.reg_base))
+            } else {
+                (frame.scope.clone(), None)
+            };
             mirror.push(Snapshot {
                 code: frame.code.clone(),
                 pc: frame.pc,
-                scope: frame.scope.clone(),
+                scope,
                 this: frame.this.clone(),
                 catches: frame.catches(),
+                reg_base,
             });
         }
     }
 
     // before each op: pauses at a breakpoint, a debugger statement, the statement a step or a
     // pause request was waiting for
-    pub(super) fn debug_step(&mut self, frames: &[Box<Frame>], base: usize) {
-        self.mirror_frames(frames, base);
+    pub(super) fn debug_step(&mut self) {
+        self.mirror_frames();
         if self.debugger.paused {
             return;
         }
@@ -770,12 +785,12 @@ impl ScriptRuntime {
         if self.debugger.polled.is_multiple_of(POLL_STEPS) {
             self.poll_pause();
         }
-        let frame = frames.last().expect("a frame is running");
-        let (code, pc) = (&frame.code, frame.pc);
+        let frame = self.frames.last().expect("a frame is running");
+        let (code, pc) = (frame.code.clone(), frame.pc);
         let mut hit = Vec::new();
         let mut stop = false;
         if self.debugger.breaking && code.breakpoints.get() > 0 {
-            let key = (Rc::as_ptr(code) as usize, pc as u32);
+            let key = (Rc::as_ptr(&code) as usize, pc as u32);
             if let Some((_, ids)) = self.debugger.resolved.get(&key) {
                 let ids = ids.clone();
                 stop = self.debugger.continuing && ids.iter().any(String::is_empty);
@@ -806,11 +821,11 @@ impl ScriptRuntime {
     }
 
     // a thrown value on its way to a handler, or out of every run when no frame catches it
-    pub(super) fn debug_thrown(&mut self, frames: &[Box<Frame>], base: usize, thrown: &Value) {
+    pub(super) fn debug_thrown(&mut self, thrown: &Value) {
         if self.debugger.paused {
             return;
         }
-        self.mirror_frames(frames, base);
+        self.mirror_frames();
         let caught = self.debugger.mirror.iter().any(|snapshot| snapshot.catches);
         let wanted = match self.debugger.pause_on {
             PauseOn::None => false,
@@ -1089,11 +1104,14 @@ impl ScriptRuntime {
                 .self_scope
                 .as_ref()
                 .is_some_and(|own| Rc::ptr_eq(own, &layout));
-            let kind = if parent.is_none() {
-                if module { "module" } else { "script" }
-            } else if !local && Rc::ptr_eq(&layout, &snapshot.code.layout) {
+            let kind = if !local
+                && Rc::ptr_eq(&layout, &snapshot.code.layout)
+                && !snapshot.code.is_script
+            {
                 local = true;
                 "local"
+            } else if parent.is_none() {
+                if module { "module" } else { "script" }
             } else if local {
                 "closure"
             } else {
@@ -1189,7 +1207,18 @@ impl ScriptRuntime {
             Value::Uninitialized => Value::Undefined,
             this => this.clone(),
         };
-        self.call_function(closure, this, Vec::new())
+        let result = self.call_function(closure, this, Vec::new());
+        // sync any register mutations performed by debug evaluation back to vm_stack
+        if let (Some(reg_base), Some(scope)) = (snapshot.reg_base, &snapshot.scope) {
+            let slots = &scope.borrow().slots;
+            let count = slots.len();
+            if reg_base + count <= self.vm_stack.len() {
+                for (index, value) in slots.iter().enumerate() {
+                    self.vm_stack[reg_base + index] = value.clone();
+                }
+            }
+        }
+        result
     }
 }
 

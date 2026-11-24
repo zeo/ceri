@@ -67,6 +67,26 @@ pub(super) enum Op {
         increment: bool,
         prefix: bool,
     },
+    // locals of a non-capturing function live directly in the runtime stack frame
+    GetReg {
+        reg: u16,
+        name: u32,
+    },
+    SetReg {
+        reg: u16,
+        name: u32,
+    },
+    InitReg(u16),
+    UpdateReg {
+        reg: u16,
+        name: u32,
+        increment: bool,
+        prefix: bool,
+    },
+    UninitRegs {
+        index: u16,
+        count: u16,
+    },
     GetGlobal(u32),
     SetGlobal(u32),
     InitGlobal(u32),
@@ -310,6 +330,15 @@ pub(super) struct Code {
     pub(super) function_template: std::cell::RefCell<Option<super::object::ObjectTemplate>>,
     // where a run starts: past the prologue slots no arrow needed, which would only be stepped over
     pub(super) entry: usize,
+    // true when this function's own scope lives in flat stack registers instead of a heap Scope
+    pub(super) uses_regs: bool,
+    pub(super) registers: u16,
+    // true when simple parameters map 1:1 to registers 0..param_slots.len()
+    pub(super) linear_params: bool,
+    // true when this function and its inner closures never read any enclosing function scope
+    pub(super) captures_nothing: bool,
+    // true for top-level script and module bodies
+    pub(super) is_script: bool,
 }
 
 #[derive(Debug)]
@@ -509,20 +538,18 @@ impl FunctionState {
         if self.is_global || block.kind != ScopeKind::Block || block.overflowed {
             return false;
         }
-        let captures = self.ops[block.start..].iter().any(|op| {
-            matches!(
-                op,
-                Op::Closure(_)
-                    | Op::Class { .. }
-                    | Op::CallEval(_)
-                    | Op::CallEvalSpread
-                    | Op::CloneScope
-                    | Op::GetName { .. }
-                    | Op::SetName { .. }
-                    | Op::DeleteName { .. }
-                    | Op::TypeofName { .. }
-                    | Op::CalleeName { .. }
-            )
+        let captures = self.ops[block.start..].iter().any(|op| match op {
+            Op::Closure(index) => !self.children[*index as usize].captures_nothing,
+            Op::Class { .. }
+            | Op::CallEval(_)
+            | Op::CallEvalSpread
+            | Op::CloneScope
+            | Op::GetName { .. }
+            | Op::SetName { .. }
+            | Op::DeleteName { .. }
+            | Op::TypeofName { .. }
+            | Op::CalleeName { .. } => true,
+            _ => false,
         });
         let Some(host) = self
             .scopes
@@ -1495,9 +1522,176 @@ impl Compiler {
             .take(4)
             .take_while(|op| matches!(op, Op::Nop))
             .count();
+        let mut captures_nothing = !state.is_global && !state.eval_code && self_scope.is_none();
+        if captures_nothing {
+            let mut nested = 0u16;
+            for op in &ops {
+                match op {
+                    Op::PushScope(_) | Op::PushVarScope(_) => nested += 1,
+                    Op::PopScope => nested = nested.saturating_sub(1),
+                    Op::GetLocal { depth, .. }
+                    | Op::SetLocal { depth, .. }
+                    | Op::InitLocal { depth, .. }
+                    | Op::UpdateLocal { depth, .. }
+                        if *depth > nested =>
+                    {
+                        captures_nothing = false;
+                        break;
+                    }
+                    Op::Closure(index) if !state.children[*index as usize].captures_nothing => {
+                        captures_nothing = false;
+                        break;
+                    }
+                    Op::GetName { .. }
+                    | Op::SetName { .. }
+                    | Op::TypeofName { .. }
+                    | Op::DeleteName { .. }
+                    | Op::CalleeName { .. }
+                    | Op::CallEval(_)
+                    | Op::CallEvalSpread
+                    | Op::Class { .. } => {
+                        captures_nothing = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut uses_regs = !state.is_global
+            && !state.eval_code
+            && !is_async
+            && !is_generator
+            && self_scope.is_none()
+            && simple_params
+            && state.arguments_slot.is_none()
+            && state.this_slot.is_none()
+            && state.new_target_slot.is_none()
+            && state.home_slot.is_none();
+        if uses_regs {
+            for op in &ops {
+                let forbids = match op {
+                    Op::PushScope(_)
+                    | Op::PushVarScope(_)
+                    | Op::PopScope
+                    | Op::CloneScope
+                    | Op::Class { .. }
+                    | Op::CallEval(_)
+                    | Op::CallEvalSpread
+                    | Op::GetName { .. }
+                    | Op::SetName { .. }
+                    | Op::TypeofName { .. }
+                    | Op::DeleteName { .. }
+                    | Op::CalleeName { .. }
+                    | Op::InitThisSlot(_)
+                    | Op::InitArgumentsSlot(_)
+                    | Op::InitNewTargetSlot(_)
+                    | Op::InitHomeSlot(_) => true,
+                    Op::Exit { scopes, .. } if *scopes != 0 => true,
+                    Op::Closure(index) => !state.children[*index as usize].captures_nothing,
+                    _ => false,
+                };
+                if forbids {
+                    uses_regs = false;
+                    break;
+                }
+            }
+        }
+        let registers = if uses_regs {
+            layout.names.len() as u16
+        } else {
+            0
+        };
+        let linear_params = uses_regs
+            && param_slots
+                .iter()
+                .enumerate()
+                .all(|(position, slot)| *slot == Some(position as u16));
+        if uses_regs {
+            for op in &mut ops {
+                match *op {
+                    Op::GetLocal {
+                        depth: 0,
+                        index,
+                        name,
+                    } => *op = Op::GetReg { reg: index, name },
+                    Op::GetLocal {
+                        depth,
+                        index,
+                        name,
+                    } if depth != GLOBAL => {
+                        *op = Op::GetLocal {
+                            depth: depth - 1,
+                            index,
+                            name,
+                        }
+                    }
+                    Op::SetLocal {
+                        depth: 0,
+                        index,
+                        name,
+                    } => *op = Op::SetReg { reg: index, name },
+                    Op::SetLocal {
+                        depth,
+                        index,
+                        name,
+                    } if depth != GLOBAL => {
+                        *op = Op::SetLocal {
+                            depth: depth - 1,
+                            index,
+                            name,
+                        }
+                    }
+                    Op::InitLocal { depth: 0, index } => *op = Op::InitReg(index),
+                    Op::InitLocal { depth, index } if depth != GLOBAL => {
+                        *op = Op::InitLocal {
+                            depth: depth - 1,
+                            index,
+                        }
+                    }
+                    Op::UpdateLocal {
+                        depth: 0,
+                        index,
+                        name,
+                        increment,
+                        prefix,
+                    } => {
+                        *op = Op::UpdateReg {
+                            reg: index,
+                            name,
+                            increment,
+                            prefix,
+                        }
+                    }
+                    Op::UpdateLocal {
+                        depth,
+                        index,
+                        name,
+                        increment,
+                        prefix,
+                    } if depth != GLOBAL => {
+                        *op = Op::UpdateLocal {
+                            depth: depth - 1,
+                            index,
+                            name,
+                            increment,
+                            prefix,
+                        }
+                    }
+                    Op::Uninitialize { index, count } => {
+                        *op = Op::UninitRegs { index, count };
+                    }
+                    _ => {}
+                }
+            }
+        }
         Code {
             ops,
             entry,
+            uses_regs,
+            registers,
+            linear_params,
+            captures_nothing,
+            is_script: state.is_global,
             names: state.names,
             children: state.children,
             classes: state.classes,
@@ -2360,15 +2554,14 @@ impl Compiler {
         // the copy only shows to a function made in the loop or code a direct eval runs there,
         // so a loop with neither keeps one scope and spares a copy per iteration
         if let Some(clone) = clone {
-            let ops = &self.state().ops[head as usize..];
-            let captures = ops.iter().any(|op| {
-                matches!(
-                    op,
-                    Op::Closure(_) | Op::Class { .. } | Op::CallEval(_) | Op::CallEvalSpread
-                )
+            let state = self.state();
+            let captures = state.ops[head as usize..].iter().any(|op| match op {
+                Op::Closure(index) => !state.children[*index as usize].captures_nothing,
+                Op::Class { .. } | Op::CallEval(_) | Op::CallEvalSpread => true,
+                _ => false,
             });
             if !captures {
-                self.state().ops[clone] = Op::Nop;
+                state.ops[clone] = Op::Nop;
             }
         }
         self.emit(Op::Jump(start));

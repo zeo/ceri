@@ -827,8 +827,8 @@ impl ScriptRuntime {
     }
 
     pub(super) fn loose_equals(&mut self, left: Value, right: Value) -> Result<bool, ScriptError> {
-        let left = left.resolve();
-        let right = right.resolve();
+        let left = left.resolve_owned();
+        let right = right.resolve_owned();
         Ok(match (&left, &right) {
             (Value::Undefined | Value::Null, Value::Undefined | Value::Null) => true,
             (Value::Undefined | Value::Null, _) | (_, Value::Undefined | Value::Null) => false,
@@ -2673,15 +2673,9 @@ fn receiver_label(value: &Value) -> String {
     }
 }
 
+#[inline]
 pub(super) fn strict_equals(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left == right,
-        (Value::Binding(_) | Value::ConstBinding(_), _)
-        | (_, Value::Binding(_) | Value::ConstBinding(_)) => {
-            strict_equals(&left.resolve(), &right.resolve())
-        }
-        _ => values_equal(left, right),
-    }
+    values_equal(left, right)
 }
 
 // SameValueZero: like === except NaN equals itself
