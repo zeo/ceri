@@ -1533,6 +1533,39 @@ impl ScriptRuntime {
                     let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
                     self.write_local(frame, depth, index, name, value)?;
                 }
+                Op::UpdateLocal {
+                    depth,
+                    index,
+                    name,
+                    increment,
+                    prefix,
+                } => {
+                    let current = self.read_local(frame, depth, index, name)?;
+                    let delta = if increment { 1 } else { -1 };
+                    let (old, new) = match current {
+                        Value::Number(number) => (
+                            Value::Number(number),
+                            Value::Number(number + f64::from(delta)),
+                        ),
+                        other => match self.coerce_numeric(other)? {
+                            Value::BigInt(value) => {
+                                let stepped =
+                                    value.add(&super::bigint::BigInt::from_i64(i64::from(delta)));
+                                (Value::BigInt(value), Value::BigInt(Rc::new(stepped)))
+                            }
+                            numeric => {
+                                let number = self.coerce_number(numeric)?;
+                                (
+                                    Value::Number(number),
+                                    Value::Number(number + f64::from(delta)),
+                                )
+                            }
+                        },
+                    };
+                    let frame = frames.last_mut().expect("frame");
+                    self.write_local(frame, depth, index, name, new.clone())?;
+                    frame.stack.push(if prefix { new } else { old });
+                }
                 Op::InitLocal { depth, index } => {
                     let value = Self::pop(frame);
                     let mut scope = Self::scope_cell_at(frame, depth).borrow_mut();

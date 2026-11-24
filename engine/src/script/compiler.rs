@@ -58,6 +58,15 @@ pub(super) enum Op {
         depth: u16,
         index: u16,
     },
+    // `x++`, `--x` and the like on a writable local, read, stepped and written in one op,
+    // leaving the old value for a postfix and the new one for a prefix
+    UpdateLocal {
+        depth: u16,
+        index: u16,
+        name: u32,
+        increment: bool,
+        prefix: bool,
+    },
     GetGlobal(u32),
     SetGlobal(u32),
     InitGlobal(u32),
@@ -545,6 +554,7 @@ impl FunctionState {
                 Op::PopScope => nested = nested.saturating_sub(1),
                 Op::GetLocal { depth, index, .. }
                 | Op::SetLocal { depth, index, .. }
+                | Op::UpdateLocal { depth, index, .. }
                 | Op::InitLocal { depth, index } => {
                     if *depth == nested {
                         *index = moved(*index);
@@ -4058,6 +4068,26 @@ impl Compiler {
         prefix: bool,
         target: &Expr,
     ) -> Result<(), ScriptError> {
+        // a writable local no with object or eval can shadow steps in place
+        if let Expr::Identifier(name) = target
+            && !self.shadowable(name)
+            && self.with_objects(name).is_empty()
+            && let Some((depth, index, kind)) = self.resolve(name)
+            && !matches!(
+                kind,
+                BindingKind::Const | BindingKind::Import | BindingKind::SelfName
+            )
+        {
+            let name = self.name(name);
+            self.emit(Op::UpdateLocal {
+                depth,
+                index,
+                name,
+                increment,
+                prefix,
+            });
+            return Ok(());
+        }
         let step = if increment {
             Op::Increment
         } else {
