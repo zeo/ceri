@@ -746,6 +746,9 @@ static INTERFACES: &[Interface] = &[
             ("videoHeight", ReadOnly),
             ("poster", Url("poster")),
             ("playsInline", Flag("playsinline")),
+            ("requestVideoFrameCallback", Method(1)),
+            ("cancelVideoFrameCallback", Method(1)),
+            ("getVideoPlaybackQuality", Method(0)),
         ],
     },
     Interface {

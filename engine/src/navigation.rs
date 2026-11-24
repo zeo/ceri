@@ -7854,6 +7854,41 @@ mod tests {
     }
 
     #[test]
+    fn a_video_frame_callback_runs_once_with_the_frame_shown_and_quality_counts_frames() {
+        let mut resources = bundle(
+            r#"<video id="v" src="/reel.mp4" muted style="display: block; width: 40px; height: 20px"></video><p id="status"></p><script>
+                const log = [];
+                const v = document.getElementById("v");
+                const cancelled = v.requestVideoFrameCallback(() => log.push("cancelled ran"));
+                v.cancelVideoFrameCallback(cancelled);
+                let calls = 0;
+                v.requestVideoFrameCallback((now, frame) => {
+                    calls++;
+                    log.push(typeof now, frame.width + "x" + frame.height, frame.presentedFrames >= 1, frame.mediaTime >= 0, frame.expectedDisplayTime >= frame.presentationTime);
+                });
+                try { v.requestVideoFrameCallback(1); } catch (error) { log.push(error.name); }
+                v.play();
+                v.onended = () => {
+                    const quality = v.getVideoPlaybackQuality();
+                    log.push(calls, quality.totalVideoFrames > 1, quality.droppedVideoFrames, quality.corruptedVideoFrames);
+                    document.getElementById("status").textContent = log.join(",");
+                };
+            </script>"#,
+        );
+        resources
+            .insert("/reel.mp4", "video/mp4", b"reel".to_vec())
+            .expect("video should be accepted");
+        let mut browser = Browser::new(resources).with_media_decoder(Arc::new(Reel));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("video page should load");
+        assert_eq!(
+            play_until_status(&mut browser),
+            "TypeError,number,4x2,true,true,true,1,true,0,0"
+        );
+    }
+
+    #[test]
     fn a_playing_video_shown_as_a_plane_leaves_its_box_clear_and_new_frames_unpainted() {
         let mut resources = bundle(
             r#"<video id="v" src="/reel.mp4" muted style="display: block; width: 40px; height: 20px"></video><div id="cover" style="position: absolute; left: 8px; top: 8px; width: 10px; height: 10px; background: rgba(0, 0, 255, 0.6)"></div><p id="status"></p><script>

@@ -67,6 +67,9 @@ struct MediaElement {
     connected: bool,
     reported: u64,
     waiters: Vec<PromiseHandle>,
+    // frames shown since the element was made, and the callbacks waiting on the next one
+    presented: u64,
+    frame_callbacks: Vec<(u64, Value)>,
 }
 
 impl MediaElement {
@@ -99,6 +102,8 @@ impl MediaElement {
             connected: false,
             reported: 0,
             waiters: Vec::new(),
+            presented: 0,
+            frame_callbacks: Vec::new(),
         }
     }
 
@@ -208,6 +213,7 @@ impl MediaElement {
                     self.frame = Some(picture);
                     self.frame_time = at;
                     self.shown = true;
+                    self.presented += 1;
                     step.frames += 1;
                 }
                 done = state.exhausted();
@@ -686,6 +692,9 @@ impl ScriptRuntime {
             let audio = &self.audio;
             element.follow_sound(now, muted, |rate, render| audio.open(Some(rate), render));
             frames += step.frames;
+            if step.frames > 0 && !element.frame_callbacks.is_empty() {
+                self.run_video_frame_callbacks(node);
+            }
             if step.failed {
                 self.fail_media(node);
             }
@@ -843,6 +852,34 @@ impl ScriptRuntime {
                 self.load_media(node);
                 Value::Undefined
             }
+            ("requestVideoFrameCallback", Call) => {
+                if !is_callable(&first) {
+                    return Err(self.type_error(
+                        "Failed to execute 'requestVideoFrameCallback' on 'HTMLVideoElement': The callback provided as parameter 1 is not a function.",
+                    ));
+                }
+                let id = self.next_task_id;
+                self.next_task_id = id.saturating_add(1);
+                let element = self.media.elements.get_mut(&node).expect("inserted above");
+                element.frame_callbacks.push((id, first));
+                Value::Number(id as f64)
+            }
+            ("cancelVideoFrameCallback", Call) => {
+                let id = self.coerce_number(first)? as u64;
+                let element = self.media.elements.get_mut(&node).expect("inserted above");
+                element.frame_callbacks.retain(|(waiting, _)| *waiting != id);
+                self.tasks.retain(|task| task.id != id);
+                Value::Undefined
+            }
+            ("getVideoPlaybackQuality", Call) => {
+                let presented = element.presented as f64;
+                self.object_from_entries(vec![
+                    ("creationTime".into(), Value::Number(now as f64)),
+                    ("totalVideoFrames".into(), Value::Number(presented)),
+                    ("droppedVideoFrames".into(), Value::Number(0.0)),
+                    ("corruptedVideoFrames".into(), Value::Number(0.0)),
+                ])
+            }
             ("play", Call) => Value::Promise(self.play_media(node)),
             ("pause", Call) => {
                 self.pause_media(node);
@@ -851,6 +888,35 @@ impl ScriptRuntime {
             _ => return Ok(None),
         };
         Ok(Some(value))
+    }
+
+    // the callbacks waiting on a video's next frame run once, with the frame it showed
+    fn run_video_frame_callbacks(&mut self, node: NodeId) {
+        let now = self.clock;
+        let element = self.media.elements.get_mut(&node).expect("pumped above");
+        let callbacks = std::mem::take(&mut element.frame_callbacks);
+        let (width, height) = element.info.map_or((0, 0), |info| (info.width, info.height));
+        let (media_time, presented) = (element.frame_time, element.presented);
+        let metadata = self.object_from_entries(vec![
+            ("presentationTime".into(), Value::Number(now as f64)),
+            (
+                "expectedDisplayTime".into(),
+                Value::Number(now.saturating_add(self.frame_interval) as f64),
+            ),
+            ("width".into(), Value::Number(f64::from(width))),
+            ("height".into(), Value::Number(f64::from(height))),
+            ("mediaTime".into(), Value::Number(media_time)),
+            ("presentedFrames".into(), Value::Number(presented as f64)),
+        ]);
+        for (id, callback) in callbacks {
+            self.tasks.push(ScheduledTask {
+                id,
+                due: now,
+                callback,
+                arguments: vec![Value::Number(now as f64), metadata.clone()],
+                kind: TaskKind::Timeout,
+            });
+        }
     }
 
     fn media_number(&mut self, value: Value, name: &str) -> Result<f64, ScriptError> {
