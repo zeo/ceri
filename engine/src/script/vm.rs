@@ -1817,9 +1817,10 @@ impl ScriptRuntime {
                 }
                 Op::DefineField(name) => {
                     let value = Self::pop(frame);
-                    let key = frame.code.names[name as usize].to_string();
                     if let Some(Value::Object(object)) = frame.stack.last() {
-                        object.borrow_mut().define(key, Property::data(value));
+                        object
+                            .borrow_mut()
+                            .define_key(&frame.code.names[name as usize], Property::data(value));
                     }
                 }
                 Op::DefineComputed => {

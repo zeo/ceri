@@ -717,14 +717,19 @@ impl JsObject {
 
     // defines or replaces a property with exact attributes
     pub(super) fn define(&mut self, key: String, property: Property) {
-        if let Some(position) = self.position(&key) {
+        self.define_key(&key, property);
+    }
+
+    // the same with a borrowed key, which a shared shape that already has it never copies
+    pub(super) fn define_key(&mut self, key: &str, property: Property) {
+        if let Some(position) = self.position(key) {
             self.properties.own()[position] = property;
             return;
         }
         if self.shape.own || self.properties.len() >= SHARED_KEYS {
             self.own_shape().push_own(Rc::from(key));
         } else {
-            self.shape = self.shape.with_key(&key);
+            self.shape = self.shape.with_key(key);
             let length = self.properties.len();
             if length == self.properties.capacity() {
                 // never more than doubling would take, so a shape shared by unlike objects only
