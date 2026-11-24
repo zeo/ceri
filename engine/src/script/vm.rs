@@ -1417,7 +1417,11 @@ impl ScriptRuntime {
     // one instruction; Some ends this run with a result
     fn step(&mut self, frames: &mut Vec<Frame>) -> Result<Option<RunResult>, ScriptError> {
         // ops that leave the same frame on top run on here, sparing each a trip through the run loop
-        let mut budget = 64;
+        // a debugger or a step limit looks at every op, so each takes its own trip then; either
+        // one set while these run is seen when the next trip starts
+        let watched = self.debugger.active || self.step_limit.is_some();
+        let mut budget = if watched { 1 } else { 64 };
+        let sampling = crate::profile::enabled();
         loop {
             let depth = frames.len();
             let frame = frames.last_mut().expect("a frame is running");
@@ -1450,9 +1454,12 @@ impl ScriptRuntime {
                     let value = self.template_object(&code, index as usize);
                     frames.last_mut().expect("frame").stack.push(value);
                 }
-                Op::Pop => {
-                    frame.stack.pop();
-                }
+                Op::Pop => match frame.stack.pop() {
+                    // these own nothing, so they go without the drop a value takes
+                    Some(Value::Number(_) | Value::Bool(_) | Value::Undefined | Value::Null)
+                    | None => {}
+                    Some(other) => drop(other),
+                },
                 Op::Dup => {
                     let value = frame.stack.last().cloned().unwrap_or(Value::Undefined);
                     frame.stack.push(value);
@@ -2448,12 +2455,22 @@ impl ScriptRuntime {
                 }
                 Op::Jump(target) => frame.pc = target as usize,
                 Op::JumpIfFalse(target) => {
-                    if !Self::pop(frame).truthy() {
+                    let test = match frame.stack.pop() {
+                        Some(Value::Bool(test)) => test,
+                        Some(other) => other.truthy(),
+                        None => false,
+                    };
+                    if !test {
                         frame.pc = target as usize;
                     }
                 }
                 Op::JumpIfTrue(target) => {
-                    if Self::pop(frame).truthy() {
+                    let test = match frame.stack.pop() {
+                        Some(Value::Bool(test)) => test,
+                        Some(other) => other.truthy(),
+                        None => false,
+                    };
+                    if test {
                         frame.pc = target as usize;
                     }
                 }
@@ -2748,12 +2765,7 @@ impl ScriptRuntime {
                 }
             }
             budget -= 1;
-            if budget == 0
-                || frames.len() != depth
-                || self.debugger.active
-                || self.step_limit.is_some()
-                || self.interrupted
-            {
+            if budget == 0 || frames.len() != depth {
                 return Ok(None);
             }
             // what the run loop does before each op: note the top frame's place, for an error to
@@ -2763,9 +2775,11 @@ impl ScriptRuntime {
                 Some(call) if Rc::ptr_eq(&call.0, &top.code) => call.1 = top.pc,
                 _ => return Ok(None),
             }
-            self.steps += 1;
-            if self.steps.is_multiple_of(1024) && crate::profile::enabled() {
-                self.sample_script(frames);
+            if sampling {
+                self.steps += 1;
+                if self.steps.is_multiple_of(1024) {
+                    self.sample_script(frames);
+                }
             }
         }
     }

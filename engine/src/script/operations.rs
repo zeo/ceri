@@ -168,6 +168,11 @@ pub(super) fn string_to_number(text: &str) -> f64 {
 }
 
 pub(super) fn to_int32_number(value: f64) -> i32 {
+    // a number that is already a 32-bit integer, as nearly all are, converts as it stands
+    let whole = value as i32;
+    if f64::from(whole) == value {
+        return whole;
+    }
     to_uint32_number(value) as i32
 }
 
@@ -701,9 +706,21 @@ impl ScriptRuntime {
                 B::GreaterEqual => Some(Value::Bool(a >= b)),
                 B::StrictEqual | B::Equal => Some(Value::Bool(a == b)),
                 B::StrictNotEqual | B::NotEqual => Some(Value::Bool(a != b)),
+                B::BitOr => Some(Value::Number(f64::from(
+                    to_int32_number(a) | to_int32_number(b),
+                ))),
+                B::BitAnd => Some(Value::Number(f64::from(
+                    to_int32_number(a) & to_int32_number(b),
+                ))),
+                B::BitXor => Some(Value::Number(f64::from(
+                    to_int32_number(a) ^ to_int32_number(b),
+                ))),
                 _ => None,
             };
             if let Some(value) = fast {
+                // two numbers own nothing, so there is nothing to drop
+                std::mem::forget(left);
+                std::mem::forget(right);
                 return Ok(value);
             }
         }
