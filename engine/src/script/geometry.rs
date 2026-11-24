@@ -416,6 +416,13 @@ fn camel_case(property: &str) -> String {
     result
 }
 
+// the layout a script's read of a box last made, together with its wake time and repaint-only motion
+pub(crate) type MeasuredFrame = (
+    Rc<LayoutDocument>,
+    Option<u64>,
+    Option<std::collections::BTreeSet<NodeId>>,
+);
+
 impl ScriptRuntime {
     pub(crate) fn set_layout_inputs(&mut self, inputs: Rc<RefCell<LayoutInputs>>) {
         self.layout_inputs = Some(inputs);
@@ -556,11 +563,7 @@ impl ScriptRuntime {
         version: u64,
         stylesheet: crate::navigation::SheetIdentity,
         state: &StyleState,
-    ) -> Option<(
-        Rc<LayoutDocument>,
-        Option<u64>,
-        Option<std::collections::BTreeSet<NodeId>>,
-    )> {
+    ) -> Option<MeasuredFrame> {
         let measured = self.measured.borrow();
         let measured = measured.as_ref()?;
         let same = measured.state.eq_for_measured(state);
@@ -1000,6 +1003,7 @@ impl ScriptRuntime {
         inputs
             .stylesheet
             .populate_custom_properties(&document, &mut state);
+        let _styles = crate::css::memoize_styles();
         let (style, font_size) = inputs.stylesheet.computed_style(&document, node, &state)?;
         let padding = resolve_edges(style.padding, parent_width, font_size);
         let rect = geometry.rect;

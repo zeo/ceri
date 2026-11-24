@@ -1482,7 +1482,7 @@ impl DeviceBounds {
 // a subtree's bounds, and how far glyphs, outlines and focus rings can reach past them, which
 // is none under a transform
 type Extent = (Rect, Option<f32>);
-type Extents = std::collections::HashMap<(usize, [u32; 2]), Extent>;
+type Extents = crate::hashing::HashMap<(usize, [u32; 2]), Extent>;
 
 thread_local! {
     // the extent of each box asked about while one layout paints, by the box's address and
@@ -1509,7 +1509,7 @@ fn memoize_extents() -> MemoizedExtents {
         let mut extents = extents.borrow_mut();
         let began = extents.is_none();
         if began {
-            *extents = Some(std::collections::HashMap::default());
+            *extents = Some(crate::hashing::HashMap::default());
         }
         MemoizedExtents { began }
     })
@@ -2916,6 +2916,7 @@ pub(crate) fn damage(
     planes: &[Plane],
 ) -> Damage {
     let _profile = crate::profile::scope("paint: damage");
+    let _extents = memoize_extents();
     let ((old, old_canvases), (new, new_canvases)) = (before, after);
     if old.viewport != new.viewport || old.prose_selections != new.prose_selections {
         return Damage::Everything;
@@ -2968,6 +2969,9 @@ fn changed_area(
     depth: usize,
     area: &mut Region,
 ) -> bool {
+    if std::ptr::eq(old, new) && offsets.0 == offsets.1 {
+        return true;
+    }
     if old.same_own(new) && old.children.len() == new.children.len() {
         if old.transform.is_some() || !old.filters.own.is_empty() {
             if old.children == new.children {
@@ -4861,7 +4865,7 @@ fn paint_control_selection(
     let Some(value) = &layout_box.control_value else {
         return;
     };
-    let Some((start, end, _)) = layout_box.control_selection else {
+    let Some(&(start, end, _)) = layout_box.control_selection.as_deref() else {
         return;
     };
     if layout_box.control_text_origin.is_none() || start == end {
@@ -4912,7 +4916,8 @@ fn paint_control_caret(
     }
     let caret = layout_box
         .control_selection
-        .map(|(start, end, backward)| if backward { start } else { end })
+        .as_deref()
+        .map(|&(start, end, backward)| if backward { start } else { end })
         .unwrap_or_else(|| value.encode_utf16().count());
     let Some((x, y)) = control_text_position(layout_box, value, caret) else {
         return;
@@ -6508,7 +6513,10 @@ mod tests {
         let list = document
             .find_element_by_id("list")
             .expect("the list exists");
-        state.scroll_offsets.make_mut().insert(list, (0.0, scrolled));
+        state
+            .scroll_offsets
+            .make_mut()
+            .insert(list, (0.0, scrolled));
         let stylesheet =
             Stylesheet::parse(&format!("{DAMAGE_STYLE}{extra}")).expect("stylesheet should parse");
         crate::layout::layout_with_state(
@@ -6615,7 +6623,10 @@ mod tests {
         let scroller = document
             .find_element_by_id("list")
             .expect("the list exists");
-        state.scroll_offsets.make_mut().insert(scroller, (0.0, list));
+        state
+            .scroll_offsets
+            .make_mut()
+            .insert(scroller, (0.0, list));
         state
             .scroll_offsets
             .make_mut()
@@ -7116,6 +7127,8 @@ mod tests {
                 stable_gutter: false,
                 row_baseline: None,
                 margin: Default::default(),
+                child_shift: (0.0, 0.0),
+                has_child_shift: false,
             },
             images: Vec::new(),
             prose_selections: vec![crate::layout::ProseSpan {
@@ -7817,6 +7830,8 @@ mod tests {
                 stable_gutter: false,
                 row_baseline: None,
                 margin: Default::default(),
+                child_shift: (0.0, 0.0),
+                has_child_shift: false,
             },
             images: Vec::new(),
             prose_selections: Vec::new(),
@@ -7826,7 +7841,7 @@ mod tests {
 
         let mut focused = document.clone();
         focused.root.control_value = Some("A".to_string());
-        focused.root.control_selection = Some((0, 1, false));
+        focused.root.control_selection = Some(Box::new((0, 1, false)));
         focused.root.control_focused = true;
         focused.root.control_text_origin = Some((4.0, 5.0));
         let focused_canvas = paint(&focused);
@@ -7846,7 +7861,7 @@ mod tests {
             &focused_canvas.rgba_pixels()[selection_index..selection_index + 3],
             &[170, 205, 238]
         );
-        focused.root.control_selection = Some((0, 1, true));
+        focused.root.control_selection = Some(Box::new((0, 1, true)));
         let backward_canvas = paint(&focused);
         let backward_caret_index = ((5 * backward_canvas.width() + 4) * 4) as usize;
         assert_eq!(
@@ -7947,7 +7962,7 @@ mod tests {
                     },
                 ],
                 control_value: Some("ABCD".to_string()),
-                control_selection: Some((2, 3, false)),
+                control_selection: Some(Box::new((2, 3, false))),
                 control_focused: true,
                 control_text_origin: Some((4.0, 5.0)),
                 children: Vec::new(),
@@ -7978,6 +7993,8 @@ mod tests {
                 stable_gutter: false,
                 row_baseline: None,
                 margin: Default::default(),
+                child_shift: (0.0, 0.0),
+                has_child_shift: false,
             },
             images: Vec::new(),
             prose_selections: Vec::new(),
@@ -7993,7 +8010,7 @@ mod tests {
             &canvas.rgba_pixels()[caret_index..caret_index + 3],
             &[0, 0, 0]
         );
-        document.root.control_selection = Some((0, 0, false));
+        document.root.control_selection = Some(Box::new((0, 0, false)));
         assert_ne!(paint(&document).rgba_pixels(), canvas.rgba_pixels());
     }
 }

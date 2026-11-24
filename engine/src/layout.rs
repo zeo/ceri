@@ -146,7 +146,7 @@ pub struct LayoutBox {
     pub(crate) outline: Option<BoxOutline>,
     pub text: Vec<TextRun>,
     pub(crate) control_value: Option<String>,
-    pub(crate) control_selection: Option<(usize, usize, bool)>,
+    pub(crate) control_selection: Option<Box<(usize, usize, bool)>>,
     pub(crate) control_focused: bool,
     pub(crate) control_text_origin: Option<(f32, f32)>,
     pub children: Vec<Rc<LayoutBox>>,
@@ -185,6 +185,9 @@ pub struct LayoutBox {
     // item's bottom edge when it holds no line of text
     pub(crate) row_baseline: Option<f32>,
     pub(crate) margin: ResolvedEdges,
+    // deferred translation accumulated for descendants during layout and flushed once at the end
+    pub(crate) child_shift: (f32, f32),
+    pub(crate) has_child_shift: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -977,11 +980,12 @@ pub fn layout_with_state(
         stylesheet.populate_custom_properties(document, &mut computed_state);
     }
     let style_state = &computed_state;
+    let _styles = crate::css::memoize_styles();
+    let root_font = root_font_size(document, stylesheet, viewport, style_state);
     let _root_environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
         viewport,
-        root_font_size: root_font_size(document, stylesheet, viewport, style_state),
+        root_font_size: root_font,
     });
-    let _styles = crate::css::memoize_styles();
     let _answers = keep_answers(document, stylesheet, style_state);
     let mut root = LayoutBox {
         node: document.root(),
@@ -1041,10 +1045,12 @@ pub fn layout_with_state(
         stable_gutter: false,
         row_baseline: None,
         margin: ResolvedEdges::default(),
+        child_shift: (0.0, 0.0),
+        has_child_shift: false,
     };
     // the root element's scrollbar styles draw the viewport's bars
     if let Some(html) = document.document_element() {
-        let font_size = root_font_size(document, stylesheet, viewport, style_state);
+        let font_size = root_font;
         let style = stylesheet.style_for(Subject::new(document, html).style_context(
             ParentStyle {
                 font_size,
@@ -1064,6 +1070,7 @@ pub fn layout_with_state(
             scrollbar_for(stylesheet, (document, html), &style, font_size, style_state);
     }
     root.children = layout_document_children(document, stylesheet, viewport, style_state);
+    flush_child_shifts(&mut root, (0.0, 0.0));
     finalize_scroll(&mut root, ResolvedEdges::default(), style_state);
     // a classic vertical scrollbar takes its width from the initial and fixed containing
     // blocks, while vw, resolved from the layout environment, keeps the whole viewport
@@ -1074,6 +1081,7 @@ pub fn layout_with_state(
         };
         CONTAINERS.with(|containers| containers.borrow_mut().clear());
         root.children = layout_document_children(document, stylesheet, scrollport, style_state);
+        flush_child_shifts(&mut root, (0.0, 0.0));
         finalize_scroll(&mut root, ResolvedEdges::default(), style_state);
     }
     LayoutDocument {
@@ -2110,6 +2118,27 @@ fn position_layout_box(
         let offset_x = x - layout.rect.x;
         let offset_y = y - layout.rect.y;
         translate_layout_box(layout, offset_x, offset_y);
+    }
+}
+
+fn append_positioned_to(
+    layout: &mut LayoutBox,
+    nodes: Vec<Subject<'_>>,
+    context: PositionedLayoutContext<'_>,
+) {
+    if nodes.is_empty() {
+        return;
+    }
+    let start = layout.children.len();
+    append_positioned_nodes(&mut layout.children, nodes, context);
+    let shift = layout.child_shift;
+    for child in &mut layout.children[start..] {
+        if shift != (0.0, 0.0) {
+            translate_layout_box(Rc::make_mut(child), -shift.0, -shift.1);
+        }
+        if child.has_child_shift {
+            layout.has_child_shift = true;
+        }
     }
 }
 
@@ -4089,6 +4118,8 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
             *thumb = 16.0;
         }
     }
+    let children: Vec<Rc<LayoutBox>> = children.into_iter().map(Rc::new).collect();
+    let has_child_shift = children.iter().any(|child| child.has_child_shift);
     let mut layout = LayoutBox {
         node: node.node,
         tag: name.to_string(),
@@ -4119,11 +4150,12 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
             .filter(|color| *color != style.color),
         control_selection: node
             .own()
-            .and_then(|own| style_state.text_selections.get(&own).copied()),
+            .and_then(|own| style_state.text_selections.get(&own).copied())
+            .map(Box::new),
         control_focused: node.own().is_some() && style_state.focused == node.own(),
         control_text_origin,
         control_value,
-        children: children.into_iter().map(Rc::new).collect(),
+        children,
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
@@ -4152,6 +4184,8 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
             style_state,
         ),
         margin,
+        child_shift: (0.0, 0.0),
+        has_child_shift,
     };
     // a checked box fills with the accent color, and a checked radio rings with it, unless
     // the page painted the box itself
@@ -4177,8 +4211,8 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     apply_relative_offset(&mut layout, style, containing_block, font_size);
     apply_transform(&mut layout, &style, font_size);
     let positioned_block = padding_block(&layout);
-    append_positioned_nodes(
-        &mut layout.children,
+    append_positioned_to(
+        &mut layout,
         positioned,
         PositionedLayoutContext {
             containing_block: if style.position == Position::Static {
@@ -4329,6 +4363,8 @@ fn anonymous_box(
         stable_gutter: false,
         row_baseline: None,
         margin: ResolvedEdges::default(),
+        child_shift: (0.0, 0.0),
+        has_child_shift: false,
     }
 }
 
@@ -4617,28 +4653,55 @@ fn baseline_offset(layout: &LayoutBox) -> f32 {
 }
 
 fn first_baseline(layout: &LayoutBox) -> Option<f32> {
-    baselines(layout).reduce(f32::min)
+    first_baseline_at(layout, 0.0)
 }
 
 fn last_baseline(layout: &LayoutBox) -> Option<f32> {
-    baselines(layout).reduce(f32::max)
+    last_baseline_at(layout, 0.0)
 }
 
-fn baselines(layout: &LayoutBox) -> Box<dyn Iterator<Item = f32> + '_> {
+fn first_baseline_at(layout: &LayoutBox, shift_y: f32) -> Option<f32> {
     if let Some(offset) = layout.row_baseline {
-        return Box::new(std::iter::once(layout.rect.y + offset));
+        return Some(layout.rect.y + shift_y + offset);
     }
     let fonts = crate::font::active_fonts();
-    let own = layout
-        .text
-        .iter()
-        .map(move |run| run.y + fonts.ascent(run.font_stack, run.font_size));
-    let nested = layout
-        .children
-        .iter()
-        .filter(|child| !child.position.is_out_of_flow())
-        .flat_map(|child| baselines(child));
-    Box::new(own.chain(nested))
+    let mut best: Option<f32> = None;
+    for run in &layout.text {
+        let y = run.y + shift_y + fonts.ascent(run.font_stack, run.font_size);
+        best = Some(best.map_or(y, |current| current.min(y)));
+    }
+    let child_shift = shift_y + layout.child_shift.1;
+    for child in &layout.children {
+        if child.position.is_out_of_flow() {
+            continue;
+        }
+        if let Some(y) = first_baseline_at(child, child_shift) {
+            best = Some(best.map_or(y, |current| current.min(y)));
+        }
+    }
+    best
+}
+
+fn last_baseline_at(layout: &LayoutBox, shift_y: f32) -> Option<f32> {
+    if let Some(offset) = layout.row_baseline {
+        return Some(layout.rect.y + shift_y + offset);
+    }
+    let fonts = crate::font::active_fonts();
+    let mut best: Option<f32> = None;
+    for run in &layout.text {
+        let y = run.y + shift_y + fonts.ascent(run.font_stack, run.font_size);
+        best = Some(best.map_or(y, |current| current.max(y)));
+    }
+    let child_shift = shift_y + layout.child_shift.1;
+    for child in &layout.children {
+        if child.position.is_out_of_flow() {
+            continue;
+        }
+        if let Some(y) = last_baseline_at(child, child_shift) {
+            best = Some(best.map_or(y, |current| current.max(y)));
+        }
+    }
+    best
 }
 
 // the part of a line box a font takes above and below its baseline
@@ -4995,10 +5058,13 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                 }),
             }
         };
-    // the content widths an item takes at its widest and narrowest
-    let intrinsic_widths = |item: &FlexItem<'_>| -> (f32, f32) {
+    // the content width an item takes at its narrowest or widest, measured only when asked
+    let intrinsic_width_of = |item: &FlexItem<'_>, minimum: bool| -> f32 {
         match &item.source {
-            FlexSource::Text(pieces) => text_intrinsic_widths(pieces, text_context),
+            FlexSource::Text(pieces) => {
+                let (min, max) = text_intrinsic_widths(pieces, text_context);
+                if minimum { min } else { max }
+            }
             FlexSource::Element(child) => {
                 let extras = item.padding.left
                     + item.padding.right
@@ -5006,22 +5072,19 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                     + item.border.right
                     + item.margin.left
                     + item.margin.right;
-                let measure = |minimum: bool| {
-                    (intrinsic_width(
-                        MaxContentInput {
-                            node: *child,
-                            stylesheet,
-                            style_state,
-                            parent: child_parent,
-                            containing_width: content_width,
-                            own_width: false,
-                            definite: true,
-                        },
-                        minimum,
-                    ) - extras)
-                        .max(0.0)
-                };
-                (measure(true), measure(false))
+                (intrinsic_width(
+                    MaxContentInput {
+                        node: *child,
+                        stylesheet,
+                        style_state,
+                        parent: child_parent,
+                        containing_width: content_width,
+                        own_width: false,
+                        definite: true,
+                    },
+                    minimum,
+                ) - extras)
+                    .max(0.0)
             }
         }
     };
@@ -5049,12 +5112,15 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         } else {
             item.style.height
         };
-        let (min_content, max_content) = intrinsic_widths(item);
+        let mut min_content = None;
+        let mut get_min = |item: &FlexItem<'_>| -> f32 {
+            *min_content.get_or_insert_with(|| intrinsic_width_of(item, true))
+        };
         item.base =
             match resolve_main(item.style.flex_basis).or_else(|| resolve_main(main_property)) {
                 Some(size) => to_content(size),
-                None if row && item.style.content_size[0] == ContentSize::Min => min_content,
-                None if row => max_content,
+                None if row && item.style.content_size[0] == ContentSize::Min => get_min(item),
+                None if row => intrinsic_width_of(item, false),
                 None => {
                     let cross =
                         (content_width - item.cross_margins(row) - item.cross_inner(row)).max(0.0);
@@ -5076,8 +5142,9 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         item.min_main = match resolve_main(min_property) {
             Some(size) => to_content(size),
             None if row && item.style.overflow == Overflow::Visible => {
+                let min_width = get_min(item);
                 let specified = resolve_main(main_property).map(to_content);
-                specified.map_or(min_content, |specified| specified.min(min_content))
+                specified.map_or(min_width, |specified| specified.min(min_width))
             }
             None => 0.0,
         };
@@ -5164,7 +5231,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                 Some(if stretch {
                     available
                 } else {
-                    intrinsic_widths(item).1.min(available)
+                    intrinsic_width_of(item, false).min(available)
                 })
             }
             None => None,
@@ -5245,8 +5312,15 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                 && !item.auto_margins[2]
                 && !item.auto_margins[3];
             if stretch && row {
-                let cross = (cross_size - item.cross_margins(row) - item.cross_inner(row)).max(0.0);
-                item.layout = lay_out(item, Some(item.target), Some(cross));
+                let inner = item.cross_inner(row);
+                let cross = (cross_size - item.cross_margins(row) - inner).max(0.0);
+                let already = item
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| (layout.rect.height - inner - cross).abs() <= 0.01);
+                if !already {
+                    item.layout = lay_out(item, Some(item.target), Some(cross));
+                }
             }
         }
         let used = line
@@ -5357,6 +5431,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         height: content_height + padding.top + padding.bottom + border.top + border.bottom,
         ..rect
     };
+    let children: Vec<Rc<LayoutBox>> = children.into_iter().map(Rc::new).collect();
+    let has_child_shift = children.iter().any(|child| child.has_child_shift);
     let mut layout = LayoutBox {
         node: node.node,
         tag: node.name().to_string(),
@@ -5382,7 +5458,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         control_selection: None,
         control_focused: false,
         control_text_origin: None,
-        children: children.into_iter().map(Rc::new).collect(),
+        children,
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
@@ -5413,6 +5489,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             style_state,
         ),
         margin,
+        child_shift: (0.0, 0.0),
+        has_child_shift,
     };
     if row {
         layout.row_baseline = layout
@@ -5439,8 +5517,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     apply_transform(&mut layout, &style, font_size);
     let positioned_block = padding_block(&layout);
-    append_positioned_nodes(
-        &mut layout.children,
+    append_positioned_to(
+        &mut layout,
         positioned,
         PositionedLayoutContext {
             containing_block: if style.position == Position::Static {
@@ -5644,28 +5722,27 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         auto_margin_alignment(item.style.margin.top, item.style.margin.bottom)
             .unwrap_or(item.style.align_self.unwrap_or(style.align_items))
     };
-    // an item's outer min-content and max-content widths; its grid area is what the tracks
-    // being sized make, so a percentage width there counts as auto
-    let intrinsic = |item: &GridItem<'_>| -> (f32, f32) {
+    // an item's outer min-content or max-content width, measured lazily per axis demand; its
+    // grid area is what the tracks being sized make, so a percentage width counts as auto
+    let mut cached_intrinsic: Vec<(Option<f32>, Option<f32>)> = vec![(None, None); items.len()];
+    let measure_grid_intrinsic = |item: &GridItem<'_>, minimum: bool| -> f32 {
         match &item.source {
-            FlexSource::Text(pieces) => text_intrinsic_widths(pieces, text_context),
-            FlexSource::Element(child) => {
-                let measure = |minimum: bool| {
-                    intrinsic_width(
-                        MaxContentInput {
-                            node: *child,
-                            stylesheet,
-                            style_state,
-                            parent: child_parent,
-                            containing_width: content_width,
-                            own_width: true,
-                            definite: false,
-                        },
-                        minimum,
-                    )
-                };
-                (measure(true), measure(false))
+            FlexSource::Text(pieces) => {
+                let (min, max) = text_intrinsic_widths(pieces, text_context);
+                if minimum { min } else { max }
             }
+            FlexSource::Element(child) => intrinsic_width(
+                MaxContentInput {
+                    node: *child,
+                    stylesheet,
+                    style_state,
+                    parent: child_parent,
+                    containing_width: content_width,
+                    own_width: true,
+                    definite: false,
+                },
+                minimum,
+            ),
         }
     };
 
@@ -5683,29 +5760,71 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             stretch: style.justify_content == JustifyContent::FlexStart,
         },
         &column_items,
-        &mut |index| {
+        &mut |index, [need_floor, need_min, need_max]| {
             let item = &items[index];
-            let (minimum, maximum) = intrinsic(item);
-            // a scroll container, or an item with a min-width of its own, has that for its
-            // automatic minimum, where any other item has its narrowest content
-            let scrolls = item.style.overflow_axes()[0] != Overflow::Visible;
-            let own = item.style.min_width.resolve(content_width, font_size);
-            let floor = match own {
-                None if !scrolls => minimum,
-                own => {
-                    let inner = item.padding.left
-                        + item.padding.right
-                        + item.border.left
-                        + item.border.right;
-                    let own = own.unwrap_or(0.0);
-                    item.margin.left
-                        + item.margin.right
-                        + match item.style.box_sizing {
-                            crate::css::BoxSizing::BorderBox => own.max(inner),
-                            crate::css::BoxSizing::ContentBox => own + inner,
-                        }
+            let get_min = |cache: &mut (Option<f32>, Option<f32>)| -> f32 {
+                if let Some(value) = cache.0 {
+                    return value;
+                }
+                match &item.source {
+                    FlexSource::Text(pieces) => {
+                        let (min, max) = text_intrinsic_widths(pieces, text_context);
+                        cache.0 = Some(min);
+                        cache.1 = Some(max);
+                        min
+                    }
+                    FlexSource::Element(_) => {
+                        let value = measure_grid_intrinsic(item, true);
+                        cache.0 = Some(value);
+                        value
+                    }
                 }
             };
+            let get_max = |cache: &mut (Option<f32>, Option<f32>)| -> f32 {
+                if let Some(value) = cache.1 {
+                    return value;
+                }
+                match &item.source {
+                    FlexSource::Text(pieces) => {
+                        let (min, max) = text_intrinsic_widths(pieces, text_context);
+                        cache.0 = Some(min);
+                        cache.1 = Some(max);
+                        max
+                    }
+                    FlexSource::Element(_) => {
+                        let value = measure_grid_intrinsic(item, false);
+                        cache.1 = Some(value);
+                        value
+                    }
+                }
+            };
+            let cache = &mut cached_intrinsic[index];
+            // a scroll container, or an item with a min-width of its own, has that for its
+            // automatic minimum, where any other item has its narrowest content
+            let floor = if need_floor {
+                let scrolls = item.style.overflow_axes()[0] != Overflow::Visible;
+                let own = item.style.min_width.resolve(content_width, font_size);
+                match own {
+                    None if !scrolls => get_min(cache),
+                    own => {
+                        let inner = item.padding.left
+                            + item.padding.right
+                            + item.border.left
+                            + item.border.right;
+                        let own = own.unwrap_or(0.0);
+                        item.margin.left
+                            + item.margin.right
+                            + match item.style.box_sizing {
+                                crate::css::BoxSizing::BorderBox => own.max(inner),
+                                crate::css::BoxSizing::ContentBox => own + inner,
+                            }
+                    }
+                }
+            } else {
+                0.0
+            };
+            let minimum = if need_min { get_min(cache) } else { 0.0 };
+            let maximum = if need_max { get_max(cache) } else { 0.0 };
             [floor, minimum, maximum]
         },
     );
@@ -5761,7 +5880,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         let end = start + span - 1;
         offsets[end] + sizes[end] - offsets[start]
     };
-    for item in &mut items {
+    for (index, item) in items.iter_mut().enumerate() {
         let cell_width = span_size(&column_offsets, &column_sizes, item.area[0]);
         // a stretched element fills its area as a block fills its container
         let width = match (&item.source, justify(item)) {
@@ -5775,7 +5894,13 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     + item.padding.right
                     + item.border.left
                     + item.border.right;
-                let (minimum, maximum) = intrinsic(item);
+                let cache = cached_intrinsic[index];
+                let minimum = cache
+                    .0
+                    .unwrap_or_else(|| measure_grid_intrinsic(item, true));
+                let maximum = cache
+                    .1
+                    .unwrap_or_else(|| measure_grid_intrinsic(item, false));
                 let extras = if matches!(item.source, FlexSource::Text(_)) {
                     0.0
                 } else {
@@ -5803,7 +5928,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 stretch: style.align_content == AlignContent::Stretch,
             },
             &row_items,
-            &mut |index| {
+            &mut |index, _| {
                 let item = &items[index];
                 let margins = item.margin.top + item.margin.bottom;
                 let height = item
@@ -5910,6 +6035,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         height: content_height + padding.top + padding.bottom + border.top + border.bottom,
         ..rect
     };
+    let children: Vec<Rc<LayoutBox>> = children.into_iter().map(Rc::new).collect();
+    let has_child_shift = children.iter().any(|child| child.has_child_shift);
     let mut layout = LayoutBox {
         node: node.node,
         tag: node.name().to_string(),
@@ -5935,7 +6062,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         control_selection: None,
         control_focused: false,
         control_text_origin: None,
-        children: children.into_iter().map(Rc::new).collect(),
+        children,
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
@@ -5966,6 +6093,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             style_state,
         ),
         margin,
+        child_shift: (0.0, 0.0),
+        has_child_shift,
     };
     if mode != LayoutMode::Flow {
         position_layout_box(
@@ -5983,8 +6112,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     apply_transform(&mut layout, &style, font_size);
     let positioned_block = padding_block(&layout);
-    append_positioned_nodes(
-        &mut layout.children,
+    append_positioned_to(
+        &mut layout,
         positioned,
         PositionedLayoutContext {
             containing_block: if style.position == Position::Static {
@@ -6271,99 +6400,41 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let edge_y = spacing_y.max(0.0);
     // the room between each row and the next: collapsed rows overlap by the narrower of the
     // borders that meet there, the widest under the one and the widest over the other
-    let row_gaps = (1..row_count)
-        .map(|below| {
-            if !style.border_collapse {
-                return spacing_y;
+    let row_gaps = if !style.border_collapse {
+        vec![spacing_y; row_count.saturating_sub(1)]
+    } else {
+        let mut ends_at = vec![0.0_f32; row_count];
+        let mut starts_at = vec![0.0_f32; row_count];
+        for cell in &cells {
+            // a td shown as something else keeps its border to itself
+            if cell.style.display != Display::TableCell {
+                continue;
             }
-            let widest = |ends: bool| {
-                cells
-                    .iter()
-                    // a td shown as something else keeps its border to itself
-                    .filter(|cell| cell.style.display == Display::TableCell)
-                    .filter(|cell| {
-                        if ends {
-                            cell.row + cell.rows == below
-                        } else {
-                            cell.row == below
-                        }
-                    })
-                    .map(|cell| {
-                        let border = used_border(&cell.style);
-                        if ends { border.bottom } else { border.top }
-                    })
-                    .fold(0.0_f32, f32::max)
-            };
-            -widest(true).min(widest(false))
-        })
-        .collect::<Vec<_>>();
+            let border = used_border(&cell.style);
+            let end = cell.row + cell.rows;
+            if end > 0 && end < row_count {
+                ends_at[end] = ends_at[end].max(border.bottom);
+            }
+            if cell.row > 0 && cell.row < row_count {
+                starts_at[cell.row] = starts_at[cell.row].max(border.top);
+            }
+        }
+        (1..row_count)
+            .map(|below| -ends_at[below].min(starts_at[below]))
+            .collect()
+    };
     let gaps = |rows: std::ops::Range<usize>| {
         row_gaps[rows.start.min(row_gaps.len())..(rows.end.max(1) - 1).min(row_gaps.len())]
             .iter()
             .sum::<f32>()
     };
 
-    // column widths from the cells' minimum and maximum content widths
-    let intrinsic = |cell: &TableCellSlot<'_>, minimum: bool| {
-        intrinsic_width(
-            MaxContentInput {
-                node: cell.node,
-                stylesheet,
-                style_state,
-                parent: child_parent,
-                containing_width: content_width,
-                // a width in percent is a share of the table, set once the table is as wide
-                // as it will be, so the cell counts by its content alone
-                own_width: !cell.style.width.has_percent(),
-                definite: true,
-            },
-            minimum,
-        )
-    };
-    let mut column_min = vec![0.0_f32; column_count];
-    let mut column_max = vec![0.0_f32; column_count];
-    // the share of the table a column was given by a cell of its own
-    let mut column_share = vec![0.0_f32; column_count];
-    for cell in cells.iter().filter(|cell| cell.columns == 1) {
-        let at = |basis: f32| cell.style.width.resolve(basis, font_size).unwrap_or(0.0);
-        if cell.style.width.has_percent() {
-            column_share[cell.column] = column_share[cell.column].max(at(1.0) - at(0.0));
-        }
-    }
-    let mut by_span = (0..cells.len()).collect::<Vec<_>>();
-    by_span.sort_by_key(|index| cells[*index].columns);
-    for index in by_span {
-        let cell = &cells[index];
-        let (minimum, maximum) = (intrinsic(cell, true), intrinsic(cell, false));
-        let maximum = maximum.max(minimum);
-        let range = cell.column..cell.column + cell.columns;
-        let gaps = spacing_x * (cell.columns - 1) as f32;
-        let have_min = column_min[range.clone()].iter().sum::<f32>() + gaps;
-        let have_max = column_max[range.clone()].iter().sum::<f32>() + gaps;
-        let share = |extra: f32| (extra / cell.columns as f32).max(0.0);
-        let (min_share, max_share) = (share(minimum - have_min), share(maximum - have_max));
-        for column in range {
-            column_min[column] += min_share;
-            column_max[column] += max_share;
-            column_max[column] = column_max[column].max(column_min[column]);
-        }
-    }
     let spacing_total = edge_x * 2.0 + spacing_x * column_count.saturating_sub(1) as f32;
-    let sum_min = column_min.iter().sum::<f32>();
-    let sum_max = column_max.iter().sum::<f32>();
-    let table_width = if style.width == Length::Auto {
-        (sum_max + spacing_total)
-            .min(content_width)
-            .max(sum_min + spacing_total)
-    } else if style.table_fixed {
-        // a fixed table is as wide as it is told to be, whatever its cells hold
-        content_width
-    } else {
-        content_width.max(sum_min + spacing_total)
-    };
-    let available = (table_width - spacing_total).max(0.0);
-    let mut column_widths = if style.table_fixed && style.width != Length::Auto {
-        // fixed layout reads widths from the first row and shares out the rest
+    let (table_width, mut column_widths) = if style.table_fixed && style.width != Length::Auto {
+        // a fixed table is as wide as it is told to be, whatever its cells hold, and reads
+        // column widths from the first row alone without measuring cell content widths
+        let table_width = content_width;
+        let available = (table_width - spacing_total).max(0.0);
         let mut widths = vec![None; column_count];
         for cell in cells
             .iter()
@@ -6405,7 +6476,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         } else {
             1.0
         };
-        widths
+        let column_widths = widths
             .into_iter()
             .enumerate()
             .map(|(column, width)| match width {
@@ -6413,8 +6484,64 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 Some(width) => width,
                 None => share,
             })
-            .collect()
+            .collect();
+        (table_width, column_widths)
     } else {
+        // column widths from the cells' minimum and maximum content widths
+        let intrinsic = |cell: &TableCellSlot<'_>, minimum: bool| {
+            intrinsic_width(
+                MaxContentInput {
+                    node: cell.node,
+                    stylesheet,
+                    style_state,
+                    parent: child_parent,
+                    containing_width: content_width,
+                    // a width in percent is a share of the table, set once the table is as wide
+                    // as it will be, so the cell counts by its content alone
+                    own_width: !cell.style.width.has_percent(),
+                    definite: true,
+                },
+                minimum,
+            )
+        };
+        let mut column_min = vec![0.0_f32; column_count];
+        let mut column_max = vec![0.0_f32; column_count];
+        // the share of the table a column was given by a cell of its own
+        let mut column_share = vec![0.0_f32; column_count];
+        for cell in cells.iter().filter(|cell| cell.columns == 1) {
+            let at = |basis: f32| cell.style.width.resolve(basis, font_size).unwrap_or(0.0);
+            if cell.style.width.has_percent() {
+                column_share[cell.column] = column_share[cell.column].max(at(1.0) - at(0.0));
+            }
+        }
+        let mut by_span = (0..cells.len()).collect::<Vec<_>>();
+        by_span.sort_by_key(|index| cells[*index].columns);
+        for index in by_span {
+            let cell = &cells[index];
+            let (minimum, maximum) = (intrinsic(cell, true), intrinsic(cell, false));
+            let maximum = maximum.max(minimum);
+            let range = cell.column..cell.column + cell.columns;
+            let gaps = spacing_x * (cell.columns - 1) as f32;
+            let have_min = column_min[range.clone()].iter().sum::<f32>() + gaps;
+            let have_max = column_max[range.clone()].iter().sum::<f32>() + gaps;
+            let share = |extra: f32| (extra / cell.columns as f32).max(0.0);
+            let (min_share, max_share) = (share(minimum - have_min), share(maximum - have_max));
+            for column in range {
+                column_min[column] += min_share;
+                column_max[column] += max_share;
+                column_max[column] = column_max[column].max(column_min[column]);
+            }
+        }
+        let sum_min = column_min.iter().sum::<f32>();
+        let sum_max = column_max.iter().sum::<f32>();
+        let table_width = if style.width == Length::Auto {
+            (sum_max + spacing_total)
+                .min(content_width)
+                .max(sum_min + spacing_total)
+        } else {
+            content_width.max(sum_min + spacing_total)
+        };
+        let available = (table_width - spacing_total).max(0.0);
         // a column given a share of the table takes it, down to its narrowest content, and
         // the others divide what is left by their widest and narrowest content
         let mut widths = column_share
@@ -6473,7 +6600,10 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 minimum + (maximum - minimum) * ratio
             });
         }
-        widths.into_iter().flatten().collect::<Vec<_>>()
+        (
+            table_width,
+            widths.into_iter().flatten().collect::<Vec<_>>(),
+        )
     };
     if column_widths.is_empty() {
         column_widths.push(0.0);
@@ -6613,19 +6743,18 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             + gaps(cell.row..cell.row + cell.rows);
         // the free space is measured from the content, which an explicit cell height leaves
         // at the top of a taller box
-        let content_top = laid_out.rect.y + laid_out.border.widths.top + {
-            let padding = resolve_edges(cell.style.padding, span_width(cell), font_size);
-            padding.top
-        };
+        let cell_padding = resolve_edges(cell.style.padding, span_width(cell), font_size);
+        let content_top = laid_out.rect.y + laid_out.border.widths.top + cell_padding.top;
+        let child_shift_y = laid_out.child_shift.1;
         let content_bottom = laid_out
             .children
             .iter()
-            .map(|child| child.rect.bottom() + child.margin.bottom)
+            .map(|child| child.rect.bottom() + child_shift_y + child.margin.bottom)
             .chain(laid_out.text.iter().map(|run| run.y + run.font_size * 1.25))
             .fold(content_top, f32::max);
         let inner_bottom = laid_out.rect.y + height.max(laid_out.rect.height)
             - laid_out.border.widths.bottom
-            - resolve_edges(cell.style.padding, span_width(cell), font_size).bottom;
+            - cell_padding.bottom;
         let free = inner_bottom - content_bottom;
         // a cell element displayed as a flex, grid or block box sits in an anonymous cell, so it
         // keeps its own height and lays out its own content, as in blink
@@ -6639,11 +6768,14 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 VerticalAlign::Bottom => free,
                 _ => 0.0,
             };
-            for child in laid_out.children.iter_mut().map(Rc::make_mut) {
-                translate_layout_box(child, 0.0, shift);
-            }
-            for run in &mut laid_out.text {
-                run.y += shift;
+            if shift != 0.0 {
+                if !laid_out.children.is_empty() {
+                    laid_out.child_shift.1 += shift;
+                    laid_out.has_child_shift = true;
+                }
+                for run in &mut laid_out.text {
+                    run.y += shift;
+                }
             }
         }
         let target = (table_x + column_x[cell.column], row_y[cell.row]);
@@ -6679,38 +6811,26 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         section.selectable = section_style.selectable;
         section
     };
-    let mut row_boxes: Vec<(usize, LayoutBox)> = Vec::new();
+    let mut grouped_rows: Vec<Vec<LayoutBox>> = (0..groups.len()).map(|_| Vec::new()).collect();
     for (index, (row, cells_here)) in rows.iter().zip(cell_boxes).enumerate() {
         match row.node {
             Some((row_node, row_style)) => {
                 let mut row_box =
                     section_box(row_node, &row_style, row_y[index], row_heights[index]);
                 row_box.children = cells_here.into_iter().map(Rc::new).collect();
-                row_boxes.push((row.group, row_box));
+                row_box.has_child_shift =
+                    row_box.children.iter().any(|child| child.has_child_shift);
+                grouped_rows[row.group].push(row_box);
             }
             None => {
-                for cell_box in cells_here {
-                    row_boxes.push((row.group, cell_box));
-                }
+                grouped_rows[row.group].extend(cells_here);
             }
         }
     }
     for group in group_order {
-        let members = row_boxes
-            .iter()
-            .filter(|(owner, _)| *owner == group)
-            .count();
-        if members == 0 {
+        let contents = std::mem::take(&mut grouped_rows[group]);
+        if contents.is_empty() {
             continue;
-        }
-        let mut contents = Vec::with_capacity(members);
-        let mut index = 0;
-        while index < row_boxes.len() {
-            if row_boxes[index].0 == group {
-                contents.push(row_boxes.remove(index).1);
-            } else {
-                index += 1;
-            }
         }
         match groups[group].0 {
             Some((group_node, group_style)) => {
@@ -6724,6 +6844,8 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     .fold(f32::NEG_INFINITY, f32::max);
                 let mut group_box = section_box(group_node, &group_style, top, bottom - top);
                 group_box.children = contents.into_iter().map(Rc::new).collect();
+                group_box.has_child_shift =
+                    group_box.children.iter().any(|child| child.has_child_shift);
                 children.push(group_box);
             }
             None => children.extend(contents),
@@ -6763,6 +6885,8 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             }
         }
     }
+    let children: Vec<Rc<LayoutBox>> = children.into_iter().map(Rc::new).collect();
+    let has_child_shift = children.iter().any(|child| child.has_child_shift);
     let mut layout = LayoutBox {
         node: node.node,
         tag: node.name().to_string(),
@@ -6788,7 +6912,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         control_selection: None,
         control_focused: false,
         control_text_origin: None,
-        children: children.into_iter().map(Rc::new).collect(),
+        children,
         position: style.position,
         visual_offset: (0.0, 0.0),
         z_index: positioned_z_index(style),
@@ -6819,6 +6943,8 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             style_state,
         ),
         margin,
+        child_shift: (0.0, 0.0),
+        has_child_shift,
     };
     if mode != LayoutMode::Flow {
         position_layout_box(
@@ -6836,8 +6962,8 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
     apply_transform(&mut layout, &style, font_size);
     let positioned_block = padding_block(&layout);
-    append_positioned_nodes(
-        &mut layout.children,
+    append_positioned_to(
+        &mut layout,
         positioned,
         PositionedLayoutContext {
             containing_block: if style.position == Position::Static {
@@ -7925,7 +8051,7 @@ fn grow_tracks(sizes: &mut [f32], targets: &[usize], extra: f32) {
 fn size_grid_tracks(
     axis: GridAxis<'_>,
     items: &[(usize, usize)],
-    contribution: &mut dyn FnMut(usize) -> [f32; 3],
+    contribution: &mut dyn FnMut(usize, [bool; 3]) -> [f32; 3],
 ) -> Vec<f32> {
     let GridAxis {
         tracks,
@@ -7992,14 +8118,46 @@ fn size_grid_tracks(
         let range = start..start + span;
         let crosses_flex = range.clone().any(flexible);
         let needs_min = range.clone().any(intrinsic_min);
-        let needs_max = range
-            .clone()
-            .any(|track| intrinsic_max(track) || mins[track] == Sizing::MaxContent)
-            || (crosses_flex && available.is_none());
-        if !needs_min && !needs_max {
+        let (need_floor, need_min, need_max) = if crosses_flex {
+            let any_flex_min = range
+                .clone()
+                .any(|track| flexible(track) && intrinsic_min(track));
+            let all_auto = range
+                .clone()
+                .filter(|track| flexible(*track) && intrinsic_min(*track))
+                .all(|track| mins[track] == Sizing::Auto);
+            (
+                any_flex_min && all_auto,
+                any_flex_min && !all_auto,
+                available.is_none(),
+            )
+        } else {
+            let min_uses_max = range
+                .clone()
+                .any(|track| intrinsic_min(track) && mins[track] == Sizing::MaxContent);
+            let min_all_auto = needs_min
+                && !min_uses_max
+                && range
+                    .clone()
+                    .filter(|track| intrinsic_min(*track))
+                    .all(|track| mins[track] == Sizing::Auto);
+            let has_max_target = range.clone().any(intrinsic_max);
+            let max_all_min = has_max_target
+                && range
+                    .clone()
+                    .filter(|track| intrinsic_max(*track))
+                    .all(|track| maxs[track] == Sizing::MinContent);
+            (
+                needs_min && !min_uses_max && min_all_auto,
+                (needs_min && !min_uses_max && !min_all_auto) || max_all_min,
+                min_uses_max || (has_max_target && !max_all_min),
+            )
+        };
+        if !need_floor && !need_min && !need_max {
             continue;
         }
-        let [minimum, min_content, max_content] = contribution(index);
+        let [minimum, min_content, max_content] =
+            contribution(index, [need_floor, need_min, need_max]);
         let floor = |targets: &[usize]| {
             if targets.iter().all(|track| mins[*track] == Sizing::Auto) {
                 minimum
@@ -8283,12 +8441,13 @@ fn apply_transform(layout: &mut LayoutBox, style: &Style, font_size: f32) {
             .resolve(height, font_size)
             .unwrap_or(height / 2.0);
         let (corner_x, corner_y) = (layout.rect.x, layout.rect.y);
+        let shift = layout.child_shift;
         for child in layout.children.iter_mut().map(Rc::make_mut) {
             let Some(transform) = child.transform.as_deref().copied() else {
                 continue;
             };
-            let relative_x = corner_x + origin_x - child.rect.x;
-            let relative_y = corner_y + origin_y - child.rect.y;
+            let relative_x = corner_x + origin_x - (child.rect.x + shift.0);
+            let relative_y = corner_y + origin_y - (child.rect.y + shift.1);
             child.transform = Some(Box::new(
                 Matrix::perspective(distance)
                     .about(relative_x, relative_y)
@@ -8369,14 +8528,18 @@ fn finalize_scroll(layout: &mut LayoutBox, padding: ResolvedEdges, style_state: 
     layout.scroll_offset = offset;
     let scrollport = scrollbar_metrics(layout).scrollport;
     if offset == (0.0, 0.0) {
-        apply_sticky_descendants(
-            &mut layout.children,
-            scrollport,
-            layout.rect,
-            layout.visual_offset,
-        );
+        if layout.children.iter().any(|child| holds_sticky(child)) {
+            flush_child_shifts(layout, (0.0, 0.0));
+            apply_sticky_descendants(
+                &mut layout.children,
+                scrollport,
+                layout.rect,
+                layout.visual_offset,
+            );
+        }
         return;
     }
+    flush_child_shifts(layout, (0.0, 0.0));
     for child in layout.children.iter_mut().map(Rc::make_mut) {
         translate_scroll_box(child, -offset.0, -offset.1);
     }
@@ -8388,14 +8551,35 @@ fn finalize_scroll(layout: &mut LayoutBox, padding: ResolvedEdges, style_state: 
     );
 }
 
+// a subtree with no sticky box moves nothing, and is left shared as it is
+fn holds_sticky(layout: &LayoutBox) -> bool {
+    layout.position == Position::Sticky || layout.children.iter().any(|child| holds_sticky(child))
+}
+
 // what laying out again with only the scroll offsets changed would give, by moving each
 // scroller's content as finalize_scroll does; none when a sticky box would have to settle again
 pub(crate) fn rescroll(
     document: &LayoutDocument,
     offsets: &std::collections::BTreeMap<NodeId, (f32, f32)>,
 ) -> Option<LayoutDocument> {
-    fn has_sticky(layout: &LayoutBox) -> bool {
-        layout.position == Position::Sticky || layout.children.iter().any(|child| has_sticky(child))
+    fn scroll_offset_changes(
+        layout: &LayoutBox,
+        offsets: &std::collections::BTreeMap<NodeId, (f32, f32)>,
+    ) -> bool {
+        if matches!(layout.overflow, Overflow::Auto | Overflow::Hidden) || layout.is_document() {
+            let scrollport = scrollbar_metrics(layout).scrollport;
+            let max_x = (layout.scroll_content.width - scrollport.width).max(0.0);
+            let max_y = (layout.scroll_content.height - scrollport.height).max(0.0);
+            let requested = offsets.get(&layout.node).copied().unwrap_or_default();
+            let offset = (requested.0.clamp(0.0, max_x), requested.1.clamp(0.0, max_y));
+            if offset != layout.scroll_offset {
+                return true;
+            }
+        }
+        layout
+            .children
+            .iter()
+            .any(|child| scroll_offset_changes(child, offsets))
     }
     fn scroll(
         layout: &mut LayoutBox,
@@ -8408,7 +8592,7 @@ pub(crate) fn rescroll(
             let requested = offsets.get(&layout.node).copied().unwrap_or_default();
             let offset = (requested.0.clamp(0.0, max_x), requested.1.clamp(0.0, max_y));
             if offset != layout.scroll_offset {
-                if layout.children.iter().any(|child| has_sticky(child)) {
+                if layout.children.iter().any(|child| holds_sticky(child)) {
                     return false;
                 }
                 let shift = (
@@ -8421,11 +8605,15 @@ pub(crate) fn rescroll(
                 layout.scroll_offset = offset;
             }
         }
-        layout
-            .children
-            .iter_mut()
-            .map(Rc::make_mut)
-            .all(|child| scroll(child, offsets))
+        for child in &mut layout.children {
+            if !scroll_offset_changes(child, offsets) {
+                continue;
+            }
+            if !scroll(Rc::make_mut(child), offsets) {
+                return false;
+            }
+        }
+        true
     }
     let mut moved = document.clone();
     scroll(&mut moved.root, offsets).then_some(moved)
@@ -8437,11 +8625,6 @@ fn apply_sticky_descendants(
     containing_block: Rect,
     ancestor_offset: (f32, f32),
 ) {
-    // a subtree with no sticky box moves nothing, and is left shared as it is
-    fn holds_sticky(layout: &LayoutBox) -> bool {
-        layout.position == Position::Sticky
-            || layout.children.iter().any(|child| holds_sticky(child))
-    }
     for child in children.iter_mut().filter(|child| holds_sticky(child)) {
         let child = Rc::make_mut(child);
         let child_rect = visual_rect_for(child, ancestor_offset);
@@ -8497,8 +8680,12 @@ fn measure_scroll_content(layout: &LayoutBox, padding: ResolvedEdges, floor: Siz
                 child.margin.bottom + padding.bottom + border.bottom,
             )
         };
-        right = right.max(child.rect.x + child.visual_offset.0 + child.rect.width + end_x);
-        bottom = bottom.max(child.rect.y + child.visual_offset.1 + child.rect.height + end_y);
+        right = right.max(
+            child.rect.x + layout.child_shift.0 + child.visual_offset.0 + child.rect.width + end_x,
+        );
+        bottom = bottom.max(
+            child.rect.y + layout.child_shift.1 + child.visual_offset.1 + child.rect.height + end_y,
+        );
     }
     let extent = |far: f32, start: f32, size: f32| {
         let measured = far - start;
@@ -8515,7 +8702,7 @@ fn measure_scroll_content(layout: &LayoutBox, padding: ResolvedEdges, floor: Siz
 }
 
 fn translate_scroll_box(layout: &mut LayoutBox, offset_x: f32, offset_y: f32) {
-    if layout.position == Position::Fixed {
+    if (offset_x == 0.0 && offset_y == 0.0) || layout.position == Position::Fixed {
         return;
     }
     layout.rect.x += offset_x;
@@ -8534,6 +8721,9 @@ fn translate_scroll_box(layout: &mut LayoutBox, offset_x: f32, offset_y: f32) {
 }
 
 fn translate_layout_box(layout: &mut LayoutBox, offset_x: f32, offset_y: f32) {
+    if offset_x == 0.0 && offset_y == 0.0 {
+        return;
+    }
     layout.rect.x += offset_x;
     layout.rect.y += offset_y;
     for text in &mut layout.text {
@@ -8544,8 +8734,44 @@ fn translate_layout_box(layout: &mut LayoutBox, offset_x: f32, offset_y: f32) {
         origin.0 += offset_x;
         origin.1 += offset_y;
     }
-    for child in layout.children.iter_mut().map(Rc::make_mut) {
-        translate_layout_box(child, offset_x, offset_y);
+    if !layout.children.is_empty() {
+        layout.child_shift.0 += offset_x;
+        layout.child_shift.1 += offset_y;
+        layout.has_child_shift = true;
+    }
+}
+
+// applies deferred flex/grid/table translations in one top-down pass so nested containers do
+// not deep-clone shared children at every level
+fn flush_child_shifts(layout: &mut LayoutBox, shift: (f32, f32)) {
+    if shift != (0.0, 0.0) {
+        layout.rect.x += shift.0;
+        layout.rect.y += shift.1;
+        for text in &mut layout.text {
+            text.x += shift.0;
+            text.y += shift.1;
+        }
+        if let Some(origin) = &mut layout.control_text_origin {
+            origin.0 += shift.0;
+            origin.1 += shift.1;
+        }
+    }
+    let child_shift = (
+        shift.0 + layout.child_shift.0,
+        shift.1 + layout.child_shift.1,
+    );
+    layout.child_shift = (0.0, 0.0);
+    layout.has_child_shift = false;
+    if child_shift != (0.0, 0.0) {
+        for child in &mut layout.children {
+            flush_child_shifts(Rc::make_mut(child), child_shift);
+        }
+    } else {
+        for child in &mut layout.children {
+            if child.has_child_shift {
+                flush_child_shifts(Rc::make_mut(child), (0.0, 0.0));
+            }
+        }
     }
 }
 
@@ -9967,31 +10193,49 @@ pub(crate) fn repaint_motion(
         viewport,
         root_font_size: 16.0,
     });
+    let root_font = {
+        let _styles = crate::css::memoize_styles();
+        root_font_size(document, stylesheet, viewport, next_state)
+    };
     let _root_environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
         viewport,
-        root_font_size: root_font_size(document, stylesheet, viewport, next_state),
+        root_font_size: root_font,
     });
     let mut styles = HashMap::default();
-    for &node in nodes {
-        // their backgrounds reach the canvas, which a box patch does not
-        if document
-            .element(node)
-            .is_none_or(|element| matches!(element.name.as_str(), "html" | "body"))
-        {
-            return None;
+    {
+        let _styles = crate::css::memoize_styles();
+        for &node in nodes {
+            // their backgrounds reach the canvas, which a box patch does not
+            if document
+                .element(node)
+                .is_none_or(|element| matches!(element.name.as_str(), "html" | "body"))
+            {
+                return None;
+            }
+            let (last_style, _) = stylesheet.computed_style(document, node, last_state)?;
+            styles.insert(node, last_style);
         }
-        let (last_style, _) = stylesheet.computed_style(document, node, last_state)?;
-        styles.insert(node, last_style);
     }
     // the wake belongs to the frame drawn now, not the last one
     crate::css::take_animation_wake();
     let mut moved = HashMap::default();
-    for (node, last_style) in styles {
-        let (next_style, font_size) = stylesheet.computed_style(document, node, next_state)?;
-        moved.insert(node, (last_style, next_style, font_size));
+    {
+        let _styles = crate::css::memoize_styles();
+        for (node, last_style) in styles {
+            let (next_style, font_size) = stylesheet.computed_style(document, node, next_state)?;
+            moved.insert(node, (last_style, next_style, font_size));
+        }
     }
     let mut next = last.clone();
     patch_motion(&mut next.root, document, &moved).then_some(next)
+}
+
+fn subtree_has_moved(layout: &LayoutBox, moved: &HashMap<NodeId, (Style, Style, f32)>) -> bool {
+    moved.contains_key(&layout.node)
+        || layout
+            .children
+            .iter()
+            .any(|child| subtree_has_moved(child, moved))
 }
 
 fn patch_motion(
@@ -10039,11 +10283,16 @@ fn patch_motion(
             return false;
         }
     }
-    layout
-        .children
-        .iter_mut()
-        .map(Rc::make_mut)
-        .all(|child| patch_motion(child, document, moved))
+    // leave subtrees with no moving node shared so damage skips them by pointer identity
+    for child in &mut layout.children {
+        if !subtree_has_moved(child, moved) {
+            continue;
+        }
+        if !patch_motion(Rc::make_mut(child), document, moved) {
+            return false;
+        }
+    }
+    true
 }
 
 // rem resolves against the root element font size, which itself may only use absolute units
@@ -10316,6 +10565,8 @@ impl LayoutBox {
             stable_gutter,
             row_baseline,
             margin,
+            child_shift: _,
+            has_child_shift: _,
         } = self;
         *node == other.node
             && *tag == other.tag
@@ -11603,7 +11854,10 @@ mod tests {
         );
         let input = &result.root.children[0];
         assert_eq!(input.control_value.as_deref(), Some("live"));
-        assert_eq!(input.control_selection, Some((1, 3, true)));
+        assert_eq!(
+            input.control_selection.as_deref().copied(),
+            Some((1, 3, true))
+        );
         assert!(input.control_focused);
         assert_eq!(input.text[0].text, "live");
     }
@@ -11709,7 +11963,10 @@ mod tests {
         let input = &result.root.children[0];
         assert_eq!(input.control_value.as_deref(), Some("s😀cret"));
         assert_eq!(input.text[0].text, "*******");
-        assert_eq!(input.control_selection, Some((1, 3, false)));
+        assert_eq!(
+            input.control_selection.as_deref().copied(),
+            Some((1, 3, false))
+        );
         assert!(input.control_focused);
     }
 
@@ -11743,7 +12000,10 @@ mod tests {
         );
         let textarea = &result.root.children[0];
         assert_eq!(textarea.control_value.as_deref(), Some("live\nvalue"));
-        assert_eq!(textarea.control_selection, Some((1, 7, false)));
+        assert_eq!(
+            textarea.control_selection.as_deref().copied(),
+            Some((1, 7, false))
+        );
         assert!(textarea.control_focused);
         assert_eq!(textarea.text.len(), 2);
         assert_eq!(textarea.text[0].text, "live");

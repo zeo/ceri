@@ -4008,7 +4008,9 @@ impl Stylesheet {
                         continue;
                     }
                     let matching: Vec<_> = (0..rule.selectors.len())
-                        .filter(|&index| rule.selectors[index].matches(document, node, pseudo, state))
+                        .filter(|&index| {
+                            rule.selectors[index].matches(document, node, pseudo, state)
+                        })
                         .collect();
                     let Some(specificity) = matching
                         .iter()

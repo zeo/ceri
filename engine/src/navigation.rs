@@ -2446,6 +2446,7 @@ impl Browser {
         state.color_scheme = self.preferences.color_scheme;
         state.reduced_motion = self.preferences.reduced_motion;
         state.forced_colors = self.preferences.forced_colors;
+        let _styles = crate::css::memoize_styles();
         self.stylesheet(page)
             .computed_style(&document, element, &state)
             .is_some_and(|(style, _)| style.drag_region)
@@ -3255,9 +3256,9 @@ impl Browser {
         }
         // a script that read a box since the document last changed has made this layout already
         let sheet_id = SheetIdentity::of(stylesheet);
-        let measured = page
-            .runtime
-            .measured_layout(document.version(), sheet_id.clone(), &style_state);
+        let measured =
+            page.runtime
+                .measured_layout(document.version(), sheet_id.clone(), &style_state);
         let reused = measured.is_some();
         let (mut layout, motion, wake_at, timeless) = match measured {
             Some((layout, wake_at, motion)) => {
@@ -3292,12 +3293,12 @@ impl Browser {
         }
         page.animation_wake.set(wake_at);
         // keep the cached key aligned with the animation wake discovered by this layout
-        key.state.clock = if page.animation_wake.get().is_none() && style_state.transitions.is_empty()
-        {
-            0
-        } else {
-            style_state.clock
-        };
+        key.state.clock =
+            if page.animation_wake.get().is_none() && style_state.transitions.is_empty() {
+                0
+            } else {
+                style_state.clock
+            };
         key.state.container_sizes = style_state.container_sizes.clone();
         page.layout_inputs.borrow_mut().extras = StyleState {
             hovered: self.hovered_node,
