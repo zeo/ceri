@@ -3271,6 +3271,7 @@ impl Browser {
             painted.behind.clear();
         }
         crate::layout::forget_kept_answers();
+        crate::paint::forget_backdrop();
         crate::release_memory();
     }
 

@@ -4472,6 +4472,11 @@ fn paint_backgrounds(
     opacity: f32,
     clip: Option<Rect>,
 ) {
+    if let Some(clip) = clip
+        && paint_cached_backdrop(canvas, layout_box, (outer, surface), opacity, clip)
+    {
+        return;
+    }
     if layout_box.background.alpha > 0 {
         let color = layout_box.background.scale_alpha(opacity);
         canvas.fill_shape(outer, &Paint::Solid(color), clip);
@@ -4486,6 +4491,158 @@ fn paint_backgrounds(
         opacity,
         clip,
     );
+}
+
+// a large box's opaque background of gradients, painted once whole and copied from where a
+// repaint asks for it: a page backdrop under a list whose rows change each second otherwise
+// works every gradient out again over each changed area
+struct Backdrop {
+    key: (Color, Vec<crate::css::BackgroundLayer>, String, [u32; 2]),
+    // the device pixels the box covers, and its pixels there; none where the stack lets
+    // something through, which paints as layers do
+    bounds: [u32; 4],
+    pixels: Option<Vec<u8>>,
+}
+
+thread_local! {
+    static BACKDROP: std::cell::RefCell<Option<Backdrop>> = const { std::cell::RefCell::new(None) };
+}
+
+// lets go of the kept backdrop, as a page at rest does of what speeds up its next frame
+pub(crate) fn forget_backdrop() {
+    BACKDROP.with(|backdrop| backdrop.borrow_mut().take());
+}
+
+// copies the box's background over the clip from a backdrop painted whole, when the box is
+// square on whole device pixels and its stack is opaque, so the copy is what painting each
+// layer over the clip gives
+fn paint_cached_backdrop(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    (outer, surface): (Shape, Shape),
+    opacity: f32,
+    clip: Rect,
+) -> bool {
+    const LEAST_PIXELS: f32 = 250_000.0;
+    let device = canvas.device_shape(outer);
+    let whole = |value: f32| (value - value.round()).abs() < 1e-3;
+    if opacity < 1.0
+        || !canvas.masks.is_empty()
+        || canvas.shift != (0.0, 0.0)
+        || canvas.nudge != (0.0, 0.0)
+        || !outer.is_square()
+        || ![device.x, device.y, device.width, device.height]
+            .into_iter()
+            .all(whole)
+        || device.x < 0.0
+        || device.y < 0.0
+        || device.width * device.height < LEAST_PIXELS
+        || layout_box.backgrounds.is_empty()
+        || layout_box
+            .backgrounds
+            .iter()
+            .any(|layer| !matches!(layer.image, LayerImage::Gradient(_)))
+    {
+        return false;
+    }
+    let key = (
+        layout_box.background,
+        layout_box.backgrounds.clone(),
+        format!("{outer:?} {surface:?}"),
+        [canvas.scale.to_bits(), layout_box.font_size.to_bits()],
+    );
+    let bounds = [
+        device.x.round() as u32,
+        device.y.round() as u32,
+        (device.x + device.width).round() as u32,
+        (device.y + device.height).round() as u32,
+    ];
+    BACKDROP.with(|backdrop| {
+        let mut backdrop = backdrop.borrow_mut();
+        if backdrop
+            .as_ref()
+            .is_none_or(|kept| kept.key != key || kept.bounds != bounds)
+        {
+            let area = Rect {
+                x: outer.x,
+                y: outer.y,
+                width: outer.width,
+                height: outer.height,
+            };
+            let mut whole = Canvas::transparent(area, canvas.scale);
+            if layout_box.background.alpha > 0 {
+                whole.fill_shape(outer, &Paint::Solid(layout_box.background), None);
+            }
+            paint_layers(
+                &mut whole,
+                &layout_box.backgrounds,
+                layout_box,
+                &[],
+                surface,
+                outer,
+                1.0,
+                None,
+            );
+            let width = (bounds[2] - bounds[0]) as usize;
+            let opaque = whole.width as usize >= width
+                && whole.height >= bounds[3] - bounds[1]
+                && (0..(bounds[3] - bounds[1]) as usize).all(|row| {
+                    whole.pixels[row * whole.bytes_per_row()..][..width * 4]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|pixel| pixel[3] == 255)
+                });
+            let pixels = opaque.then(|| {
+                (0..(bounds[3] - bounds[1]) as usize)
+                    .flat_map(|row| {
+                        whole.pixels[row * whole.bytes_per_row()..][..width * 4]
+                            .iter()
+                            .copied()
+                    })
+                    .collect()
+            });
+            *backdrop = Some(Backdrop {
+                key,
+                bounds,
+                pixels,
+            });
+        }
+        let Some(kept) = backdrop.as_ref() else {
+            return false;
+        };
+        let Some(pixels) = &kept.pixels else {
+            return false;
+        };
+        // the pixels fill_shape would paint: the box's rows and columns the clip reaches
+        let clip = canvas.device_shape(Shape::square(clip));
+        let [left, top, right, bottom] = narrow(
+            [
+                bounds[0].min(canvas.width),
+                bounds[1].min(canvas.height),
+                bounds[2].min(canvas.width),
+                bounds[3].min(canvas.height),
+            ],
+            Some(clip),
+        );
+        let width = (bounds[2] - bounds[0]) as usize;
+        let stride = canvas.bytes_per_row();
+        for pixel_y in top..bottom {
+            let row = pixel_y as f32 + 0.5;
+            let run = run_where(left..right, |pixel| {
+                clip.coverage((pixel as f32 + 0.5, row)) > 0.0
+            });
+            if run.is_empty() {
+                continue;
+            }
+            let from =
+                (pixel_y - bounds[1]) as usize * width * 4 + (run.start - bounds[0]) as usize * 4;
+            let to = pixel_y as usize * stride + run.start as usize * 4;
+            let length = run.len() * 4;
+            canvas.pixels[to..to + length].copy_from_slice(&pixels[from..from + length]);
+        }
+        true
+    })
 }
 
 // layers take their place from `origin` and paint across `painted`, the last lowest
@@ -6730,6 +6887,56 @@ mod tests {
             .map(|rect| rect.width * rect.height)
             .sum();
         assert_eq!(covered, 12.0 * 60.0 * 14.0);
+    }
+
+    // a repaint over a large gradient backdrop copies it from the backdrop painted whole, and
+    // comes out as painting each layer over the area does
+    #[test]
+    fn a_repaint_over_a_cached_backdrop_matches_a_whole_frame() {
+        let markup = |text: &str| {
+            format!(
+                "<html><body><div id='app'><p id='cell'>{text}</p><p>beside</p></div></body></html>"
+            )
+        };
+        let stylesheet = Stylesheet::parse(concat!(
+            "html, body { margin: 0 } #app { width: 600px; height: 500px; padding: 40px;",
+            " background: radial-gradient(130% 60% at 50% -12%, #ffffff0b, #0000 60%),",
+            " radial-gradient(100% 120% at 50% 120%, #00000073, #0000 55%),",
+            " linear-gradient(179deg, #181818 0%, #101010 45%, #080808 100%) }",
+            " p { color: #eee; margin: 0 0 8px; font: 14px sans-serif }",
+        ))
+        .expect("stylesheet should parse");
+        let lay_out = |text: &str| {
+            let document = Document::parse_markup(&markup(text)).expect("document should parse");
+            crate::layout::layout(
+                &document,
+                &stylesheet,
+                Size {
+                    width: 680.0,
+                    height: 580.0,
+                },
+            )
+        };
+        for scale in [1.0, 1.5] {
+            forget_backdrop();
+            let (old, new) = (lay_out("12.4 KB"), lay_out("980 KB"));
+            let Damage::Areas(areas) = damage((&old, &[]), (&new, &[]), &[]) else {
+                panic!("a changed cell should damage an area");
+            };
+            let mut canvas = paint_with_canvases(&old, &[], scale, false);
+            for &area in &areas {
+                repaint(&mut canvas, &new, &[], area);
+            }
+            assert!(
+                BACKDROP.with(|backdrop| backdrop
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|kept| kept.pixels.is_some())),
+                "the repaint should have kept the backdrop"
+            );
+            let whole = paint_with_canvases(&new, &[], scale, false);
+            assert!(canvas.rgba_pixels() == whole.rgba_pixels(), "at {scale}x");
+        }
     }
 
     #[test]
