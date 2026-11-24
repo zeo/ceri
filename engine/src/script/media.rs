@@ -867,7 +867,9 @@ impl ScriptRuntime {
             ("cancelVideoFrameCallback", Call) => {
                 let id = self.coerce_number(first)? as u64;
                 let element = self.media.elements.get_mut(&node).expect("inserted above");
-                element.frame_callbacks.retain(|(waiting, _)| *waiting != id);
+                element
+                    .frame_callbacks
+                    .retain(|(waiting, _)| *waiting != id);
                 self.tasks.retain(|task| task.id != id);
                 Value::Undefined
             }
@@ -895,7 +897,9 @@ impl ScriptRuntime {
         let now = self.clock;
         let element = self.media.elements.get_mut(&node).expect("pumped above");
         let callbacks = std::mem::take(&mut element.frame_callbacks);
-        let (width, height) = element.info.map_or((0, 0), |info| (info.width, info.height));
+        let (width, height) = element
+            .info
+            .map_or((0, 0), |info| (info.width, info.height));
         let (media_time, presented) = (element.frame_time, element.presented);
         let metadata = self.object_from_entries(vec![
             ("presentationTime".into(), Value::Number(now as f64)),
