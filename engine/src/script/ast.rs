@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-pub(super) type Name = Rc<str>;
+pub(super) type Name = super::JsStr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DeclarationKind {

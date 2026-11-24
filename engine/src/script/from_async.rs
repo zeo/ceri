@@ -35,7 +35,7 @@ pub(super) enum Phase {
 
 impl ScriptRuntime {
     fn from_async_step(state: &Rc<FromAsync>, phase: Phase) -> Value {
-        Value::Builtin(Builtin::Native(Native::Promise(Rc::new(
+        Value::Builtin(Builtin::native(Native::Promise(Rc::new(
             PromiseFunction::FromAsyncStep(state.clone(), phase),
         ))))
     }

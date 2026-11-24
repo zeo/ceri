@@ -325,7 +325,7 @@ impl ScriptRuntime {
 
     fn await_disposal(&mut self, disposal: &Rc<AsyncDisposal>, value: Value) {
         let step = |rejected| {
-            Value::Builtin(Builtin::Native(Native::Promise(Rc::new(
+            Value::Builtin(Builtin::native(Native::Promise(Rc::new(
                 PromiseFunction::DisposalStep(disposal.clone(), rejected),
             ))))
         };

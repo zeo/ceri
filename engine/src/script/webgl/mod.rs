@@ -90,7 +90,7 @@ pub(crate) struct GlContext {
     extensions: HashMap<&'static str, ObjectHandle>,
     // what paint showed last
     snapshot: Option<std::sync::Arc<crate::image::Image>>,
-    color_space: [Rc<str>; 2],
+    color_space: [crate::script::JsStr; 2],
 }
 
 pub(crate) enum GlObject {

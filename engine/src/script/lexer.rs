@@ -3,7 +3,6 @@
 
 use super::ScriptError;
 use crate::unicode_tables::{ID_CONTINUE, ID_START};
-use std::rc::Rc;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum TokenKind {
@@ -15,7 +14,7 @@ pub(super) enum TokenKind {
     Punct(&'static str),
     Number(f64),
     // a BigInt literal, as its decimal digits
-    BigInt(Rc<str>),
+    BigInt(super::JsStr),
     String(String),
     // cooked text is None when a tagged template holds an invalid escape
     Template {

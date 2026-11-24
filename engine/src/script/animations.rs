@@ -435,7 +435,7 @@ impl ScriptRuntime {
         self.tasks.push(ScheduledTask {
             id,
             due,
-            callback: Value::Builtin(Builtin::Native(Native::AnimFinish(handle, generation))),
+            callback: Value::Builtin(Builtin::native(Native::AnimFinish(handle, generation))),
             arguments: Vec::new(),
             kind: TaskKind::Timeout,
         });

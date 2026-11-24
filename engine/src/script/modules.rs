@@ -99,8 +99,8 @@ impl ScriptRuntime {
         let mut locals = BTreeMap::new();
         for (exported, slot) in &module.exports {
             let cell = Rc::new(RefCell::new(Value::Undefined));
-            scope.borrow_mut().slots[*slot as usize] = Value::Binding(cell.clone(), true);
-            locals.insert(exported.to_string(), Value::Binding(cell, false));
+            scope.borrow_mut().slots[*slot as usize] = Value::Binding(cell.clone());
+            locals.insert(exported.to_string(), Value::ConstBinding(cell));
         }
         let specifiers = module
             .imports
@@ -265,7 +265,9 @@ impl ScriptRuntime {
                             }
                         };
                         let value = match value {
-                            Value::Binding(cell, _) => Value::Binding(cell, false),
+                            Value::Binding(cell) | Value::ConstBinding(cell) => {
+                                Value::ConstBinding(cell)
+                            }
                             value => value,
                         };
                         slots.push((*slot, value));

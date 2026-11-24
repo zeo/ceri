@@ -110,7 +110,7 @@ impl ScriptRuntime {
             }
             Value::BigInt(value) => format!("{}n", value.to_string_radix(10)),
             value if is_primitive(value) => value.string_value(),
-            Value::Binding(cell, _) => {
+            Value::Binding(cell) | Value::ConstBinding(cell) => {
                 let inner = cell.borrow().clone();
                 self.inspect(&inner, depth, seen)
             }

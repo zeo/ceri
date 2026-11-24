@@ -79,7 +79,7 @@ impl ScriptRuntime {
         self.tasks.push(ScheduledTask {
             id,
             due: self.clock.saturating_add(self.frame_interval),
-            callback: Value::Builtin(Builtin::Native(step(&transition, TransitionStep::Run))),
+            callback: Value::Builtin(Builtin::native(step(&transition, TransitionStep::Run))),
             arguments: Vec::new(),
             kind: TaskKind::AnimationFrame,
         });
@@ -129,11 +129,11 @@ impl ScriptRuntime {
                 let waited = result.and_then(|value| self.promise_resolve(value));
                 match waited {
                     Ok(promise) => {
-                        let fulfilled = Value::Builtin(Builtin::Native(step(
+                        let fulfilled = Value::Builtin(Builtin::native(step(
                             transition,
                             TransitionStep::Updated,
                         )));
-                        let rejected = Value::Builtin(Builtin::Native(step(
+                        let rejected = Value::Builtin(Builtin::native(step(
                             transition,
                             TransitionStep::Failed,
                         )));

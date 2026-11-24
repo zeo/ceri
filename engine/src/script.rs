@@ -45,6 +45,8 @@ mod displaynames;
 mod disposables;
 mod durationformat;
 mod heap;
+mod jsstr;
+pub(crate) use jsstr::JsStr;
 mod lexer;
 mod locale;
 mod locale_data;
@@ -298,10 +300,12 @@ enum Value {
     Null,
     Bool(bool),
     Number(f64),
-    String(Rc<str>),
-    Symbol(Rc<str>),
+    String(JsStr),
+    Symbol(JsStr),
     BigInt(Rc<bigint::BigInt>),
-    Binding(Rc<RefCell<Value>>, bool),
+    // a cell shared with the binding it reads, writable or constant
+    Binding(Rc<RefCell<Value>>),
+    ConstBinding(Rc<RefCell<Value>>),
     Object(ObjectHandle),
     Array(ArrayHandle),
     NodeList(NodeListHandle),
@@ -631,7 +635,14 @@ enum Builtin {
     WorkerGlobalPostMessage(SyncSender<WorkerEvent>),
     WebAssemblyInstantiate,
     WebAssemblyFunction(WasmFunctionHandle),
-    Native(Native),
+    // boxed, as a native kept as a plain value is rare and would otherwise widen every value
+    Native(Rc<Native>),
+}
+
+impl Builtin {
+    fn native(native: Native) -> Self {
+        Self::Native(Rc::new(native))
+    }
 }
 
 // the script identity of a document node: one handle per node, so handles compare by pointer
@@ -763,7 +774,7 @@ pub struct ScriptRuntime {
     // the emptied stacks and argument lists of returned calls, for the next calls to fill
     spare_values: Vec<Vec<Value>>,
     // the length and name a bound function starts with, by its target's name and its length
-    bound_templates: HashMap<(Rc<str>, u64), object::ObjectTemplate>,
+    bound_templates: HashMap<(JsStr, u64), object::ObjectTemplate>,
     // milliseconds from an animation frame request to its callback
     frame_interval: u64,
     // whether the page's window shows; a hidden page runs no animation frames
@@ -7970,7 +7981,9 @@ impl ScriptRuntime {
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
         match builtin {
-            Builtin::Native(native) => self.call_native(native, Value::Undefined, arguments),
+            Builtin::Native(native) => {
+                self.call_native(Rc::unwrap_or_clone(native), Value::Undefined, arguments)
+            }
             Builtin::DocumentGetElementById => {
                 let id = arguments
                     .first()
@@ -10774,7 +10787,7 @@ impl ScriptRuntime {
 
     // a host step that runs as its own task once the current one finishes
     fn schedule_native_task(&mut self, native: Native) {
-        self.schedule_callback(Value::Builtin(Builtin::Native(native)), Vec::new());
+        self.schedule_callback(Value::Builtin(Builtin::native(native)), Vec::new());
     }
 
     fn schedule_callback(&mut self, callback: Value, arguments: Vec<Value>) {
@@ -11716,7 +11729,7 @@ fn delay_milliseconds(value: f64) -> u64 {
 impl Value {
     fn resolve(&self) -> Value {
         match self {
-            Self::Binding(binding, _) => binding.borrow().resolve(),
+            Self::Binding(binding) | Self::ConstBinding(binding) => binding.borrow().resolve(),
             _ => self.clone(),
         }
     }
@@ -11767,7 +11780,9 @@ impl Value {
             Self::Symbol(value) => {
                 format!("Symbol({})", symbol_description(value).unwrap_or_default())
             }
-            Self::Binding(_, _) => unreachable!("binding values resolve before formatting"),
+            Self::Binding(_) | Self::ConstBinding(_) => {
+                unreachable!("binding values resolve before formatting")
+            }
             Self::Object(object) => object_display(object),
             Self::Array(array) => array_display(array, &mut Vec::new()),
             Self::NodeList(_) => "[object NodeList]".to_string(),
@@ -11965,7 +11980,7 @@ fn clone_value(
 ) -> Result<CloneValue, ScriptError> {
     context.visit(depth)?;
     match value {
-        Value::Binding(binding, _) => {
+        Value::Binding(binding) | Value::ConstBinding(binding) => {
             let pointer = Rc::as_ptr(binding) as usize;
             context.enter(pointer)?;
             let value = binding.borrow().clone();
@@ -14956,7 +14971,9 @@ fn value_typeof(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Symbol(_) => "symbol",
         Value::BigInt(_) => "bigint",
-        Value::Binding(_, _) => unreachable!("binding values resolve before typeof"),
+        Value::Binding(_) | Value::ConstBinding(_) => {
+            unreachable!("binding values resolve before typeof")
+        }
         Value::Builtin(_)
         | Value::ResponseConstructor
         | Value::RequestConstructor
@@ -15399,7 +15416,8 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::String(left), Value::String(right)) => left == right,
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::BigInt(left), Value::BigInt(right)) => left == right,
-        (Value::Binding(_, _), _) | (_, Value::Binding(_, _)) => {
+        (Value::Binding(_) | Value::ConstBinding(_), _)
+        | (_, Value::Binding(_) | Value::ConstBinding(_)) => {
             unreachable!("binding values resolve before comparison")
         }
         (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
@@ -24763,4 +24781,10 @@ mod tests {
             .expect_err("unknown name should fail");
         assert!(error.message.contains("is not defined"));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_script_value_is_two_words() {
+    assert_eq!(std::mem::size_of::<Value>(), 16);
 }

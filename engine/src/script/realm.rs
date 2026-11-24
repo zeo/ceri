@@ -2888,9 +2888,9 @@ impl ScriptRuntime {
                     Value::Number(length) if length.is_finite() => length.max(0.0),
                     _ => 0.0,
                 };
-                let target_name: Rc<str> = match self.get_property(&this, "name")? {
+                let target_name: JsStr = match self.get_property(&this, "name")? {
                     Value::String(name) => name,
-                    _ => Rc::from(""),
+                    _ => JsStr::default(),
                 };
                 let length = (target_length - bound.len() as f64).max(0.0);
                 let prototype = self.prototype_of(&this);

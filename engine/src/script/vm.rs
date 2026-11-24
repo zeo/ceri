@@ -819,7 +819,9 @@ impl ScriptRuntime {
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
         match callee {
-            Value::Builtin(Builtin::Native(native)) => self.call_native(native, this, arguments),
+            Value::Builtin(Builtin::Native(native)) => {
+                self.call_native(Rc::unwrap_or_clone(native), this, arguments)
+            }
             Value::Builtin(builtin) => self.call_builtin(builtin, arguments),
             other if is_callable(&other) => self.call_host_constructor(other, arguments),
             other => Err(self.type_error(format!("{} is not a function", other.string_value()))),
@@ -1144,7 +1146,7 @@ impl ScriptRuntime {
         name: u32,
     ) -> Result<Value, ScriptError> {
         let value = Self::with_scope_at(frame, depth, |scope| match &scope.slots[index as usize] {
-            Value::Binding(cell, _) => cell.borrow().clone(),
+            Value::Binding(cell) | Value::ConstBinding(cell) => cell.borrow().clone(),
             value => value.clone(),
         });
         if matches!(value, Value::Uninitialized) {
@@ -1164,15 +1166,15 @@ impl ScriptRuntime {
     ) -> Result<(), ScriptError> {
         let mut scope = Self::scope_cell_at(frame, depth).borrow_mut();
         match &mut scope.slots[index as usize] {
-            Value::Binding(cell, true) if !matches!(*cell.borrow(), Value::Uninitialized) => {
+            Value::Binding(cell) if !matches!(*cell.borrow(), Value::Uninitialized) => {
                 *cell.borrow_mut() = value;
             }
-            Value::Binding(_, false) => {
+            Value::ConstBinding(_) => {
                 drop(scope);
                 let name = frame.code.names[name as usize].clone();
                 return Err(self.type_error(format!("Assignment to constant variable '{name}'")));
             }
-            Value::Binding(..) | Value::Uninitialized => {
+            Value::Binding(_) | Value::Uninitialized => {
                 drop(scope);
                 let name = frame.code.names[name as usize].clone();
                 return Err(
@@ -1500,7 +1502,9 @@ impl ScriptRuntime {
                     let value = Self::pop(frame);
                     let mut scope = Self::scope_cell_at(frame, depth).borrow_mut();
                     match &scope.slots[index as usize] {
-                        Value::Binding(cell, _) => *cell.borrow_mut() = value,
+                        Value::Binding(cell) | Value::ConstBinding(cell) => {
+                            *cell.borrow_mut() = value
+                        }
                         _ => scope.slots[index as usize] = value,
                     }
                 }
@@ -1645,7 +1649,7 @@ impl ScriptRuntime {
                     self.global
                         .borrow_mut()
                         .values
-                        .insert(name, Value::Binding(Rc::new(RefCell::new(value)), false));
+                        .insert(name, Value::ConstBinding(Rc::new(RefCell::new(value))));
                 }
                 Op::DeclareGlobal(name) => {
                     let name = frame.code.names[name as usize].clone();
@@ -3039,11 +3043,11 @@ impl ScriptRuntime {
         state: Rc<RefCell<AsyncFunctionData>>,
     ) -> Result<(), ScriptError> {
         let promise = self.promise_resolve(value)?;
-        let fulfilled = Value::Builtin(Builtin::Native(Native::AsyncResume(
+        let fulfilled = Value::Builtin(Builtin::native(Native::AsyncResume(
             AsyncResumeHandle(state.clone()),
             false,
         )));
-        let rejected = Value::Builtin(Builtin::Native(Native::AsyncResume(
+        let rejected = Value::Builtin(Builtin::native(Native::AsyncResume(
             AsyncResumeHandle(state),
             true,
         )));

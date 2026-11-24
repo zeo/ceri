@@ -524,7 +524,7 @@ impl JsObject {
                 slot: Slot::Data(current),
                 writable: true,
                 ..
-            }) if !matches!(current, Value::Binding(..))
+            }) if !matches!(current, Value::Binding(_) | Value::ConstBinding(_))
         );
         if !plain {
             return Err(value);

@@ -16,7 +16,7 @@ pub(super) enum KeyId {
     Null,
     Bool(bool),
     Number(u64),
-    String(Rc<str>),
+    String(JsStr),
     Symbol(String),
     BigInt(Rc<super::bigint::BigInt>),
     Node(usize, u8),
@@ -41,7 +41,7 @@ pub(super) fn key_id(value: &Value) -> KeyId {
         Value::String(text) => KeyId::String(text.clone()),
         Value::Symbol(key) => KeyId::Symbol(key.to_string()),
         Value::BigInt(value) => KeyId::BigInt(value.clone()),
-        Value::Binding(cell, _) => key_id(&cell.borrow()),
+        Value::Binding(cell) | Value::ConstBinding(cell) => key_id(&cell.borrow()),
         // a node and its style, dataset and class list views share one handle
         Value::Element(handle) => KeyId::Node(Rc::as_ptr(handle) as usize, 0),
         Value::Style(handle) => KeyId::Node(Rc::as_ptr(handle) as usize, 1),

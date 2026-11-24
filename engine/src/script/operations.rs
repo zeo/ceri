@@ -12,9 +12,9 @@ use super::*;
 // how the vm names a value it starts iterating, as v8's call printer finds it
 pub(super) enum Callsite {
     // the whole not-iterable message, from the iterated source
-    Source(Rc<str>),
+    Source(JsStr),
     // the source of a spread call argument
-    Argument(Rc<str>),
+    Argument(JsStr),
 }
 
 // the iteration state behind for-of, spread and destructuring; host collections iterate a
@@ -70,7 +70,7 @@ pub(super) fn is_primitive(value: &Value) -> bool {
 pub(super) fn is_callable(value: &Value) -> bool {
     match value {
         Value::Object(object) => object.borrow().is_callable(),
-        Value::Binding(cell, _) => is_callable(&cell.borrow()),
+        Value::Binding(cell) | Value::ConstBinding(cell) => is_callable(&cell.borrow()),
         Value::Builtin(_)
         | Value::ResponseConstructor
         | Value::RequestConstructor
@@ -199,16 +199,16 @@ fn display_key(key: &str) -> String {
 }
 
 // the string a typeof answers, made once per kind instead of once per typeof
-pub(super) fn type_name(kind: &'static str) -> Rc<str> {
+pub(super) fn type_name(kind: &'static str) -> JsStr {
     thread_local! {
-        static NAMES: RefCell<Vec<(&'static str, Rc<str>)>> = const { RefCell::new(Vec::new()) };
+        static NAMES: RefCell<Vec<(&'static str, JsStr)>> = const { RefCell::new(Vec::new()) };
     }
     NAMES.with(|names| {
         let mut names = names.borrow_mut();
         if let Some((_, name)) = names.iter().find(|(known, _)| *known == kind) {
             return name.clone();
         }
-        let name: Rc<str> = kind.into();
+        let name: JsStr = kind.into();
         names.push((kind, name.clone()));
         name
     })
@@ -381,7 +381,7 @@ impl ScriptRuntime {
                 }
                 Err(self.type_error("Cannot convert object to primitive value"))
             }
-            Value::Binding(cell, _) => {
+            Value::Binding(cell) | Value::ConstBinding(cell) => {
                 let inner = cell.borrow().clone();
                 self.coerce_primitive(inner, hint)
             }
@@ -943,7 +943,9 @@ impl ScriptRuntime {
                 return object.borrow().prototype_or(&self.intrinsics);
             }
             Value::Window => intrinsics.dom.prototype("EventTarget"),
-            Value::Binding(cell, _) => return self.prototype_of(&cell.borrow()),
+            Value::Binding(cell) | Value::ConstBinding(cell) => {
+                return self.prototype_of(&cell.borrow());
+            }
             Value::Bool(_) => intrinsics.boolean_prototype.clone(),
             Value::Number(_) => intrinsics.number_prototype.clone(),
             Value::String(_) => intrinsics.string_prototype.clone(),
@@ -1001,7 +1003,7 @@ impl ScriptRuntime {
                 value.string_value(),
                 display_key(key)
             ))),
-            Value::Binding(cell, _) => {
+            Value::Binding(cell) | Value::ConstBinding(cell) => {
                 let inner = cell.borrow().clone();
                 self.get_property(&inner, key)
             }
@@ -1149,7 +1151,7 @@ impl ScriptRuntime {
                 target.string_value(),
                 display_key(key)
             ))),
-            Value::Binding(cell, _) => {
+            Value::Binding(cell) | Value::ConstBinding(cell) => {
                 let inner = cell.borrow().clone();
                 self.set_property(&inner, key, value, strict)
             }
@@ -1378,7 +1380,7 @@ impl ScriptRuntime {
         if let Some(property) = receiver_object.property_mut(key) {
             if let Slot::Data(existing) = &mut property.slot {
                 match existing {
-                    Value::Binding(cell, true) => *cell.borrow_mut() = value,
+                    Value::Binding(cell) => *cell.borrow_mut() = value,
                     _ => *existing = value,
                 }
             }
@@ -2220,11 +2222,11 @@ impl ScriptRuntime {
         }
         let existing = self.global.borrow().values.get(name).cloned();
         match existing {
-            Some(Value::Binding(cell, true)) => {
+            Some(Value::Binding(cell)) => {
                 *cell.borrow_mut() = value;
                 Ok(())
             }
-            Some(Value::Binding(_, false)) => {
+            Some(Value::ConstBinding(_)) => {
                 Err(self.type_error(format!("Assignment to constant variable '{name}'")))
             }
             Some(_) => {
@@ -2411,7 +2413,7 @@ impl ScriptRuntime {
         };
         match stepped {
             Some(Value::Promise(promise)) => {
-                let wrap = Value::Builtin(Builtin::Native(Native::IterResultWrap(false)));
+                let wrap = Value::Builtin(Builtin::native(Native::IterResultWrap(false)));
                 self.promise_then(promise, Some(&wrap), None)
             }
             Some(value) => Ok(self.iterator_result(value, false)),
@@ -2658,7 +2660,8 @@ fn receiver_label(value: &Value) -> String {
 pub(super) fn strict_equals(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => left == right,
-        (Value::Binding(..), _) | (_, Value::Binding(..)) => {
+        (Value::Binding(_) | Value::ConstBinding(_), _)
+        | (_, Value::Binding(_) | Value::ConstBinding(_)) => {
             strict_equals(&left.resolve(), &right.resolve())
         }
         _ => values_equal(left, right),
