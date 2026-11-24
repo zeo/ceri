@@ -1426,12 +1426,17 @@ impl ScriptRuntime {
         let caller = frames.last_mut().expect("a frame is running");
         {
             let mut slots = scope.borrow_mut();
-            for (position, slot) in code.param_slots.iter().enumerate().take(count) {
+            // every parameter is written, the ones past the arguments as undefined, so the
+            // last of two parameters with one name decides its value
+            for (position, slot) in code.param_slots.iter().enumerate() {
                 if let Some(slot) = slot {
-                    slots.slots[*slot as usize] = std::mem::replace(
-                        &mut caller.stack[callee_at + 1 + position],
-                        Value::Undefined,
-                    );
+                    slots.slots[*slot as usize] = match position < count {
+                        true => std::mem::replace(
+                            &mut caller.stack[callee_at + 1 + position],
+                            Value::Undefined,
+                        ),
+                        false => Value::Undefined,
+                    };
                 }
             }
         }
