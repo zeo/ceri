@@ -795,13 +795,15 @@ impl ScriptRuntime {
         frame.construct = construct;
         if code.simple_params {
             let mut scope = scope.borrow_mut();
+            // with no arguments object to read them again, the values move into their slots
+            let moves = !code.reads_arguments;
             for (position, slot) in code.param_slots.iter().enumerate() {
                 if let Some(slot) = slot {
-                    scope.slots[*slot as usize] = frame
-                        .arguments
-                        .get(position)
-                        .cloned()
-                        .unwrap_or(Value::Undefined);
+                    scope.slots[*slot as usize] = match frame.arguments.get_mut(position) {
+                        Some(value) if moves => std::mem::replace(value, Value::Undefined),
+                        Some(value) => value.clone(),
+                        None => Value::Undefined,
+                    };
                 }
             }
         } else {

@@ -291,6 +291,8 @@ pub(super) struct Code {
     pub(super) self_scope: Option<Rc<Layout>>,
     // simple parameter lists bind straight into slots; others run destructuring code
     pub(super) simple_params: bool,
+    // whether the function makes an arguments object, which reads the call's arguments again
+    pub(super) reads_arguments: bool,
     // what a direct eval this code makes may use
     pub(super) eval_context: EvalContext,
     // one per name, for reads of a property by that name
@@ -1505,6 +1507,7 @@ impl Compiler {
             breakpoints: Cell::new(0),
             self_scope,
             simple_params,
+            reads_arguments: state.arguments_slot.is_some(),
             eval_context: EvalContext::default(),
             property_caches,
             function_template: std::cell::RefCell::new(None),
