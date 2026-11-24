@@ -167,6 +167,28 @@ pub(super) fn string_to_number(text: &str) -> f64 {
     text.parse::<f64>().unwrap_or(f64::NAN)
 }
 
+// what an operator makes of two numbers, for the ones that need nothing else
+#[inline]
+pub(super) fn number_binary(operator: BinaryOperator, a: f64, b: f64) -> Option<Value> {
+    use BinaryOperator as B;
+    Some(match operator {
+        B::Add => Value::Number(a + b),
+        B::Subtract => Value::Number(a - b),
+        B::Multiply => Value::Number(a * b),
+        B::Divide => Value::Number(a / b),
+        B::Less => Value::Bool(a < b),
+        B::LessEqual => Value::Bool(a <= b),
+        B::Greater => Value::Bool(a > b),
+        B::GreaterEqual => Value::Bool(a >= b),
+        B::StrictEqual | B::Equal => Value::Bool(a == b),
+        B::StrictNotEqual | B::NotEqual => Value::Bool(a != b),
+        B::BitOr => Value::Number(f64::from(to_int32_number(a) | to_int32_number(b))),
+        B::BitAnd => Value::Number(f64::from(to_int32_number(a) & to_int32_number(b))),
+        B::BitXor => Value::Number(f64::from(to_int32_number(a) ^ to_int32_number(b))),
+        _ => return None,
+    })
+}
+
 pub(super) fn to_int32_number(value: f64) -> i32 {
     // a number that is already a 32-bit integer, as nearly all are, converts as it stands
     let whole = value as i32;
@@ -693,36 +715,13 @@ impl ScriptRuntime {
         right: Value,
     ) -> Result<Value, ScriptError> {
         use BinaryOperator as B;
-        if let (Value::Number(a), Value::Number(b)) = (&left, &right) {
-            let (a, b) = (*a, *b);
-            let fast = match operator {
-                B::Add => Some(Value::Number(a + b)),
-                B::Subtract => Some(Value::Number(a - b)),
-                B::Multiply => Some(Value::Number(a * b)),
-                B::Divide => Some(Value::Number(a / b)),
-                B::Less => Some(Value::Bool(a < b)),
-                B::LessEqual => Some(Value::Bool(a <= b)),
-                B::Greater => Some(Value::Bool(a > b)),
-                B::GreaterEqual => Some(Value::Bool(a >= b)),
-                B::StrictEqual | B::Equal => Some(Value::Bool(a == b)),
-                B::StrictNotEqual | B::NotEqual => Some(Value::Bool(a != b)),
-                B::BitOr => Some(Value::Number(f64::from(
-                    to_int32_number(a) | to_int32_number(b),
-                ))),
-                B::BitAnd => Some(Value::Number(f64::from(
-                    to_int32_number(a) & to_int32_number(b),
-                ))),
-                B::BitXor => Some(Value::Number(f64::from(
-                    to_int32_number(a) ^ to_int32_number(b),
-                ))),
-                _ => None,
-            };
-            if let Some(value) = fast {
-                // two numbers own nothing, so there is nothing to drop
-                std::mem::forget(left);
-                std::mem::forget(right);
-                return Ok(value);
-            }
+        if let (Value::Number(a), Value::Number(b)) = (&left, &right)
+            && let Some(value) = number_binary(operator, *a, *b)
+        {
+            // two numbers own nothing, so there is nothing to drop
+            std::mem::forget(left);
+            std::mem::forget(right);
+            return Ok(value);
         }
         Ok(match operator {
             B::Add => {

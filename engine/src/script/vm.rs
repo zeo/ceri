@@ -1414,6 +1414,171 @@ impl ScriptRuntime {
         }
     }
 
+    // runs the ops ahead that touch only the frame's stack and plain slots of its scopes, with
+    // the frame's parts held in locals, and stops before the first op that needs more or meets
+    // anything unusual, which step then runs as it always did; the count is of ops run
+    fn run_simple(frame: &mut Frame) -> usize {
+        // how many ops run before step looks around again
+        const RUN: usize = 4096;
+        // how far out a scope is still reached from here
+        const REACH: usize = 4;
+        fn plain(value: &Value) -> Value {
+            match value {
+                Value::Number(number) => Value::Number(*number),
+                Value::Bool(flag) => Value::Bool(*flag),
+                Value::Undefined => Value::Undefined,
+                Value::Null => Value::Null,
+                other => other.clone(),
+            }
+        }
+        let Some(innermost) = frame.scope.as_ref() else {
+            return 0;
+        };
+        // safety: the frame holds its code for as long as it is borrowed here, and nothing in
+        // this function replaces it
+        let code: &Code = unsafe { &*Rc::as_ptr(&frame.code) };
+        let ops = &code.ops[..];
+        let mut scopes: [*const RefCell<Scope>; REACH] = [std::ptr::null(); REACH];
+        scopes[0] = Rc::as_ptr(innermost);
+        // the scope that many parents out, found once for the run: no op run here adds or
+        // removes a scope
+        let mut scope_at = |depth: u16| -> Option<&RefCell<Scope>> {
+            let depth = depth as usize;
+            if depth >= REACH {
+                return None;
+            }
+            for level in 1..=depth {
+                if scopes[level].is_null() {
+                    // safety: the frame holds the innermost scope and every scope holds its
+                    // parent, so each one lives at least as long as the frame is borrowed
+                    let nearer = unsafe { &*scopes[level - 1] };
+                    scopes[level] = Rc::as_ptr(nearer.try_borrow().ok()?.parent.as_ref()?);
+                }
+            }
+            // safety: as above
+            Some(unsafe { &*scopes[depth] })
+        };
+        let stack = &mut frame.stack;
+        let mut pc = frame.pc;
+        let mut ran = 0;
+        while ran < RUN {
+            let Some(&op) = ops.get(pc) else {
+                break;
+            };
+            match op {
+                Op::Nop => {}
+                Op::Undefined => stack.push(Value::Undefined),
+                Op::Null => stack.push(Value::Null),
+                Op::True => stack.push(Value::Bool(true)),
+                Op::False => stack.push(Value::Bool(false)),
+                Op::Number(value) => stack.push(Value::Number(value)),
+                Op::String(index) => {
+                    stack.push(Value::String(code.names[index as usize].clone()));
+                }
+                Op::Pop => match stack.pop() {
+                    Some(Value::Number(_) | Value::Bool(_) | Value::Undefined | Value::Null)
+                    | None => {}
+                    Some(other) => drop(other),
+                },
+                Op::Dup => {
+                    let Some(top) = stack.last() else {
+                        break;
+                    };
+                    let copy = plain(top);
+                    stack.push(copy);
+                }
+                Op::GetLocal { depth, index, .. } => {
+                    let Some(Ok(scope)) = scope_at(depth).map(RefCell::try_borrow) else {
+                        break;
+                    };
+                    match scope.slots.get(index as usize) {
+                        Some(Value::Binding(_) | Value::ConstBinding(_) | Value::Uninitialized)
+                        | None => break,
+                        Some(value) => stack.push(plain(value)),
+                    }
+                }
+                Op::SetLocal { depth, index, .. } => {
+                    let Some(top) = stack.last() else {
+                        break;
+                    };
+                    let Some(Ok(mut scope)) = scope_at(depth).map(RefCell::try_borrow_mut) else {
+                        break;
+                    };
+                    match scope.slots.get_mut(index as usize) {
+                        Some(Value::Binding(_) | Value::ConstBinding(_) | Value::Uninitialized)
+                        | None => break,
+                        Some(slot) => *slot = plain(top),
+                    }
+                }
+                Op::UpdateLocal {
+                    depth,
+                    index,
+                    increment,
+                    prefix,
+                    ..
+                } => {
+                    let Some(Ok(mut scope)) = scope_at(depth).map(RefCell::try_borrow_mut) else {
+                        break;
+                    };
+                    let Some(Value::Number(slot)) = scope.slots.get_mut(index as usize) else {
+                        break;
+                    };
+                    let old = *slot;
+                    *slot = if increment { old + 1.0 } else { old - 1.0 };
+                    stack.push(Value::Number(if prefix { *slot } else { old }));
+                }
+                Op::Binary(operator) => {
+                    let [.., Value::Number(left), Value::Number(right)] = stack[..] else {
+                        break;
+                    };
+                    let Some(value) = super::operations::number_binary(operator, left, right)
+                    else {
+                        break;
+                    };
+                    // two numbers own nothing, so the stack shortens without dropping them
+                    let length = stack.len() - 2;
+                    // safety: both are numbers, which have no drop, and length is in bounds
+                    unsafe { stack.set_len(length) };
+                    stack.push(value);
+                }
+                Op::Jump(target) => {
+                    pc = target as usize;
+                    ran += 1;
+                    continue;
+                }
+                Op::JumpIfFalse(target) | Op::JumpIfTrue(target) => {
+                    let test = match stack.pop() {
+                        Some(Value::Bool(test)) => test,
+                        Some(other) => other.truthy(),
+                        None => false,
+                    };
+                    if test == matches!(op, Op::JumpIfTrue(_)) {
+                        pc = target as usize;
+                        ran += 1;
+                        continue;
+                    }
+                }
+                Op::JumpIfFalseKeep(target) | Op::JumpIfTrueKeep(target) => {
+                    let test = match stack.last() {
+                        Some(Value::Bool(test)) => *test,
+                        Some(other) => other.truthy(),
+                        None => false,
+                    };
+                    if test == matches!(op, Op::JumpIfTrueKeep(_)) {
+                        pc = target as usize;
+                        ran += 1;
+                        continue;
+                    }
+                }
+                _ => break,
+            }
+            pc += 1;
+            ran += 1;
+        }
+        frame.pc = pc;
+        ran
+    }
+
     // one instruction; Some ends this run with a result
     fn step(&mut self, frames: &mut Vec<Frame>) -> Result<Option<RunResult>, ScriptError> {
         // ops that leave the same frame on top run on here, sparing each a trip through the run loop
@@ -1424,6 +1589,23 @@ impl ScriptRuntime {
         let sampling = crate::profile::enabled();
         loop {
             let depth = frames.len();
+            let frame = frames.last_mut().expect("a frame is running");
+            if !watched {
+                let ran = Self::run_simple(frame);
+                if ran > 0 {
+                    // the op an error made next would name
+                    if let Some(call) = self.debugger.calls.last_mut() {
+                        call.1 = frame.pc;
+                    }
+                    if sampling {
+                        let before = self.steps;
+                        self.steps += ran as u64;
+                        if before / 1024 != self.steps / 1024 {
+                            self.sample_script(frames);
+                        }
+                    }
+                }
+            }
             let frame = frames.last_mut().expect("a frame is running");
             let op = frame.code.ops[frame.pc];
             frame.pc += 1;
