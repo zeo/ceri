@@ -24,12 +24,14 @@ use winit::window::{
 
 type WindowSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
 
-// where a window's frames go: a composition swapchain, or a software surface where one cannot
-// be made, with the canvas revision and surface size it shows
+// where a window's frames go: a software surface, a layered bitmap for undecorated transparent
+// windows on windows, or a DirectComposition swapchain for decorated transparency or video
 enum Output {
     #[cfg(target_os = "windows")]
     Composition(crate::presenter::Presenter),
-    Software(WindowSurface, Option<(u64, (u32, u32))>),
+    #[cfg(target_os = "windows")]
+    Layered(LayeredSurface),
+    Software(WindowSurface, Option<(u64, (u32, u32))>, Option<Frame>),
 }
 
 impl Output {
@@ -37,32 +39,69 @@ impl Output {
         match self {
             #[cfg(target_os = "windows")]
             Self::Composition(_) => true,
+            #[cfg(target_os = "windows")]
+            Self::Layered(_) => false,
             Self::Software(..) => false,
         }
     }
 
-    fn open(context: &Context<OwnedDisplayHandle>, window: &Rc<Window>) -> Result<Self, String> {
+    fn open(
+        context: &mut SoftwareContext,
+        window: &Rc<Window>,
+        transparent: bool,
+        decorations: bool,
+    ) -> Result<Self, String> {
+        #[cfg(not(target_os = "windows"))]
+        let _ = (transparent, decorations);
         #[cfg(target_os = "windows")]
-        {
-            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            let size = window.inner_size();
-            let composed = window
-                .window_handle()
-                .map_err(|error| error.to_string())
-                .and_then(|handle| match handle.as_raw() {
-                    RawWindowHandle::Win32(handle) => {
-                        crate::presenter::Presenter::new(handle.hwnd.get(), size.width, size.height)
-                    }
-                    _ => Err("the window has no Win32 handle".to_string()),
-                });
-            match composed {
-                Ok(presenter) => return Ok(Self::Composition(presenter)),
+        if transparent {
+            if !decorations {
+                match LayeredSurface::new(window) {
+                    Ok(layered) => return Ok(Self::Layered(layered)),
+                    Err(error) => eprintln!("ceri: falling back to composition, {error}"),
+                }
+            }
+            match Self::compose(window, false) {
+                Ok(output) => return Ok(output),
                 Err(error) => eprintln!("ceri: drawing in software, {error}"),
             }
         }
-        Surface::new(context, window.clone())
-            .map(|surface| Self::Software(surface, None))
+        Surface::new(context.get()?, window.clone())
+            .map(|surface| Self::Software(surface, None, None))
             .map_err(|error| format!("window surface creation failed: {error}"))
+    }
+
+    // a composition swapchain on the window, used directly for decorated transparency or when
+    // any window receives its first video frame
+    #[cfg(target_os = "windows")]
+    fn compose(window: &Rc<Window>, for_video: bool) -> Result<Self, String> {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let size = window.inner_size();
+        window
+            .window_handle()
+            .map_err(|error| error.to_string())
+            .and_then(|handle| match handle.as_raw() {
+                RawWindowHandle::Win32(handle) if for_video => {
+                    crate::presenter::Presenter::new_for_video(
+                        handle.hwnd.get(),
+                        size.width,
+                        size.height,
+                    )
+                }
+                RawWindowHandle::Win32(handle) => {
+                    crate::presenter::Presenter::new(handle.hwnd.get(), size.width, size.height)
+                }
+                _ => Err("the window has no Win32 handle".to_string()),
+            })
+            .map(Self::Composition)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn sync_layered(&mut self) -> Result<(), String> {
+        if let Self::Layered(layered) = self {
+            layered.sync_style()?;
+        }
+        Ok(())
     }
 
     fn present(
@@ -86,7 +125,9 @@ impl Output {
                     &frame.planes,
                 )
             }
-            Self::Software(surface, shown) => {
+            #[cfg(target_os = "windows")]
+            Self::Layered(layered) => layered.present(frame, width, height),
+            Self::Software(surface, shown, last) => {
                 let revision = frame.canvas.revision();
                 let size = (width.get(), height.get());
                 if *shown == Some((revision.id, size)) {
@@ -123,6 +164,7 @@ impl Output {
                         .map_err(|error| format!("window surface present failed: {error}"))?;
                 }
                 *shown = Some((revision.id, size));
+                *last = Some(frame.clone());
                 Ok(())
             }
         }
@@ -130,44 +172,50 @@ impl Output {
 
     // a frame laid out for an earlier size, shown while the new size's frame is made: its
     // pixels where they fall inside the window, and past its edges the page's canvas colour
+    // (or transparent on a layered window)
     fn present_stale(
         &mut self,
         frame: &Frame,
         width: NonZeroU32,
         height: NonZeroU32,
     ) -> Result<(), String> {
-        let (columns, rows) = (width.get() as usize, height.get() as usize);
-        let canvas = &frame.canvas;
-        let pixels = canvas.rgba_pixels();
-        let stride = canvas.bytes_per_row();
-        let (canvas_columns, canvas_rows) = (canvas.width() as usize, canvas.height() as usize);
-        let [red, green, blue] = frame.background;
-        let corner = [red, green, blue, 255];
-        let mut padded = vec![0u8; columns * rows * 4];
-        for (row, target) in padded.chunks_exact_mut(columns * 4).enumerate() {
-            let shared = if row < canvas_rows {
-                columns.min(canvas_columns)
-            } else {
-                0
-            };
-            if shared > 0 {
-                let source = &pixels[row * stride..row * stride + shared * 4];
-                target[..shared * 4].copy_from_slice(source);
-            }
-            for pixel in target[shared * 4..].as_chunks_mut::<4>().0 {
-                *pixel = corner;
-            }
-        }
         match self {
             #[cfg(target_os = "windows")]
-            Self::Composition(presenter) => presenter.present(
-                &padded,
-                (width.get(), height.get()),
-                (width.get(), height.get()),
-                None,
-                &frame.planes,
-            ),
-            Self::Software(surface, shown) => {
+            Self::Composition(presenter) => {
+                let (columns, rows) = (width.get() as usize, height.get() as usize);
+                let canvas = &frame.canvas;
+                let pixels = canvas.rgba_pixels();
+                let stride = canvas.bytes_per_row();
+                let (canvas_columns, canvas_rows) =
+                    (canvas.width() as usize, canvas.height() as usize);
+                let [red, green, blue] = frame.background;
+                let corner = [red, green, blue, 255];
+                let mut padded = vec![0u8; columns * rows * 4];
+                for (row, target) in padded.chunks_exact_mut(columns * 4).enumerate() {
+                    let shared = if row < canvas_rows {
+                        columns.min(canvas_columns)
+                    } else {
+                        0
+                    };
+                    if shared > 0 {
+                        let source = &pixels[row * stride..row * stride + shared * 4];
+                        target[..shared * 4].copy_from_slice(source);
+                    }
+                    for pixel in target[shared * 4..].as_chunks_mut::<4>().0 {
+                        *pixel = corner;
+                    }
+                }
+                presenter.present(
+                    &padded,
+                    (width.get(), height.get()),
+                    (width.get(), height.get()),
+                    None,
+                    &frame.planes,
+                )
+            }
+            #[cfg(target_os = "windows")]
+            Self::Layered(layered) => layered.present_stale(frame, width, height),
+            Self::Software(surface, shown, _) => {
                 *shown = None;
                 surface
                     .resize(width, height)
@@ -175,10 +223,7 @@ impl Output {
                 let mut buffer = surface
                     .buffer_mut()
                     .map_err(|error| format!("window surface buffer failed: {error}"))?;
-                for (pixel, rgba) in buffer.iter_mut().zip(padded.as_chunks::<4>().0) {
-                    *pixel =
-                        u32::from(rgba[0]) << 16 | u32::from(rgba[1]) << 8 | u32::from(rgba[2]);
-                }
+                present_stale_software(frame, (width.get(), height.get()), &mut buffer);
                 buffer
                     .present()
                     .map_err(|error| format!("window surface present failed: {error}"))
@@ -186,13 +231,22 @@ impl Output {
         }
     }
 
-    // covers a window grown past its last frame until a frame of the new size comes; a
-    // software surface has nothing kept to extend
+    // covers a window grown past its last frame until a frame of the new size comes
     #[cfg(target_os = "windows")]
     fn extend(&mut self, width: u32, height: u32) -> Result<(), String> {
         match self {
             Self::Composition(presenter) => presenter.extend((width, height)),
-            Self::Software(..) => Ok(()),
+            Self::Layered(layered) => layered.extend(width, height),
+            Self::Software(_, _, last) => {
+                let (Some(last), Some(width), Some(height)) = (
+                    last.clone(),
+                    NonZeroU32::new(width),
+                    NonZeroU32::new(height),
+                ) else {
+                    return Ok(());
+                };
+                self.present_stale(&last, width, height)
+            }
         }
     }
 
@@ -208,7 +262,9 @@ impl Output {
                 None,
                 &[],
             ),
-            Self::Software(surface, shown) => {
+            #[cfg(target_os = "windows")]
+            Self::Layered(_) => Ok(()),
+            Self::Software(surface, shown, _) => {
                 *shown = None;
                 surface
                     .resize(width, height)
@@ -222,6 +278,350 @@ impl Output {
                     .map_err(|error| format!("window surface present failed: {error}"))
             }
         }
+    }
+}
+
+// per-pixel alpha transparency over a GDI DIB section and UpdateLayeredWindowIndirect, so
+// undecorated transparent windows avoid loading Direct3D/DirectComposition unless video plays
+#[cfg(target_os = "windows")]
+struct LayeredSurface {
+    hwnd: isize,
+    dc: windows::Win32::Graphics::Gdi::HDC,
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    previous: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    bits: *mut u8,
+    size: (u32, u32),
+    presented: bool,
+    shown: Option<(u64, (u32, u32))>,
+    last: Option<Frame>,
+}
+
+#[cfg(target_os = "windows")]
+impl LayeredSurface {
+    fn new(window: &Rc<Window>) -> Result<Self, String> {
+        use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, HBITMAP, HGDIOBJ};
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let hwnd = match window
+            .window_handle()
+            .map_err(|error| error.to_string())?
+            .as_raw()
+        {
+            RawWindowHandle::Win32(handle) => handle.hwnd.get(),
+            _ => return Err("the window has no Win32 handle".to_string()),
+        };
+        ensure_layered_style(hwnd);
+        // safety: creates a memory DC compatible with the screen, released in Drop
+        let dc = unsafe { CreateCompatibleDC(None) };
+        if dc.is_invalid() {
+            return Err("layered memory DC creation failed".to_string());
+        }
+        Ok(Self {
+            hwnd,
+            dc,
+            bitmap: HBITMAP::default(),
+            previous: HGDIOBJ::default(),
+            bits: std::ptr::null_mut(),
+            size: (0, 0),
+            presented: false,
+            shown: None,
+            last: None,
+        })
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<bool, String> {
+        use windows::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject,
+            SelectObject,
+        };
+
+        if self.size == (width, height) && !self.bits.is_null() {
+            return Ok(false);
+        }
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                // negative height selects a top-down DIB matching canvas row order
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        // safety: info describes a valid 32-bit top-down DIB and out pointer lives across the call
+        let bitmap =
+            unsafe { CreateDIBSection(Some(self.dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) }
+                .map_err(|error| format!("layered bitmap creation failed: {error}"))?;
+        if bits.is_null() {
+            // safety: bitmap is not selected into any DC
+            unsafe {
+                let _ = DeleteObject(bitmap.into());
+            }
+            return Err("layered bitmap returned no pixels".to_string());
+        }
+        // safety: swaps the DIB into self.dc and deletes any previous DIB owned by this surface
+        unsafe {
+            let replaced = SelectObject(self.dc, bitmap.into());
+            if self.bitmap.is_invalid() {
+                self.previous = replaced;
+            } else {
+                let _ = DeleteObject(self.bitmap.into());
+            }
+            std::ptr::write_bytes(bits.cast::<u8>(), 0, width as usize * height as usize * 4);
+        }
+        self.bitmap = bitmap;
+        self.bits = bits.cast();
+        self.size = (width, height);
+        self.shown = None;
+        self.presented = false;
+        Ok(true)
+    }
+
+    fn pixels_mut(&mut self) -> &mut [u8] {
+        let len = self.size.0 as usize * self.size.1 as usize * 4;
+        // safety: bits points to a live width * height * 4 DIB section owned by self.bitmap
+        unsafe { std::slice::from_raw_parts_mut(self.bits, len) }
+    }
+
+    fn commit(&mut self, dirty: Option<[u32; 4]>) -> Result<(), String> {
+        use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
+        use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            ULW_ALPHA, UPDATELAYEREDWINDOWINFO, UpdateLayeredWindowIndirect,
+        };
+
+        if ensure_layered_style(self.hwnd) {
+            self.presented = false;
+        }
+        let full = !self.presented || dirty.is_none();
+        let size = SIZE {
+            cx: self.size.0 as i32,
+            cy: self.size.1 as i32,
+        };
+        let source = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let rect = dirty.map(|[left, top, right, bottom]| RECT {
+            left: left as i32,
+            top: top as i32,
+            right: right as i32,
+            bottom: bottom as i32,
+        });
+        let info = UPDATELAYEREDWINDOWINFO {
+            cbSize: size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+            hdcDst: HDC::default(),
+            pptDst: std::ptr::null(),
+            psize: &size,
+            hdcSrc: self.dc,
+            pptSrc: &source,
+            crKey: COLORREF(0),
+            pblend: &blend,
+            dwFlags: ULW_ALPHA,
+            prcDirty: if full {
+                std::ptr::null()
+            } else {
+                rect.as_ref().map_or(std::ptr::null(), std::ptr::from_ref)
+            },
+        };
+        // safety: info and all pointers inside it stay live across the call, and self.dc holds a
+        // 32-bit DIB of `size`
+        let ok = unsafe { UpdateLayeredWindowIndirect(HWND(self.hwnd as *mut _), &info) }.as_bool();
+        if !ok {
+            return Err(format!(
+                "layered window update failed: {}",
+                windows::core::Error::from_thread()
+            ));
+        }
+        self.presented = true;
+        Ok(())
+    }
+
+    // winit overwrites GWL_EXSTYLE on window flag changes, stripping WS_EX_LAYERED when
+    // click-through is off; re-applying it discards the layered surface so the DIB is recommitted
+    fn sync_style(&mut self) -> Result<(), String> {
+        if ensure_layered_style(self.hwnd) {
+            self.presented = false;
+            if !self.bits.is_null() && self.size.0 > 0 && self.size.1 > 0 {
+                self.commit(None)?;
+            }
+        }
+        Ok(())
+    }
+
+    // leaves UpdateLayeredWindow mode before attaching a DirectComposition target for video
+    fn release_for_composition(&self, click_through: bool) {
+        use windows::Win32::Foundation::{COLORREF, HWND};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetWindowLongW, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+            SWP_NOSIZE, SWP_NOZORDER, SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos,
+            WS_EX_LAYERED, WS_EX_TRANSPARENT,
+        };
+
+        let hwnd = HWND(self.hwnd as *mut _);
+        // safety: hwnd belongs to the live window on this thread
+        unsafe {
+            let style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            let cleared = style & !WS_EX_LAYERED.0;
+            SetWindowLongW(hwnd, GWL_EXSTYLE, cleared as i32);
+            if click_through {
+                SetWindowLongW(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    (cleared | WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0) as i32,
+                );
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+    }
+
+    fn present(
+        &mut self,
+        frame: &Frame,
+        width: NonZeroU32,
+        height: NonZeroU32,
+    ) -> Result<(), String> {
+        let size = (width.get(), height.get());
+        let revision = frame.canvas.revision();
+        if self.shown == Some((revision.id, size)) && self.presented && has_layered_style(self.hwnd)
+        {
+            return Ok(());
+        }
+        let resized = self.resize(size.0, size.1)?;
+        let changed = match revision.changed {
+            Some((base, boxes)) if !resized && self.shown == Some((base, size)) => {
+                let [left, top, right, bottom] = boxes.bounds();
+                [left, top, right.min(size.0), bottom.min(size.1)]
+            }
+            _ => [0, 0, size.0, size.1],
+        };
+        let whole = changed == [0, 0, size.0, size.1];
+        if changed[0] < changed[2] && changed[1] < changed[3] {
+            pack_layered_frame(frame, size, changed, self.pixels_mut());
+            self.commit((!whole).then_some(changed))?;
+        } else if !self.presented {
+            self.commit(None)?;
+        }
+        self.shown = Some((revision.id, size));
+        self.last = Some(frame.clone());
+        Ok(())
+    }
+
+    fn present_stale(
+        &mut self,
+        frame: &Frame,
+        width: NonZeroU32,
+        height: NonZeroU32,
+    ) -> Result<(), String> {
+        let size = (width.get(), height.get());
+        self.shown = None;
+        self.resize(size.0, size.1)?;
+        pack_layered_frame(frame, size, [0, 0, size.0, size.1], self.pixels_mut());
+        self.commit(None)
+    }
+
+    fn extend(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let (Some(last), Some(width), Some(height)) = (
+            self.last.clone(),
+            NonZeroU32::new(width),
+            NonZeroU32::new(height),
+        ) else {
+            return Ok(());
+        };
+        self.present_stale(&last, width, height)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for LayeredSurface {
+    fn drop(&mut self) {
+        use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, SelectObject};
+        // safety: restores the stock bitmap before deleting our DIB and memory DC
+        unsafe {
+            if !self.dc.is_invalid() {
+                if !self.previous.is_invalid() {
+                    SelectObject(self.dc, self.previous);
+                }
+                if !self.bitmap.is_invalid() {
+                    let _ = DeleteObject(self.bitmap.into());
+                }
+                let _ = DeleteDC(self.dc);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn has_layered_style(hwnd: isize) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, WS_EX_LAYERED, WS_EX_WINDOWEDGE,
+        WS_OVERLAPPEDWINDOW, WS_POPUP,
+    };
+    let hwnd = HWND(hwnd as *mut _);
+    // safety: reads window style bits on a live window handle owned by this thread
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        (style & WS_OVERLAPPEDWINDOW.0) == 0
+            && (style & WS_POPUP.0) != 0
+            && (ex & WS_EX_LAYERED.0) != 0
+            && (ex & WS_EX_WINDOWEDGE.0) == 0
+    }
+}
+
+// enforces WS_POPUP + WS_EX_LAYERED without frame bits that cause classic border artifacts over
+// UpdateLayeredWindow surfaces; returns true if either style changed
+#[cfg(target_os = "windows")]
+fn ensure_layered_style(hwnd: isize) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_NOZORDER, SetWindowLongW, SetWindowPos, WS_EX_LAYERED, WS_EX_WINDOWEDGE,
+        WS_OVERLAPPEDWINDOW, WS_POPUP,
+    };
+    let hwnd = HWND(hwnd as *mut _);
+    // safety: updates window style bits on a live window handle owned by this thread
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let wanted_style = (style & !WS_OVERLAPPEDWINDOW.0) | WS_POPUP.0;
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let wanted_ex = (ex & !WS_EX_WINDOWEDGE.0) | WS_EX_LAYERED.0;
+        let changed = style != wanted_style || ex != wanted_ex;
+        if style != wanted_style {
+            SetWindowLongW(hwnd, GWL_STYLE, wanted_style as i32);
+        }
+        if ex != wanted_ex {
+            SetWindowLongW(hwnd, GWL_EXSTYLE, wanted_ex as i32);
+        }
+        if changed {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+        changed
     }
 }
 
@@ -456,6 +856,8 @@ pub struct WindowControl {
 enum Request {
     // a worker has events to poll
     Wake,
+    // a closed window's worker has finished exiting, so main-thread caches can trim if idle
+    Trim,
     Open(Box<WindowConfig>),
     Close(String),
     Act(String, WindowAction),
@@ -536,6 +938,13 @@ impl WindowControl {
             let _ = proxy.send_event(Request::Wake);
         })
     }
+
+    fn trim_waker(&self) -> Waker {
+        let proxy = self.proxy.clone();
+        Arc::new(move || {
+            let _ = proxy.send_event(Request::Trim);
+        })
+    }
 }
 
 // what a window's browser is built with
@@ -596,8 +1005,10 @@ where
         proxy: event_loop.create_proxy(),
         published: Arc::default(),
     };
-    let context =
-        Context::new(event_loop.owned_display_handle()).map_err(|error| error.to_string())?;
+    let context = SoftwareContext {
+        display: event_loop.owned_display_handle(),
+        context: None,
+    };
     let mut app = App {
         context,
         factory,
@@ -611,8 +1022,28 @@ where
         .map_err(|error| error.to_string())
 }
 
+// created on first software window open and dropped once no window stays open
+struct SoftwareContext {
+    display: OwnedDisplayHandle,
+    context: Option<Context<OwnedDisplayHandle>>,
+}
+
+impl SoftwareContext {
+    fn get(&mut self) -> Result<&Context<OwnedDisplayHandle>, String> {
+        if self.context.is_none() {
+            self.context =
+                Some(Context::new(self.display.clone()).map_err(|error| error.to_string())?);
+        }
+        Ok(self.context.as_ref().expect("context was just created"))
+    }
+
+    fn clear(&mut self) {
+        self.context = None;
+    }
+}
+
 struct App<F> {
-    context: Context<OwnedDisplayHandle>,
+    context: SoftwareContext,
     factory: F,
     control: WindowControl,
     // the windows to open once the loop starts
@@ -665,6 +1096,8 @@ struct AppWindow {
     published: Arc<Mutex<Published>>,
     closing: bool,
     intercept_close: bool,
+    #[cfg(target_os = "windows")]
+    click_through: bool,
 }
 
 impl<F> App<F>
@@ -693,13 +1126,14 @@ where
         let see_through = config.transparent;
         let control = self.control.clone();
         let notify = control.waker();
+        let on_exit = control.trim_waker();
         let spawn: Spawn = Rc::new(move |viewport, recovery: Option<String>| {
             let factory = factory.clone();
             let context = WindowContext {
                 label: label.clone(),
                 control: control.clone(),
             };
-            EngineWorker::spawn_live(
+            EngineWorker::spawn_live_with_exit(
                 viewport,
                 move || {
                     let mut browser = factory(&context)?;
@@ -710,6 +1144,7 @@ where
                     Ok(browser)
                 },
                 notify.clone(),
+                Some(on_exit.clone()),
             )
         });
         let worker = match spawn(viewport, None) {
@@ -722,6 +1157,8 @@ where
                 return;
             }
         };
+        #[cfg(target_os = "windows")]
+        let click_through = config.click_through;
         let mut this = AppWindow {
             config,
             spawn,
@@ -754,9 +1191,11 @@ where
             published: self.control.published.clone(),
             closing: false,
             intercept_close: false,
+            #[cfg(target_os = "windows")]
+            click_through,
         };
         let monitors = self.control.monitors();
-        let Some(id) = this.create(event_loop, &self.context, &monitors) else {
+        let Some(id) = this.create(event_loop, &mut self.context, &monitors) else {
             this.worker.shutdown();
             return;
         };
@@ -852,7 +1291,7 @@ impl AppWindow {
     fn create(
         &mut self,
         event_loop: &ActiveEventLoop,
-        context: &Context<OwnedDisplayHandle>,
+        context: &mut SoftwareContext,
         monitors: &[Monitor],
     ) -> Option<WindowId> {
         let background = background_mode();
@@ -903,9 +1342,9 @@ impl AppWindow {
             attributes = attributes
                 .with_skip_taskbar(config.skip_taskbar || background)
                 .with_undecorated_shadow(config.shadow)
-                // with no surface of its own behind the composition, the window is clear
-                // where the frame is
-                .with_no_redirection_bitmap(config.transparent);
+                // undecorated transparent windows present through UpdateLayeredWindow, which
+                // rejects WS_EX_NOREDIRECTIONBITMAP; decorated transparent windows keep DirectComposition
+                .with_no_redirection_bitmap(config.transparent && config.decorations);
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         if let Some(id) = &config.app_id {
@@ -954,7 +1393,12 @@ impl AppWindow {
                 return None;
             }
         };
-        let mut output = match Output::open(context, &window) {
+        let mut output = match Output::open(
+            context,
+            &window,
+            self.config.transparent,
+            self.config.decorations,
+        ) {
             Ok(output) => output,
             Err(error) => {
                 eprintln!("ceri: {error}");
@@ -971,6 +1415,10 @@ impl AppWindow {
         }
         if self.config.click_through {
             let _ = window.set_cursor_hittest(false);
+        }
+        #[cfg(target_os = "windows")]
+        if let Err(error) = output.sync_layered() {
+            eprintln!("ceri: {error}");
         }
         window.set_ime_allowed(true);
         self.handle = native_handle(&window);
@@ -1088,6 +1536,10 @@ impl AppWindow {
                 let _ = skip;
             }
             WindowAction::ClickThrough(on) => {
+                #[cfg(target_os = "windows")]
+                {
+                    self.click_through = on;
+                }
                 let _ = window.set_cursor_hittest(!on);
             }
             WindowAction::ContentProtected(on) => window.set_content_protected(on),
@@ -1113,6 +1565,12 @@ impl AppWindow {
                 self.remember_geometry();
                 self.closing = true;
             }
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(output) = &mut self.output
+            && let Err(error) = output.sync_layered()
+        {
+            eprintln!("ceri: {error}");
         }
         self.publish();
     }
@@ -1372,9 +1830,10 @@ impl AppWindow {
         }
     }
 
-    // a composition presenter shows videos under the canvas, so the engine stops painting them
+    // the compositor shows videos under the canvas, so the engine stops painting them; on
+    // windows every window can move there when a video comes
     fn announce_planes(&mut self) {
-        if self.output.as_ref().is_some_and(Output::composed)
+        if (cfg!(target_os = "windows") || self.output.as_ref().is_some_and(Output::composed))
             && let Err(error) = self.worker.show_planes()
         {
             eprintln!("ceri: videos stay painted into the page, {error}");
@@ -1600,7 +2059,7 @@ impl AppWindow {
             .cloned()
     }
 
-    fn answer_region(&self, region: RegionPress) {
+    fn answer_region(&mut self, region: RegionPress) {
         let Some(window) = &self.window else {
             return;
         };
@@ -1612,7 +2071,13 @@ impl AppWindow {
             }
             // as on a native caption, a window that keeps its size does not maximize
             RegionPress::ToggleMaximize if self.config.resizable => {
-                window.set_maximized(!window.is_maximized())
+                window.set_maximized(!window.is_maximized());
+                #[cfg(target_os = "windows")]
+                if let Some(output) = &mut self.output
+                    && let Err(error) = output.sync_layered()
+                {
+                    eprintln!("ceri: {error}");
+                }
             }
             RegionPress::ToggleMaximize => {}
         }
@@ -1627,6 +2092,12 @@ impl AppWindow {
             && !background_mode()
         {
             window.set_fullscreen(frame.fullscreen.then_some(Fullscreen::Borderless(None)));
+            #[cfg(target_os = "windows")]
+            if let Some(output) = &mut self.output
+                && let Err(error) = output.sync_layered()
+            {
+                eprintln!("ceri: {error}");
+            }
         }
     }
 
@@ -1693,6 +2164,23 @@ impl AppWindow {
         let Some(output) = &mut self.output else {
             return;
         };
+        // a video shows under the canvas through the compositor, so the window moves there
+        #[cfg(target_os = "windows")]
+        if !frame.planes.is_empty()
+            && !output.composed()
+            && let Some(window) = &self.window
+        {
+            if let Output::Layered(layered) = &*output {
+                layered.release_for_composition(self.click_through);
+            }
+            match Output::compose(window, true) {
+                Ok(composed) => *output = composed,
+                Err(error) => {
+                    eprintln!("ceri: the video stays unshown, {error}");
+                    let _ = output.sync_layered();
+                }
+            }
+        }
         if let Err(error) = output.present(&frame, width, height) {
             eprintln!("ceri: {error}");
             self.closing = true;
@@ -1839,6 +2327,10 @@ where
             window.request_redraw();
         }
         self.sweep(event_loop);
+        if self.windows.is_empty() && self.control.published().opening == 0 {
+            self.context.clear();
+            crate::trim_idle_memory();
+        }
     }
 
     fn window_event(
@@ -1871,6 +2363,16 @@ where
                 for window in self.windows.values_mut() {
                     window.poll_worker();
                 }
+            }
+            Request::Trim => {
+                if self.windows.is_empty()
+                    && self.startup.is_none()
+                    && self.control.published().opening == 0
+                {
+                    self.context.clear();
+                    crate::trim_idle_memory();
+                }
+                return;
             }
             Request::Open(config) => {
                 self.refresh_monitors(event_loop);
@@ -2122,6 +2624,78 @@ fn present_frame(
     }
 }
 
+// copies an earlier-size canvas directly into a software surface buffer, filling exposed edges
+// with the page background colour
+fn present_stale_software(frame: &Frame, (width, height): (u32, u32), buffer: &mut [u32]) {
+    let (columns, rows) = (width as usize, height as usize);
+    let canvas = &frame.canvas;
+    let pixels = canvas.rgba_pixels();
+    let stride = canvas.bytes_per_row();
+    let (canvas_columns, canvas_rows) = (canvas.width() as usize, canvas.height() as usize);
+    let [red, green, blue] = frame.background;
+    let fill = u32::from(red) << 16 | u32::from(green) << 8 | u32::from(blue);
+    let shared_columns = columns.min(canvas_columns);
+    let shared_rows = rows.min(canvas_rows);
+    for row in 0..shared_rows {
+        let source = &pixels[row * stride..row * stride + shared_columns * 4];
+        let target = &mut buffer[row * columns..(row + 1) * columns];
+        for (pixel, rgba) in target[..shared_columns]
+            .iter_mut()
+            .zip(source.as_chunks::<4>().0)
+        {
+            *pixel = u32::from(rgba[0]) << 16 | u32::from(rgba[1]) << 8 | u32::from(rgba[2]);
+        }
+        target[shared_columns..].fill(fill);
+    }
+    if shared_rows < rows {
+        buffer[shared_rows * columns..rows * columns].fill(fill);
+    }
+}
+
+// packs premultiplied RGBA canvas pixels into a top-down premultiplied BGRA DIB section,
+// clearing any pixels past the canvas edge to transparent
+#[cfg(any(target_os = "windows", test))]
+fn pack_layered_frame(
+    frame: &Frame,
+    (width, height): (u32, u32),
+    [left, top, right, bottom]: [u32; 4],
+    dst: &mut [u8],
+) {
+    let (width, height) = (width as usize, height as usize);
+    let canvas = &frame.canvas;
+    let pixels = canvas.rgba_pixels();
+    let stride = canvas.bytes_per_row();
+    let (canvas_width, canvas_height) = (canvas.width() as usize, canvas.height() as usize);
+    let dst_left = (left as usize).min(width);
+    let dst_right = (right as usize).min(width).max(dst_left);
+    let dst_top = (top as usize).min(height);
+    let dst_bottom = (bottom as usize).min(height).max(dst_top);
+    let src_end = dst_right.min(canvas_width);
+    let clear_start = dst_left.max(src_end);
+    for row in dst_top..dst_bottom {
+        let dst_row = &mut dst[row * width * 4..(row + 1) * width * 4];
+        if row < canvas_height {
+            if dst_left < src_end {
+                let source = &pixels[row * stride + dst_left * 4..row * stride + src_end * 4];
+                let target = &mut dst_row[dst_left * 4..src_end * 4];
+                for (to, from) in target
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(source.as_chunks::<4>().0)
+                {
+                    *to = [from[2], from[1], from[0], from[3]];
+                }
+            }
+            if clear_start < dst_right {
+                dst_row[clear_start * 4..dst_right * 4].fill(0);
+            }
+        } else {
+            dst_row[dst_left * 4..dst_right * 4].fill(0);
+        }
+    }
+}
+
 fn drop_payload(paths: &[PathBuf]) -> String {
     let quoted: Vec<_> = paths
         .iter()
@@ -2190,7 +2764,8 @@ fn forced_palette() -> Option<crate::css::SystemColors> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Monitor, ResizeDirection, centred, layout_viewport, present_frame, resize_direction,
+        Monitor, ResizeDirection, centred, layout_viewport, pack_layered_frame, present_frame,
+        present_stale_software, resize_direction,
     };
 
     #[test]
@@ -2226,6 +2801,84 @@ mod tests {
                 .all(|row| row[..4] == [painted; 4] && row[4] == 7),
             "the surface past the canvas is left alone"
         );
+    }
+
+    #[test]
+    fn stale_software_present_fills_exposed_edges_with_background() {
+        let frame = crate::host::Frame {
+            sequence: 0,
+            viewport: crate::layout::Size {
+                width: 2.0,
+                height: 2.0,
+            },
+            scale: 1.0,
+            title: None,
+            fullscreen: false,
+            background: [10, 20, 30],
+            canvas: std::sync::Arc::new(crate::paint::Canvas::new(
+                2,
+                2,
+                crate::css::Color::opaque(1, 2, 3),
+            )),
+            planes: Vec::new(),
+        };
+        let mut buffer = vec![0; 4 * 3];
+        present_stale_software(&frame, (4, 3), &mut buffer);
+        let painted = 0x01_02_03;
+        let fill = 0x0a_14_1e;
+        assert_eq!(
+            buffer,
+            [
+                painted, painted, fill, fill, painted, painted, fill, fill, fill, fill, fill, fill,
+            ]
+        );
+        let mut shrunk = vec![0; 1];
+        present_stale_software(&frame, (1, 1), &mut shrunk);
+        assert_eq!(shrunk, [painted]);
+    }
+
+    #[test]
+    fn layered_present_swizzles_premultiplied_bgra_and_clears_past_canvas() {
+        let frame = crate::host::Frame {
+            sequence: 0,
+            viewport: crate::layout::Size {
+                width: 2.0,
+                height: 2.0,
+            },
+            scale: 1.0,
+            title: None,
+            fullscreen: false,
+            background: [255, 255, 255],
+            canvas: std::sync::Arc::new(
+                crate::paint::Canvas::new(2, 2, crate::css::Color::transparent()).overlaid(&[(
+                    [0.0, 0.0, 2.0, 2.0],
+                    crate::css::Color::rgba(100, 150, 200, 128),
+                )]),
+            ),
+            planes: Vec::new(),
+        };
+        let pixel = &frame.canvas.rgba_pixels()[..4];
+        let bgra = [pixel[2], pixel[1], pixel[0], pixel[3]];
+        assert_eq!(bgra[3], 128);
+        let mut dst = vec![99u8; 3 * 3 * 4];
+        pack_layered_frame(&frame, (3, 3), [0, 0, 3, 3], &mut dst);
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            dst[(y * 3 + x) * 4..(y * 3 + x + 1) * 4]
+                .try_into()
+                .unwrap()
+        };
+        assert_eq!(px(0, 0), bgra);
+        assert_eq!(px(1, 1), bgra);
+        assert_eq!(px(2, 0), [0, 0, 0, 0]);
+        assert_eq!(px(0, 2), [0, 0, 0, 0]);
+        assert_eq!(px(2, 2), [0, 0, 0, 0]);
+
+        // partial update leaves untouched pixels alone and clears overhang
+        let mut partial = vec![77u8; 3 * 3 * 4];
+        pack_layered_frame(&frame, (3, 3), [1, 1, 3, 2], &mut partial);
+        assert_eq!(&partial[0..4], &[77, 77, 77, 77]);
+        assert_eq!(&partial[16..20], &bgra);
+        assert_eq!(&partial[20..24], &[0, 0, 0, 0]);
     }
 
     #[test]

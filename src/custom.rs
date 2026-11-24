@@ -613,7 +613,7 @@ pub fn run() -> Result<(), String> {
 }
 
 fn run_app(
-    bridge: Bridge,
+    mut bridge: Bridge,
     identifier: &str,
     windows: Vec<WindowConfig>,
     mut lifecycle: Lifecycle,
@@ -631,10 +631,12 @@ fn run_app(
     let storage = profile.join("storage");
     let allowed = allowed_origins(&arguments)?;
     let assets = launch.assets.clone();
-    let icon_source = bridge
+    // share one icon byte buffer across tray, notifications and window creation
+    let icon_source: Option<Arc<[u8]>> = bridge
         .icon
-        .clone()
-        .or_else(|| app_icon_source(launch.assets.as_ref()));
+        .take()
+        .or_else(|| app_icon_source(launch.assets.as_ref()))
+        .map(Arc::from);
     let _ = bridge.taskbar.set(Taskbar::new(identifier));
     let _ = bridge.notifier.set(Notifier::new(
         identifier,
@@ -642,9 +644,6 @@ fn run_app(
         icon_source.clone(),
         &profile,
     ));
-    let icon = icon_source
-        .as_deref()
-        .and_then(|source| ceri_engine::rasterize_icon(source, 64));
     let windows = match windows.is_empty() && !lifecycle.keep_running {
         true => vec![WindowConfig {
             title: "Ceri".to_string(),
@@ -655,11 +654,26 @@ fn run_app(
         false => windows,
     };
     let app_id = identifier.to_string();
-    let prepare = move |config: WindowConfig| WindowConfig {
-        start_url: app_url(&config.start_url),
-        icon: config.icon.or_else(|| icon.clone()),
-        app_id: config.app_id.or_else(|| Some(app_id.clone())),
-        ..config
+    // defer 64x64 window icon rasterization until a window opens so tray-only runs skip it
+    let window_icon = std::cell::OnceCell::new();
+    let window_icon_source = std::cell::RefCell::new(icon_source.clone());
+    let prepare = move |config: WindowConfig| {
+        let icon = config.icon.or_else(|| {
+            window_icon
+                .get_or_init(|| {
+                    let source = window_icon_source.borrow_mut().take();
+                    source
+                        .as_deref()
+                        .and_then(|source| ceri_engine::rasterize_icon(source, 64))
+                })
+                .clone()
+        });
+        WindowConfig {
+            start_url: app_url(&config.start_url),
+            icon,
+            app_id: config.app_id.or_else(|| Some(app_id.clone())),
+            ..config
+        }
     };
     if let Some(path) = launch::switch_value(arguments.clone(), SCREENSHOT_SWITCH) {
         let mut config = prepare(windows.first().cloned().unwrap_or_else(|| WindowConfig {
@@ -723,13 +737,10 @@ fn run_app(
     }
     if let Some((config, on_event)) = tray {
         let events = handle.clone();
-        let config = TrayConfig {
-            icon: config.icon.or(icon_source),
-            ..config
-        };
         let tray = Tray::create(
             identifier,
             config,
+            icon_source,
             Box::new(move |event| on_event(&events, event)),
         );
         let _ = handle.tray.set(tray);

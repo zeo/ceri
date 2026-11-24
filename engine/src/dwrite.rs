@@ -3,16 +3,42 @@
 
 use crate::font::{FontFace, GlyphBitmap};
 use std::ffi::c_void;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{E_NOINTERFACE, S_OK};
 use windows::Win32::Graphics::DirectWrite::*;
-use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface};
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, s, w};
+
+type FarProc = unsafe extern "system" fn() -> isize;
+type CreateFactoryFn =
+    unsafe extern "system" fn(DWRITE_FACTORY_TYPE, *const GUID, *mut *mut c_void) -> HRESULT;
+
+fn create_factory() -> Option<IDWriteFactory6> {
+    static CREATE: OnceLock<Option<CreateFactoryFn>> = OnceLock::new();
+    let create = *CREATE
+        .get_or_init(|| {
+            // safety: dwrite stays loaded for the process lifetime and export matches directwrite abi
+            unsafe {
+                let module = LoadLibraryW(w!("dwrite.dll")).ok()?;
+                let proc = GetProcAddress(module, s!("DWriteCreateFactory"))?;
+                Some(std::mem::transmute::<FarProc, CreateFactoryFn>(proc))
+            }
+        })
+        .as_ref()?;
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    // safety: raw receives an owning IDWriteFactory6 interface pointer on success
+    unsafe {
+        create(DWRITE_FACTORY_TYPE_SHARED, &IDWriteFactory6::IID, &mut raw)
+            .ok()
+            .ok()?;
+        (!raw.is_null()).then(|| IDWriteFactory6::from_raw(raw))
+    }
+}
 
 thread_local! {
     static FACTORY: Option<(IDWriteFactory6, IDWriteInMemoryFontFileLoader)> = unsafe {
-        let factory: Option<IDWriteFactory6> = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok();
-        factory.and_then(|factory| {
+        create_factory().and_then(|factory| {
             let loader = factory.CreateInMemoryFontFileLoader().ok()?;
             factory.RegisterFontFileLoader(&loader).ok()?;
             Some((factory, loader))

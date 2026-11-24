@@ -98,7 +98,7 @@ pub enum TrayEvent {
 pub(crate) type TrayHandler = Box<dyn Fn(TrayEvent) + Send + Sync>;
 
 pub(crate) struct State {
-    pub(crate) icon: Option<Vec<u8>>,
+    pub(crate) icon: Option<Arc<[u8]>>,
     pub(crate) tooltip: String,
     pub(crate) menu: Vec<MenuItem>,
     pub(crate) revision: u32,
@@ -204,9 +204,15 @@ pub struct Tray {
 
 impl Tray {
     // a tray that cannot reach the shell still keeps its state, so a later shell shows it
-    pub(crate) fn create(identifier: &str, config: TrayConfig, handler: TrayHandler) -> Self {
+    pub(crate) fn create(
+        identifier: &str,
+        config: TrayConfig,
+        default_icon: Option<Arc<[u8]>>,
+        handler: TrayHandler,
+    ) -> Self {
+        let icon = config.icon.map(Arc::<[u8]>::from).or(default_icon);
         let state = Arc::new(Mutex::new(State {
-            icon: config.icon,
+            icon,
             tooltip: config.tooltip,
             menu: config.menu,
             revision: 1,
@@ -222,7 +228,9 @@ impl Tray {
     }
 
     pub fn set_icon(&self, image: Vec<u8>) {
-        self.change(Change::Icon, |state| state.icon = Some(image));
+        self.change(Change::Icon, |state| {
+            state.icon = Some(Arc::from(image));
+        });
     }
 
     pub fn set_checked(&self, id: &str, value: bool) {

@@ -80,6 +80,7 @@ fn pace(render: &AudioRender, rate: u32, stop: &AtomicBool, span: Duration) {
 #[cfg(target_os = "windows")]
 mod speakers {
     use super::{AtomicBool, AudioRender, Instant, Ordering, RETRY, Sender, pace};
+    use std::sync::OnceLock;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Media::Audio::{
         AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
@@ -91,11 +92,35 @@ mod speakers {
         CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
         CoUninitialize,
     };
-    use windows::Win32::System::Threading::{
-        AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
-        WaitForSingleObject,
-    };
-    use windows::core::{Result, w};
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    use windows::core::{BOOL, PCWSTR, Result, s, w};
+
+    type FarProc = unsafe extern "system" fn() -> isize;
+    type SetCharacteristicsFn = unsafe extern "system" fn(PCWSTR, *mut u32) -> HANDLE;
+    type RevertCharacteristicsFn = unsafe extern "system" fn(HANDLE) -> BOOL;
+
+    struct Avrt {
+        set: SetCharacteristicsFn,
+        revert: RevertCharacteristicsFn,
+    }
+
+    fn avrt() -> Option<&'static Avrt> {
+        static AVRT: OnceLock<Option<Avrt>> = OnceLock::new();
+        AVRT.get_or_init(|| {
+            // safety: avrt stays loaded for the process lifetime and exports match mmcss abi
+            unsafe {
+                let module = LoadLibraryW(w!("avrt.dll")).ok()?;
+                let set = GetProcAddress(module, s!("AvSetMmThreadCharacteristicsW"))?;
+                let revert = GetProcAddress(module, s!("AvRevertMmThreadCharacteristics"))?;
+                Some(Avrt {
+                    set: std::mem::transmute::<FarProc, SetCharacteristicsFn>(set),
+                    revert: std::mem::transmute::<FarProc, RevertCharacteristicsFn>(revert),
+                })
+            }
+        })
+        .as_ref()
+    }
 
     const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 
@@ -253,8 +278,12 @@ mod speakers {
         let _ = opened.send(Ok(rate));
         let mut stream = Some(stream);
         let mut task = 0;
-        // SAFETY: registers this thread with the multimedia scheduler until the revert below
-        let priority = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task) }.ok();
+        let avrt = avrt();
+        // safety: registers this thread with the multimedia scheduler until the revert below
+        let priority = avrt.and_then(|api| {
+            let handle = unsafe { (api.set)(w!("Pro Audio"), &mut task) };
+            (!handle.is_invalid()).then_some(handle)
+        });
         let mut checked = Instant::now();
         while !stop.load(Ordering::Acquire) {
             let playing = match &stream {
@@ -280,9 +309,9 @@ mod speakers {
             }
         }
         drop(stream);
-        if let Some(priority) = priority {
-            // SAFETY: the handle came from AvSetMmThreadCharacteristicsW on this thread
-            let _ = unsafe { AvRevertMmThreadCharacteristics(priority) };
+        if let (Some(api), Some(priority)) = (avrt, priority) {
+            // safety: the handle came from AvSetMmThreadCharacteristicsW on this thread
+            let _ = unsafe { (api.revert)(priority) };
         }
     }
 }

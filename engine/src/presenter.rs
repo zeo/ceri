@@ -9,18 +9,21 @@
 use crate::image::Image;
 use crate::paint::{Plane, PlaneFrame, Revision};
 use crate::video::VideoSurface;
-use std::sync::{Arc, Weak};
+use std::ffi::c_void;
+use std::sync::{Arc, OnceLock, Weak};
 use windows::Win32::Foundation::{HANDLE, HMODULE, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL,
+};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BOX, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11DeviceContext,
+    D3D11_BOX, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11Device1, ID3D11DeviceContext,
     ID3D11Texture2D,
 };
 use windows::Win32::Graphics::DirectComposition::{
     DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR, DCOMPOSITION_BORDER_MODE_HARD,
-    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+    IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE, DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED,
@@ -28,13 +31,76 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_PRESENT, DXGI_PRESENT_PARAMETERS, DXGI_SCALING_STRETCH,
+    DXGI_PRESENT, DXGI_PRESENT_PARAMETERS, DXGI_SCALING_STRETCH,
     DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory1,
     IDXGIFactory2, IDXGIKeyedMutex, IDXGIOutput6, IDXGISwapChain1, IDXGISwapChain3,
 };
 use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
-use windows::core::Interface;
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::core::{GUID, HRESULT, Interface, s, w};
+
+type FarProc = unsafe extern "system" fn() -> isize;
+type CreateDeviceFn = unsafe extern "system" fn(
+    *mut c_void,
+    D3D_DRIVER_TYPE,
+    HMODULE,
+    D3D11_CREATE_DEVICE_FLAG,
+    *const D3D_FEATURE_LEVEL,
+    u32,
+    u32,
+    *mut *mut c_void,
+    *mut D3D_FEATURE_LEVEL,
+    *mut *mut c_void,
+) -> HRESULT;
+type CreateCompositionFn =
+    unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+type CreateDxgiFactoryFn = unsafe extern "system" fn(*const GUID, *mut *mut c_void) -> HRESULT;
+
+struct GraphicsApi {
+    create_device: CreateDeviceFn,
+    create_composition: CreateCompositionFn,
+    create_factory: CreateDxgiFactoryFn,
+}
+
+// loaded on first DirectComposition use so processes without video never pull in d3d11/dcomp/dxgi
+fn graphics_api() -> Result<&'static GraphicsApi, String> {
+    static API: OnceLock<Result<GraphicsApi, String>> = OnceLock::new();
+    API.get_or_init(|| {
+        // safety: dlls stay loaded for the process lifetime and exports match windows sdk signatures
+        unsafe {
+            let d3d11 =
+                LoadLibraryW(w!("d3d11.dll")).map_err(failed("d3d11.dll failed to load"))?;
+            let dcomp =
+                LoadLibraryW(w!("dcomp.dll")).map_err(failed("dcomp.dll failed to load"))?;
+            let dxgi = LoadLibraryW(w!("dxgi.dll")).map_err(failed("dxgi.dll failed to load"))?;
+            let create_device = GetProcAddress(d3d11, s!("D3D11CreateDevice"))
+                .ok_or_else(|| "D3D11CreateDevice was not found".to_string())?;
+            let create_composition = GetProcAddress(dcomp, s!("DCompositionCreateDevice"))
+                .ok_or_else(|| "DCompositionCreateDevice was not found".to_string())?;
+            let create_factory = GetProcAddress(dxgi, s!("CreateDXGIFactory1"))
+                .ok_or_else(|| "CreateDXGIFactory1 was not found".to_string())?;
+            Ok(GraphicsApi {
+                create_device: std::mem::transmute::<FarProc, CreateDeviceFn>(create_device),
+                create_composition: std::mem::transmute::<FarProc, CreateCompositionFn>(
+                    create_composition,
+                ),
+                create_factory: std::mem::transmute::<FarProc, CreateDxgiFactoryFn>(create_factory),
+            })
+        }
+    })
+    .as_ref()
+    .map_err(Clone::clone)
+}
+
+unsafe fn create_dxgi_factory(api: &GraphicsApi) -> windows::core::Result<IDXGIFactory1> {
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    // safety: raw receives an owning IDXGIFactory1 interface pointer on success
+    unsafe {
+        (api.create_factory)(&IDXGIFactory1::IID, &mut raw).ok()?;
+        Ok(IDXGIFactory1::from_raw(raw))
+    }
+}
 
 const BUFFER_COUNT: u32 = 2;
 // the most bytes of upload buffer kept from one present to the next
@@ -100,6 +166,12 @@ impl Presenter {
             .or_else(|_| Self::on_device(hwnd, width, height, false))
     }
 
+    // opens directly on the GPU when video is already present so D3D10Warp is never loaded first
+    pub(crate) fn new_for_video(hwnd: isize, width: u32, height: u32) -> Result<Self, String> {
+        Self::on_device(hwnd, width, height, false)
+            .or_else(|_| Self::on_device(hwnd, width, height, true))
+    }
+
     // a decoder's frames are shared with the GPU's own device without a copy, so a window
     // moves there the first time it shows video and stays; if it cannot, it stays on WARP
     pub(crate) fn show_video(&mut self) {
@@ -141,13 +213,14 @@ impl Presenter {
     }
 
     fn on_device(hwnd: isize, width: u32, height: u32, warp: bool) -> Result<Self, String> {
+        let api = graphics_api()?;
         let (width, height) = (width.max(1), height.max(1));
-        let mut device: Option<ID3D11Device> = None;
-        let mut context: Option<ID3D11DeviceContext> = None;
-        // SAFETY: the out pointers refer to live locals for the duration of the call
+        let mut raw_device: *mut c_void = std::ptr::null_mut();
+        let mut raw_context: *mut c_void = std::ptr::null_mut();
+        // safety: the out pointers refer to live locals for the duration of the call
         unsafe {
-            D3D11CreateDevice(
-                None,
+            (api.create_device)(
+                std::ptr::null_mut(),
                 if warp {
                     D3D_DRIVER_TYPE_WARP
                 } else {
@@ -155,17 +228,23 @@ impl Presenter {
                 },
                 HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
+                std::ptr::null(),
+                0,
                 D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
+                &mut raw_device,
+                std::ptr::null_mut(),
+                &mut raw_context,
             )
+            .ok()
         }
         .map_err(failed("the Direct3D device could not be created"))?;
-        let device = device.ok_or("Direct3D returned no device")?;
-        let context = context.ok_or("Direct3D returned no device context")?;
-        // SAFETY: plain COM calls on interfaces this function owns
+        let device = (!raw_device.is_null())
+            .then(|| unsafe { ID3D11Device::from_raw(raw_device) })
+            .ok_or("Direct3D returned no device")?;
+        let context = (!raw_context.is_null())
+            .then(|| unsafe { ID3D11DeviceContext::from_raw(raw_context) })
+            .ok_or("Direct3D returned no device context")?;
+        // safety: plain COM calls on interfaces this function owns
         unsafe {
             let dxgi: IDXGIDevice = device.cast().map_err(failed("no DXGI device"))?;
             let factory: IDXGIFactory2 = dxgi
@@ -179,8 +258,13 @@ impl Presenter {
                 DXGI_FORMAT_B8G8R8A8_UNORM,
                 DXGI_ALPHA_MODE_PREMULTIPLIED,
             )?;
-            let composition: IDCompositionDevice =
-                DCompositionCreateDevice(&dxgi).map_err(failed("no composition device"))?;
+            let mut raw_comp: *mut c_void = std::ptr::null_mut();
+            (api.create_composition)(dxgi.as_raw(), &IDCompositionDevice::IID, &mut raw_comp)
+                .ok()
+                .map_err(failed("no composition device"))?;
+            let composition = (!raw_comp.is_null())
+                .then(|| IDCompositionDevice::from_raw(raw_comp))
+                .ok_or("no composition device")?;
             let root = composition
                 .CreateVisual()
                 .map_err(failed("no composition visual"))?;
@@ -211,7 +295,7 @@ impl Presenter {
                 edge: [0, 0, 0, 255],
                 staging: Vec::new(),
                 opened: Vec::new(),
-                outputs: CreateDXGIFactory1().map_err(failed("no DXGI factory"))?,
+                outputs: create_dxgi_factory(api).map_err(failed("no DXGI factory"))?,
                 display: None,
                 sdr_only: false,
             };
@@ -536,7 +620,10 @@ impl Presenter {
         unsafe {
             let monitor = MonitorFromWindow(HWND(self.hwnd as *mut _), MONITOR_DEFAULTTONEAREST);
             if !self.outputs.IsCurrent().as_bool() {
-                let Ok(outputs) = CreateDXGIFactory1() else {
+                let Ok(api) = graphics_api() else {
+                    return false;
+                };
+                let Ok(outputs) = create_dxgi_factory(api) else {
                     return false;
                 };
                 self.outputs = outputs;

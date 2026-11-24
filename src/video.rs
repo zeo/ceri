@@ -50,25 +50,25 @@ mod platform {
         E_NOTIMPL, E_POINTER, S_FALSE, S_OK, STG_E_ACCESSDENIED, STG_E_INVALIDFUNCTION,
     };
     use windows::Win32::Graphics::Direct3D::D3D11_SRV_DIMENSION_TEXTURE2D;
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::{
-        D3D_DRIVER_TYPE_HARDWARE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
+        D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL,
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SHADER_MACRO, ID3DBlob,
     };
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
         D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
-        D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
-        D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-        D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE,
-        D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ,
+        D3D11_MAPPED_SUBRESOURCE, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+        D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
+        D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT,
+        D3D11_USAGE_IMMUTABLE, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
         D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
         D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
         D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
         D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VIEWPORT, D3D11_VPIV_DIMENSION_TEXTURE2D,
-        D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice, ID3D11Buffer, ID3D11Device,
-        ID3D11DeviceContext, ID3D11Multithread, ID3D11PixelShader, ID3D11Texture2D,
-        ID3D11VertexShader, ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
+        D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext,
+        ID3D11Multithread, ID3D11PixelShader, ID3D11Texture2D, ID3D11VertexShader,
+        ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
         ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorEnumerator1,
         ID3D11VideoProcessorOutputView,
     };
@@ -93,8 +93,8 @@ mod platform {
         DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE, IDXGIKeyedMutex, IDXGIResource1,
     };
     use windows::Win32::Media::MediaFoundation::{
-        IMF2DBuffer, IMFAttributes, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer,
-        IMFMediaType, IMFSample, IMFSourceReader, MF_BYTESTREAM_CONTENT_TYPE,
+        IMF2DBuffer, IMFAttributes, IMFByteStream, IMFDXGIBuffer, IMFDXGIDeviceManager,
+        IMFMediaBuffer, IMFMediaType, IMFSample, IMFSourceReader, MF_BYTESTREAM_CONTENT_TYPE,
         MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
         MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_MAX_LUMINANCE_LEVEL,
         MF_MT_MAX_MASTERING_LUMINANCE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_PIXEL_ASPECT_RATIO,
@@ -104,13 +104,11 @@ mod platform {
         MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
         MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
         MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MF_VERSION, MFAudioFormat_Float,
-        MFCreateAttributes, MFCreateDXGIDeviceManager, MFCreateMFByteStreamOnStream,
-        MFCreateMediaType, MFCreateSourceReaderFromByteStream, MFCreateSourceReaderFromURL,
-        MFMediaType_Audio, MFMediaType_Video, MFNominalRange_0_255, MFSTARTUP_LITE, MFStartup,
-        MFVideoArea, MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32,
-        MFVideoTransFunc_2084, MFVideoTransFunc_HLG, MFVideoTransferFunction,
-        MFVideoTransferMatrix, MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709,
-        MFVideoTransferMatrix_BT2020_10, MFVideoTransferMatrix_BT2020_12,
+        MFMediaType_Audio, MFMediaType_Video, MFNominalRange_0_255, MFSTARTUP_LITE, MFVideoArea,
+        MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32, MFVideoTransFunc_2084,
+        MFVideoTransFunc_HLG, MFVideoTransferFunction, MFVideoTransferMatrix,
+        MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709, MFVideoTransferMatrix_BT2020_10,
+        MFVideoTransferMatrix_BT2020_12,
     };
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
@@ -118,10 +116,148 @@ mod platform {
         ISequentialStream_Impl, IStream, IStream_Impl, LOCKTYPE, STATFLAG, STATSTG, STGC,
         STGM_READ, STGTY_STREAM, STREAM_SEEK, STREAM_SEEK_CUR, STREAM_SEEK_END, STREAM_SEEK_SET,
     };
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     use windows::Win32::System::Threading::INFINITE;
     use windows::Win32::System::Variant::{VT_I8, VT_UI8};
-    use windows::core::{GUID, Interface, PCSTR, PCWSTR, s};
+    use windows::core::{GUID, Interface, PCSTR, PCWSTR, s, w};
     use windows::core::{HRESULT, implement};
+
+    type FarProc = unsafe extern "system" fn() -> isize;
+    type CreateDeviceFn = unsafe extern "system" fn(
+        *mut c_void,
+        D3D_DRIVER_TYPE,
+        HMODULE,
+        D3D11_CREATE_DEVICE_FLAG,
+        *const D3D_FEATURE_LEVEL,
+        u32,
+        u32,
+        *mut *mut c_void,
+        *mut D3D_FEATURE_LEVEL,
+        *mut *mut c_void,
+    ) -> HRESULT;
+    type CompileFn = unsafe extern "system" fn(
+        *const c_void,
+        usize,
+        PCSTR,
+        *const D3D_SHADER_MACRO,
+        *mut c_void,
+        PCSTR,
+        PCSTR,
+        u32,
+        u32,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> HRESULT;
+    type MfStartupFn = unsafe extern "system" fn(u32, u32) -> HRESULT;
+    type MfCreateAttributesFn = unsafe extern "system" fn(*mut *mut c_void, u32) -> HRESULT;
+    type MfCreateMediaTypeFn = unsafe extern "system" fn(*mut *mut c_void) -> HRESULT;
+    type MfCreateDxgiManagerFn = unsafe extern "system" fn(*mut u32, *mut *mut c_void) -> HRESULT;
+    type MfCreateByteStreamFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+    type MfCreateReaderFromUrlFn =
+        unsafe extern "system" fn(PCWSTR, *mut c_void, *mut *mut c_void) -> HRESULT;
+    type MfCreateReaderFromStreamFn =
+        unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT;
+
+    struct MfPlat {
+        startup: MfStartupFn,
+        create_attributes: MfCreateAttributesFn,
+        create_media_type: MfCreateMediaTypeFn,
+        create_dxgi_manager: MfCreateDxgiManagerFn,
+        create_byte_stream: MfCreateByteStreamFn,
+    }
+
+    struct MfReadWrite {
+        from_url: MfCreateReaderFromUrlFn,
+        from_byte_stream: MfCreateReaderFromStreamFn,
+    }
+
+    fn d3d11_create_device() -> Option<CreateDeviceFn> {
+        static FN: OnceLock<Option<CreateDeviceFn>> = OnceLock::new();
+        *FN.get_or_init(|| {
+            // safety: d3d11 stays loaded for the process lifetime and export matches sdk abi
+            unsafe {
+                let module = LoadLibraryW(w!("d3d11.dll")).ok()?;
+                let proc = GetProcAddress(module, s!("D3D11CreateDevice"))?;
+                Some(std::mem::transmute::<FarProc, CreateDeviceFn>(proc))
+            }
+        })
+    }
+
+    fn d3d_compile() -> Result<CompileFn, String> {
+        static FN: OnceLock<Result<CompileFn, String>> = OnceLock::new();
+        FN.get_or_init(|| {
+            // safety: d3dcompiler_47 stays loaded for the process lifetime and export matches sdk abi
+            unsafe {
+                let module = LoadLibraryW(w!("d3dcompiler_47.dll")).map_err(text)?;
+                let proc = GetProcAddress(module, s!("D3DCompile"))
+                    .ok_or_else(|| "D3DCompile was not found".to_string())?;
+                Ok(std::mem::transmute::<FarProc, CompileFn>(proc))
+            }
+        })
+        .as_ref()
+        .copied()
+        .map_err(Clone::clone)
+    }
+
+    fn mfplat() -> Result<&'static MfPlat, String> {
+        static API: OnceLock<Result<MfPlat, String>> = OnceLock::new();
+        API.get_or_init(|| {
+            // safety: mfplat stays loaded for the process lifetime and exports match media foundation abi
+            unsafe {
+                let module = LoadLibraryW(w!("mfplat.dll")).map_err(text)?;
+                Ok(MfPlat {
+                    startup: std::mem::transmute::<FarProc, MfStartupFn>(
+                        GetProcAddress(module, s!("MFStartup"))
+                            .ok_or_else(|| "MFStartup was not found".to_string())?,
+                    ),
+                    create_attributes: std::mem::transmute::<FarProc, MfCreateAttributesFn>(
+                        GetProcAddress(module, s!("MFCreateAttributes"))
+                            .ok_or_else(|| "MFCreateAttributes was not found".to_string())?,
+                    ),
+                    create_media_type: std::mem::transmute::<FarProc, MfCreateMediaTypeFn>(
+                        GetProcAddress(module, s!("MFCreateMediaType"))
+                            .ok_or_else(|| "MFCreateMediaType was not found".to_string())?,
+                    ),
+                    create_dxgi_manager: std::mem::transmute::<FarProc, MfCreateDxgiManagerFn>(
+                        GetProcAddress(module, s!("MFCreateDXGIDeviceManager"))
+                            .ok_or_else(|| "MFCreateDXGIDeviceManager was not found".to_string())?,
+                    ),
+                    create_byte_stream: std::mem::transmute::<FarProc, MfCreateByteStreamFn>(
+                        GetProcAddress(module, s!("MFCreateMFByteStreamOnStream")).ok_or_else(
+                            || "MFCreateMFByteStreamOnStream was not found".to_string(),
+                        )?,
+                    ),
+                })
+            }
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+    }
+
+    fn mfreadwrite() -> Result<&'static MfReadWrite, String> {
+        static API: OnceLock<Result<MfReadWrite, String>> = OnceLock::new();
+        API.get_or_init(|| {
+            // safety: mfreadwrite stays loaded for the process lifetime and exports match media foundation abi
+            unsafe {
+                let module = LoadLibraryW(w!("mfreadwrite.dll")).map_err(text)?;
+                Ok(MfReadWrite {
+                    from_url: std::mem::transmute::<FarProc, MfCreateReaderFromUrlFn>(
+                        GetProcAddress(module, s!("MFCreateSourceReaderFromURL")).ok_or_else(
+                            || "MFCreateSourceReaderFromURL was not found".to_string(),
+                        )?,
+                    ),
+                    from_byte_stream: std::mem::transmute::<FarProc, MfCreateReaderFromStreamFn>(
+                        GetProcAddress(module, s!("MFCreateSourceReaderFromByteStream"))
+                            .ok_or_else(|| {
+                                "MFCreateSourceReaderFromByteStream was not found".to_string()
+                            })?,
+                    ),
+                })
+            }
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+    }
 
     pub(super) const TYPES: &[&str] = &[
         "video/mp4",
@@ -188,28 +324,39 @@ mod platform {
 
     impl Gpu {
         unsafe fn new() -> Option<Self> {
+            let create_device = d3d11_create_device()?;
+            let mf = mfplat().ok()?;
             unsafe {
-                let mut device = None;
-                let mut context = None;
-                D3D11CreateDevice(
-                    None,
+                let mut raw_device: *mut c_void = std::ptr::null_mut();
+                let mut raw_context: *mut c_void = std::ptr::null_mut();
+                create_device(
+                    std::ptr::null_mut(),
                     D3D_DRIVER_TYPE_HARDWARE,
                     HMODULE::default(),
                     D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    None,
+                    std::ptr::null(),
+                    0,
                     D3D11_SDK_VERSION,
-                    Some(&mut device),
-                    None,
-                    Some(&mut context),
+                    &mut raw_device,
+                    std::ptr::null_mut(),
+                    &mut raw_context,
                 )
+                .ok()
                 .ok()?;
-                let (device, context): (ID3D11Device, ID3D11DeviceContext) = (device?, context?);
+                if raw_device.is_null() || raw_context.is_null() {
+                    return None;
+                }
+                let device = ID3D11Device::from_raw(raw_device);
+                let context = ID3D11DeviceContext::from_raw(raw_context);
                 let multithread = context.cast::<ID3D11Multithread>().ok()?;
                 let _ = multithread.SetMultithreadProtected(true);
                 let mut token = 0;
-                let mut manager = None;
-                MFCreateDXGIDeviceManager(&mut token, &mut manager).ok()?;
-                let manager = manager?;
+                let mut raw_manager: *mut c_void = std::ptr::null_mut();
+                (mf.create_dxgi_manager)(&mut token, &mut raw_manager)
+                    .ok()
+                    .ok()?;
+                let manager = (!raw_manager.is_null())
+                    .then(|| IMFDXGIDeviceManager::from_raw(raw_manager))?;
                 manager.ResetDevice(&device, token).ok()?;
                 Some(Self {
                     video: device.cast().ok()?,
@@ -645,23 +792,29 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
         device: &ID3D11Device,
         source: &str,
     ) -> Result<(ID3D11VertexShader, ID3D11PixelShader), String> {
+        let compile = d3d_compile()?;
         let compiled = |entry: PCSTR, target: PCSTR| {
-            let (mut code, mut errors) = (None, None);
+            let mut raw_code: *mut c_void = std::ptr::null_mut();
+            let mut raw_errors: *mut c_void = std::ptr::null_mut();
             let compiled = unsafe {
-                D3DCompile(
+                compile(
                     source.as_ptr().cast(),
                     source.len(),
                     PCSTR::null(),
-                    None,
-                    None,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
                     entry,
                     target,
                     0,
                     0,
-                    &mut code,
-                    Some(&mut errors),
+                    &mut raw_code,
+                    &mut raw_errors,
                 )
+                .ok()
             };
+            // safety: non-null out pointers own freshly allocated COM blobs even on error
+            let code = (!raw_code.is_null()).then(|| unsafe { ID3DBlob::from_raw(raw_code) });
+            let errors = (!raw_errors.is_null()).then(|| unsafe { ID3DBlob::from_raw(raw_errors) });
             let bytes = |blob: &ID3DBlob| unsafe {
                 std::slice::from_raw_parts(
                     blob.GetBufferPointer().cast::<u8>(),
@@ -1161,8 +1314,11 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
     fn started() -> Result<(), String> {
         static STARTED: OnceLock<Result<(), String>> = OnceLock::new();
         STARTED
-            // SAFETY: media foundation stays started for the life of the process
-            .get_or_init(|| unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE) }.map_err(text))
+            .get_or_init(|| {
+                let mf = mfplat()?;
+                // safety: media foundation stays started for the life of the process
+                unsafe { (mf.startup)(MF_VERSION, MFSTARTUP_LITE).ok() }.map_err(text)
+            })
             .clone()
     }
 
@@ -1294,11 +1450,15 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
         stream: u32,
         missing: &str,
     ) -> Result<IMFSourceReader, String> {
+        let mf = mfplat()?;
+        let rw = mfreadwrite()?;
+        let raw_attributes = attributes.map_or(std::ptr::null_mut(), Interface::as_raw);
         unsafe {
-            let reader = match source {
+            let mut raw_reader: *mut c_void = std::ptr::null_mut();
+            let opened = match source {
                 MediaSource::File(path) => {
                     let path = wide(&resolvable(path));
-                    MFCreateSourceReaderFromURL(PCWSTR(path.as_ptr()), attributes)
+                    (rw.from_url)(PCWSTR(path.as_ptr()), raw_attributes, &mut raw_reader).ok()
                 }
                 MediaSource::Bytes { body, mime_type } => {
                     let stream: IStream = Held {
@@ -1306,7 +1466,13 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                         at: AtomicU64::new(0),
                     }
                     .into();
-                    let bytes = MFCreateMFByteStreamOnStream(&stream).map_err(text)?;
+                    let mut raw_bytes: *mut c_void = std::ptr::null_mut();
+                    (mf.create_byte_stream)(stream.as_raw(), &mut raw_bytes)
+                        .ok()
+                        .map_err(text)?;
+                    let bytes = (!raw_bytes.is_null())
+                        .then(|| IMFByteStream::from_raw(raw_bytes))
+                        .ok_or("media foundation gave no byte stream")?;
                     let mime_type = wide(mime_type.as_ref());
                     bytes
                         .cast::<IMFAttributes>()
@@ -1315,10 +1481,13 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                                 .SetString(&MF_BYTESTREAM_CONTENT_TYPE, PCWSTR(mime_type.as_ptr()))
                         })
                         .map_err(text)?;
-                    MFCreateSourceReaderFromByteStream(&bytes, attributes)
+                    (rw.from_byte_stream)(bytes.as_raw(), raw_attributes, &mut raw_reader).ok()
                 }
-            }
-            .map_err(text)?;
+            };
+            opened.map_err(text)?;
+            let reader = (!raw_reader.is_null())
+                .then(|| IMFSourceReader::from_raw(raw_reader))
+                .ok_or("media foundation gave no source reader")?;
             reader
                 .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)
                 .map_err(text)?;
@@ -1473,13 +1642,17 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
             gpu: Option<&'static Gpu>,
         ) -> Result<Self, String> {
             let apartment = apartment()?;
+            let mf = mfplat()?;
             // SAFETY: every call below follows the source reader's documented contract, on
             // interfaces this function created and still holds
             unsafe {
-                let mut attributes = None;
-                MFCreateAttributes(&mut attributes, 2).map_err(text)?;
-                let attributes: IMFAttributes =
-                    attributes.ok_or("media foundation gave no attribute store")?;
+                let mut raw_attributes: *mut c_void = std::ptr::null_mut();
+                (mf.create_attributes)(&mut raw_attributes, 2)
+                    .ok()
+                    .map_err(text)?;
+                let attributes: IMFAttributes = (!raw_attributes.is_null())
+                    .then(|| IMFAttributes::from_raw(raw_attributes))
+                    .ok_or("media foundation gave no attribute store")?;
                 match gpu {
                     Some(gpu) => {
                         attributes
@@ -1513,7 +1686,11 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                 let shift = edit_shift(&headers, b"vide").unwrap_or(0.0);
                 let duration = fragmented_end(&headers, b"vide")
                     .map_or_else(|| duration(&reader), |end| end + shift);
-                let output = MFCreateMediaType().map_err(text)?;
+                let mut raw_output: *mut c_void = std::ptr::null_mut();
+                (mf.create_media_type)(&mut raw_output).ok().map_err(text)?;
+                let output = (!raw_output.is_null())
+                    .then(|| IMFMediaType::from_raw(raw_output))
+                    .ok_or("media foundation gave no media type")?;
                 output
                     .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
                     .map_err(text)?;
@@ -1712,11 +1889,16 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
     impl Sound {
         pub(super) fn open(source: &MediaSource) -> Result<Self, String> {
             let apartment = apartment()?;
+            let mf = mfplat()?;
             // SAFETY: every call below follows the source reader's documented contract, on
             // interfaces this function created and still holds
             unsafe {
                 let reader = source_reader(source, None, AUDIO, "the media has no sound")?;
-                let output = MFCreateMediaType().map_err(text)?;
+                let mut raw_output: *mut c_void = std::ptr::null_mut();
+                (mf.create_media_type)(&mut raw_output).ok().map_err(text)?;
+                let output = (!raw_output.is_null())
+                    .then(|| IMFMediaType::from_raw(raw_output))
+                    .ok_or("media foundation gave no media type")?;
                 output
                     .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
                     .map_err(text)?;

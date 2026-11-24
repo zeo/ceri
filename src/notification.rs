@@ -3,12 +3,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 pub(crate) struct Notifier {
     identifier: String,
     name: String,
-    icon_source: Option<Vec<u8>>,
+    icon_source: Option<Arc<[u8]>>,
     profile: PathBuf,
     // the icon file, written and the app id registered on the first notification
     icon: OnceLock<Option<PathBuf>>,
@@ -18,7 +18,7 @@ impl Notifier {
     pub(crate) fn new(
         identifier: &str,
         name: &str,
-        icon_source: Option<Vec<u8>>,
+        icon_source: Option<Arc<[u8]>>,
         profile: &Path,
     ) -> Self {
         Self {

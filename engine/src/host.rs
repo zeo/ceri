@@ -293,6 +293,19 @@ impl EngineWorker {
     where
         F: FnOnce() -> Result<Browser, String> + Send + 'static,
     {
+        Self::spawn_live_with_exit(viewport, factory, notify, None)
+    }
+
+    #[cfg_attr(not(feature = "windowed"), allow(dead_code))]
+    pub(crate) fn spawn_live_with_exit<F>(
+        viewport: Size,
+        factory: F,
+        notify: Waker,
+        on_exit: Option<Waker>,
+    ) -> Result<Self, String>
+    where
+        F: FnOnce() -> Result<Browser, String> + Send + 'static,
+    {
         let (commands, command_receiver) = mpsc::sync_channel(64);
         let (events, event_receiver) = mpsc::channel();
         let (ready, ready_receiver) = mpsc::channel();
@@ -334,16 +347,20 @@ impl EngineWorker {
             .map_err(|error| format!("could not start engine worker: {error}"))?;
         // the heap a worker leaves behind is only abandoned once its thread has ended, so the
         // release that hands a closed window's page back to the system runs after it
-        #[cfg(feature = "mimalloc")]
-        let _ = thread::Builder::new()
-            .name("ceri-release".to_string())
-            .stack_size(64 * 1024)
-            .spawn(move || {
-                let _ = worker.join();
-                crate::release_memory();
-            });
-        #[cfg(not(feature = "mimalloc"))]
-        drop(worker);
+        if cfg!(feature = "mimalloc") || on_exit.is_some() {
+            let _ = thread::Builder::new()
+                .name("ceri-release".to_string())
+                .stack_size(64 * 1024)
+                .spawn(move || {
+                    let _ = worker.join();
+                    crate::release_memory();
+                    if let Some(on_exit) = on_exit {
+                        on_exit();
+                    }
+                });
+        } else {
+            drop(worker);
+        }
         match ready_receiver.recv() {
             Ok(Ok(())) => Ok(Self {
                 commands,
@@ -627,18 +644,43 @@ fn run_live_engine_worker(
 // 40 fps, so the 1 ms tick is held only while a wait that short is pending
 #[cfg(all(target_os = "windows", feature = "windowed"))]
 fn hold_fine_timer(held: &mut bool, wanted: bool) {
-    use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
-    if *held != wanted {
-        // SAFETY: `held` pairs every begin with one end
-        unsafe {
-            if wanted {
-                timeBeginPeriod(1);
-            } else {
-                timeEndPeriod(1);
-            }
-        }
-        *held = wanted;
+    use std::sync::OnceLock;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::core::{s, w};
+
+    type FarProc = unsafe extern "system" fn() -> isize;
+    type PeriodFn = unsafe extern "system" fn(u32) -> u32;
+    static WINMM: OnceLock<Option<(PeriodFn, PeriodFn)>> = OnceLock::new();
+
+    if *held == wanted {
+        return;
     }
+    let Some(&(begin, end)) = WINMM
+        .get_or_init(|| {
+            // safety: winmm stays loaded for the process lifetime and exports match winmm signatures
+            unsafe {
+                let module = LoadLibraryW(w!("winmm.dll")).ok()?;
+                let begin = GetProcAddress(module, s!("timeBeginPeriod"))?;
+                let end = GetProcAddress(module, s!("timeEndPeriod"))?;
+                Some((
+                    std::mem::transmute::<FarProc, PeriodFn>(begin),
+                    std::mem::transmute::<FarProc, PeriodFn>(end),
+                ))
+            }
+        })
+        .as_ref()
+    else {
+        return;
+    };
+    // safety: `held` pairs every begin with one end
+    unsafe {
+        if wanted {
+            begin(1);
+        } else {
+            end(1);
+        }
+    }
+    *held = wanted;
 }
 
 #[cfg(not(all(target_os = "windows", feature = "windowed")))]
