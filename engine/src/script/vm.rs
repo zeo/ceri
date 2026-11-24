@@ -1386,9 +1386,9 @@ impl ScriptRuntime {
                     .stack
                     .push(Value::String(frame.code.names[index as usize].clone())),
                 Op::Regex { pattern, flags } => {
-                    let pattern = frame.code.names[pattern as usize].to_string();
-                    let flags = frame.code.names[flags as usize].to_string();
-                    let regex = self.new_regexp(&pattern, &flags)?;
+                    let code = frame.code.clone();
+                    let regex =
+                        self.new_regexp(&code.names[pattern as usize], &code.names[flags as usize])?;
                     frames.last_mut().expect("frame").stack.push(regex);
                 }
                 Op::TemplateObject(index) => {

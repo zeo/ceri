@@ -73,8 +73,11 @@ fn advance(subject: &[u16], index: usize, unicode: bool) -> usize {
 impl ScriptRuntime {
     // compiles a pattern once per source and flags; literals in loops reuse the program
     fn compiled_pattern(&mut self, pattern: &str, flags: &str) -> Result<Rc<Regex>, ScriptError> {
-        let key = (pattern.to_string(), flags.to_string());
-        if let Some(regex) = self.pattern_cache.get(&key) {
+        if let Some((_, regex)) = self
+            .pattern_cache
+            .get(pattern)
+            .and_then(|compiled| compiled.iter().find(|(known, _)| known == flags))
+        {
             return Ok(regex.clone());
         }
         let parsed =
@@ -89,7 +92,10 @@ impl ScriptRuntime {
         if self.pattern_cache.len() >= PATTERN_CACHE_LIMIT {
             self.pattern_cache.clear();
         }
-        self.pattern_cache.insert(key, regex.clone());
+        self.pattern_cache
+            .entry(pattern.to_string())
+            .or_default()
+            .push((flags.to_string(), regex.clone()));
         Ok(regex)
     }
 
@@ -105,22 +111,30 @@ impl ScriptRuntime {
         prototype: object::ObjectHandle,
     ) -> Result<Value, ScriptError> {
         let regex = self.compiled_pattern(pattern, flags)?;
-        let mut object = JsObject::with_prototype(
-            Some(prototype),
-            ObjectClass::RegExp(Rc::new(RegExpData {
-                source: pattern.to_string(),
-                regex,
-            })),
-        );
-        object.define(
-            "lastIndex".to_string(),
+        fn last_index() -> Property {
             Property {
                 slot: Slot::Data(Value::Number(0.0)),
                 enumerable: false,
                 writable: true,
                 configurable: false,
-            },
-        );
+            }
+        }
+        thread_local! {
+            // keeps the shape of a fresh RegExp alive, so a literal run in a loop shares it
+            // instead of growing one per object once the last RegExp of it is gone
+            static TEMPLATE: JsObject = {
+                let mut template = JsObject::with_prototype(None, ObjectClass::Ordinary);
+                template.define("lastIndex".to_string(), last_index());
+                template
+            };
+        }
+        let mut object =
+            TEMPLATE.with(|template| JsObject::with_shape_of(template, vec![last_index()]));
+        object.set_prototype(Some(prototype));
+        object.class = ObjectClass::RegExp(Rc::new(RegExpData {
+            source: pattern.to_string(),
+            regex,
+        }));
         Ok(Value::Object(new_object(object)))
     }
 

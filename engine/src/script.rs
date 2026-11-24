@@ -878,7 +878,8 @@ pub struct ScriptRuntime {
     // Web Locks requests, granted ones first in the order they were made
     lock_queue: RefCell<Vec<Rc<navigator_apis::LockRequest>>>,
     next_fetch_id: std::cell::Cell<u32>,
-    pattern_cache: HashMap<(String, String), Rc<pattern::Regex>>,
+    // by pattern, then by flags, so a lookup borrows both and allocates nothing
+    pattern_cache: HashMap<String, Vec<(String, Rc<pattern::Regex>)>>,
     random_state: u64,
     console_depth: usize,
     inspector: inspector::Inspector,
