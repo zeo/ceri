@@ -45,12 +45,11 @@ impl JsStr {
     }
 
     pub(crate) fn as_str(&self) -> &str {
+        const DATA_OFFSET: usize = std::mem::size_of::<Header>();
         let len = self.header().len;
-        let (_, offset) = layout_for(len);
-        // SAFETY: the bytes after the header were copied from a str of this length and are
-        // never written again
+        // SAFETY: Header is repr(C) with align >= 1 so u8 bytes immediately follow it
         unsafe {
-            let bytes = self.0.as_ptr().cast::<u8>().add(offset);
+            let bytes = self.0.as_ptr().cast::<u8>().add(DATA_OFFSET);
             std::str::from_utf8_unchecked(std::slice::from_raw_parts(bytes, len))
         }
     }

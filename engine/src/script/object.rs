@@ -2,10 +2,16 @@
 // link and an internal class slot for functions, boxed primitives and other exotic kinds
 
 use super::Value;
-use std::cell::RefCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::rc::{Rc, Weak};
 
 pub(super) type ObjectHandle = Rc<RefCell<JsObject>>;
+
+pub(super) const ATTR_ENUMERABLE: u8 = 1;
+pub(super) const ATTR_WRITABLE: u8 = 2;
+pub(super) const ATTR_CONFIGURABLE: u8 = 4;
+pub(super) const ATTR_ACCESSOR: u8 = 8;
+pub(super) const ATTR_DATA: u8 = ATTR_ENUMERABLE | ATTR_WRITABLE | ATTR_CONFIGURABLE;
 
 // a property key hash a word at a time, far quicker than the standard one on the short keys
 // scripts use, and seeded once per process so a page cannot line its keys up on purpose
@@ -59,6 +65,14 @@ impl Slot {
     pub(super) fn accessor(get: Option<Value>, set: Option<Value>) -> Self {
         Self::Accessor(Box::new(Accessors { get, set }))
     }
+
+    #[inline]
+    pub(super) fn value(&self) -> Option<&Value> {
+        match self {
+            Self::Data(value) => Some(value),
+            Self::Accessor(_) => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -87,10 +101,44 @@ impl Property {
         }
     }
 
-    pub(super) fn value(&self) -> Option<&Value> {
-        match &self.slot {
-            Slot::Data(value) => Some(value),
-            Slot::Accessor { .. } => None,
+    pub(super) fn attrs(&self) -> u8 {
+        let mut bits = 0u8;
+        if self.enumerable {
+            bits |= ATTR_ENUMERABLE;
+        }
+        if self.writable {
+            bits |= ATTR_WRITABLE;
+        }
+        if self.configurable {
+            bits |= ATTR_CONFIGURABLE;
+        }
+        if matches!(self.slot, Slot::Accessor(_)) {
+            bits |= ATTR_ACCESSOR;
+        }
+        bits
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PropertyRef<'a> {
+    pub(super) slot: &'a Slot,
+    pub(super) enumerable: bool,
+    pub(super) writable: bool,
+    pub(super) configurable: bool,
+}
+
+impl<'a> PropertyRef<'a> {
+    #[inline]
+    pub(super) fn value(&self) -> Option<&'a Value> {
+        self.slot.value()
+    }
+
+    pub(super) fn to_property(&self) -> Property {
+        Property {
+            slot: self.slot.clone(),
+            enumerable: self.enumerable,
+            writable: self.writable,
+            configurable: self.configurable,
         }
     }
 }
@@ -201,15 +249,17 @@ pub(super) enum ObjectClass {
     IteratorHelper(Rc<RefCell<super::iterator_helpers::HelperState>>),
 }
 
-// the keys of an object in insertion order. objects that gained the same keys in the same order
-// share one, so each keeps only its property values, and a key added moves an object to the
-// shape one key longer. an object that loses a key or grows large gets a shape of its own
-struct Shape {
+// the keys and attributes of an object in insertion order. objects that gained the same keys
+// with the same attributes in the same order share one, so each keeps only compact 16-byte slots
+pub(super) struct Shape {
     keys: Vec<Rc<str>>,
+    attrs: Vec<u8>,
     // built once a shape grows past a handful of keys
     index: Option<KeyMap<usize>>,
-    // the shapes one key longer, while some object still has them
+    // the shapes one key longer with default data attributes, while some object still has them
     transitions: RefCell<KeyMap<Weak<Shape>>>,
+    // shapes one key longer with non-default attributes (hidden, accessor, read-only)
+    attr_transitions: RefCell<Vec<(Rc<str>, u8, Weak<Shape>)>>,
     // the shape one key shorter, kept alive so the next object to take the same keys finds
     // the same path
     _parent: Option<Rc<Shape>>,
@@ -218,38 +268,69 @@ struct Shape {
     longest: std::cell::Cell<usize>,
     // a shape of one object's own, changed in place
     own: bool,
+    // true if any non-symbol non-private key on this shape is enumerable
+    has_enumerable: bool,
+    // true if any key on this shape is an array index
+    has_integer_key: bool,
+}
+
+impl std::fmt::Debug for Shape {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Shape")
+    }
 }
 
 // keys past which an object stops sharing its shape, so one used as a map makes no chain of
 // shapes as long as itself
-const SHARED_KEYS: usize = 64;
+pub(super) const SHARED_KEYS: usize = 64;
 
 impl Shape {
     fn root() -> Rc<Self> {
         thread_local! {
             static ROOT: Rc<Shape> = Rc::new(Shape {
                 keys: Vec::new(),
+                attrs: Vec::new(),
                 index: None,
                 transitions: RefCell::default(),
+                attr_transitions: RefCell::default(),
                 _parent: None,
                 longest: std::cell::Cell::new(0),
                 own: false,
+                has_enumerable: false,
+                has_integer_key: false,
             });
         }
         ROOT.with(Rc::clone)
     }
 
+    pub(super) fn from_keys(keys: &[&str]) -> Rc<Self> {
+        let mut shape = Self::root();
+        for key in keys {
+            shape = shape.with_key_attrs(key, ATTR_DATA);
+        }
+        shape
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.keys.len()
+    }
+
     fn own_copy(&self) -> Self {
         Self {
             keys: self.keys.clone(),
+            attrs: self.attrs.clone(),
             index: self.index.clone(),
             transitions: RefCell::default(),
+            attr_transitions: RefCell::default(),
             _parent: None,
             longest: std::cell::Cell::new(self.keys.len()),
             own: true,
+            has_enumerable: self.has_enumerable,
+            has_integer_key: self.has_integer_key,
         }
     }
 
+    #[inline]
     fn position(&self, key: &str) -> Option<usize> {
         match &self.index {
             Some(index) => index.get(key).copied(),
@@ -267,37 +348,93 @@ impl Shape {
         });
     }
 
-    fn push_own(&mut self, key: Rc<str>) {
+    fn recompute_flags(&mut self) {
+        self.has_enumerable = self
+            .keys
+            .iter()
+            .zip(&self.attrs)
+            .any(|(key, &attr)| (attr & ATTR_ENUMERABLE) != 0 && !is_symbol_key(key) && !is_private_key(key));
+        self.has_integer_key = self.keys.iter().any(|key| array_index(key).is_some());
+    }
+
+    fn push_own(&mut self, key: Rc<str>, attrs: u8) {
+        if (attrs & ATTR_ENUMERABLE) != 0 && !is_symbol_key(&key) && !is_private_key(&key) {
+            self.has_enumerable = true;
+        }
+        if !self.has_integer_key && array_index(&key).is_some() {
+            self.has_integer_key = true;
+        }
         if let Some(index) = &mut self.index {
             index.insert(key.clone(), self.keys.len());
         }
         self.keys.push(key);
+        self.attrs.push(attrs);
         if self.index.is_none() && self.keys.len() > INDEX_THRESHOLD {
             self.reindex();
         }
     }
 
     // the shared shape with one key more, made once and found again by every object after
-    fn with_key(self: &Rc<Self>, key: &str) -> Rc<Self> {
-        let mut transitions = self.transitions.borrow_mut();
-        if let Some(next) = transitions.get(key).and_then(Weak::upgrade) {
+    fn with_key_attrs(self: &Rc<Self>, key: &str, attrs: u8) -> Rc<Self> {
+        if attrs == ATTR_DATA {
+            let mut transitions = self.transitions.borrow_mut();
+            if let Some(next) = transitions.get(key).and_then(Weak::upgrade) {
+                return next;
+            }
+            if transitions.len() >= 16 {
+                transitions.retain(|_, next| next.strong_count() > 0);
+            }
+            let key: Rc<str> = Rc::from(key);
+            let mut next = Shape {
+                keys: self.keys.clone(),
+                attrs: self.attrs.clone(),
+                index: self.index.clone(),
+                transitions: RefCell::default(),
+                attr_transitions: RefCell::default(),
+                _parent: Some(self.clone()),
+                longest: std::cell::Cell::new(self.keys.len() + 1),
+                own: false,
+                has_enumerable: self.has_enumerable,
+                has_integer_key: self.has_integer_key,
+            };
+            next.push_own(key.clone(), attrs);
+            let next = Rc::new(next);
+            transitions.insert(key, Rc::downgrade(&next));
+            let length = next.keys.len();
+            let mut shape = Some(self);
+            while let Some(ancestor) = shape {
+                ancestor.longest.set(ancestor.longest.get().max(length));
+                shape = ancestor._parent.as_ref();
+            }
             return next;
         }
+        let mut transitions = self.attr_transitions.borrow_mut();
+        for (existing_key, existing_attrs, weak) in transitions.iter() {
+            if *existing_attrs == attrs && &**existing_key == key {
+                if let Some(next) = weak.upgrade() {
+                    return next;
+                }
+            }
+        }
         if transitions.len() >= 16 {
-            transitions.retain(|_, next| next.strong_count() > 0);
+            transitions.retain(|(_, _, weak)| weak.strong_count() > 0);
         }
         let key: Rc<str> = Rc::from(key);
         let mut next = Shape {
             keys: self.keys.clone(),
+            attrs: self.attrs.clone(),
             index: self.index.clone(),
             transitions: RefCell::default(),
+            attr_transitions: RefCell::default(),
             _parent: Some(self.clone()),
             longest: std::cell::Cell::new(self.keys.len() + 1),
             own: false,
+            has_enumerable: self.has_enumerable,
+            has_integer_key: self.has_integer_key,
         };
-        next.push_own(key.clone());
+        next.push_own(key.clone(), attrs);
         let next = Rc::new(next);
-        transitions.insert(key, Rc::downgrade(&next));
+        transitions.push((key, attrs, Rc::downgrade(&next)));
         let length = next.keys.len();
         let mut shape = Some(self);
         while let Some(ancestor) = shape {
@@ -316,37 +453,158 @@ pub(super) struct BoundFunction {
     pub(super) arguments: Vec<Value>,
 }
 
-// where a property name was last found on objects of one shared shape, so the next read of it
-// through the same code skips the search; it holds the shape weakly, which keeps its address
-// from going to another shape while the entry stands
-#[derive(Default)]
-pub(super) struct PropertyCache(RefCell<Option<Cached>>);
+const PIC_SIZE: usize = 4;
 
-enum Cached {
-    // an own data property of objects of one shared shape
-    Own(Weak<Shape>, usize),
-    // a data property of the prototype one step up: the shape of the objects it was read
-    // through, none for an array with nothing of its own, then the prototype, its shape, and
-    // where the property sits on it
-    Inherited {
-        receiver: Option<Weak<Shape>>,
-        holder: Weak<RefCell<JsObject>>,
-        shape: Weak<Shape>,
-        index: usize,
-    },
+// per-site 4-entry polymorphic inline cache for GetProp and SetProp; holds shapes weakly so
+// their addresses stay unique while referenced
+pub(super) struct PropIc(UnsafeCell<PropIcInner>);
+
+struct PropIcInner {
+    entries: [IcEntry; PIC_SIZE],
+    next: u8,
 }
 
-impl std::fmt::Debug for PropertyCache {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("PropertyCache")
+impl Default for PropIc {
+    fn default() -> Self {
+        Self(UnsafeCell::new(PropIcInner {
+            entries: [
+                IcEntry::Empty,
+                IcEntry::Empty,
+                IcEntry::Empty,
+                IcEntry::Empty,
+            ],
+            next: 0,
+        }))
     }
 }
-// an object's property values, or ones it holds in common with others made alike until it
+
+pub(super) enum IcGetHit {
+    Value(Value),
+    Getter(Value),
+    Missing,
+}
+
+struct DeepProtoChain {
+    skipped: Vec<(Weak<RefCell<JsObject>>, Weak<Shape>)>,
+    holder: Weak<RefCell<JsObject>>,
+    holder_shape: Weak<Shape>,
+    index: u16,
+    accessor: bool,
+}
+
+struct ProtoGuard {
+    holder: Weak<RefCell<JsObject>>,
+    shape: Weak<Shape>,
+}
+
+enum IcEntry {
+    Empty,
+    OwnData {
+        shape: Weak<Shape>,
+        index: u16,
+        writable: bool,
+    },
+    OwnAccessor {
+        shape: Weak<Shape>,
+        index: u16,
+    },
+    OwnAdd {
+        from: Weak<Shape>,
+        to: Weak<Shape>,
+        proto: Option<Box<ProtoGuard>>,
+    },
+    ProtoData {
+        receiver: Option<Weak<Shape>>,
+        holder: Weak<RefCell<JsObject>>,
+        holder_shape: Weak<Shape>,
+        index: u16,
+    },
+    ProtoAccessor {
+        receiver: Weak<Shape>,
+        holder: Weak<RefCell<JsObject>>,
+        holder_shape: Weak<Shape>,
+        index: u16,
+    },
+    DeepProto {
+        receiver: Weak<Shape>,
+        chain: Box<DeepProtoChain>,
+    },
+    StringMethod {
+        holder: Weak<RefCell<JsObject>>,
+        holder_shape: Weak<Shape>,
+        index: u16,
+    },
+    Missing {
+        receiver: Weak<Shape>,
+        proto: Option<Box<ProtoGuard>>,
+    },
+    ArrayLength,
+    StringLength,
+}
+
+impl PropIc {
+    fn replace_or_insert(&self, matches_existing: impl Fn(&IcEntry) -> bool, entry: IcEntry) {
+        // safety: single-threaded VM, never re-entered during mutation
+        let inner = unsafe { &mut *self.0.get() };
+        for slot in &mut inner.entries {
+            if matches_existing(slot) {
+                *slot = entry;
+                return;
+            }
+        }
+        for slot in &mut inner.entries {
+            if matches!(slot, IcEntry::Empty) {
+                *slot = entry;
+                return;
+            }
+        }
+        let slot = inner.next as usize % PIC_SIZE;
+        inner.next = inner.next.wrapping_add(1);
+        inner.entries[slot] = entry;
+    }
+
+    #[inline]
+    pub(super) fn is_array_length(&self) -> bool {
+        let inner = unsafe { &*self.0.get() };
+        inner
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, IcEntry::ArrayLength))
+    }
+
+    #[inline]
+    pub(super) fn is_string_length(&self) -> bool {
+        let inner = unsafe { &*self.0.get() };
+        inner
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, IcEntry::StringLength))
+    }
+
+    pub(super) fn record_array_length(&self) {
+        self.replace_or_insert(|entry| matches!(entry, IcEntry::ArrayLength), IcEntry::ArrayLength);
+    }
+
+    pub(super) fn record_string_length(&self) {
+        self.replace_or_insert(
+            |entry| matches!(entry, IcEntry::StringLength),
+            IcEntry::StringLength,
+        );
+    }
+}
+
+impl std::fmt::Debug for PropIc {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PropIc")
+    }
+}
+
+// an object's property slots, or ones it holds in common with others made alike until it
 // changes them, as the many closures of one function do with their length and name
 #[derive(Clone)]
 enum Properties {
-    Own(Vec<Property>),
-    Shared(Rc<[Property]>),
+    Own(Vec<Slot>),
+    Shared(Rc<[Slot]>),
 }
 
 impl Default for Properties {
@@ -356,9 +614,9 @@ impl Default for Properties {
 }
 
 impl std::ops::Deref for Properties {
-    type Target = [Property];
+    type Target = [Slot];
 
-    fn deref(&self) -> &[Property] {
+    fn deref(&self) -> &[Slot] {
         match self {
             Self::Own(own) => own,
             Self::Shared(shared) => shared,
@@ -367,7 +625,7 @@ impl std::ops::Deref for Properties {
 }
 
 impl Properties {
-    fn own(&mut self) -> &mut Vec<Property> {
+    fn own(&mut self) -> &mut Vec<Slot> {
         if let Self::Shared(shared) = self {
             *self = Self::Own(shared.to_vec());
         }
@@ -388,7 +646,7 @@ impl Properties {
 // the keys and values objects made alike start with, which each takes without copying
 pub(super) struct ObjectTemplate {
     shape: Rc<Shape>,
-    properties: Rc<[Property]>,
+    properties: Rc<[Slot]>,
 }
 
 impl std::fmt::Debug for ObjectTemplate {
@@ -409,7 +667,7 @@ pub(super) struct JsObject {
     pub(super) class: ObjectClass,
 }
 
-const INDEX_THRESHOLD: usize = 12;
+const INDEX_THRESHOLD: usize = 8;
 
 impl Default for JsObject {
     fn default() -> Self {
@@ -459,107 +717,290 @@ impl JsObject {
         }
     }
 
+    // an object built straight from a shared shape and pre-sized slots
+    pub(super) fn from_shape(
+        shape: Rc<Shape>,
+        slots: Vec<Slot>,
+        prototype: Option<ObjectHandle>,
+    ) -> Self {
+        debug_assert_eq!(shape.keys.len(), slots.len());
+        Self {
+            shape,
+            properties: Properties::Own(slots),
+            prototype,
+            orphan: false,
+            extensible: true,
+            class: ObjectClass::Ordinary,
+        }
+    }
+
     // an object with another's keys, prototype and class and these properties in the same
     // order, which shares the other's shape instead of building one key by key
     pub(super) fn with_shape_of(template: &JsObject, properties: Vec<Property>) -> Self {
         debug_assert_eq!(template.properties.len(), properties.len());
-        Self {
-            shape: template.shape.clone(),
-            properties: Properties::Own(properties),
+        if template.shape.attrs.len() == properties.len()
+            && template
+                .shape
+                .attrs
+                .iter()
+                .zip(&properties)
+                .all(|(&attr, property)| attr == property.attrs())
+        {
+            return Self {
+                shape: template.shape.clone(),
+                properties: Properties::Own(
+                    properties.into_iter().map(|property| property.slot).collect(),
+                ),
+                prototype: template.prototype.clone(),
+                orphan: template.orphan,
+                extensible: template.extensible,
+                class: template.class.clone(),
+            };
+        }
+        let mut object = Self {
+            shape: Shape::root(),
+            properties: Properties::Own(Vec::with_capacity(properties.len())),
             prototype: template.prototype.clone(),
             orphan: template.orphan,
             extensible: template.extensible,
             class: template.class.clone(),
+        };
+        for (key, property) in template.shape.keys.iter().zip(properties) {
+            object.define_key(key, property);
         }
+        object
     }
 
-    // the own data value the cache points at, when the object still has the shape it saw
-    pub(super) fn cached_value(&self, cache: &PropertyCache) -> Option<Value> {
-        // a proxy answers through its traps, never from what it holds
+    pub(super) fn shape_handle(&self) -> Option<Rc<Shape>> {
+        (!self.shape.own).then(|| self.shape.clone())
+    }
+
+    #[inline]
+    pub(super) fn ic_get(&self, ic: &PropIc) -> Option<IcGetHit> {
         if matches!(self.class, ObjectClass::Proxy(_)) {
             return None;
         }
-        let cached = cache.0.borrow();
-        match cached.as_ref()? {
-            Cached::Own(shape, index) => {
-                if !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&self.shape)) {
-                    return None;
+        let shape_ptr = Rc::as_ptr(&self.shape);
+        // safety: single-threaded VM, entries are read without re-entering PropIc
+        let inner = unsafe { &*ic.0.get() };
+        for entry in &inner.entries {
+            match entry {
+                IcEntry::Empty => break,
+                IcEntry::OwnData { shape, index, .. } => {
+                    if std::ptr::eq(shape.as_ptr(), shape_ptr) {
+                        if let Some(Slot::Data(value)) = self.properties.get(*index as usize) {
+                            return Some(IcGetHit::Value(value.resolve()));
+                        }
+                    }
                 }
-                self.properties.get(*index)?.value().map(Value::resolve)
+                IcEntry::OwnAccessor { shape, index } => {
+                    if std::ptr::eq(shape.as_ptr(), shape_ptr) {
+                        if let Some(Slot::Accessor(accessors)) =
+                            self.properties.get(*index as usize)
+                        {
+                            return Some(match &accessors.get {
+                                Some(getter) => IcGetHit::Getter(getter.clone()),
+                                None => IcGetHit::Value(Value::Undefined),
+                            });
+                        }
+                    }
+                }
+                IcEntry::ProtoData {
+                    receiver: Some(receiver),
+                    holder,
+                    holder_shape,
+                    index,
+                } => {
+                    if std::ptr::eq(receiver.as_ptr(), shape_ptr)
+                        && !matches!(self.class, ObjectClass::String(_))
+                    {
+                        if let Some(prototype) = &self.prototype
+                            && std::ptr::eq(Rc::as_ptr(prototype), holder.as_ptr())
+                            && let Some(value) =
+                                Self::held_data(prototype, holder_shape, *index as usize)
+                        {
+                            return Some(IcGetHit::Value(value));
+                        }
+                    }
+                }
+                IcEntry::ProtoAccessor {
+                    receiver,
+                    holder,
+                    holder_shape,
+                    index,
+                } => {
+                    if std::ptr::eq(receiver.as_ptr(), shape_ptr)
+                        && !matches!(self.class, ObjectClass::String(_))
+                    {
+                        if let Some(prototype) = &self.prototype
+                            && std::ptr::eq(Rc::as_ptr(prototype), holder.as_ptr())
+                            && let Some(hit) =
+                                Self::held_accessor(prototype, holder_shape, *index as usize)
+                        {
+                            return Some(hit);
+                        }
+                    }
+                }
+                IcEntry::DeepProto { receiver, chain } => {
+                    if std::ptr::eq(receiver.as_ptr(), shape_ptr)
+                        && !matches!(self.class, ObjectClass::String(_))
+                    {
+                        if let Some(prototype) = &self.prototype
+                            && let Some(hit) = Self::check_chain(
+                                prototype,
+                                &chain.skipped,
+                                &chain.holder,
+                                &chain.holder_shape,
+                                chain.index as usize,
+                                chain.accessor,
+                            )
+                        {
+                            return Some(hit);
+                        }
+                    }
+                }
+                IcEntry::Missing { receiver, proto } => {
+                    if std::ptr::eq(receiver.as_ptr(), shape_ptr)
+                        && !matches!(self.class, ObjectClass::String(_))
+                        && !self.orphan
+                        && Self::check_missing_proto(&self.prototype, proto.as_deref())
+                    {
+                        return Some(IcGetHit::Missing);
+                    }
+                }
+                _ => {}
             }
-            Cached::Inherited {
-                receiver: Some(receiver),
-                holder,
-                shape,
-                index,
-            } => {
-                // the same shape has the same own keys, so the read still passes through to
-                // the prototype, if that is still the one noted
-                if !std::ptr::eq(receiver.as_ptr(), Rc::as_ptr(&self.shape)) {
-                    return None;
-                }
-                let prototype = self.prototype.as_ref()?;
-                if !std::ptr::eq(Rc::as_ptr(prototype), holder.as_ptr()) {
-                    return None;
-                }
-                Self::held(prototype, shape, *index)
-            }
-            Cached::Inherited { receiver: None, .. } => None,
         }
+        None
     }
 
-    // writes an ordinary object's own writable data property where the cache noted it, which
-    // a write to it settles without looking up the prototypes for a setter; the value comes
-    // back when the write needs the full path
-    pub(super) fn cached_set(&mut self, cache: &PropertyCache, value: Value) -> Result<(), Value> {
+    // writes an ordinary object's own writable data property, or transitions to a cached shape
+    // when adding a new property on an extensible object with a guarded root prototype
+    #[inline]
+    pub(super) fn ic_set(&mut self, ic: &PropIc, value: Value) -> Result<(), Value> {
         if !matches!(self.class, ObjectClass::Ordinary) {
             return Err(value);
         }
-        let index = match cache.0.borrow().as_ref() {
-            Some(Cached::Own(shape, index))
-                if std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&self.shape)) =>
-            {
-                *index
+        let shape_ptr = Rc::as_ptr(&self.shape);
+        // safety: single-threaded VM, entries are read without re-entering PropIc
+        let inner = unsafe { &*ic.0.get() };
+        for entry in &inner.entries {
+            match entry {
+                IcEntry::Empty => break,
+                IcEntry::OwnData {
+                    shape,
+                    index,
+                    writable: true,
+                } => {
+                    if std::ptr::eq(shape.as_ptr(), shape_ptr) {
+                        let index = *index as usize;
+                        let plain = matches!(
+                            self.properties.get(index),
+                            Some(Slot::Data(current))
+                                if !matches!(current, Value::Binding(_) | Value::ConstBinding(_))
+                        );
+                        if !plain {
+                            return Err(value);
+                        }
+                        if let Slot::Data(slot) = &mut self.properties.own()[index] {
+                            let old = std::mem::replace(slot, value);
+                            old.fast_drop();
+                        }
+                        return Ok(());
+                    }
+                }
+                IcEntry::OwnAdd { from, to, proto } => {
+                    if std::ptr::eq(from.as_ptr(), shape_ptr)
+                        && self.extensible
+                        && !self.orphan
+                        && Self::check_missing_proto(&self.prototype, proto.as_deref())
+                        && let Some(next_shape) = to.upgrade()
+                    {
+                        let length = self.properties.len();
+                        self.shape = next_shape;
+                        if length == self.properties.capacity() {
+                            let doubled = (length * 2).max(4);
+                            let wanted = self.shape.longest.get().clamp(length + 1, doubled);
+                            self.properties.own().reserve_exact(wanted - length);
+                        }
+                        self.properties.own().push(Slot::Data(value));
+                        return Ok(());
+                    }
+                }
+                _ => {}
             }
-            _ => return Err(value),
-        };
-        let plain = matches!(
-            self.properties.get(index),
-            Some(Property {
-                slot: Slot::Data(current),
-                writable: true,
-                ..
-            }) if !matches!(current, Value::Binding(_) | Value::ConstBinding(_))
-        );
-        if !plain {
-            return Err(value);
         }
-        if let Slot::Data(slot) = &mut self.properties.own()[index].slot {
-            *slot = value;
-        }
-        Ok(())
+        Err(value)
     }
 
-    // a method read off Array.prototype through an array with no prototype or property of
-    // its own
-    pub(super) fn cached_array_method(
-        prototype: &ObjectHandle,
-        cache: &PropertyCache,
-    ) -> Option<Value> {
-        match cache.0.borrow().as_ref()? {
-            Cached::Inherited {
-                receiver: None,
-                holder,
-                shape,
-                index,
-            } if std::ptr::eq(Rc::as_ptr(prototype), holder.as_ptr()) => {
-                Self::held(prototype, shape, *index)
+    #[inline]
+    pub(super) fn ic_array_get(prototype: &ObjectHandle, ic: &PropIc) -> Option<Value> {
+        let proto_ptr = Rc::as_ptr(prototype);
+        let inner = unsafe { &*ic.0.get() };
+        for entry in &inner.entries {
+            match entry {
+                IcEntry::Empty => break,
+                IcEntry::ProtoData {
+                    receiver: None,
+                    holder,
+                    holder_shape,
+                    index,
+                } if std::ptr::eq(proto_ptr, holder.as_ptr()) => {
+                    if let Some(value) = Self::held_data(prototype, holder_shape, *index as usize) {
+                        return Some(value);
+                    }
+                }
+                _ => {}
             }
-            _ => None,
+        }
+        None
+    }
+
+    #[inline]
+    pub(super) fn ic_string_get(prototype: &ObjectHandle, ic: &PropIc) -> Option<Value> {
+        let proto_ptr = Rc::as_ptr(prototype);
+        let inner = unsafe { &*ic.0.get() };
+        for entry in &inner.entries {
+            match entry {
+                IcEntry::Empty => break,
+                IcEntry::StringMethod {
+                    holder,
+                    holder_shape,
+                    index,
+                } if std::ptr::eq(proto_ptr, holder.as_ptr()) => {
+                    if let Some(value) = Self::held_data(prototype, holder_shape, *index as usize) {
+                        return Some(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn check_missing_proto(
+        prototype: &Option<ObjectHandle>,
+        guard: Option<&ProtoGuard>,
+    ) -> bool {
+        match (prototype, guard) {
+            (None, None) => true,
+            (Some(proto), Some(guard)) => {
+                if !std::ptr::eq(Rc::as_ptr(proto), guard.holder.as_ptr()) {
+                    return false;
+                }
+                let Ok(borrowed) = proto.try_borrow() else {
+                    return false;
+                };
+                borrowed.prototype.is_none()
+                    && !borrowed.orphan
+                    && !matches!(borrowed.class, ObjectClass::Proxy(_) | ObjectClass::String(_))
+                    && std::ptr::eq(Rc::as_ptr(&borrowed.shape), guard.shape.as_ptr())
+            }
+            _ => false,
         }
     }
 
-    fn held(holder: &ObjectHandle, shape: &Weak<Shape>, index: usize) -> Option<Value> {
+    fn held_data(holder: &ObjectHandle, shape: &Weak<Shape>, index: usize) -> Option<Value> {
         let holder = holder.try_borrow().ok()?;
         if matches!(holder.class, ObjectClass::Proxy(_))
             || !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&holder.shape))
@@ -569,54 +1010,312 @@ impl JsObject {
         holder.properties.get(index)?.value().map(Value::resolve)
     }
 
-    // notes where the key sits on this object's shape, or on its prototype's when it has none
-    // of its own; an own shape changes in place and is never noted
-    pub(super) fn note_position(&self, key: &str, cache: &PropertyCache) {
+    fn held_accessor(
+        holder: &ObjectHandle,
+        shape: &Weak<Shape>,
+        index: usize,
+    ) -> Option<IcGetHit> {
+        let holder = holder.try_borrow().ok()?;
+        if matches!(holder.class, ObjectClass::Proxy(_))
+            || !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&holder.shape))
+        {
+            return None;
+        }
+        match holder.properties.get(index)? {
+            Slot::Accessor(accessors) => Some(match &accessors.get {
+                Some(getter) => IcGetHit::Getter(getter.clone()),
+                None => IcGetHit::Value(Value::Undefined),
+            }),
+            Slot::Data(_) => None,
+        }
+    }
+
+    fn check_chain(
+        current: &ObjectHandle,
+        skipped: &[(Weak<RefCell<JsObject>>, Weak<Shape>)],
+        holder: &Weak<RefCell<JsObject>>,
+        holder_shape: &Weak<Shape>,
+        index: usize,
+        accessor: bool,
+    ) -> Option<IcGetHit> {
+        if let Some(((expected, shape), rest)) = skipped.split_first() {
+            if !std::ptr::eq(Rc::as_ptr(current), expected.as_ptr()) {
+                return None;
+            }
+            let borrowed = current.try_borrow().ok()?;
+            if matches!(borrowed.class, ObjectClass::Proxy(_) | ObjectClass::String(_))
+                || !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&borrowed.shape))
+            {
+                return None;
+            }
+            let next = borrowed.prototype.as_ref()?;
+            Self::check_chain(next, rest, holder, holder_shape, index, accessor)
+        } else {
+            if !std::ptr::eq(Rc::as_ptr(current), holder.as_ptr()) {
+                return None;
+            }
+            if accessor {
+                Self::held_accessor(current, holder_shape, index)
+            } else {
+                Self::held_data(current, holder_shape, index).map(IcGetHit::Value)
+            }
+        }
+    }
+
+    pub(super) fn record_get_ic(&self, key: &str, ic: &PropIc) {
         if self.shape.own || matches!(self.class, ObjectClass::Proxy(_)) {
             return;
         }
+        let shape_ptr = Rc::as_ptr(&self.shape);
         if let Some(index) = self.shape.position(key) {
-            *cache.0.borrow_mut() = Some(Cached::Own(Rc::downgrade(&self.shape), index));
-        } else if let Some(prototype) = &self.prototype {
-            Self::note_inherited(Some(Rc::downgrade(&self.shape)), prototype, key, cache);
+            let Ok(index_u16) = u16::try_from(index) else {
+                return;
+            };
+            let attrs = self.shape.attrs[index];
+            let entry = if (attrs & ATTR_ACCESSOR) != 0 {
+                IcEntry::OwnAccessor {
+                    shape: Rc::downgrade(&self.shape),
+                    index: index_u16,
+                }
+            } else {
+                IcEntry::OwnData {
+                    shape: Rc::downgrade(&self.shape),
+                    index: index_u16,
+                    writable: (attrs & ATTR_WRITABLE) != 0,
+                }
+            };
+            ic.replace_or_insert(
+                |existing| match existing {
+                    IcEntry::OwnData { shape, .. } | IcEntry::OwnAccessor { shape, .. } => {
+                        std::ptr::eq(shape.as_ptr(), shape_ptr)
+                    }
+                    _ => false,
+                },
+                entry,
+            );
+            return;
+        }
+        if matches!(self.class, ObjectClass::String(_)) {
+            return;
+        }
+        let Some(first_proto) = self.prototype.clone() else {
+            if !self.orphan {
+                ic.replace_or_insert(
+                    |existing| {
+                        matches!(existing, IcEntry::Missing { receiver, .. } if std::ptr::eq(receiver.as_ptr(), shape_ptr))
+                    },
+                    IcEntry::Missing {
+                        receiver: Rc::downgrade(&self.shape),
+                        proto: None,
+                    },
+                );
+            }
+            return;
+        };
+        // walk up to 6 prototype hops (covers HTML* -> Element -> Node -> EventTarget -> Object)
+        let mut skipped: Vec<(Weak<RefCell<JsObject>>, Weak<Shape>)> = Vec::new();
+        let mut current = first_proto;
+        for depth in 0..6 {
+            let Ok(object) = current.try_borrow() else {
+                return;
+            };
+            if object.shape.own
+                || matches!(object.class, ObjectClass::Proxy(_) | ObjectClass::String(_))
+            {
+                return;
+            }
+            if let Some(index) = object.shape.position(key) {
+                let Ok(index_u16) = u16::try_from(index) else {
+                    return;
+                };
+                let accessor = (object.shape.attrs[index] & ATTR_ACCESSOR) != 0;
+                let entry = if depth == 0 {
+                    if accessor {
+                        IcEntry::ProtoAccessor {
+                            receiver: Rc::downgrade(&self.shape),
+                            holder: Rc::downgrade(&current),
+                            holder_shape: Rc::downgrade(&object.shape),
+                            index: index_u16,
+                        }
+                    } else {
+                        IcEntry::ProtoData {
+                            receiver: Some(Rc::downgrade(&self.shape)),
+                            holder: Rc::downgrade(&current),
+                            holder_shape: Rc::downgrade(&object.shape),
+                            index: index_u16,
+                        }
+                    }
+                } else {
+                    IcEntry::DeepProto {
+                        receiver: Rc::downgrade(&self.shape),
+                        chain: Box::new(DeepProtoChain {
+                            skipped,
+                            holder: Rc::downgrade(&current),
+                            holder_shape: Rc::downgrade(&object.shape),
+                            index: index_u16,
+                            accessor,
+                        }),
+                    }
+                };
+                ic.replace_or_insert(
+                    |existing| match existing {
+                        IcEntry::ProtoData {
+                            receiver: Some(receiver),
+                            ..
+                        }
+                        | IcEntry::ProtoAccessor { receiver, .. }
+                        | IcEntry::DeepProto { receiver, .. }
+                        | IcEntry::Missing { receiver, .. } => {
+                            std::ptr::eq(receiver.as_ptr(), shape_ptr)
+                        }
+                        _ => false,
+                    },
+                    entry,
+                );
+                return;
+            }
+            if object.prototype.is_none() {
+                if depth == 0 && !object.orphan && !self.orphan {
+                    ic.replace_or_insert(
+                        |existing| {
+                            matches!(existing, IcEntry::Missing { receiver, .. } if std::ptr::eq(receiver.as_ptr(), shape_ptr))
+                        },
+                        IcEntry::Missing {
+                            receiver: Rc::downgrade(&self.shape),
+                            proto: Some(Box::new(ProtoGuard {
+                                holder: Rc::downgrade(&current),
+                                shape: Rc::downgrade(&object.shape),
+                            })),
+                        },
+                    );
+                }
+                return;
+            }
+            let next = object.prototype.clone().expect("checked above");
+            skipped.push((Rc::downgrade(&current), Rc::downgrade(&object.shape)));
+            drop(object);
+            current = next;
         }
     }
 
-    // notes where a method sits on Array.prototype, for arrays with nothing of their own
-    pub(super) fn note_array_method(prototype: &ObjectHandle, key: &str, cache: &PropertyCache) {
-        Self::note_inherited(None, prototype, key, cache);
-    }
-
-    fn note_inherited(
-        receiver: Option<Weak<Shape>>,
-        holder: &ObjectHandle,
-        key: &str,
-        cache: &PropertyCache,
-    ) {
-        let Ok(object) = holder.try_borrow() else {
+    pub(super) fn record_set_ic(&self, key: &str, from_shape: Option<Rc<Shape>>, ic: &PropIc) {
+        if self.shape.own || !matches!(self.class, ObjectClass::Ordinary) {
+            return;
+        }
+        let Some(index) = self.shape.position(key) else {
             return;
         };
-        if matches!(object.class, ObjectClass::Proxy(_)) {
+        let Ok(index_u16) = u16::try_from(index) else {
+            return;
+        };
+        let attrs = self.shape.attrs[index];
+        if (attrs & ATTR_ACCESSOR) != 0 || (attrs & ATTR_WRITABLE) == 0 {
+            return;
+        }
+        if let Some(from) = from_shape
+            && !from.own
+            && !Rc::ptr_eq(&from, &self.shape)
+            && self.shape.keys.len() == from.keys.len() + 1
+            && index == from.keys.len()
+            && attrs == ATTR_DATA
+            && !self.orphan
+        {
+            let proto_guard = match &self.prototype {
+                None => Some(None),
+                Some(proto) => proto.try_borrow().ok().and_then(|borrowed| {
+                    (borrowed.prototype.is_none()
+                        && !borrowed.orphan
+                        && !borrowed.shape.own
+                        && !matches!(borrowed.class, ObjectClass::Proxy(_) | ObjectClass::String(_))
+                        && !borrowed.contains_key(key))
+                    .then(|| {
+                        Some(Box::new(ProtoGuard {
+                            holder: Rc::downgrade(proto),
+                            shape: Rc::downgrade(&borrowed.shape),
+                        }))
+                    })
+                }),
+            };
+            if let Some(proto) = proto_guard {
+                let from_ptr = Rc::as_ptr(&from);
+                ic.replace_or_insert(
+                    |existing| {
+                        matches!(existing, IcEntry::OwnAdd { from, .. } if std::ptr::eq(from.as_ptr(), from_ptr))
+                    },
+                    IcEntry::OwnAdd {
+                        from: Rc::downgrade(&from),
+                        to: Rc::downgrade(&self.shape),
+                        proto,
+                    },
+                );
+                return;
+            }
+        }
+        let shape_ptr = Rc::as_ptr(&self.shape);
+        ic.replace_or_insert(
+            |existing| {
+                matches!(existing, IcEntry::OwnData { shape, .. } if std::ptr::eq(shape.as_ptr(), shape_ptr))
+            },
+            IcEntry::OwnData {
+                shape: Rc::downgrade(&self.shape),
+                index: index_u16,
+                writable: true,
+            },
+        );
+    }
+
+    pub(super) fn record_array_method_ic(prototype: &ObjectHandle, key: &str, ic: &PropIc) {
+        let Ok(object) = prototype.try_borrow() else {
+            return;
+        };
+        if object.shape.own || matches!(object.class, ObjectClass::Proxy(_)) {
             return;
         }
         if let Some(index) = object.shape.position(key)
-            && object.properties[index].value().is_some()
+            && (object.shape.attrs[index] & ATTR_ACCESSOR) == 0
+            && let Ok(index_u16) = u16::try_from(index)
         {
-            *cache.0.borrow_mut() = Some(Cached::Inherited {
-                receiver,
-                holder: Rc::downgrade(holder),
-                shape: Rc::downgrade(&object.shape),
-                index,
-            });
+            ic.replace_or_insert(
+                |existing| matches!(existing, IcEntry::ProtoData { receiver: None, .. }),
+                IcEntry::ProtoData {
+                    receiver: None,
+                    holder: Rc::downgrade(prototype),
+                    holder_shape: Rc::downgrade(&object.shape),
+                    index: index_u16,
+                },
+            );
         }
     }
+
+    pub(super) fn record_string_method_ic(prototype: &ObjectHandle, key: &str, ic: &PropIc) {
+        let Ok(object) = prototype.try_borrow() else {
+            return;
+        };
+        if object.shape.own || matches!(object.class, ObjectClass::Proxy(_)) {
+            return;
+        }
+        if let Some(index) = object.shape.position(key)
+            && (object.shape.attrs[index] & ATTR_ACCESSOR) == 0
+            && let Ok(index_u16) = u16::try_from(index)
+        {
+            ic.replace_or_insert(
+                |existing| matches!(existing, IcEntry::StringMethod { .. }),
+                IcEntry::StringMethod {
+                    holder: Rc::downgrade(prototype),
+                    holder_shape: Rc::downgrade(&object.shape),
+                    index: index_u16,
+                },
+            );
+        }
+    }
+
     // the keys and values this object has, for others made alike to start from; it then holds
     // its values in common with them, and an object with a shape of its own makes none
     pub(super) fn template(&mut self) -> Option<ObjectTemplate> {
         if self.shape.own {
             return None;
         }
-        let shared: Rc<[Property]> = match &self.properties {
+        let shared: Rc<[Slot]> = match &self.properties {
             Properties::Shared(shared) => shared.clone(),
             Properties::Own(own) => Rc::from(own.as_slice()),
         };
@@ -710,12 +1409,19 @@ impl JsObject {
         Rc::get_mut(&mut self.shape).expect("an own shape has no other holder")
     }
 
-    pub(super) fn property(&self, key: &str) -> Option<&Property> {
-        self.position(key)
-            .map(|position| &self.properties[position])
+    #[inline]
+    pub(super) fn property(&self, key: &str) -> Option<PropertyRef<'_>> {
+        let position = self.position(key)?;
+        let attrs = self.shape.attrs[position];
+        Some(PropertyRef {
+            slot: &self.properties[position],
+            enumerable: (attrs & ATTR_ENUMERABLE) != 0,
+            writable: (attrs & ATTR_WRITABLE) != 0,
+            configurable: (attrs & ATTR_CONFIGURABLE) != 0,
+        })
     }
 
-    pub(super) fn property_mut(&mut self, key: &str) -> Option<&mut Property> {
+    pub(super) fn slot_mut(&mut self, key: &str) -> Option<&mut Slot> {
         self.position(key)
             .map(move |position| &mut self.properties.own()[position])
     }
@@ -727,14 +1433,20 @@ impl JsObject {
 
     // the same with a borrowed key, which a shared shape that already has it never copies
     pub(super) fn define_key(&mut self, key: &str, property: Property) {
+        let attrs = property.attrs();
         if let Some(position) = self.position(key) {
-            self.properties.own()[position] = property;
+            if self.shape.attrs[position] != attrs {
+                let shape = self.own_shape();
+                shape.attrs[position] = attrs;
+                shape.recompute_flags();
+            }
+            self.properties.own()[position] = property.slot;
             return;
         }
         if self.shape.own || self.properties.len() >= SHARED_KEYS {
-            self.own_shape().push_own(Rc::from(key));
+            self.own_shape().push_own(Rc::from(key), attrs);
         } else {
-            self.shape = self.shape.with_key(key);
+            self.shape = self.shape.with_key_attrs(key, attrs);
             let length = self.properties.len();
             if length == self.properties.capacity() {
                 // never more than doubling would take, so a shape shared by unlike objects only
@@ -744,12 +1456,13 @@ impl JsObject {
                 self.properties.own().reserve_exact(wanted - length);
             }
         }
-        self.properties.own().push(property);
+        self.properties.own().push(property.slot);
     }
 
     // the data value of an own property; accessors read as absent for host code
     pub(super) fn get(&self, key: &str) -> Option<&Value> {
-        self.property(key).and_then(Property::value)
+        let position = self.position(key)?;
+        self.properties[position].value()
     }
 
     pub(super) fn contains_key(&self, key: &str) -> bool {
@@ -758,9 +1471,14 @@ impl JsObject {
 
     // sets a data value, keeping the attributes of an existing property
     pub(super) fn insert(&mut self, key: String, value: Value) -> Option<Value> {
-        if let Some(property) = self.property_mut(&key) {
-            let previous = property.value().cloned();
-            property.slot = Slot::Data(value);
+        if let Some(position) = self.position(&key) {
+            if (self.shape.attrs[position] & ATTR_ACCESSOR) != 0 {
+                let shape = self.own_shape();
+                shape.attrs[position] &= !ATTR_ACCESSOR;
+            }
+            let slot = &mut self.properties.own()[position];
+            let previous = slot.value().cloned();
+            *slot = Slot::Data(value);
             return previous;
         }
         self.define(key, Property::data(value));
@@ -769,15 +1487,20 @@ impl JsObject {
 
     pub(super) fn remove(&mut self, key: &str) -> Option<Value> {
         let position = self.position(key)?;
-        let property = self.properties.own().remove(position);
+        let slot = self.properties.own().remove(position);
         let shape = self.own_shape();
         shape.keys.remove(position);
+        shape.attrs.remove(position);
         shape.reindex();
-        property.value().cloned()
+        shape.recompute_flags();
+        slot.value().cloned()
     }
 
     // own property keys in spec order: integer keys ascending, then strings in insertion order
     pub(super) fn ordered_keys(&self) -> Vec<String> {
+        if !self.shape.has_integer_key {
+            return self.shape.keys.iter().map(|key| key.to_string()).collect();
+        }
         let mut integers = Vec::new();
         let mut strings = Vec::new();
         for key in &self.shape.keys {
@@ -792,6 +1515,78 @@ impl JsObject {
             .map(|(_, key)| key)
             .chain(strings)
             .collect()
+    }
+
+    pub(super) fn has_enumerable(&self) -> bool {
+        self.shape.has_enumerable
+    }
+
+    // collects own enumerable keys in spec order directly from shape without re-looking up positions
+    pub(super) fn collect_enumerable_keys(&self, include_symbols: bool, out: &mut Vec<String>) {
+        if !include_symbols && !self.shape.has_enumerable {
+            return;
+        }
+        if !self.shape.has_integer_key {
+            for (key, &attrs) in self.shape.keys.iter().zip(&self.shape.attrs) {
+                if (attrs & ATTR_ENUMERABLE) == 0 || is_private_key(key) {
+                    continue;
+                }
+                if !include_symbols && is_symbol_key(key) {
+                    continue;
+                }
+                out.push(key.to_string());
+            }
+            return;
+        }
+        let mut integers = Vec::new();
+        let mut strings = Vec::new();
+        for (key, &attrs) in self.shape.keys.iter().zip(&self.shape.attrs) {
+            if (attrs & ATTR_ENUMERABLE) == 0 || is_private_key(key) {
+                continue;
+            }
+            if !include_symbols && is_symbol_key(key) {
+                continue;
+            }
+            match array_index(key) {
+                Some(index) => integers.push((index, key.to_string())),
+                None => strings.push(key.to_string()),
+            }
+        }
+        integers.sort_unstable_by_key(|(index, _)| *index);
+        out.extend(integers.into_iter().map(|(_, key)| key));
+        out.extend(strings);
+    }
+
+    // visits own non-symbol non-private keys with their enumerable bit in spec order
+    pub(super) fn visit_for_in_keys(&self, mut visit: impl FnMut(&str, bool)) {
+        if !self.shape.has_integer_key {
+            for (key, &attrs) in self.shape.keys.iter().zip(&self.shape.attrs) {
+                if is_symbol_key(key) || is_private_key(key) {
+                    continue;
+                }
+                visit(key, (attrs & ATTR_ENUMERABLE) != 0);
+            }
+            return;
+        }
+        let mut integers = Vec::new();
+        let mut strings = Vec::new();
+        for (key, &attrs) in self.shape.keys.iter().zip(&self.shape.attrs) {
+            if is_symbol_key(key) || is_private_key(key) {
+                continue;
+            }
+            let enumerable = (attrs & ATTR_ENUMERABLE) != 0;
+            match array_index(key) {
+                Some(index) => integers.push((index, &**key, enumerable)),
+                None => strings.push((&**key, enumerable)),
+            }
+        }
+        integers.sort_unstable_by_key(|(index, _, _)| *index);
+        for (_, key, enumerable) in integers {
+            visit(key, enumerable);
+        }
+        for (key, enumerable) in strings {
+            visit(key, enumerable);
+        }
     }
 
     // enumerable own data properties in spec order, which most host code reads
@@ -810,9 +1605,13 @@ impl JsObject {
         self.iter().map(|(key, _)| key)
     }
 
-    // the own properties in insertion order, without their keys
-    pub(super) fn properties(&self) -> &[Property] {
+    // the own slots in insertion order, without their keys
+    pub(super) fn slots(&self) -> &[Slot] {
         &self.properties
+    }
+
+    pub(super) fn attrs(&self) -> &[u8] {
+        &self.shape.attrs
     }
 
     // the prototype set on the object itself, which the cycle collector follows
@@ -823,8 +1622,8 @@ impl JsObject {
     // empties an object the cycle collector found unreachable: what it held, and its class
     pub(super) fn take_for_collection(&mut self) -> (Vec<Value>, ObjectClass) {
         let mut values = Vec::new();
-        for property in std::mem::take(&mut self.properties).iter().cloned() {
-            match property.slot {
+        for slot in std::mem::take(&mut self.properties).iter().cloned() {
+            match slot {
                 Slot::Data(value) => values.push(value),
                 Slot::Accessor(accessors) => {
                     values.extend(accessors.get.into_iter().chain(accessors.set))
@@ -843,10 +1642,13 @@ impl JsObject {
 
     pub(super) fn freeze(&mut self, writable: bool) {
         self.extensible = false;
-        for property in self.properties.own() {
-            property.configurable = false;
-            if !writable && matches!(property.slot, Slot::Data(_)) {
-                property.writable = false;
+        if !self.shape.attrs.is_empty() {
+            let shape = self.own_shape();
+            for attr in &mut shape.attrs {
+                *attr &= !ATTR_CONFIGURABLE;
+                if !writable && (*attr & ATTR_ACCESSOR) == 0 {
+                    *attr &= !ATTR_WRITABLE;
+                }
             }
         }
     }
@@ -901,6 +1703,7 @@ mod tests {
     #[test]
     fn an_object_and_a_property_stay_small_enough_for_heaps_of_them() {
         assert!(std::mem::size_of::<JsObject>() <= 80);
+        assert_eq!(std::mem::size_of::<Slot>(), 16);
         assert!(std::mem::size_of::<Property>() <= 32);
         assert!(std::mem::size_of::<Value>() <= 24);
     }

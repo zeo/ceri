@@ -3,8 +3,7 @@
 
 use super::ast::BinaryOperator;
 use super::object::{
-    JsObject, ObjectClass, ObjectHandle, PRIVATE_PREFIX, Property, Slot, array_index,
-    is_private_key, new_object,
+    JsObject, ObjectClass, ObjectHandle, PRIVATE_PREFIX, Property, Slot, array_index, new_object,
 };
 use super::vm::{DelegateResult, ResumeMode};
 use super::*;
@@ -168,7 +167,7 @@ pub(super) fn string_to_number(text: &str) -> f64 {
 }
 
 // what an operator makes of two numbers, for the ones that need nothing else
-#[inline]
+#[inline(always)]
 pub(super) fn number_binary(operator: BinaryOperator, a: f64, b: f64) -> Option<Value> {
     use BinaryOperator as B;
     Some(match operator {
@@ -189,6 +188,7 @@ pub(super) fn number_binary(operator: BinaryOperator, a: f64, b: f64) -> Option<
     })
 }
 
+#[inline]
 pub(super) fn to_int32_number(value: f64) -> i32 {
     // a number that is already a 32-bit integer, as nearly all are, converts as it stands
     let whole = value as i32;
@@ -1111,33 +1111,37 @@ impl ScriptRuntime {
         key: &str,
         receiver: &Value,
     ) -> Result<Value, ScriptError> {
+        enum Found {
+            Data(Value),
+            Getter(Option<Value>),
+            Next(Option<ObjectHandle>),
+        }
         let mut current = object;
         loop {
             if let Some(proxy) = super::reflect::proxy_of(&current) {
                 return self.proxy_get(&proxy, key, receiver);
             }
-            let (slot, next) = {
+            let found = {
                 let borrowed = current.borrow();
                 match borrowed.property(key) {
-                    Some(property) => (Some(property.slot.clone()), None),
+                    Some(property) => match property.slot {
+                        Slot::Data(value) => Found::Data(value.resolve()),
+                        Slot::Accessor(accessors) => Found::Getter(accessors.get.clone()),
+                    },
                     None => match exotic_own(&borrowed, key) {
-                        Some(value) => (Some(Slot::Data(value)), None),
-                        None => (None, borrowed.prototype_or(&self.intrinsics)),
+                        Some(value) => Found::Data(value),
+                        None => Found::Next(borrowed.prototype_or(&self.intrinsics)),
                     },
                 }
             };
-            match slot {
-                Some(Slot::Data(value)) => return Ok(value.resolve()),
-                Some(Slot::Accessor(accessors)) => {
-                    return match accessors.get {
-                        Some(getter) => self.call_function(getter, receiver.clone(), Vec::new()),
-                        None => Ok(Value::Undefined),
-                    };
+            match found {
+                Found::Data(value) => return Ok(value),
+                Found::Getter(Some(getter)) => {
+                    return self.call_function(getter, receiver.clone(), Vec::new());
                 }
-                None => match next {
-                    Some(next) => current = next,
-                    None => return Ok(Value::Undefined),
-                },
+                Found::Getter(None) => return Ok(Value::Undefined),
+                Found::Next(Some(next)) => current = next,
+                Found::Next(None) => return Ok(Value::Undefined),
             }
         }
     }
@@ -1312,30 +1316,37 @@ impl ScriptRuntime {
         receiver: &Value,
         strict: bool,
     ) -> Result<(), ScriptError> {
+        enum Found {
+            Accessor(Option<Value>),
+            ReadOnly,
+            Writable,
+            Next(Option<ObjectHandle>),
+        }
         let mut current = object;
         loop {
             if let Some(proxy) = super::reflect::proxy_of(&current) {
                 return self.proxy_set(&proxy, key, value, receiver, strict);
             }
-            let (found, next) = {
+            let found = {
                 let borrowed = current.borrow();
                 match borrowed.property(key) {
-                    Some(property) => (Some((property.slot.clone(), property.writable)), None),
+                    Some(property) => match property.slot {
+                        Slot::Accessor(accessors) => Found::Accessor(accessors.set.clone()),
+                        Slot::Data(_) if !property.writable => Found::ReadOnly,
+                        Slot::Data(_) => Found::Writable,
+                    },
                     None => {
-                        let exotic =
-                            exotic_own(&borrowed, key).map(|value| (Slot::Data(value), false));
-                        let next = if exotic.is_some() {
-                            None
+                        if exotic_own(&borrowed, key).is_some() {
+                            Found::ReadOnly
                         } else {
-                            borrowed.prototype_or(&self.intrinsics)
-                        };
-                        (exotic, next)
+                            Found::Next(borrowed.prototype_or(&self.intrinsics))
+                        }
                     }
                 }
             };
             match found {
-                Some((Slot::Accessor(accessors), _)) => {
-                    return match accessors.set {
+                Found::Accessor(setter) => {
+                    return match setter {
                         Some(setter) => self
                             .call_function(setter, receiver.clone(), vec![value])
                             .map(|_| ()),
@@ -1347,7 +1358,7 @@ impl ScriptRuntime {
                         None => Ok(()),
                     };
                 }
-                Some((Slot::Data(_), false)) => {
+                Found::ReadOnly => {
                     return if strict {
                         Err(self.type_error(format!(
                             "Cannot assign to read only property '{}' of {}",
@@ -1358,11 +1369,9 @@ impl ScriptRuntime {
                         Ok(())
                     };
                 }
-                Some((Slot::Data(_), true)) => break,
-                None => match next {
-                    Some(next) => current = next,
-                    None => break,
-                },
+                Found::Writable => break,
+                Found::Next(Some(next)) => current = next,
+                Found::Next(None) => break,
             }
         }
         let receiver_object = match receiver {
@@ -1393,8 +1402,8 @@ impl ScriptRuntime {
             return Ok(());
         }
         let mut receiver_object = receiver_object.borrow_mut();
-        if let Some(property) = receiver_object.property_mut(key) {
-            if let Slot::Data(existing) = &mut property.slot {
+        if let Some(slot) = receiver_object.slot_mut(key) {
+            if let Slot::Data(existing) = slot {
                 match existing {
                     Value::Binding(cell) => *cell.borrow_mut() = value,
                     _ => *existing = value,
@@ -1864,21 +1873,13 @@ impl ScriptRuntime {
             Value::Object(object) => {
                 let keys: Vec<String> = {
                     let borrowed = object.borrow();
-                    let mut keys: Vec<String> = borrowed
-                        .ordered_keys()
-                        .into_iter()
-                        .filter(|key| !is_private_key(key))
-                        .filter(|key| {
-                            borrowed
-                                .property(key)
-                                .is_some_and(|property| property.enumerable)
-                        })
-                        .collect();
+                    let mut keys = Vec::new();
                     if let ObjectClass::String(text) = &borrowed.class {
-                        let indices =
-                            (0..super::strings::utf16_length(text)).map(|index| index.to_string());
-                        keys.splice(0..0, indices);
+                        keys.extend(
+                            (0..super::strings::utf16_length(text)).map(|index| index.to_string()),
+                        );
                     }
+                    borrowed.collect_enumerable_keys(true, &mut keys);
                     keys
                 };
                 if keys.len() > MAX_RUNTIME_OBJECT_PROPERTIES {
@@ -1983,6 +1984,29 @@ impl ScriptRuntime {
         }
         match value {
             Value::Object(object) => {
+                // fast path: if no prototype in the chain has enumerable keys (the common case
+                // with Object.prototype), no shadowing is possible and no HashSet is needed
+                let mut proto_has_enumerable = false;
+                let mut walk = object.borrow().prototype_or(&self.intrinsics);
+                while let Some(proto) = walk {
+                    let borrowed = proto.borrow();
+                    if borrowed.has_enumerable() || matches!(borrowed.class, ObjectClass::String(_)) {
+                        proto_has_enumerable = true;
+                        break;
+                    }
+                    walk = borrowed.prototype_or(&self.intrinsics);
+                }
+                if !proto_has_enumerable {
+                    let borrowed = object.borrow();
+                    let mut keys = Vec::new();
+                    if let ObjectClass::String(text) = &borrowed.class {
+                        keys.extend(
+                            (0..super::strings::utf16_length(text)).map(|index| index.to_string()),
+                        );
+                    }
+                    borrowed.collect_enumerable_keys(false, &mut keys);
+                    return Ok(keys);
+                }
                 let mut seen = HashSet::default();
                 let mut keys = Vec::new();
                 let mut current = Some(object.clone());
@@ -1996,17 +2020,11 @@ impl ScriptRuntime {
                             }
                         }
                     }
-                    for key in borrowed.ordered_keys() {
-                        if super::object::is_symbol_key(&key) || is_private_key(&key) {
-                            continue;
+                    borrowed.visit_for_in_keys(|key, enumerable| {
+                        if seen.insert(key.to_string()) && enumerable {
+                            keys.push(key.to_string());
                         }
-                        let enumerable = borrowed
-                            .property(&key)
-                            .is_some_and(|property| property.enumerable);
-                        if seen.insert(key.clone()) && enumerable {
-                            keys.push(key);
-                        }
-                    }
+                    });
                     current = borrowed.prototype_or(&self.intrinsics);
                 }
                 Ok(keys)

@@ -2003,27 +2003,57 @@ impl ScriptRuntime {
     }
 
     pub(super) fn descriptor_value(&self, property: &Property) -> Value {
-        let object = self.new_plain_object();
-        {
-            let mut object = object.borrow_mut();
-            match &property.slot {
-                Slot::Data(value) => {
-                    object.insert("value".to_string(), value.resolve());
-                    object.insert("writable".to_string(), Value::Bool(property.writable));
-                }
-                Slot::Accessor(accessors) => {
-                    let get = accessors.get.clone().unwrap_or(Value::Undefined);
-                    let set = accessors.set.clone().unwrap_or(Value::Undefined);
-                    object.insert("get".to_string(), get);
-                    object.insert("set".to_string(), set);
-                }
-            }
-            object.insert("enumerable".to_string(), Value::Bool(property.enumerable));
-            object.insert(
-                "configurable".to_string(),
-                Value::Bool(property.configurable),
-            );
+        thread_local! {
+            static DATA_SHAPE: std::cell::OnceCell<Rc<super::object::Shape>> =
+                const { std::cell::OnceCell::new() };
+            static ACCESSOR_SHAPE: std::cell::OnceCell<Rc<super::object::Shape>> =
+                const { std::cell::OnceCell::new() };
         }
+        let (shape, slots) = match &property.slot {
+            Slot::Data(value) => (
+                DATA_SHAPE.with(|cell| {
+                    cell.get_or_init(|| {
+                        super::object::Shape::from_keys(&[
+                            "value",
+                            "writable",
+                            "enumerable",
+                            "configurable",
+                        ])
+                    })
+                    .clone()
+                }),
+                vec![
+                    Slot::Data(value.resolve()),
+                    Slot::Data(Value::Bool(property.writable)),
+                    Slot::Data(Value::Bool(property.enumerable)),
+                    Slot::Data(Value::Bool(property.configurable)),
+                ],
+            ),
+            Slot::Accessor(accessors) => (
+                ACCESSOR_SHAPE.with(|cell| {
+                    cell.get_or_init(|| {
+                        super::object::Shape::from_keys(&[
+                            "get",
+                            "set",
+                            "enumerable",
+                            "configurable",
+                        ])
+                    })
+                    .clone()
+                }),
+                vec![
+                    Slot::Data(accessors.get.clone().unwrap_or(Value::Undefined)),
+                    Slot::Data(accessors.set.clone().unwrap_or(Value::Undefined)),
+                    Slot::Data(Value::Bool(property.enumerable)),
+                    Slot::Data(Value::Bool(property.configurable)),
+                ],
+            ),
+        };
+        let object = new_object(JsObject::from_shape(
+            shape,
+            slots,
+            Some(self.intrinsics.object_prototype.clone()),
+        ));
         Value::Object(object)
     }
 
@@ -2063,7 +2093,7 @@ impl ScriptRuntime {
             Value::Object(object) => {
                 let borrowed = object.borrow();
                 match borrowed.property(key) {
-                    Some(property) => Some(property.clone()),
+                    Some(property) => Some(property.to_property()),
                     None => match &borrowed.class {
                         ObjectClass::String(text) => string_own_property(text, key),
                         _ => None,
@@ -2365,7 +2395,7 @@ impl ScriptRuntime {
             }
             _ => return Err(self.type_error("Object.defineProperty called on non-object")),
         };
-        let existing = object.borrow().property(&key).cloned();
+        let existing = object.borrow().property(&key).map(|property| property.to_property());
         match existing {
             None => {
                 if !object.borrow().extensible {
@@ -2724,11 +2754,11 @@ impl ScriptRuntime {
                     Value::Object(object) => {
                         let object = object.borrow();
                         !object.extensible
-                            && object.properties().iter().all(|property| {
-                                !property.configurable
+                            && object.attrs().iter().all(|&attrs| {
+                                (attrs & super::object::ATTR_CONFIGURABLE) == 0
                                     && (!frozen
-                                        || !property.writable
-                                        || matches!(property.slot, Slot::Accessor { .. }))
+                                        || (attrs & super::object::ATTR_WRITABLE) == 0
+                                        || (attrs & super::object::ATTR_ACCESSOR) != 0)
                             })
                     }
                     Value::Array(array) => {

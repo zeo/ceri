@@ -145,7 +145,11 @@ pub(super) enum Op {
     InitNewTargetSlot(u16),
     InitHomeSlot(u16),
     NewObject,
+    // builds a plain object from a pre-compiled static key shape, popping N values
+    MakeObject(u32),
     NewArray,
+    // builds a dense array by popping N values
+    MakeArray(u16),
     ArrayPush,
     ArrayHole,
     // the not-iterable message naming the spread expression, from the code's names
@@ -161,9 +165,15 @@ pub(super) enum Op {
     },
     ObjectSpread,
     SetPrototype,
-    GetProp(u32),
+    GetProp {
+        name: u32,
+        ic: u32,
+    },
     GetIndex,
-    SetProp(u32),
+    SetProp {
+        name: u32,
+        ic: u32,
+    },
     SetIndex,
     DeleteProp(u32),
     DeleteIndex,
@@ -324,8 +334,10 @@ pub(super) struct Code {
     pub(super) reads_arguments: bool,
     // what a direct eval this code makes may use
     pub(super) eval_context: EvalContext,
-    // one per name, for reads of a property by that name
-    pub(super) property_caches: Box<[super::object::PropertyCache]>,
+    // per-site polymorphic inline caches for GetProp and SetProp
+    pub(super) ics: Box<[super::object::PropIc]>,
+    // static key lists for MakeObject literals, lazily materialized into shared Shapes
+    pub(super) object_shapes: Box<[(Box<[Name]>, std::cell::OnceCell<Rc<super::object::Shape>>)]>,
     // what each closure of this code starts as, when it has no prototype of its own
     pub(super) function_template: std::cell::RefCell<Option<super::object::ObjectTemplate>>,
     // where a run starts: past the prologue slots no arrow needed, which would only be stepped over
@@ -497,6 +509,7 @@ struct FunctionState {
     children: Vec<Rc<Code>>,
     classes: Vec<Rc<ClassTemplate>>,
     templates: Vec<TemplateSite>,
+    object_shapes: Vec<Box<[Name]>>,
     scopes: Vec<ScopeInfo>,
     blocks: Vec<Rc<Layout>>,
     positions: Vec<(u32, u32)>,
@@ -610,6 +623,7 @@ impl FunctionState {
             children: Vec::new(),
             classes: Vec::new(),
             templates: Vec::new(),
+            object_shapes: Vec::new(),
             scopes: Vec::new(),
             blocks: Vec::new(),
             positions: Vec::new(),
@@ -1516,7 +1530,22 @@ impl Compiler {
                 ops[3] = Op::InitHomeSlot(slot);
             }
         }
-        let property_caches = (0..state.names.len()).map(|_| Default::default()).collect();
+        let mut ic_count = 0u32;
+        for op in &mut ops {
+            match op {
+                Op::GetProp { ic, .. } | Op::SetProp { ic, .. } => {
+                    *ic = ic_count;
+                    ic_count += 1;
+                }
+                _ => {}
+            }
+        }
+        let ics = (0..ic_count).map(|_| super::object::PropIc::default()).collect();
+        let object_shapes = state
+            .object_shapes
+            .into_iter()
+            .map(|keys| (keys, std::cell::OnceCell::new()))
+            .collect();
         let entry = ops
             .iter()
             .take(4)
@@ -1713,7 +1742,8 @@ impl Compiler {
             simple_params,
             reads_arguments: state.arguments_slot.is_some(),
             eval_context: EvalContext::default(),
-            property_caches,
+            ics,
+            object_shapes,
             function_template: std::cell::RefCell::new(None),
         }
     }
@@ -1885,7 +1915,7 @@ impl Compiler {
             return self.compile_get_name_direct(name);
         }
         let ends = self.compile_with_lookups(name, &objects, |compiler, index| {
-            compiler.emit(Op::GetProp(index));
+            compiler.emit(Op::GetProp { name: index, ic: 0 });
         })?;
         self.compile_get_name_direct(name)?;
         for end in ends {
@@ -1950,7 +1980,7 @@ impl Compiler {
         }
         let ends = self.compile_with_lookups(name, &objects, |compiler, index| {
             compiler.emit(Op::Swap);
-            compiler.emit(Op::SetProp(index));
+            compiler.emit(Op::SetProp { name: index, ic: 0 });
         })?;
         self.compile_set_name_direct(name, initialize)?;
         for end in ends {
@@ -2892,7 +2922,7 @@ impl Compiler {
                         self.compile_expression(object)?;
                         self.emit(Op::Swap);
                         let name = self.name(property);
-                        self.emit(Op::SetProp(name));
+                        self.emit(Op::SetProp { name, ic: 0 });
                     }
                     Expr::Index { object, index, .. } => {
                         self.compile_expression(object)?;
@@ -2961,7 +2991,7 @@ impl Compiler {
                                 self.emit(Op::Pop);
                             }
                             let name = self.name(name);
-                            self.emit(Op::GetProp(name));
+                            self.emit(Op::GetProp { name, ic: 0 });
                         }
                         PropertyKey::Computed(expression) => {
                             self.compile_expression(expression)?;
@@ -3423,20 +3453,33 @@ impl Compiler {
                 self.emit(Op::ImportMeta);
             }
             Expr::Array(elements) => {
-                self.emit(Op::NewArray);
-                for element in elements {
-                    match element {
-                        ArrayElement::Hole => {
-                            self.emit(Op::ArrayHole);
-                        }
-                        ArrayElement::Item(item) => {
+                if elements.len() <= u16::MAX as usize
+                    && elements
+                        .iter()
+                        .all(|element| matches!(element, ArrayElement::Item(_)))
+                {
+                    for element in elements {
+                        if let ArrayElement::Item(item) = element {
                             self.compile_expression(item)?;
-                            self.emit(Op::ArrayPush);
                         }
-                        ArrayElement::Spread(item) => {
-                            self.compile_expression(item)?;
-                            let callsite = self.iterable_callsite(item);
-                            self.emit(Op::ArraySpread(Some(callsite)));
+                    }
+                    self.emit(Op::MakeArray(elements.len() as u16));
+                } else {
+                    self.emit(Op::NewArray);
+                    for element in elements {
+                        match element {
+                            ArrayElement::Hole => {
+                                self.emit(Op::ArrayHole);
+                            }
+                            ArrayElement::Item(item) => {
+                                self.compile_expression(item)?;
+                                self.emit(Op::ArrayPush);
+                            }
+                            ArrayElement::Spread(item) => {
+                                self.compile_expression(item)?;
+                                let callsite = self.iterable_callsite(item);
+                                self.emit(Op::ArraySpread(Some(callsite)));
+                            }
                         }
                     }
                 }
@@ -3545,7 +3588,7 @@ impl Compiler {
                     self.chain_jumps_push(skip);
                 }
                 let name = self.name(property);
-                self.emit(Op::GetProp(name));
+                self.emit(Op::GetProp { name, ic: 0 });
             }
             Expr::Index {
                 object,
@@ -3730,7 +3773,7 @@ impl Compiler {
                 }
                 self.emit(Op::Dup);
                 let name = self.name(property);
-                self.emit(Op::GetProp(name));
+                self.emit(Op::GetProp { name, ic: 0 });
             }
             Expr::Index {
                 object,
@@ -3803,7 +3846,7 @@ impl Compiler {
                 let objects = self.with_objects(name);
                 let ends = self.compile_with_lookups(name, &objects, |compiler, index| {
                     compiler.emit(Op::Dup);
-                    compiler.emit(Op::GetProp(index));
+                    compiler.emit(Op::GetProp { name: index, ic: 0 });
                 })?;
                 self.emit(Op::Undefined);
                 self.compile_get_name_direct(name)?;
@@ -3875,6 +3918,31 @@ impl Compiler {
     }
 
     fn compile_object(&mut self, properties: &[ObjectProperty]) -> Result<(), ScriptError> {
+        if !properties.is_empty() && properties.len() <= super::object::SHARED_KEYS {
+            let mut keys: Vec<Name> = Vec::with_capacity(properties.len());
+            let mut static_distinct = true;
+            for property in properties {
+                if let ObjectProperty::Value(PropertyKey::Static(name), _) = property
+                    && !keys.iter().any(|existing| existing == name)
+                {
+                    keys.push(name.clone());
+                } else {
+                    static_distinct = false;
+                    break;
+                }
+            }
+            if static_distinct {
+                for property in properties {
+                    if let ObjectProperty::Value(PropertyKey::Static(name), value) = property {
+                        self.compile_named_expression(value, &Pattern::Identifier(name.clone()))?;
+                    }
+                }
+                let index = self.state().object_shapes.len() as u32;
+                self.state().object_shapes.push(keys.into_boxed_slice());
+                self.emit(Op::MakeObject(index));
+                return Ok(());
+            }
+        }
         self.emit(Op::NewObject);
         for property in properties {
             match property {
@@ -3951,7 +4019,7 @@ impl Compiler {
                 {
                     let objects = self.with_objects(name);
                     let ends = self.compile_with_lookups(name, &objects, |compiler, index| {
-                        compiler.emit(Op::GetProp(index));
+                        compiler.emit(Op::GetProp { name: index, ic: 0 });
                         compiler.emit(Op::TypeOf);
                     })?;
                     if self.resolve(name).is_none() {
@@ -4075,7 +4143,7 @@ impl Compiler {
                 self.compile_expression(object)?;
                 self.emit(Op::Dup);
                 let name = self.name(property);
-                self.emit(Op::GetProp(name));
+                self.emit(Op::GetProp { name, ic: 0 });
                 RefKind::Member(name)
             }
             Expr::Index { object, index, .. } => {
@@ -4129,7 +4197,7 @@ impl Compiler {
         match kind {
             RefKind::Name(name) => self.compile_set_name(name, false)?,
             RefKind::Member(name) => {
-                self.emit(Op::SetProp(*name));
+                self.emit(Op::SetProp { name: *name, ic: 0 });
             }
             RefKind::Index => {
                 self.emit(Op::SetIndex);
@@ -4166,7 +4234,7 @@ impl Compiler {
                         self.compile_expression(object)?;
                         self.compile_expression(value)?;
                         let name = self.name(property);
-                        self.emit(Op::SetProp(name));
+                        self.emit(Op::SetProp { name, ic: 0 });
                     }
                     Expr::Index { object, index, .. } => {
                         self.compile_expression(object)?;

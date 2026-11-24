@@ -11935,18 +11935,27 @@ impl Value {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn resolve(&self) -> Value {
+        match self {
+            Self::Binding(_) | Self::ConstBinding(_) => self.resolve_slow(),
+            _ => self.clone(),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn resolve_slow(&self) -> Value {
         match self {
             Self::Binding(binding) | Self::ConstBinding(binding) => binding.borrow().resolve(),
             _ => self.clone(),
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn resolve_owned(self) -> Value {
         match self {
-            Self::Binding(binding) | Self::ConstBinding(binding) => binding.borrow().resolve(),
+            Self::Binding(_) | Self::ConstBinding(_) => self.resolve_slow(),
             other => other,
         }
     }

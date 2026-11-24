@@ -851,7 +851,7 @@ impl ScriptRuntime {
         enumerable: bool,
     ) {
         let mut object = object.borrow_mut();
-        let (mut get, mut set) = match object.property(key).map(|property| &property.slot) {
+        let (mut get, mut set) = match object.property(key).map(|property| property.slot) {
             Some(Slot::Accessor(accessors)) => (accessors.get.clone(), accessors.set.clone()),
             _ => (None, None),
         };
@@ -2052,43 +2052,127 @@ impl ScriptRuntime {
                         block_start = pc;
                     }
                 }
-                Op::GetProp(name) => {
-                    let cache = unsafe { &(&*code).property_caches[name as usize] };
+                Op::NewObject => {
+                    let object = self.new_plain_object();
+                    self.vm_stack.push(Value::Object(object));
+                }
+                Op::MakeObject(template) => {
+                    let (keys, cell) = unsafe { &(&*code).object_shapes[template as usize] };
+                    let shape = cell
+                        .get_or_init(|| {
+                            let names: Vec<&str> = keys.iter().map(|name| &**name).collect();
+                            super::object::Shape::from_keys(&names)
+                        })
+                        .clone();
+                    let count = shape.len();
+                    let start = self.vm_stack.len() - count;
+                    let slots: Vec<Slot> = self.vm_stack.drain(start..).map(Slot::Data).collect();
+                    let object = new_object(JsObject::from_shape(
+                        shape,
+                        slots,
+                        Some(self.intrinsics.object_prototype.clone()),
+                    ));
+                    self.vm_stack.push(Value::Object(object));
+                }
+                Op::MakeArray(count) => {
+                    let count = count as usize;
+                    let values = if count == 0 {
+                        Vec::new()
+                    } else {
+                        let start = self.vm_stack.len() - count;
+                        self.vm_stack.split_off(start)
+                    };
+                    self.vm_stack.push(Self::new_array(values));
+                }
+                Op::GetProp { name, ic } => {
+                    use super::object::IcGetHit;
+                    let cache = unsafe { &(&*code).ics[ic as usize] };
                     let hit = match self.vm_stack.last() {
                         Some(Value::Object(handle)) => handle
                             .try_borrow()
                             .ok()
-                            .and_then(|object| object.cached_value(cache)),
-                        Some(Value::Array(array))
-                            if array
+                            .and_then(|object| object.ic_get(cache)),
+                        Some(Value::Element(handle)) => handle
+                            .object
+                            .try_borrow()
+                            .ok()
+                            .and_then(|object| object.ic_get(cache)),
+                        Some(Value::Array(array)) => {
+                            if cache.is_array_length() {
+                                array
+                                    .try_borrow()
+                                    .ok()
+                                    .map(|a| IcGetHit::Value(Value::Number(a.len() as f64)))
+                            } else if array
                                 .try_borrow()
                                 .ok()
-                                .is_some_and(|a| a.prototype.is_none() && a.properties.is_empty()) =>
-                        {
-                            JsObject::cached_array_method(&self.intrinsics.array_prototype, cache)
+                                .is_some_and(|a| a.prototype.is_none() && a.properties.is_empty())
+                            {
+                                JsObject::ic_array_get(&self.intrinsics.array_prototype, cache)
+                                    .map(IcGetHit::Value)
+                            } else {
+                                None
+                            }
+                        }
+                        Some(Value::String(text)) => {
+                            if cache.is_string_length() {
+                                Some(IcGetHit::Value(Value::Number(
+                                    super::strings::utf16_length(text) as f64,
+                                )))
+                            } else {
+                                JsObject::ic_string_get(&self.intrinsics.string_prototype, cache)
+                                    .map(IcGetHit::Value)
+                            }
                         }
                         _ => None,
                     };
-                    if let Some(value) = hit {
-                        if let Some(slot) = self.vm_stack.last_mut() {
-                            let old = std::mem::replace(slot, value);
-                            old.fast_drop();
+                    match hit {
+                        Some(IcGetHit::Value(value)) => {
+                            if let Some(slot) = self.vm_stack.last_mut() {
+                                let old = std::mem::replace(slot, value);
+                                old.fast_drop();
+                            }
                         }
-                    } else {
-                        self.frames[top].pc = pc;
-                        self.get_prop_slow(name)?;
+                        Some(IcGetHit::Missing) => {
+                            if let Some(slot) = self.vm_stack.last_mut() {
+                                let old = std::mem::replace(slot, Value::Undefined);
+                                old.fast_drop();
+                            }
+                        }
+                        Some(IcGetHit::Getter(getter)) => {
+                            self.steps += (op_pc + 1).saturating_sub(block_start).max(1) as u64;
+                            if self.steps >= safepoint_at {
+                                safepoint_at = self.hit_safepoint(sampling, op_pc)?;
+                            }
+                            self.frames[top].pc = pc;
+                            self.vm_stack.push(getter);
+                            if !self.call_plain(0, true) {
+                                let callee = self.pop();
+                                let this = self.pop();
+                                self.call_in_loop(callee, this, Vec::new())?;
+                            }
+                            top = self.frames.len() - 1;
+                            code = Rc::as_ptr(&self.frames[top].code);
+                            pc = self.frames[top].pc;
+                            reg_base = self.frames[top].reg_base;
+                            block_start = pc;
+                        }
+                        None => {
+                            self.frames[top].pc = pc;
+                            self.get_prop_slow(name, ic)?;
+                        }
                     }
                 }
-                Op::SetProp(name) => {
+                Op::SetProp { name, ic } => {
                     let len = self.vm_stack.len();
-                    let cache = unsafe { &(&*code).property_caches[name as usize] };
+                    let cache = unsafe { &(&*code).ics[ic as usize] };
                     let hit = len >= 2
                         && match &self.vm_stack[len - 2] {
                             Value::Object(handle) => {
                                 let value = self.vm_stack[len - 1].clone();
                                 handle
                                     .try_borrow_mut()
-                                    .is_ok_and(|mut target| target.cached_set(cache, value).is_ok())
+                                    .is_ok_and(|mut target| target.ic_set(cache, value).is_ok())
                             }
                             _ => false,
                         };
@@ -2098,7 +2182,7 @@ impl ScriptRuntime {
                         old.fast_drop();
                     } else {
                         self.frames[top].pc = pc;
-                        self.set_prop_slow(name)?;
+                        self.set_prop_slow(name, ic)?;
                     }
                 }
                 Op::Call(count) | Op::CallMethod(count) => {
@@ -2238,27 +2322,45 @@ impl ScriptRuntime {
         Ok(())
     }
 
-    fn get_prop_slow(&mut self, name: u32) -> Result<(), ScriptError> {
+    fn get_prop_slow(&mut self, name: u32, ic: u32) -> Result<(), ScriptError> {
         let object = self.pop();
         let top = self.frames.len() - 1;
         let code = self.frames[top].code.clone();
-        let cache = &code.property_caches[name as usize];
+        let cache = &code.ics[ic as usize];
         let key = code.names[name as usize].clone();
         let value = self.get_property(&object, &key)?;
         match &object {
             Value::Object(handle) => {
                 if let Ok(object) = handle.try_borrow() {
-                    object.note_position(&key, cache);
+                    object.record_get_ic(&key, cache);
                 }
             }
-            Value::Array(array)
-                if {
+            Value::Element(handle) => {
+                if let Ok(object) = handle.object.try_borrow() {
+                    object.record_get_ic(&key, cache);
+                }
+            }
+            Value::Array(array) => {
+                if &*key == "length" {
+                    cache.record_array_length();
+                } else if {
                     let a = array.borrow();
                     a.prototype.is_none() && a.properties.is_empty()
-                } && &*key != "length"
-                    && key.parse::<usize>().is_err() =>
-            {
-                JsObject::note_array_method(&self.intrinsics.array_prototype, &key, cache);
+                } && key.parse::<usize>().is_err()
+                {
+                    JsObject::record_array_method_ic(&self.intrinsics.array_prototype, &key, cache);
+                }
+            }
+            Value::String(_) => {
+                if &*key == "length" {
+                    cache.record_string_length();
+                } else if super::object::array_index(&key).is_none() {
+                    JsObject::record_string_method_ic(
+                        &self.intrinsics.string_prototype,
+                        &key,
+                        cache,
+                    );
+                }
             }
             _ => {}
         }
@@ -2266,19 +2368,23 @@ impl ScriptRuntime {
         Ok(())
     }
 
-    fn set_prop_slow(&mut self, name: u32) -> Result<(), ScriptError> {
+    fn set_prop_slow(&mut self, name: u32, ic: u32) -> Result<(), ScriptError> {
         let value = self.pop();
         let object = self.pop();
         let top = self.frames.len() - 1;
         let code = self.frames[top].code.clone();
-        let cache = &code.property_caches[name as usize];
+        let cache = &code.ics[ic as usize];
         let key = code.names[name as usize].clone();
         let strict = code.strict;
+        let from_shape = match &object {
+            Value::Object(handle) => handle.try_borrow().ok().and_then(|o| o.shape_handle()),
+            _ => None,
+        };
         self.set_property(&object, &key, value.clone(), strict)?;
         if let Value::Object(handle) = &object
             && let Ok(target) = handle.try_borrow()
         {
-            target.note_position(&key, cache);
+            target.record_set_ic(&key, from_shape, cache);
         }
         self.vm_stack.push(value);
         Ok(())
@@ -2729,9 +2835,36 @@ impl ScriptRuntime {
                 let object = self.new_plain_object();
                 self.vm_stack.push(Value::Object(object));
             }
-            Op::NewArray => self
-                .vm_stack
-                .push(Value::Array(Rc::new(RefCell::new(Vec::new().into())))),
+            Op::MakeObject(template) => {
+                let shape = {
+                    let (keys, cell) = &self.frames[top].code.object_shapes[template as usize];
+                    cell.get_or_init(|| {
+                        let names: Vec<&str> = keys.iter().map(|name| &**name).collect();
+                        super::object::Shape::from_keys(&names)
+                    })
+                    .clone()
+                };
+                let count = shape.len();
+                let start = self.vm_stack.len() - count;
+                let slots: Vec<Slot> = self.vm_stack.drain(start..).map(Slot::Data).collect();
+                let object = new_object(JsObject::from_shape(
+                    shape,
+                    slots,
+                    Some(self.intrinsics.object_prototype.clone()),
+                ));
+                self.vm_stack.push(Value::Object(object));
+            }
+            Op::NewArray => self.vm_stack.push(Self::new_array(Vec::new())),
+            Op::MakeArray(count) => {
+                let count = count as usize;
+                let values = if count == 0 {
+                    Vec::new()
+                } else {
+                    let start = self.vm_stack.len() - count;
+                    self.vm_stack.split_off(start)
+                };
+                self.vm_stack.push(Self::new_array(values));
+            }
             Op::ArrayPush => {
                 let value = self.pop();
                 if let Some(Value::Array(array)) = self.vm_stack.last() {
@@ -2823,8 +2956,8 @@ impl ScriptRuntime {
                     }
                 }
             }
-            Op::GetProp(name) => {
-                self.get_prop_slow(name)?;
+            Op::GetProp { name, ic } => {
+                self.get_prop_slow(name, ic)?;
             }
             Op::GetIndex => {
                 let key = self.pop();
@@ -2832,8 +2965,8 @@ impl ScriptRuntime {
                 let value = self.get_index(&object, key)?;
                 self.vm_stack.push(value);
             }
-            Op::SetProp(name) => {
-                self.set_prop_slow(name)?;
+            Op::SetProp { name, ic } => {
+                self.set_prop_slow(name, ic)?;
             }
             Op::SetIndex => {
                 let value = self.pop();

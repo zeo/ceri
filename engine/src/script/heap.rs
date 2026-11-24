@@ -206,8 +206,8 @@ impl Node {
             }
             Node::Object(object) => {
                 let object = object.try_borrow().ok()?;
-                for property in object.properties() {
-                    slot_edges(&property.slot, out);
+                for slot in object.slots() {
+                    slot_edges(slot, out);
                 }
                 if let Some(prototype) = object.own_prototype() {
                     out.push(Rc::as_ptr(prototype) as *const u8 as usize);
