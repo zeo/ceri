@@ -973,7 +973,7 @@ impl ScriptRuntime {
                 self.debug_step(&frames, base);
             }
             self.note_frames(&frames, below);
-            let outcome = self.step(&mut frames);
+            let outcome = self.step(&mut frames, below);
             match outcome {
                 Ok(Some(result)) => return Ok(result),
                 Ok(None) => {}
@@ -1459,6 +1459,7 @@ impl ScriptRuntime {
             Some(unsafe { &*scopes[depth] })
         };
         let stack = &mut frame.stack;
+        let this = &frame.this;
         let mut pc = frame.pc;
         let mut ran = 0;
         while ran < RUN {
@@ -1486,6 +1487,25 @@ impl ScriptRuntime {
                     };
                     let copy = plain(top);
                     stack.push(copy);
+                }
+                Op::This => {
+                    if matches!(this, Value::Uninitialized) {
+                        break;
+                    }
+                    stack.push(this.clone());
+                }
+                // a data property found where it was last time is read straight off
+                Op::GetProp(name) => {
+                    let Some(Value::Object(handle)) = stack.last() else {
+                        break;
+                    };
+                    let cached = handle.try_borrow().ok().and_then(|object| {
+                        object.cached_value(&code.property_caches[name as usize])
+                    });
+                    let (Some(value), Some(top)) = (cached, stack.last_mut()) else {
+                        break;
+                    };
+                    *top = value;
                 }
                 Op::GetLocal { depth, index, .. } => {
                     let Some(Ok(scope)) = scope_at(depth).map(RefCell::try_borrow) else {
@@ -1580,7 +1600,11 @@ impl ScriptRuntime {
     }
 
     // one instruction; Some ends this run with a result
-    fn step(&mut self, frames: &mut Vec<Frame>) -> Result<Option<RunResult>, ScriptError> {
+    fn step(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        below: usize,
+    ) -> Result<Option<RunResult>, ScriptError> {
         // ops that leave the same frame on top run on here, sparing each a trip through the run loop
         // a debugger or a step limit looks at every op, so each takes its own trip then; either
         // one set while these run is seen when the next trip starts
@@ -2325,7 +2349,8 @@ impl ScriptRuntime {
                     } else {
                         Value::Undefined
                     };
-                    return self.call_in_loop(frames, callee, this, arguments);
+                    // the callee's frame, when it has one, runs on here
+                    self.call_in_loop(frames, callee, this, arguments)?;
                 }
                 Op::CallEval(_) | Op::CallEvalSpread => {
                     let arguments = match op {
@@ -2843,7 +2868,10 @@ impl ScriptRuntime {
                 } => Self::do_exit(frame, target, handlers, scopes),
                 Op::Return => {
                     let value = Self::pop(frame);
-                    return self.do_return(frames, value);
+                    // the caller's frame, when there is one, runs on here
+                    if let Some(result) = self.do_return(frames, value)? {
+                        return Ok(Some(result));
+                    }
                 }
                 Op::Yield | Op::YieldDelegating => {
                     if let Some((mode, value)) = frame.resume.take() {
@@ -2947,8 +2975,13 @@ impl ScriptRuntime {
                 }
             }
             budget -= 1;
-            if budget == 0 || frames.len() != depth {
+            if budget == 0 {
                 return Ok(None);
+            }
+            // a call or a return changed the frame on top, which the frames kept for errors follow
+            if frames.len() != depth {
+                self.note_frames(frames, below);
+                continue;
             }
             // what the run loop does before each op: note the top frame's place, for an error to
             // name, and take a profile sample on its turn
