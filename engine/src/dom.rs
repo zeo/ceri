@@ -293,6 +293,8 @@ pub struct Document {
     // renewed with the selector version where no node is written for the change: which sheets
     // and style attributes apply
     rules_version: u64,
+    // renewed when an inline style attribute mentioning a custom property changes
+    custom_style_version: u64,
     // the attribute changes a selector can see, newest last, each with its write stamp, its
     // element and what it changed: "class:name" for a class token, "#id" for an id, "[name]"
     // for an attribute, "*" for anything. bounded, so changes older than the oldest kept
@@ -458,6 +460,7 @@ impl Document {
             stamp_read: std::cell::Cell::new(false),
             selector_version: next_stamp(),
             rules_version: 0,
+            custom_style_version: 0,
             selector_changes: std::collections::VecDeque::new(),
             changes_lost: 0,
             orphans: Vec::new(),
@@ -598,6 +601,10 @@ impl Document {
     }
 
     fn allocate(&mut self, kind: NodeKind) -> NodeId {
+        self.allocate_inner(kind, true)
+    }
+
+    fn allocate_inner(&mut self, kind: NodeKind, orphan: bool) -> NodeId {
         if !matches!(kind, NodeKind::Text(_) | NodeKind::Comment(_)) {
             self.selector_version = next_stamp();
         }
@@ -628,7 +635,9 @@ impl Document {
                 generation: 0,
             }
         };
-        self.orphans.push(id);
+        if orphan {
+            self.orphans.push(id);
+        }
         id
     }
 
@@ -787,6 +796,10 @@ impl Document {
         self.rules_version
     }
 
+    pub(crate) fn custom_style_version(&self) -> u64 {
+        self.custom_style_version
+    }
+
     fn note_selector_change(&mut self, id: NodeId, changed: Box<[String]>) {
         const KEPT_CHANGES: usize = 1024;
         if self.selector_changes.len() == KEPT_CHANGES
@@ -892,6 +905,29 @@ impl Document {
     // replaces all of a text or comment node's data, which collapses live boundaries in it
     // to its start
     pub fn set_character_data(&mut self, id: NodeId, data: String) -> bool {
+        if self.live_ranges.0.is_empty() {
+            let Some(current) = self.character_data(id) else {
+                return false;
+            };
+            let unchanged = current == data;
+            if self.mutations.is_some() || self.element_changes.is_some() {
+                let old = current.to_string();
+                self.record(id, Mutation::CharacterData { old });
+            }
+            if unchanged {
+                return true;
+            }
+            match &mut self
+                .data_mut(id)
+                .expect("character data was read above")
+                .kind
+            {
+                NodeKind::Text(text) | NodeKind::Comment(text) => *text = data,
+                _ => unreachable!("only character data has text"),
+            }
+            self.version += 1;
+            return true;
+        }
         let length = self.node_length(id);
         self.replace_data(id, 0, length, &data)
     }
@@ -908,28 +944,35 @@ impl Document {
         let mut replaced = String::from_utf16_lossy(&units[..offset]);
         replaced.push_str(data);
         replaced.push_str(&String::from_utf16_lossy(&units[offset + count..]));
-        let inserted = data.encode_utf16().count();
-        let old = current.to_string();
-        self.record(id, Mutation::CharacterData { old });
-        match &mut self
-            .data_mut(id)
-            .expect("character data was read above")
-            .kind
-        {
-            NodeKind::Text(text) | NodeKind::Comment(text) => *text = replaced,
-            _ => unreachable!("only character data has text"),
+        let unchanged = replaced == current;
+        if self.mutations.is_some() || self.element_changes.is_some() {
+            let old = current.to_string();
+            self.record(id, Mutation::CharacterData { old });
         }
-        self.version += 1;
-        self.update_ranges(|_, boundary| {
-            if boundary.node != id {
-                return;
+        if !unchanged {
+            match &mut self
+                .data_mut(id)
+                .expect("character data was read above")
+                .kind
+            {
+                NodeKind::Text(text) | NodeKind::Comment(text) => *text = replaced,
+                _ => unreachable!("only character data has text"),
             }
-            if boundary.offset > offset + count {
-                boundary.offset = boundary.offset + inserted - count;
-            } else if boundary.offset > offset {
-                boundary.offset = offset;
-            }
-        });
+            self.version += 1;
+        }
+        if !self.live_ranges.0.is_empty() {
+            let inserted = data.encode_utf16().count();
+            self.update_ranges(|_, boundary| {
+                if boundary.node != id {
+                    return;
+                }
+                if boundary.offset > offset + count {
+                    boundary.offset = boundary.offset + inserted - count;
+                } else if boundary.offset > offset {
+                    boundary.offset = offset;
+                }
+            });
+        }
         true
     }
 
@@ -1004,13 +1047,15 @@ impl Document {
         edit: impl FnOnce(&mut Element) -> R,
     ) -> Option<R> {
         let old = self.element(id)?.attr(attribute).map(str::to_string);
-        self.record(
-            id,
-            Mutation::Attribute {
-                name: attribute.to_string(),
-                old: old.clone(),
-            },
-        );
+        if self.mutations.is_some() || self.element_changes.is_some() {
+            self.record(
+                id,
+                Mutation::Attribute {
+                    name: attribute.to_string(),
+                    old: old.clone(),
+                },
+            );
+        }
         // a refused style attribute reads as empty, so script edits start from nothing
         let unblocked = attribute == "style" && self.blocked_styles.remove(&id);
         let NodeKind::Element(element) = &mut self.slots[id.index as usize].node.as_mut()?.kind
@@ -1024,11 +1069,19 @@ impl Document {
         // an edit that leaves the attribute as it was is one for observers to see and for
         // nothing else: frameworks set a class or a flag again on every update, and that
         // must not cost the styles and boxes kept for the page
-        if unblocked || element.attr(attribute) != old.as_deref() {
+        let new_value = element.attr(attribute);
+        if unblocked || new_value != old.as_deref() {
+            let custom_style = attribute == "style"
+                && (unblocked
+                    || old.as_deref().is_some_and(|value| value.contains("--"))
+                    || new_value.is_some_and(|value| value.contains("--")));
             self.version += 1;
             let changed = (attribute != "style")
-                .then(|| attribute_change(attribute, old.as_deref(), element.attr(attribute)));
+                .then(|| attribute_change(attribute, old.as_deref(), new_value));
             self.mark_written(id);
+            if custom_style {
+                self.custom_style_version = next_stamp();
+            }
             if let Some(changed) = changed {
                 self.selector_version = next_stamp();
                 self.note_selector_change(id, changed);
@@ -1058,6 +1111,9 @@ impl Document {
                 (!policies.permits(check)).then_some(node)
             })
             .collect();
+        if !self.blocked_styles.is_empty() {
+            self.custom_style_version = next_stamp();
+        }
         self.content_security_policy = policies;
         // which style attributes apply is no node's own write
         self.selector_version = next_stamp();
@@ -1846,24 +1902,30 @@ impl Document {
 
     // copies a node, and with deep its descendants and template contents, as a new orphan
     pub fn clone_node(&mut self, id: NodeId, deep: bool) -> Option<NodeId> {
+        self.clone_node_inner(id, deep, true)
+    }
+
+    fn clone_node_inner(&mut self, id: NodeId, deep: bool, orphan: bool) -> Option<NodeId> {
         let kind = self.kind(id)?.clone();
         let kind = match kind {
             NodeKind::Document => NodeKind::Fragment,
             other => other,
         };
-        let copy = self.allocate(kind);
+        let copy = self.allocate_inner(kind, orphan);
         if deep {
-            for child in self.children(id).to_vec() {
-                if let Some(child_copy) = self.clone_node(child, true) {
-                    self.orphans.retain(|&orphan| orphan != child_copy);
+            let count = self.children(id).len();
+            for index in 0..count {
+                let child = self.children(id)[index];
+                if let Some(child_copy) = self.clone_node_inner(child, true, false) {
                     self.append_raw(copy, child_copy);
                 }
             }
             if let Some(content) = self.template_content(id) {
                 let content_copy = self.ensure_template_content(copy)?;
-                for child in self.children(content).to_vec() {
-                    if let Some(child_copy) = self.clone_node(child, true) {
-                        self.orphans.retain(|&orphan| orphan != child_copy);
+                let count = self.children(content).len();
+                for index in 0..count {
+                    let child = self.children(content)[index];
+                    if let Some(child_copy) = self.clone_node_inner(child, true, false) {
                         self.append_raw(content_copy, child_copy);
                     }
                 }
@@ -1877,11 +1939,11 @@ impl Document {
         let text = self.text(id)?.to_string();
         let length = self.node_length(id);
         let (_, tail) = split_utf16(&text, offset);
-        let created = self.create_text(tail);
-        if let Some(parent) = self.parent(id) {
+        let parent = self.parent(id);
+        let created = self.allocate_inner(NodeKind::Text(tail), parent.is_none());
+        if let Some(parent) = parent {
             let next = self.sibling(id, true);
             self.insert_before(parent, created, next).ok()?;
-            self.orphans.retain(|&orphan| orphan != created);
             let after = self.index_in_parent(id)? + 1;
             self.update_ranges(|_, boundary| {
                 if boundary.node == id && boundary.offset > offset {
@@ -2155,7 +2217,7 @@ impl Document {
         stylesheets
     }
 
-    fn connected_elements(&self) -> impl Iterator<Item = (NodeId, &Element)> + '_ {
+    pub(crate) fn connected_elements(&self) -> impl Iterator<Item = (NodeId, &Element)> + '_ {
         self.descendants(self.root)
             .filter_map(|node| self.element(node).map(|element| (node, element)))
     }
@@ -2474,9 +2536,13 @@ impl Element {
         if let Some(value) = self.attrs.get(name) {
             return Some(value);
         }
-        self.attrs
-            .get(&name.to_ascii_lowercase())
-            .map(String::as_str)
+        if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return self
+                .attrs
+                .get(&name.to_ascii_lowercase())
+                .map(String::as_str);
+        }
+        None
     }
 
     pub fn classes(&self) -> impl Iterator<Item = &str> {

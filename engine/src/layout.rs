@@ -5124,8 +5124,12 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                 None => {
                     let cross =
                         (content_width - item.cross_margins(row) - item.cross_inner(row)).max(0.0);
-                    lay_out(item, None, Some(cross))
-                        .map_or(0.0, |layout| (layout.rect.height - inner).max(0.0))
+                    let measured = lay_out(item, None, Some(cross));
+                    let base = measured
+                        .as_ref()
+                        .map_or(0.0, |layout| (layout.rect.height - inner).max(0.0));
+                    item.layout = measured;
+                    base
                 }
             };
         let min_property = if row {
@@ -5236,7 +5240,15 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             }
             None => None,
         };
-        item.layout = lay_out(item, Some(item.target), cross);
+        let reuse = !row
+            && item.layout.is_some()
+            && explicit_cross.is_none()
+            && cross
+                == Some((content_width - item.cross_margins(row) - item.cross_inner(row)).max(0.0))
+            && (item.target - item.base).abs() <= 0.01;
+        if !reuse {
+            item.layout = lay_out(item, Some(item.target), cross);
+        }
     }
 
     // line cross sizes

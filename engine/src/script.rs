@@ -705,10 +705,10 @@ impl Default for ViewportMetrics {
 // the selector version the lists were found at, then the options and the form controls
 type ControlLists = (u64, Rc<[Vec<NodeId>; 5]>);
 
-// the document and selector versions a disabled set was found at, and the set
-type DisabledControls = ((u64, u64), Shared<BTreeSet<NodeId>>);
+// the selector version a disabled set was found at, and the set
+type DisabledControls = (u64, Shared<BTreeSet<NodeId>>);
 type CheckedControls = (
-    (u64, u64, u64),
+    (u64, u64),
     Shared<BTreeSet<NodeId>>,
     Shared<BTreeSet<NodeId>>,
 );
@@ -3590,20 +3590,23 @@ impl ScriptRuntime {
         match controls.as_ref() {
             Some((found_at, lists)) if *found_at == version => lists.clone(),
             _ => {
-                let lists = Rc::new(
-                    [
-                        "option",
-                        "button, input, select, textarea, optgroup, option, fieldset",
-                        "canvas",
-                        "video",
-                        "img",
-                    ]
-                    .map(|selector| {
-                        document
-                            .find_elements_by_selector(selector)
-                            .unwrap_or_default()
-                    }),
-                );
+                let mut lists: [Vec<NodeId>; 5] = Default::default();
+                for (node, element) in document.connected_elements() {
+                    match element.name.as_str() {
+                        "option" => {
+                            lists[0].push(node);
+                            lists[1].push(node);
+                        }
+                        "button" | "input" | "select" | "textarea" | "optgroup" | "fieldset" => {
+                            lists[1].push(node);
+                        }
+                        "canvas" => lists[2].push(node),
+                        "video" => lists[3].push(node),
+                        "img" => lists[4].push(node),
+                        _ => {}
+                    }
+                }
+                let lists = Rc::new(lists);
                 *controls = Some((version, lists.clone()));
                 lists
             }
@@ -3611,10 +3614,7 @@ impl ScriptRuntime {
     }
 
     fn disabled_controls(&self, controls: &[NodeId]) -> Shared<BTreeSet<NodeId>> {
-        let version = {
-            let document = self.document.borrow();
-            (document.version(), document.selector_version())
-        };
+        let version = self.document.borrow().selector_version();
         let mut cached = self.disabled_controls.borrow_mut();
         match cached.as_ref() {
             Some((found_at, disabled)) if *found_at == version => disabled.clone(),
@@ -3689,7 +3689,12 @@ impl ScriptRuntime {
             control_values: if self.control_values.is_empty() {
                 Shared::default()
             } else {
-                Shared::new(self.control_values.clone().into_iter().collect())
+                Shared::new(
+                    self.control_values
+                        .iter()
+                        .map(|(&node, value)| (node, value.clone()))
+                        .collect(),
+                )
             },
             indeterminate: if self.indeterminate.is_empty() {
                 Shared::default()
@@ -3699,14 +3704,10 @@ impl ScriptRuntime {
             ..StyleState::default()
         };
         let controls = self.element_lists();
-        let stamp = {
-            let document = self.document.borrow();
-            (
-                document.version(),
-                document.selector_version(),
-                self.checked_version,
-            )
-        };
+        let stamp = (
+            self.document.borrow().selector_version(),
+            self.checked_version,
+        );
         let kept = self
             .checked_controls
             .borrow()

@@ -659,11 +659,16 @@ impl LengthTerms {
     }
 
     fn resolve(self, containing: f32, font_size: f32) -> f32 {
+        let base = self.px + self.em * font_size + self.percent * containing / 100.0;
+        if self.rem == 0.0
+            && self.viewport_width == 0.0
+            && self.viewport_height == 0.0
+            && self.zero_width == 0.0
+        {
+            return base;
+        }
         let environment = layout_environment();
-        self.px
-            + self.em * font_size
-            + self.rem * environment.root_font_size
-            + self.percent * containing / 100.0
+        base + self.rem * environment.root_font_size
             + self.viewport_width * environment.viewport.width / 100.0
             + self.viewport_height * environment.viewport.height / 100.0
             // the width of a zero is a font lookup, made only for a length that has ch in it
@@ -771,6 +776,30 @@ impl Length {
             },
         }
     }
+
+    fn hash_bits(self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        std::mem::discriminant(&self).hash(hasher);
+        match self {
+            Self::Auto => {}
+            Self::Terms(t) => {
+                // adding 0.0 normalizes -0.0 so equal lengths always land in one bucket
+                [
+                    (t.px + 0.0).to_bits(),
+                    (t.em + 0.0).to_bits(),
+                    (t.rem + 0.0).to_bits(),
+                    (t.percent + 0.0).to_bits(),
+                    (t.viewport_width + 0.0).to_bits(),
+                    (t.viewport_height + 0.0).to_bits(),
+                    (t.zero_width + 0.0).to_bits(),
+                ]
+                .hash(hasher);
+            }
+            Self::Clamp(list) | Self::Smallest(list) | Self::Largest(list) => {
+                list.0.hash(hasher);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -830,19 +859,48 @@ struct StyleMemo {
 impl StyleMemo {
     fn share(&mut self, style: Style) -> Rc<Style> {
         use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = crate::hashing::Fast::default();
         std::mem::discriminant(&style.display).hash(&mut hasher);
         std::mem::discriminant(&style.position).hash(&mut hasher);
+        std::mem::discriminant(&style.overflow).hash(&mut hasher);
+        std::mem::discriminant(&style.overflow_x).hash(&mut hasher);
+        std::mem::discriminant(&style.overflow_y).hash(&mut hasher);
+        std::mem::discriminant(&style.visibility).hash(&mut hasher);
+        std::mem::discriminant(&style.text_align).hash(&mut hasher);
+        std::mem::discriminant(&style.box_sizing).hash(&mut hasher);
+        std::mem::discriminant(&style.flex_direction).hash(&mut hasher);
+        std::mem::discriminant(&style.justify_content).hash(&mut hasher);
+        std::mem::discriminant(&style.align_items).hash(&mut hasher);
         for color in [style.color, style.background] {
             [color.red, color.green, color.blue, color.alpha].hash(&mut hasher);
         }
         style.font_weight.0.hash(&mut hasher);
-        style.opacity.to_bits().hash(&mut hasher);
-        for length in [style.width, style.height, style.font_size] {
-            length
-                .resolve(1000.0, 16.0)
-                .map(f32::to_bits)
-                .hash(&mut hasher);
+        (style.opacity + 0.0).to_bits().hash(&mut hasher);
+        (style.flex_grow + 0.0).to_bits().hash(&mut hasher);
+        (style.flex_shrink + 0.0).to_bits().hash(&mut hasher);
+        for length in [
+            style.width,
+            style.height,
+            style.min_width,
+            style.max_width,
+            style.font_size,
+            style.line_height,
+            style.margin.top,
+            style.margin.right,
+            style.margin.bottom,
+            style.margin.left,
+            style.padding.top,
+            style.padding.right,
+            style.padding.bottom,
+            style.padding.left,
+            style.gap,
+            style.row_gap,
+        ] {
+            length.hash_bits(&mut hasher);
+        }
+        for side in style.border {
+            std::mem::discriminant(&side.style).hash(&mut hasher);
+            (side.width + 0.0).to_bits().hash(&mut hasher);
         }
         let alike = self.shared.entry(hasher.finish()).or_default();
         if let Some(known) = alike.iter().find(|known| ***known == style) {
@@ -1060,7 +1118,7 @@ thread_local! {
 // the sheet, document and version a custom property pass read, with the state it read, and
 // what it found
 type CustomPropertyPass = (
-    (u64, u64, u64, StyleState),
+    (u64, u64, (u64, u64), StyleState),
     Shared<HashMap<NodeId, BTreeMap<String, String>>>,
     Option<NodeId>,
 );
@@ -2396,6 +2454,9 @@ pub struct Stylesheet {
     index: RuleIndex,
     // indexed rules that declare a transition or an animation, checked before a full cascade
     motion_index: RuleIndex,
+    // indexed rules that declare a custom property, so unchanged elements skip full cascades
+    custom_prop_index: RuleIndex,
+    has_custom_properties: bool,
     has_transitions: bool,
     has_animations: bool,
     has_container_queries: bool,
@@ -2578,6 +2639,19 @@ fn motion_rules(rules: &[Rule]) -> Vec<usize> {
         .collect()
 }
 
+fn custom_property_rules(rules: &[Rule]) -> Vec<usize> {
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| {
+            rule.declarations
+                .iter()
+                .any(|declaration| declaration.property.starts_with("--"))
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 // rules bucketed by the rightmost id, class or tag, so an element only tries plausible rules
 #[derive(Clone, Debug, Default)]
 struct RuleIndex {
@@ -2666,23 +2740,38 @@ impl RuleIndex {
                 .any(|class| self.by_class.contains_key(class))
     }
 
-    fn candidates(&self, subject: &Element) -> Vec<usize> {
-        let mut candidates = self.universal.clone();
+    fn fill_candidates(&self, subject: &Element, candidates: &mut Vec<usize>) {
+        candidates.clear();
+        let mut buckets = 0usize;
+        if !self.universal.is_empty() {
+            candidates.extend_from_slice(&self.universal);
+            buckets += 1;
+        }
         if let Some(bucket) = self.by_tag.get(&subject.name) {
             candidates.extend_from_slice(bucket);
+            buckets += 1;
         }
         if let Some(id) = subject.attr("id")
             && let Some(bucket) = self.by_id.get(id)
         {
             candidates.extend_from_slice(bucket);
+            buckets += 1;
         }
         for class in subject.classes() {
             if let Some(bucket) = self.by_class.get(class) {
                 candidates.extend_from_slice(bucket);
+                buckets += 1;
             }
         }
-        candidates.sort_unstable();
-        candidates.dedup();
+        if buckets > 1 {
+            candidates.sort_unstable();
+            candidates.dedup();
+        }
+    }
+
+    fn candidates(&self, subject: &Element) -> Vec<usize> {
+        let mut candidates = Vec::new();
+        self.fill_candidates(subject, &mut candidates);
         candidates
     }
 }
@@ -3180,6 +3269,9 @@ impl Stylesheet {
         let index = RuleIndex::build(&rules);
         let motion_rules = motion_rules(&rules);
         let motion_index = RuleIndex::build_subset(&rules, &motion_rules);
+        let custom_rules = custom_property_rules(&rules);
+        let has_custom_properties = !custom_rules.is_empty();
+        let custom_prop_index = RuleIndex::build_subset(&rules, &custom_rules);
         let has_transitions = rules.iter().any(|rule| {
             rule.declarations
                 .iter()
@@ -3210,6 +3302,8 @@ impl Stylesheet {
             keyframes,
             index,
             motion_index,
+            custom_prop_index,
+            has_custom_properties,
             has_transitions,
             has_animations,
             has_container_queries,
@@ -3229,6 +3323,9 @@ impl Stylesheet {
         let index = RuleIndex::build(&rules);
         let motion_rules = motion_rules(&rules);
         let motion_index = RuleIndex::build_subset(&rules, &motion_rules);
+        let custom_rules = custom_property_rules(&rules);
+        let has_custom_properties = !custom_rules.is_empty();
+        let custom_prop_index = RuleIndex::build_subset(&rules, &custom_rules);
         let has_transitions = rules.iter().any(|rule| {
             rule.declarations
                 .iter()
@@ -3260,6 +3357,8 @@ impl Stylesheet {
                 keyframes,
                 index,
                 motion_index,
+                custom_prop_index,
+                has_custom_properties,
                 has_transitions,
                 has_animations,
                 has_container_queries,
@@ -3353,10 +3452,15 @@ impl Stylesheet {
     // size it reads, so the last two are kept by the sheet, the document version and the state
     // they read; layout and transition sampling read different states
     pub(crate) fn populate_custom_properties(&self, document: &Document, state: &mut StyleState) {
+        let document_key = if !self.follows_versions() || document.has_shadow_roots() {
+            (document.version(), 0)
+        } else {
+            (document.selector_version(), document.custom_style_version())
+        };
         let key = (
             self.identity,
             document.identity(),
-            document.version(),
+            document_key,
             StyleState {
                 clock: 0,
                 transitions: Shared::default(),
@@ -3387,6 +3491,33 @@ impl Stylesheet {
         });
     }
 
+    fn may_declare_custom_property(
+        &self,
+        document: &Document,
+        node: NodeId,
+        element: &Element,
+        state: &StyleState,
+    ) -> bool {
+        if !document.style_blocked(node)
+            && element
+                .attr("style")
+                .is_some_and(|inline| inline.contains("--"))
+        {
+            return true;
+        }
+        if !self.has_custom_properties {
+            return false;
+        }
+        self.custom_prop_index.any_candidate(element, |index| {
+            let rule = &self.rules[index];
+            rule.applies(document, node, state)
+                && rule
+                    .selectors
+                    .iter()
+                    .any(|selector| selector.matches(document, node, None, state))
+        })
+    }
+
     fn populate_custom_properties_afresh(&self, document: &Document, state: &mut StyleState) {
         let _profile = crate::profile::scope("style: custom properties");
         state.custom_properties = Shared::default();
@@ -3415,8 +3546,16 @@ impl Stylesheet {
         let mut custom = HashMap::default();
         // only cascades are asked for here, and they read none of what this pass writes
         let _styles = memoize_styles();
+        let shadows = document.has_shadow_roots();
         for node in top {
-            self.populate_element_custom_properties(document, node, &inherited, state, &mut custom);
+            self.populate_element_custom_properties(
+                document,
+                node,
+                &inherited,
+                state,
+                shadows,
+                &mut custom,
+            );
         }
         state.custom_properties = Shared::from_value(custom);
     }
@@ -3427,31 +3566,42 @@ impl Stylesheet {
         node: NodeId,
         inherited: &BTreeMap<String, String>,
         state: &StyleState,
+        shadows: bool,
         custom: &mut HashMap<NodeId, BTreeMap<String, String>>,
     ) {
         // most elements declare none and pass on the map they inherited as it is
         let mut own = None;
-        for (property, (_, _, value)) in self.cascaded_values(document, node, None, state).iter() {
-            if !property.starts_with("--") {
-                continue;
-            }
-            let properties = own.get_or_insert_with(|| inherited.clone());
-            match value.trim().to_ascii_lowercase().as_str() {
-                "initial" => {
-                    properties.remove(property);
+        let check = shadows
+            || document.element(node).is_some_and(|element| {
+                self.may_declare_custom_property(document, node, element, state)
+            });
+        if check {
+            for (property, (_, _, value)) in
+                self.cascaded_values(document, node, None, state).iter()
+            {
+                if !property.starts_with("--") {
+                    continue;
                 }
-                "inherit" | "unset" => {}
-                _ => {
-                    properties.insert(property.clone(), value.clone());
+                let properties = own.get_or_insert_with(|| inherited.clone());
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "initial" => {
+                        properties.remove(property);
+                    }
+                    "inherit" | "unset" => {}
+                    _ => {
+                        properties.insert(property.clone(), value.clone());
+                    }
                 }
             }
-        }
-        if own.is_some() || inherited.is_empty() {
-            custom.insert(node, own.clone().unwrap_or_default());
         }
         let properties = own.as_ref().unwrap_or(inherited);
-        for child in document.element_children(node).collect::<Vec<_>>() {
-            self.populate_element_custom_properties(document, child, properties, state, custom);
+        for child in document.element_children(node) {
+            self.populate_element_custom_properties(
+                document, child, properties, state, shadows, custom,
+            );
+        }
+        if let Some(own) = own {
+            custom.insert(node, own);
         }
     }
 
@@ -3595,8 +3745,7 @@ impl Stylesheet {
             style.display = Display::None;
         }
         crate::colors::use_system_colors(state.system_colors());
-        let values = self.cascaded_values(document, node, pseudo, state);
-        let cascaded = values.clone();
+        let cascaded = self.cascaded_values(document, node, pseudo, state);
         let empty_properties = BTreeMap::new();
         let custom_properties =
             inherited_custom_properties(state, document, node).unwrap_or(&empty_properties);
@@ -3606,10 +3755,14 @@ impl Stylesheet {
         let mut base_values = BTreeMap::new();
         // declarations apply in cascade order, so a later shorthand overrides an earlier
         // longhand and the reverse; color comes first for currentColor
-        let mut values = values
+        let mut values = cascaded
             .iter()
             .filter(|(property, _)| !property.starts_with("--"))
             .collect::<Vec<_>>();
+        let needs_base = !state.reduced_motion
+            && values
+                .iter()
+                .any(|(property, _)| *property == "animation" || *property == "animation-name");
         let inherited = style;
         let initial = || {
             Style::default_for(
@@ -3668,7 +3821,9 @@ impl Stylesheet {
                 continue;
             }
             apply_declaration(&mut style, property, &value);
-            base_values.insert(property.clone(), value);
+            if needs_base {
+                base_values.insert(property.clone(), value.into_owned());
+            }
         }
         // a running transition replaces the declared value while it is in flight
         if let Some(node) = own
@@ -3979,7 +4134,7 @@ impl Stylesheet {
             .filter_map(|(property, (_, _, raw))| {
                 Some((
                     property.clone(),
-                    resolve_custom_value(raw, custom_properties)?,
+                    resolve_custom_value(raw, custom_properties)?.into_owned(),
                 ))
             })
             .collect()
@@ -4086,7 +4241,12 @@ impl Stylesheet {
         if !self.index.has_candidates(element) {
             return;
         }
-        for position in self.index.candidates(element) {
+        thread_local! {
+            static CANDIDATES: std::cell::Cell<Vec<usize>> = const { std::cell::Cell::new(Vec::new()) };
+        }
+        let mut candidates = CANDIDATES.with(std::cell::Cell::take);
+        self.index.fill_candidates(element, &mut candidates);
+        for &position in &candidates {
             let Some(rule) = self.rules.get(position) else {
                 continue;
             };
@@ -4118,6 +4278,7 @@ impl Stylesheet {
                 }
             }
         }
+        CANDIDATES.with(|slot| slot.set(candidates));
     }
 
     fn matched_declarations(
@@ -9068,43 +9229,55 @@ fn inherited_custom_properties<'a>(
     document: &Document,
     node: NodeId,
 ) -> Option<&'a BTreeMap<String, String>> {
+    if state.custom_properties.is_empty() {
+        return None;
+    }
     std::iter::once(node)
         .chain(document.ancestors(node))
         .find_map(|candidate| state.custom_properties.get(&candidate))
 }
 
-fn resolve_custom_value(value: &str, properties: &BTreeMap<String, String>) -> Option<String> {
-    resolve_custom_value_inner(value, properties, &mut Vec::new())
+fn resolve_custom_value<'a>(
+    value: &'a str,
+    properties: &BTreeMap<String, String>,
+) -> Option<Cow<'a, str>> {
+    let Some(first) = find_var_function(value) else {
+        return Some(Cow::Borrowed(value));
+    };
+    resolve_custom_value_inner(value, first, properties, &mut Vec::new()).map(Cow::Owned)
 }
 
 fn resolve_custom_value_inner(
     value: &str,
+    first: usize,
     properties: &BTreeMap<String, String>,
     stack: &mut Vec<String>,
 ) -> Option<String> {
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0;
-    while let Some(relative_start) = find_var_function(&value[cursor..]) {
-        let start = cursor + relative_start;
+    let mut next = Some(first);
+    while let Some(start) = next {
         output.push_str(&value[cursor..start]);
         let open = start + 3;
         let close = matching_parenthesis(value, open)?;
         let (name, fallback) = parse_var_arguments(&value[open + 1..close])?;
+        let resolve = |raw: &str, stack: &mut Vec<String>| match find_var_function(raw) {
+            Some(at) => resolve_custom_value_inner(raw, at, properties, stack),
+            None => Some(raw.to_string()),
+        };
         let replacement = if stack.iter().any(|current| current == name) {
-            fallback.and_then(|fallback| resolve_custom_value_inner(fallback, properties, stack))
+            fallback.and_then(|fallback| resolve(fallback, stack))
         } else if let Some(raw) = properties.get(name) {
             stack.push(name.to_string());
-            let resolved = resolve_custom_value_inner(raw, properties, stack);
+            let resolved = resolve(raw, stack);
             stack.pop();
-            resolved.or_else(|| {
-                fallback
-                    .and_then(|fallback| resolve_custom_value_inner(fallback, properties, stack))
-            })
+            resolved.or_else(|| fallback.and_then(|fallback| resolve(fallback, stack)))
         } else {
-            fallback.and_then(|fallback| resolve_custom_value_inner(fallback, properties, stack))
+            fallback.and_then(|fallback| resolve(fallback, stack))
         }?;
         output.push_str(&replacement);
         cursor = close + 1;
+        next = find_var_function(&value[cursor..]).map(|relative| cursor + relative);
     }
     output.push_str(&value[cursor..]);
     Some(output)
@@ -9112,8 +9285,14 @@ fn resolve_custom_value_inner(
 
 fn find_var_function(value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
-    (0..bytes.len().saturating_sub(3))
-        .find(|index| bytes[*index..*index + 4].eq_ignore_ascii_case(b"var("))
+    let mut index = 3;
+    while index < bytes.len() {
+        if bytes[index] == b'(' && bytes[index - 3..index].eq_ignore_ascii_case(b"var") {
+            return Some(index - 3);
+        }
+        index += 1;
+    }
+    None
 }
 
 fn matching_parenthesis(value: &str, open: usize) -> Option<usize> {
@@ -10553,8 +10732,9 @@ mod tests {
             resolve_custom_value(
                 "var(--loop, #abcdef)",
                 state.custom_properties.get(&card).expect("card variables")
-            ),
-            Some("#123456".to_string())
+            )
+            .as_deref(),
+            Some("#123456")
         );
     }
 
