@@ -12,9 +12,11 @@ use std::rc::Weak;
 
 #[derive(Default)]
 struct Registry {
-    scopes: Vec<Weak<RefCell<Scope>>>,
-    objects: Vec<Weak<RefCell<JsObject>>>,
-    arrays: Vec<Weak<RefCell<ArrayData>>>,
+    // each node with the generation of the script runtime that was newest when it was made
+    scopes: Vec<(u32, Weak<RefCell<Scope>>)>,
+    objects: Vec<(u32, Weak<RefCell<JsObject>>)>,
+    arrays: Vec<(u32, Weak<RefCell<ArrayData>>)>,
+    generation: u32,
     // registrations since the last collection, and how many trigger the next one
     since: usize,
     threshold: usize,
@@ -35,9 +37,9 @@ impl Registry {
     }
 
     fn prune(&mut self) {
-        self.scopes.retain(|weak| weak.strong_count() > 0);
-        self.objects.retain(|weak| weak.strong_count() > 0);
-        self.arrays.retain(|weak| weak.strong_count() > 0);
+        self.scopes.retain(|(_, weak)| weak.strong_count() > 0);
+        self.objects.retain(|(_, weak)| weak.strong_count() > 0);
+        self.arrays.retain(|(_, weak)| weak.strong_count() > 0);
         self.since_prune = 0;
     }
 }
@@ -54,7 +56,8 @@ thread_local! {
 pub(super) fn register_scope(handle: &ScopeRef) {
     let due = REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
-        registry.scopes.push(Rc::downgrade(handle));
+        let generation = registry.generation;
+        registry.scopes.push((generation, Rc::downgrade(handle)));
         registry.since += 1;
         registry.since_prune += 1;
         if registry.prune_due() {
@@ -72,7 +75,8 @@ pub(super) fn register_scope(handle: &ScopeRef) {
 pub(super) fn register_object(handle: &ObjectHandle) {
     let due = REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
-        registry.objects.push(Rc::downgrade(handle));
+        let generation = registry.generation;
+        registry.objects.push((generation, Rc::downgrade(handle)));
         registry.since += 1;
         registry.since_prune += 1;
         if registry.prune_due() {
@@ -90,7 +94,8 @@ pub(super) fn register_object(handle: &ObjectHandle) {
 pub(super) fn register_array(handle: &ArrayHandle) {
     let due = REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
-        registry.arrays.push(Rc::downgrade(handle));
+        let generation = registry.generation;
+        registry.arrays.push((generation, Rc::downgrade(handle)));
         registry.since += 1;
         registry.since_prune += 1;
         if registry.prune_due() {
@@ -103,6 +108,55 @@ pub(super) fn register_array(handle: &ArrayHandle) {
     if due {
         collect_cycles();
     }
+}
+
+// starts the generation a new script runtime's nodes are made in
+pub(super) fn begin_generation() -> u32 {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.generation = registry.generation.wrapping_add(1);
+        registry.generation
+    })
+}
+
+// empties every node a runtime made, once its page is gone: nothing can reach them then, but
+// cycles through references the collector does not trace would hold them for good
+pub(super) fn clear_generation(generation: u32) -> usize {
+    let nodes: Vec<Node> = REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        let mut nodes = Vec::new();
+        registry.scopes.retain(|(made, weak)| {
+            if *made != generation {
+                return true;
+            }
+            nodes.extend(weak.upgrade().map(Node::Scope));
+            false
+        });
+        registry.objects.retain(|(made, weak)| {
+            if *made != generation {
+                return true;
+            }
+            nodes.extend(weak.upgrade().map(Node::Object));
+            false
+        });
+        registry.arrays.retain(|(made, weak)| {
+            if *made != generation {
+                return true;
+            }
+            nodes.extend(weak.upgrade().map(Node::Array));
+            false
+        });
+        nodes
+    });
+    let (mut dropped, mut classes) = (Vec::new(), Vec::new());
+    for node in &nodes {
+        node.clear(&mut dropped, &mut classes);
+    }
+    let cleared = nodes.len();
+    drop(dropped);
+    drop(classes);
+    drop(nodes);
+    cleared
 }
 
 // collects once enough has been made since the last collection that it pays for itself
@@ -277,17 +331,17 @@ fn live_nodes() -> usize {
         registry
             .scopes
             .iter()
-            .filter(|weak| weak.strong_count() > 0)
+            .filter(|(_, weak)| weak.strong_count() > 0)
             .count()
             + registry
                 .objects
                 .iter()
-                .filter(|weak| weak.strong_count() > 0)
+                .filter(|(_, weak)| weak.strong_count() > 0)
                 .count()
             + registry
                 .arrays
                 .iter()
-                .filter(|weak| weak.strong_count() > 0)
+                .filter(|(_, weak)| weak.strong_count() > 0)
                 .count()
     })
 }
@@ -319,21 +373,21 @@ pub(super) fn collect_cycles() -> usize {
     let nodes: Vec<Node> = REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         let mut nodes = Vec::new();
-        registry.scopes.retain(|weak| match weak.upgrade() {
+        registry.scopes.retain(|(_, weak)| match weak.upgrade() {
             Some(scope) => {
                 nodes.push(Node::Scope(scope));
                 true
             }
             None => false,
         });
-        registry.objects.retain(|weak| match weak.upgrade() {
+        registry.objects.retain(|(_, weak)| match weak.upgrade() {
             Some(object) => {
                 nodes.push(Node::Object(object));
                 true
             }
             None => false,
         });
-        registry.arrays.retain(|weak| match weak.upgrade() {
+        registry.arrays.retain(|(_, weak)| match weak.upgrade() {
             Some(array) => {
                 nodes.push(Node::Array(array));
                 true
@@ -410,6 +464,30 @@ fn finish(nodes: Vec<Node>, cleared: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_released_runtime_leaves_none_of_its_nodes_whatever_holds_them() {
+        let document = |markup: &str| {
+            Rc::new(RefCell::new(
+                crate::dom::Document::parse(markup).expect("document should parse"),
+            ))
+        };
+        let kept = ScriptRuntime::new(document("<p></p>"));
+        let baseline = live_nodes();
+        let mut page = ScriptRuntime::new(document("<p id='out'></p>"));
+        page.execute(
+            r#"
+            const map = new Map();
+            for (let i = 0; i < 500; i++) { const box = { i }; box.self = () => map; map.set(box, [box]); }
+            document.getElementById("out").addEventListener("click", () => map);
+            "#,
+        )
+        .expect("script should run");
+        assert!(live_nodes() > baseline + 1000);
+        page.release_heap();
+        assert_eq!(live_nodes(), baseline, "a released runtime's nodes all go");
+        drop(kept);
+    }
 
     #[test]
     fn closures_that_hold_their_own_scope_are_collected() {

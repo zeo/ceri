@@ -756,6 +756,8 @@ pub struct ScriptRuntime {
     computed_styles: Option<geometry::KeptComputed>,
     // the last getComputedStyle object, whose keys the next one takes when they match
     computed_style_template: Option<JsObject>,
+    // the heap generation its nodes are made in, cleared together once its page is gone
+    generation: u32,
     // the length and name a bound function starts with, by its target's name and its length
     bound_templates: HashMap<(Rc<str>, u64), object::ObjectTemplate>,
     // milliseconds from an animation frame request to its callback
@@ -1777,6 +1779,8 @@ impl ScriptRuntime {
     ) -> Self {
         // a runtime dropped before this one may have left cycles behind
         heap::collect_if_due();
+        // every node made from here on is this runtime's, until a newer one starts
+        let generation = heap::begin_generation();
         let global = Rc::new(RefCell::new(Environment::default()));
         let (intrinsics, intrinsic_globals) = create_intrinsics();
         let selection = ranges::new_selection(&intrinsics);
@@ -1970,6 +1974,7 @@ impl ScriptRuntime {
             disabled_controls: RefCell::new(None),
             computed_styles: None,
             computed_style_template: None,
+            generation,
             bound_templates: HashMap::new(),
             frame_interval: crate::navigation::FRAME_INTERVAL,
             visible: true,
@@ -15765,6 +15770,16 @@ fn parse_fetch_options(
 }
 
 // a failure raised by the host side of an API, which script sees as a TypeError
+impl ScriptRuntime {
+    // empties what this runtime's script made, for a page that is going away: cycles through
+    // references the collector does not trace would otherwise hold all of it for good
+    pub(crate) fn release_heap(self) -> usize {
+        let generation = self.generation;
+        drop(self);
+        heap::clear_generation(generation)
+    }
+}
+
 pub(crate) fn runtime_error(message: impl Into<String>) -> ScriptError {
     ScriptError {
         offset: 0,

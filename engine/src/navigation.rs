@@ -1313,7 +1313,22 @@ fn script_error(error: crate::script::ScriptError) -> NavigationError {
     NavigationError::Script(error.to_string())
 }
 
+impl Drop for Browser {
+    fn drop(&mut self) {
+        self.drop_page();
+    }
+}
+
 impl Browser {
+    // lets the page go and the cycles its script made with it
+    fn drop_page(&mut self) {
+        if let Some(page) = self.page.take() {
+            let Page { runtime, .. } = page;
+            runtime.release_heap();
+            crate::release_memory();
+        }
+    }
+
     pub fn new(resources: ResourceBundle) -> Self {
         crate::settle_allocator();
         Self {
@@ -1895,6 +1910,7 @@ impl Browser {
         }
         self.persist_storage()?;
 
+        self.drop_page();
         self.page = Some(Page {
             document,
             runtime,
@@ -3900,6 +3916,7 @@ impl Browser {
             .collect::<Vec<_>>();
         let stylesheet = Stylesheet::parse_recovering(&joined_sheets(&sheets)).0;
         let layout_inputs = self.layout_inputs(stylesheet, sheets, &document.borrow());
+        self.drop_page();
         self.page = Some(Page {
             runtime: {
                 let mut runtime = ScriptRuntime::with_storage_and_runtime_info(
