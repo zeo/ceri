@@ -20137,6 +20137,23 @@ mod tests {
         );
     }
     #[test]
+    fn a_split_on_one_character_keeps_every_empty_part_and_limit() {
+        let document = document(r#"<main><p id="status">idle</p></main>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const parts = ["/a//b/".split(/\//), "aXbxc".split(/x/i), "a,b,c".split(/,/, 2), "a😀b".split(/[😀]/u), "a-b".split(/(-)/), "abc".split(/q/)];
+                document.getElementById("status").textContent = JSON.stringify(parts);
+                "#,
+            )
+            .expect("script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some(r#"[["","a","","b",""],["a","b","c"],["a","b"],["a","b"],["a","-","b"],["abc"]]"#)
+        );
+    }
+    #[test]
     fn patterns_that_start_with_one_character_match_wherever_it_is() {
         let document = document(r#"<main><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());

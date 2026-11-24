@@ -1220,6 +1220,30 @@ impl Regex {
         Ok(None)
     }
 
+    // whether a code unit is a whole match, for a pattern that is one character or one class
+    // and no more, which a split can then find by scanning; none for any other pattern
+    pub(super) fn unit_match(&self, unit: u16) -> Option<bool> {
+        if self.flags.full_unicode() || self.groups != 1 {
+            return None;
+        }
+        let value = u32::from(unit);
+        match self.program.as_slice() {
+            [
+                Inst::Save(0),
+                Inst::Char(expected),
+                Inst::Save(1),
+                Inst::Match,
+            ] => Some(value == *expected || self.canonical(value) == self.canonical(*expected)),
+            [
+                Inst::Save(0),
+                Inst::Class(index),
+                Inst::Save(1),
+                Inst::Match,
+            ] => Some(self.class_matches(&self.classes[*index], value)),
+            _ => None,
+        }
+    }
+
     // a program whose first step reads one character can only match where that character
     // is, so find skips every other start without setting up a run there
     fn may_start_at(&self, subject: &[u16], position: usize) -> bool {

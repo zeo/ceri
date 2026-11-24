@@ -519,6 +519,24 @@ impl ScriptRuntime {
                     }
                     return Ok(Self::new_array(parts));
                 }
+                // a pattern of one character or class splits at each unit it matches, with no
+                // match run for each position
+                if data.regex.unit_match(0).is_some() {
+                    let mut previous = 0;
+                    for (position, &unit) in subject.iter().enumerate() {
+                        if data.regex.unit_match(unit) == Some(true) {
+                            parts.push(Value::String(
+                                from_units(&subject[previous..position]).into(),
+                            ));
+                            if parts.len() == limit {
+                                return Ok(Self::new_array(parts));
+                            }
+                            previous = position + 1;
+                        }
+                    }
+                    parts.push(Value::String(from_units(&subject[previous..]).into()));
+                    return Ok(Self::new_array(parts));
+                }
                 let mut previous = 0;
                 let mut position = 0;
                 while position < subject.len() {
