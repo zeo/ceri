@@ -777,6 +777,8 @@ impl ScriptRuntime {
             closure.scope.clone()
         };
         let scope = self.new_scope(code.layout.clone(), parent);
+        let mut stack = self.spare_values.pop().unwrap_or_default();
+        stack.reserve(16);
         // TDZ: lexical bindings start uninitialized; params and vars start undefined
         let mut frame = Frame::new(
             code.clone(),
@@ -787,6 +789,7 @@ impl ScriptRuntime {
             function.clone(),
             arguments,
         );
+        frame.stack = stack;
         frame.construct = construct;
         if code.simple_params {
             let mut scope = scope.borrow_mut();
@@ -1297,6 +1300,8 @@ impl ScriptRuntime {
         }
         let mut finished = frames.pop().expect("a frame is running");
         self.recycle_scopes(finished.scope.take());
+        self.keep_values(std::mem::take(&mut finished.stack));
+        self.keep_values(std::mem::take(&mut finished.arguments));
         let value = if finished.construct {
             match value {
                 // host objects such as nodes count as objects, so a custom element's
@@ -1355,9 +1360,19 @@ impl ScriptRuntime {
         frame.stack.pop().unwrap_or(Value::Undefined)
     }
 
-    fn pop_arguments(frame: &mut Frame, count: usize) -> Vec<Value> {
+    fn pop_arguments(&mut self, frame: &mut Frame, count: usize) -> Vec<Value> {
         let start = frame.stack.len().saturating_sub(count);
-        frame.stack.split_off(start)
+        let mut arguments = self.spare_values.pop().unwrap_or_default();
+        arguments.extend(frame.stack.drain(start..));
+        arguments
+    }
+
+    fn keep_values(&mut self, mut values: Vec<Value>) {
+        const KEPT: usize = 64;
+        if (1..=256).contains(&values.capacity()) && self.spare_values.len() < KEPT {
+            values.clear();
+            self.spare_values.push(values);
+        }
     }
 
     // one instruction; Some ends this run with a result
@@ -2039,7 +2054,7 @@ impl ScriptRuntime {
                     frame.stack.push(Value::String(key.into()));
                 }
                 Op::Call(count) | Op::CallMethod(count) => {
-                    let arguments = Self::pop_arguments(frame, count as usize);
+                    let arguments = self.pop_arguments(frame, count as usize);
                     let callee = Self::pop(frame);
                     let this = if matches!(op, Op::CallMethod(_)) {
                         Self::pop(frame)
@@ -2050,7 +2065,7 @@ impl ScriptRuntime {
                 }
                 Op::CallEval(_) | Op::CallEvalSpread => {
                     let arguments = match op {
-                        Op::CallEval(count) => Self::pop_arguments(frame, count as usize),
+                        Op::CallEval(count) => self.pop_arguments(frame, count as usize),
                         _ => match Self::pop(frame) {
                             Value::Array(array) => {
                                 array.borrow().iter().cloned().map(Value::filled).collect()
@@ -2093,7 +2108,7 @@ impl ScriptRuntime {
                     return self.call_in_loop(frames, callee, this, arguments);
                 }
                 Op::New(count) => {
-                    let arguments = Self::pop_arguments(frame, count as usize);
+                    let arguments = self.pop_arguments(frame, count as usize);
                     let callee = Self::pop(frame);
                     return self.construct_in_loop(frames, callee, arguments, None);
                 }
@@ -2109,7 +2124,7 @@ impl ScriptRuntime {
                     return self.construct_in_loop(frames, callee, arguments, None);
                 }
                 Op::SuperCall(count) => {
-                    let arguments = Self::pop_arguments(frame, count as usize);
+                    let arguments = self.pop_arguments(frame, count as usize);
                     return self.super_call(frames, arguments);
                 }
                 Op::SuperCallSpread => {
@@ -2339,7 +2354,7 @@ impl ScriptRuntime {
                     frames.last_mut().expect("frame").stack.push(result);
                 }
                 Op::TemplateConcat(count) => {
-                    let parts = Self::pop_arguments(frame, count as usize);
+                    let parts = self.pop_arguments(frame, count as usize);
                     let mut text = String::new();
                     for part in parts {
                         match part {
@@ -3231,7 +3246,7 @@ impl Frame {
             pc: code.entry,
             code,
             closure,
-            stack: Vec::with_capacity(16),
+            stack: Vec::new(),
             scope,
             scopes: 0,
             this,
