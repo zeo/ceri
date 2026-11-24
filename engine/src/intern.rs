@@ -2,7 +2,7 @@
 // oldest entry gives way once the table is full, so values animated frame by frame never
 // exhaust it, and an id whose slot was reused stops resolving instead of meaning another value
 
-use std::collections::HashMap;
+use crate::hashing::HashMap;
 use std::rc::Rc;
 
 // styles live for one layout pass, which never needs this many distinct values at once
@@ -19,7 +19,7 @@ impl<T: ?Sized> Table<T> {
     pub(crate) fn new() -> Self {
         Self {
             slots: Vec::new(),
-            ids: HashMap::new(),
+            ids: HashMap::default(),
             next: 0,
         }
     }

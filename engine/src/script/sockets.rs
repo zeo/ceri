@@ -131,7 +131,7 @@ impl Default for Sockets {
     fn default() -> Self {
         let (events, reports) = channel();
         Self {
-            states: HashMap::new(),
+            states: HashMap::default(),
             events,
             reports,
             waker: None,

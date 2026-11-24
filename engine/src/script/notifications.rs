@@ -136,7 +136,7 @@ impl Default for Notices {
     fn default() -> Self {
         let (replies, answers) = channel();
         Self {
-            states: HashMap::new(),
+            states: HashMap::default(),
             replies,
             answers,
             closing: Vec::new(),

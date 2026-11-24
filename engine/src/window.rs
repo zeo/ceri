@@ -1,12 +1,13 @@
 use crate::bridge::Waker;
 use crate::css::ColorScheme;
+use crate::hashing::HashMap;
 use crate::host::{
     EngineWorker, EngineWorkerEvent, Frame, InputEvent, KeyModifiers, PointerButton, RegionPress,
 };
 use crate::layout::Size;
 use crate::navigation::{APP_ORIGIN, Browser, UserPreferences};
 use softbuffer::{Context, Surface};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -602,7 +603,7 @@ where
         factory,
         control,
         startup: Some(windows),
-        windows: HashMap::new(),
+        windows: HashMap::default(),
         lifecycle,
     };
     event_loop

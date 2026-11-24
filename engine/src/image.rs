@@ -1,7 +1,7 @@
 use crate::css::Color;
 use crate::dom::Document;
+use crate::hashing::HashMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 

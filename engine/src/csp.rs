@@ -1,8 +1,8 @@
 // content security policy (W3C CSP Level 3): which loads, inline blocks and string compilation
 // a document's policies allow
 
+use crate::hashing::HashSet;
 use std::cell::RefCell;
-use std::collections::HashSet;
 
 // the protected document's origin; documents only ever load from the app origin
 const SELF_SCHEME: &str = "https";
@@ -356,7 +356,7 @@ impl Policy {
         (!directives.is_empty()).then(|| Self {
             text: text.trim().to_string(),
             directives,
-            bundled: HashSet::new(),
+            bundled: HashSet::default(),
         })
     }
 

@@ -105,6 +105,7 @@ use crate::css::StyleState;
 use crate::dom::{
     AccessibilityNode, Boundary, Document, DomError, Element, LiveRange, NodeId, NodeKind,
 };
+use crate::hashing::{HashMap, HashSet};
 use crate::navigation::{
     AppUrl, ClipboardProvider, FilePicker, FilePickerRequest, NavigationError, Resource,
     ResourceBundle, ResourceCacheMode, ResourceProvider, ResourceRequest, ResourceResponse,
@@ -113,7 +114,7 @@ use crate::navigation::{
 use crate::text::{next_word_boundary, previous_word_boundary};
 use crate::wasm;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -706,6 +707,7 @@ type ControlLists = (u64, Rc<[Vec<NodeId>; 5]>);
 
 // the document and selector versions a disabled set was found at, and the set
 type DisabledControls = ((u64, u64), BTreeSet<NodeId>);
+type CheckedControls = ((u64, u64, u64, u64), BTreeSet<NodeId>, BTreeSet<NodeId>);
 
 pub struct ScriptRuntime {
     document: Rc<RefCell<Document>>,
@@ -764,6 +766,9 @@ pub struct ScriptRuntime {
     // which of those controls are disabled, which reads only the document and is asked for by every
     // computed style script reads, so it is found again only once the document changes
     disabled_controls: RefCell<Option<DisabledControls>>,
+    // the checked and unchecked sets selectors match against, kept while the tree, its
+    // attributes and the controls' own state stand, as a frame asks for them several times
+    checked_controls: RefCell<Option<CheckedControls>>,
     computed_styles: Option<geometry::KeptComputed>,
     // the last getComputedStyle object, whose keys the next one takes when they match
     computed_style_template: Option<JsObject>,
@@ -1957,23 +1962,23 @@ impl ScriptRuntime {
             intrinsics,
             location,
             history,
-            event_listeners: HashMap::new(),
-            event_handlers: HashMap::new(),
-            attribute_handlers: HashMap::new(),
+            event_listeners: HashMap::default(),
+            event_handlers: HashMap::default(),
+            attribute_handlers: HashMap::default(),
             focused_element: None,
             forced_pseudo_classes: BTreeMap::new(),
             pointer_modality: false,
-            control_values: HashMap::new(),
-            control_checked: HashMap::new(),
+            control_values: HashMap::default(),
+            control_checked: HashMap::default(),
             dirty_checked_controls: BTreeSet::new(),
             indeterminate: BTreeSet::new(),
-            option_selected: HashMap::new(),
+            option_selected: HashMap::default(),
             dirty_options: BTreeSet::new(),
             dirty_controls: BTreeSet::new(),
             last_user_edit: BTreeSet::new(),
             resetting_forms: BTreeSet::new(),
             custom_validity: BTreeMap::new(),
-            text_selections: HashMap::new(),
+            text_selections: HashMap::default(),
             composition: None,
             click_detail: 1,
             motion_detail: None,
@@ -1989,12 +1994,13 @@ impl ScriptRuntime {
             measure_pinned: Cell::new(false),
             controls: RefCell::new(None),
             disabled_controls: RefCell::new(None),
+            checked_controls: RefCell::new(None),
             computed_styles: None,
             computed_style_template: None,
             generation,
             spare_scopes: Vec::new(),
             spare_frames: Vec::new(),
-            bound_templates: HashMap::new(),
+            bound_templates: HashMap::default(),
             frame_interval: crate::navigation::FRAME_INTERVAL,
             visible: true,
             media_queries: Vec::new(),
@@ -2007,12 +2013,12 @@ impl ScriptRuntime {
             reported_viewport: None,
             performance_entries: Vec::new(),
             perf_observers: Vec::new(),
-            event_targets: HashMap::new(),
+            event_targets: HashMap::default(),
             next_event_target: 0,
-            held_targets: HashMap::new(),
-            observers: HashMap::new(),
+            held_targets: HashMap::default(),
+            observers: HashMap::default(),
             next_observer: 0,
-            xhr: HashMap::new(),
+            xhr: HashMap::default(),
             sockets: sockets::Sockets::default(),
             notices: notifications::Notices::default(),
             channels: broadcast::Channels::default(),
@@ -2021,24 +2027,24 @@ impl ScriptRuntime {
             animations: animations::Animations::default(),
             audio: audio::AudioState::default(),
             images: RefCell::default(),
-            object_urls: HashMap::new(),
-            image_loads: HashMap::new(),
+            object_urls: HashMap::default(),
+            image_loads: HashMap::default(),
             current_script: None,
             media: media::MediaState::default(),
-            dialogs: HashMap::new(),
+            dialogs: HashMap::default(),
             top_layer: Vec::new(),
             popovers: Vec::new(),
-            popover_toggles: HashMap::new(),
+            popover_toggles: HashMap::default(),
             hovered_node: None,
             history_activation: false,
             custom_definitions: Vec::new(),
-            custom_states: HashMap::new(),
+            custom_states: HashMap::default(),
             construction_stack: Vec::new(),
-            when_defined: HashMap::new(),
+            when_defined: HashMap::default(),
             custom_registry: Value::Undefined,
             import_map: import_map::ImportMap::default(),
-            selected_files: HashMap::new(),
-            file_lists: RefCell::new(HashMap::new()),
+            selected_files: HashMap::default(),
+            file_lists: RefCell::new(HashMap::default()),
             file_picker: None,
             clipboard_provider: None,
             script_dialogs: None,
@@ -2047,9 +2053,9 @@ impl ScriptRuntime {
             bridge: None,
             scroll_offsets: BTreeMap::new(),
             cookies: Vec::new(),
-            canvas_contexts: HashMap::new(),
-            webgl_contexts: HashMap::new(),
-            offscreen_canvases: HashMap::new(),
+            canvas_contexts: HashMap::default(),
+            webgl_contexts: HashMap::default(),
+            offscreen_canvases: HashMap::default(),
             logs: Vec::new(),
             clock: 0,
             next_task_id: 1,
@@ -2065,25 +2071,25 @@ impl ScriptRuntime {
             private_names: 0,
             symbol_counter: 0,
             joining: Vec::new(),
-            template_cache: HashMap::new(),
+            template_cache: HashMap::default(),
             registries: Vec::new(),
             fetches: RefCell::new(Vec::new()),
-            event_sources: HashMap::new(),
+            event_sources: HashMap::default(),
             activated_at: None,
             fullscreen_element: None,
             font_set: RefCell::new(None),
             font_set_faces: RefCell::new(Vec::new()),
-            sheet_objects: RefCell::new(HashMap::new()),
-            adopted_sheets: RefCell::new(HashMap::new()),
+            sheet_objects: RefCell::new(HashMap::default()),
+            adopted_sheets: RefCell::new(HashMap::default()),
             lock_queue: RefCell::new(Vec::new()),
             next_fetch_id: std::cell::Cell::new(0),
-            pattern_cache: HashMap::new(),
+            pattern_cache: HashMap::default(),
             random_state: numbers::random_seed(),
             console_depth: 0,
             inspector: inspector::Inspector::new(),
             debugger: debugger::Debugger::default(),
-            console_timers: HashMap::new(),
-            console_counts: HashMap::new(),
+            console_timers: HashMap::default(),
+            console_counts: HashMap::default(),
             time_origin: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0.0, |elapsed| elapsed.as_millis() as f64),
@@ -2091,13 +2097,13 @@ impl ScriptRuntime {
             locale: "en-US".to_string(),
             host_runtime_info,
             module_cache: BTreeMap::new(),
-            import_metas: HashMap::new(),
+            import_metas: HashMap::default(),
             workers: Vec::new(),
             worker_sender: None,
             worker_script_type: None,
             worker_resource_sender: None,
             worker_resource_receiver: None,
-            node_handles: RefCell::new(HashMap::new()),
+            node_handles: RefCell::new(HashMap::default()),
             step_limit: None,
             steps: 0,
             interrupted: false,
@@ -3647,22 +3653,52 @@ impl ScriptRuntime {
             ..StyleState::default()
         };
         state.indeterminate = self.indeterminate.clone();
-        for (control, checked) in &self.control_checked {
-            if *checked {
-                state.checked.insert(*control);
-            } else {
-                state.unchecked.insert(*control);
-            }
-        }
         let controls = self.element_lists();
-        // a selected option matches :checked and is what a closed select shows
-        for &option in &controls[0] {
-            if self.is_option_selected(option) {
-                state.checked.insert(option);
-            } else {
-                state.unchecked.insert(option);
+        // what the sets follow from: the tree and its attributes, by the document's versions,
+        // and each control's own state, folded in any order
+        let stamp = {
+            use std::hash::{Hash, Hasher};
+            let fold = |states: &HashMap<NodeId, bool>| {
+                states.iter().fold(states.len() as u64, |sum, entry| {
+                    let mut hasher = crate::hashing::Fast::default();
+                    entry.hash(&mut hasher);
+                    sum.wrapping_add(hasher.finish())
+                })
+            };
+            let document = self.document.borrow();
+            (
+                document.version(),
+                document.selector_version(),
+                fold(&self.control_checked),
+                fold(&self.option_selected),
+            )
+        };
+        let kept = self
+            .checked_controls
+            .borrow()
+            .as_ref()
+            .filter(|kept| kept.0 == stamp)
+            .map(|kept| (kept.1.clone(), kept.2.clone()));
+        (state.checked, state.unchecked) = kept.unwrap_or_else(|| {
+            let (mut checked, mut unchecked) = (BTreeSet::new(), BTreeSet::new());
+            for (control, is_checked) in &self.control_checked {
+                if *is_checked {
+                    checked.insert(*control);
+                } else {
+                    unchecked.insert(*control);
+                }
             }
-        }
+            // a selected option matches :checked and is what a closed select shows
+            for &option in &controls[0] {
+                if self.is_option_selected(option) {
+                    checked.insert(option);
+                } else {
+                    unchecked.insert(option);
+                }
+            }
+            *self.checked_controls.borrow_mut() = Some((stamp, checked.clone(), unchecked.clone()));
+            (checked, unchecked)
+        });
         state.disabled = self.disabled_controls(&controls[1]);
         state
     }
@@ -11865,7 +11901,7 @@ impl CloneContext {
             max_bytes,
             bytes: 0,
             nodes: 0,
-            active: HashSet::new(),
+            active: HashSet::default(),
         }
     }
 
@@ -14139,7 +14175,7 @@ struct PatternToken {
 fn pattern_matches(pattern: &str, value: &str) -> Option<bool> {
     let tokens = parse_pattern_tokens(pattern)?;
     let characters = value.chars().collect::<Vec<_>>();
-    let mut memo = HashMap::new();
+    let mut memo = HashMap::default();
     Some(pattern_match_from(&tokens, &characters, 0, 0, &mut memo))
 }
 

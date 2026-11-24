@@ -82,7 +82,7 @@ impl ScriptRuntime {
             waker,
             sender,
             receiver,
-            pending: HashMap::new(),
+            pending: HashMap::default(),
             next_id: 0,
             listeners: Vec::new(),
             object: RefCell::new(None),

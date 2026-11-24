@@ -1983,7 +1983,7 @@ impl ScriptRuntime {
         }
         match value {
             Value::Object(object) => {
-                let mut seen = HashSet::new();
+                let mut seen = HashSet::default();
                 let mut keys = Vec::new();
                 let mut current = Some(object.clone());
                 while let Some(object) = current {

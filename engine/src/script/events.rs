@@ -311,7 +311,7 @@ pub(super) fn create(
     object_prototype: &ObjectHandle,
     globals: &mut Vec<(&'static str, Value)>,
 ) -> EventInterfaces {
-    let mut prototypes: HashMap<&'static str, ObjectHandle> = HashMap::new();
+    let mut prototypes: HashMap<&'static str, ObjectHandle> = HashMap::default();
     for interface in EVENT_INTERFACES {
         let parent = if interface.parent.is_empty() {
             object_prototype.clone()
@@ -639,7 +639,7 @@ impl ScriptRuntime {
             composed,
             trusted,
             time_stamp: self.clock as f64,
-            fields: RefCell::new(HashMap::new()),
+            fields: RefCell::new(HashMap::default()),
             state: RefCell::new(DispatchState::default()),
         })
     }

@@ -5,7 +5,7 @@
 use super::ScriptError;
 use super::ast::*;
 use super::lexer::{Lexer, Token, TokenKind};
-use std::collections::{HashMap, HashSet};
+use crate::hashing::{HashMap, HashSet};
 use std::rc::Rc;
 
 const RESERVED: [&str; 37] = [
@@ -633,7 +633,7 @@ impl<'a> Parser<'a> {
         if lexicals.is_empty() && !parameters_may_not_repeat {
             return Ok(());
         }
-        let mut seen: HashMap<&str, bool> = HashMap::new();
+        let mut seen: HashMap<&str, bool> = HashMap::default();
         for (name, offset, plain) in &lexicals {
             match seen.get(&**name) {
                 Some(&earlier) if !(earlier && *plain) => {
@@ -670,7 +670,7 @@ impl<'a> Parser<'a> {
             if let Some(rest) = rest {
                 bound_names(rest, &mut bound);
             }
-            let mut seen_params = HashSet::new();
+            let mut seen_params = HashSet::default();
             for name in &bound {
                 if !seen_params.insert(name.clone()) && parameters_may_not_repeat {
                     let offset = self.peek().map(|token| token.start).unwrap_or(0);

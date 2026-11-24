@@ -2,7 +2,7 @@
 // type names told from identifiers by the built-in type words and the structs declared so far
 
 use super::lex::{Tok, Token};
-use std::collections::HashSet;
+use crate::hashing::HashSet;
 
 pub(crate) const TYPE_WORDS: &[&str] = &[
     "void",
@@ -214,7 +214,7 @@ impl Parser {
         Parser {
             tokens,
             at: 0,
-            structs: HashSet::new(),
+            structs: HashSet::default(),
         }
     }
 

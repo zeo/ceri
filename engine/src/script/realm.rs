@@ -1609,7 +1609,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
             .define(name.to_string(), Property::hidden(Value::Object(function)));
         intl_prototypes.push(prototype);
     }
-    let mut hosts = HashMap::new();
+    let mut hosts = HashMap::default();
     for name in HOST_INTERFACES {
         let prototype = plain(&object_prototype);
         build.value(&prototype, "@@toStringTag", Value::String((*name).into()));

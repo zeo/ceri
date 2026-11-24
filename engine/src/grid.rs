@@ -2,8 +2,8 @@
 // template areas, and item placement; lists and areas are interned so Style stays Copy
 
 use crate::css::{Length, parse_length};
+use crate::hashing::HashMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 // one end of a track's size range

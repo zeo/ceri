@@ -8,7 +8,7 @@ use super::operations::is_callable;
 use super::realm::{Builder, Native};
 use super::*;
 use crate::dom::{Document, Namespace, NodeKind};
-use std::collections::HashMap;
+use crate::hashing::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum XPathMember {
@@ -952,7 +952,7 @@ impl<'a> Evaluation<'a> {
     fn new(document: &'a Document) -> Self {
         Evaluation {
             document,
-            order: HashMap::new(),
+            order: HashMap::default(),
             counted: 0,
         }
     }
@@ -1458,7 +1458,7 @@ impl<'a> Evaluation<'a> {
                     .collect();
                 let mut found = Vec::new();
                 let mut stack = vec![self.root_of(context.node)];
-                let mut seen = std::collections::HashSet::new();
+                let mut seen = crate::hashing::HashSet::default();
                 while let Some(at) = stack.pop() {
                     if let Some(id) = self
                         .document
@@ -1630,7 +1630,7 @@ impl ScriptRuntime {
         let Some(tokens) = tokenize(text) else {
             return Err(syntax(self));
         };
-        let mut namespaces = HashMap::new();
+        let mut namespaces = HashMap::default();
         for token in &tokens {
             let prefix = match token {
                 Token::Name(Some(prefix), _) | Token::PrefixStar(prefix) => prefix,

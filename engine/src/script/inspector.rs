@@ -70,7 +70,7 @@ impl Inspector {
             capturing: false,
             messages: VecDeque::new(),
             next_sequence: 0,
-            objects: HashMap::new(),
+            objects: HashMap::default(),
             next_object: 1,
             awaited: Vec::new(),
             next_token: 1,
@@ -707,7 +707,7 @@ impl ScriptRuntime {
         let preview = params["generatePreview"] == true;
         let indexes = params["nonIndexedPropertiesOnly"] != true;
         let mut result = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut current = Some(target.clone());
         let mut is_own = true;
         while let Some(holder) = current {

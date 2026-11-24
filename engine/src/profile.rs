@@ -21,7 +21,7 @@ thread_local! {
     // script functions seen running at each sample: how often each was the innermost, and how
     // often anywhere on the stack
     static SAMPLES: RefCell<std::collections::HashMap<std::rc::Rc<str>, (u64, u64)>> =
-        RefCell::new(std::collections::HashMap::new());
+        RefCell::new(std::collections::HashMap::default());
 }
 
 pub fn enabled() -> bool {

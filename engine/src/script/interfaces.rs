@@ -928,7 +928,7 @@ pub(super) fn create(
     object_prototype: &ObjectHandle,
     globals: &mut Vec<(&'static str, Value)>,
 ) -> DomInterfaces {
-    let mut prototypes: HashMap<&'static str, ObjectHandle> = HashMap::new();
+    let mut prototypes: HashMap<&'static str, ObjectHandle> = HashMap::default();
     for interface in INTERFACES {
         let parent = if interface.parent.is_empty() {
             object_prototype.clone()

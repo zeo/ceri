@@ -366,7 +366,8 @@ impl std::hash::Hasher for AddressHasher {
     }
 }
 
-type AddressMap = HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHasher>>;
+type AddressMap =
+    std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHasher>>;
 
 // a full collection; the number of nodes cleared
 pub(super) fn collect_cycles() -> usize {

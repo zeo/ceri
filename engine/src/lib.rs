@@ -47,6 +47,7 @@ mod filter;
 mod font;
 mod gif;
 mod grid;
+pub mod hashing;
 mod host;
 mod image;
 mod inflate;

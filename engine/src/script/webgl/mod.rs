@@ -545,7 +545,7 @@ pub(super) fn create(
     object_prototype: &ObjectHandle,
     globals: &mut Vec<(&'static str, Value)>,
 ) -> WebGlInterfaces {
-    let mut prototypes: HashMap<&'static str, ObjectHandle> = HashMap::new();
+    let mut prototypes: HashMap<&'static str, ObjectHandle> = HashMap::default();
     let accessor = |target: &ObjectHandle, name: &str, get: GlMember, set: Option<GlMember>| {
         let get = build.function(Native::WebGl(get), &format!("get {name}"), 0);
         let set = set.map(|set| {
@@ -824,8 +824,8 @@ impl ScriptRuntime {
             canvas,
             node,
             options,
-            wrappers: HashMap::new(),
-            extensions: HashMap::new(),
+            wrappers: HashMap::default(),
+            extensions: HashMap::default(),
             snapshot: None,
             color_space: ["srgb".into(), "srgb".into()],
         }));

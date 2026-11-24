@@ -11,7 +11,8 @@ use super::raster::{
 use super::texture::{
     Bound, Format, Kind, Layout, Level, Params, Texture, channels, pack_pixel, pixel_size, unpack,
 };
-use std::collections::{BTreeMap, HashMap};
+use crate::hashing::HashMap;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 pub(crate) const MAX_TEXTURE_SIZE_VALUE: u32 = 8192;
@@ -545,9 +546,9 @@ impl Context {
             depth_fail: KEEP,
             pass: KEEP,
         };
-        let mut vertex_arrays = HashMap::new();
+        let mut vertex_arrays = HashMap::default();
         vertex_arrays.insert(0, VertexArray::default());
-        let mut feedbacks = HashMap::new();
+        let mut feedbacks = HashMap::default();
         feedbacks.insert(0, Feedback::default());
         Context {
             webgl2,
@@ -566,16 +567,16 @@ impl Context {
             clear_pending: false,
             default_draw_buffer: BACK,
             default_read_buffer: BACK,
-            buffers: HashMap::new(),
-            textures: HashMap::new(),
-            renderbuffers: HashMap::new(),
-            framebuffers: HashMap::new(),
-            shaders: HashMap::new(),
-            programs: HashMap::new(),
+            buffers: HashMap::default(),
+            textures: HashMap::default(),
+            renderbuffers: HashMap::default(),
+            framebuffers: HashMap::default(),
+            shaders: HashMap::default(),
+            programs: HashMap::default(),
             vertex_arrays,
-            queries: HashMap::new(),
-            samplers: HashMap::new(),
-            syncs: HashMap::new(),
+            queries: HashMap::default(),
+            samplers: HashMap::default(),
+            syncs: HashMap::default(),
             feedbacks,
             array_buffer: 0,
             copy_read: 0,
@@ -595,7 +596,7 @@ impl Context {
             read_framebuffer: 0,
             renderbuffer: 0,
             program: 0,
-            active_queries: HashMap::new(),
+            active_queries: HashMap::default(),
             enabled: vec![Capability::Dither],
             blend: Blend {
                 equation: [FUNC_ADD; 2],
@@ -3272,7 +3273,7 @@ fn link(
     // fragment outputs
     let mut outputs = Vec::new();
     let mut output_bases = Vec::new();
-    let mut fragment_locations = HashMap::new();
+    let mut fragment_locations = HashMap::default();
     let mut frag_depth = None;
     if fragment.version >= 300 {
         let count = fragment.outputs.len();

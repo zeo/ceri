@@ -1253,7 +1253,7 @@ pub(super) fn create(
     globals: &mut Vec<(&'static str, Value)>,
 ) -> StyleOmInterfaces {
     use StyleMember as M;
-    let mut prototypes: HashMap<&'static str, ObjectHandle> = HashMap::new();
+    let mut prototypes: HashMap<&'static str, ObjectHandle> = HashMap::default();
     let method = |target: &ObjectHandle, name: &str, member: M, length: u32| {
         let function = build.function(Native::StyleOm(member), name, length);
         target.borrow_mut().define(

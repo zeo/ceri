@@ -4,6 +4,7 @@ use crate::css::{
 };
 use crate::dom::{AccessibilityNode, Document, NodeId, ScriptSource, StylesheetSource};
 use crate::font::FontSet;
+use crate::hashing::HashMap;
 use crate::image::Image;
 use crate::layout::{
     ImageLayer, LayoutDocument, RangeDrag, Size, ThumbDrag, layout_with_state as build_layout,
@@ -16,7 +17,6 @@ use crate::script::{
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -1366,8 +1366,8 @@ impl Browser {
             animations: BTreeMap::new(),
             motion_clock: None,
             motion_read: None,
-            motion_nodes: HashMap::new(),
-            motion_custom: HashMap::new(),
+            motion_nodes: HashMap::default(),
+            motion_custom: HashMap::default(),
             host_runtime_info: None,
             host_bridge: None,
             waker: None,
@@ -2043,7 +2043,7 @@ impl Browser {
             page.populate_custom_properties(&document, &mut state);
         }
         let custom_unchanged = self.motion_custom == state.custom_properties;
-        let mut scanned = HashMap::new();
+        let mut scanned = HashMap::default();
         for node in candidates {
             let context = StyleContext {
                 document: &document,

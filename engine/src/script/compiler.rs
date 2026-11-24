@@ -4,8 +4,8 @@
 
 use super::ScriptError;
 use super::ast::*;
+use crate::hashing::HashMap;
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -396,7 +396,7 @@ impl ScopeInfo {
     fn new(kind: ScopeKind, materialized: bool) -> Self {
         Self {
             kind,
-            bindings: HashMap::new(),
+            bindings: HashMap::default(),
             size: 0,
             materialized,
             with_object: None,
@@ -579,7 +579,7 @@ impl FunctionState {
         Self {
             ops: Vec::new(),
             names: Vec::new(),
-            name_index: HashMap::new(),
+            name_index: HashMap::default(),
             children: Vec::new(),
             classes: Vec::new(),
             templates: Vec::new(),

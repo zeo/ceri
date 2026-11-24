@@ -2,8 +2,8 @@
 // and past the last of them the POSIX TZ rule the zone keeps, so offsets, the instants a wall
 // clock time names and the transitions around an instant hold for any year
 
+use crate::hashing::HashMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 static DATA: &[u8] = include_bytes!("tz_data.bin");
@@ -43,7 +43,7 @@ struct Index {
 
 thread_local! {
     static INDEX: Index = build_index();
-    static ZONES: RefCell<HashMap<usize, Rc<Zone>>> = RefCell::new(HashMap::new());
+    static ZONES: RefCell<HashMap<usize, Rc<Zone>>> = RefCell::new(HashMap::default());
 }
 
 struct Reader {
@@ -93,7 +93,7 @@ fn build_index() -> Index {
     // the tzdata version the file was made from
     reader.text();
     let zones = usize::from(reader.u16());
-    let mut names = HashMap::new();
+    let mut names = HashMap::default();
     let mut offsets = Vec::with_capacity(zones);
     let mut zone_names = Vec::with_capacity(zones);
     for index in 0..zones {

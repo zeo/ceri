@@ -3,7 +3,6 @@
 
 use super::Value;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
 pub(super) type ObjectHandle = Rc<RefCell<JsObject>>;
@@ -40,7 +39,8 @@ impl std::hash::Hasher for KeyHasher {
     }
 }
 
-pub(super) type KeyMap<V> = HashMap<Rc<str>, V, std::hash::BuildHasherDefault<KeyHasher>>;
+pub(super) type KeyMap<V> =
+    std::collections::HashMap<Rc<str>, V, std::hash::BuildHasherDefault<KeyHasher>>;
 
 #[derive(Clone)]
 pub(super) enum Slot {

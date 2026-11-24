@@ -1,10 +1,11 @@
 use crate::border::{BorderSide, CornerLengths, OutlineStyle, SQUARE_CORNERS};
 use crate::dom::{Document, Element, Namespace, NodeId};
 use crate::grid::{Areas, GridLine, GridPlacement, Tracks, parse_line, parse_placement};
+use crate::hashing::HashMap;
 use crate::media::{ContainerQuery, MediaQueryList};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -1103,7 +1104,7 @@ pub(crate) fn memoize_styles() -> MemoizedStyles {
     MemoizedStyles {
         previous: (
             STYLE_MEMO.with(|memo| memo.borrow_mut().replace(StyleMemo::default())),
-            CONTENT_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::new())),
+            CONTENT_MEMO.with(|memo| memo.borrow_mut().replace(HashMap::default())),
         ),
     }
 }
@@ -3758,7 +3759,7 @@ impl Stylesheet {
         state: &StyleState,
         host_only: bool,
     ) -> HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> {
-        let mut values = HashMap::new();
+        let mut values = HashMap::default();
         self.collect_declarations(
             CascadeTarget {
                 element,
@@ -3962,7 +3963,7 @@ impl Stylesheet {
         since: u64,
     ) {
         crate::profile::count("kept: cascades dropped where written");
-        let mut siblings = std::collections::HashSet::new();
+        let mut siblings = crate::hashing::HashSet::default();
         let mut reach = self.selector_reach();
         if reach == SelectorReach::Anywhere {
             let written = document.written_since(since);
@@ -4195,7 +4196,8 @@ impl Stylesheet {
         state: &StyleState,
     ) -> HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> {
         let _profile = crate::profile::scope("style: cascade");
-        let mut values: HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> = HashMap::new();
+        let mut values: HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> =
+            HashMap::default();
         // a generated box carries the id, classes and tag of the element that owns it
         let Some(element) = document.element(node) else {
             return values;
@@ -4226,7 +4228,7 @@ impl Stylesheet {
                 .unwrap_or_default()
         } else {
             // the user agent's rules go in first and lose to any author rule for a property
-            let mut values = HashMap::new();
+            let mut values = HashMap::default();
             let target = CascadeTarget {
                 element,
                 document,

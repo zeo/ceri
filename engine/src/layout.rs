@@ -12,11 +12,11 @@ use crate::css::{
 use crate::dom::{Document, Element, Namespace, NodeId, NodeKind};
 use crate::font::{FontStack, FontStyle};
 use crate::grid::{Breadth, GridLine, GridPlacement, TrackList, TrackSize, Tracks};
+use crate::hashing::HashMap;
 use crate::image::Image;
 use crate::linebreak::{WordBreak, break_opportunities};
 use crate::media::ContainerSize;
 use crate::range::RangeBounds;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1502,7 +1502,7 @@ impl LayoutDocument {
     }
 
     pub(crate) fn box_index(&self) -> HashMap<NodeId, Vec<BoxGeometry>> {
-        let mut index = HashMap::new();
+        let mut index = HashMap::default();
         index_boxes(&self.root, (0.0, 0.0), None, &mut index);
         index
     }
@@ -2976,7 +2976,7 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
             scale: crate::font::device_scale().to_bits(),
             state: StyleState {
                 clock: 0,
-                custom_properties: HashMap::new(),
+                custom_properties: HashMap::default(),
                 hovered: None,
                 ..state.clone()
             },
@@ -2990,7 +2990,7 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
             // a pointer move restyles a few subtrees, and with them the chain above each
             match stylesheet.hover_reach(document, kept.hovered, state.hovered) {
                 Some(roots) => {
-                    let mut stale = std::collections::HashSet::new();
+                    let mut stale = crate::hashing::HashSet::default();
                     for &root in &roots {
                         stale.extend(document.subtree(root));
                         stale.extend(document.ancestors(root));
@@ -3068,7 +3068,7 @@ fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet:
                 kept.widths.clear();
                 return;
             };
-            let mut stale = std::collections::HashSet::new();
+            let mut stale = crate::hashing::HashSet::default();
             for (node, _) in changes.filter(|(_, changed)| stylesheet.reaches_siblings(changed)) {
                 let Some(parent) = document.parent(node) else {
                     continue;
@@ -3262,7 +3262,7 @@ fn layout_element_fresh(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> 
 
 thread_local! {
     // the scrollbar each scroller was last laid out with
-    static GUTTERS: std::cell::RefCell<HashMap<(u64, NodeId), f32>> = std::cell::RefCell::new(HashMap::new());
+    static GUTTERS: std::cell::RefCell<HashMap<(u64, NodeId), f32>> = std::cell::RefCell::new(HashMap::default());
 }
 
 // the scrollbar gutter a laid out box asks for, if it scrolls vertically and has room for one
@@ -7797,7 +7797,7 @@ fn place_grid_items(
             place(index, major_start, minor_start, &mut occupied);
         }
     }
-    let mut line_cursors: HashMap<usize, usize> = HashMap::new();
+    let mut line_cursors: HashMap<usize, usize> = HashMap::default();
     for (index, placement) in placements.iter().enumerate() {
         let (Some(major_start), None) = (at(placement, major), at(placement, minor)) else {
             continue;
@@ -9328,8 +9328,8 @@ fn flush_line(
     let height = (above + below).max(pinned);
     let baseline_y = line.y + above;
     let mut active = line.open_inlines.clone();
-    let mut starts = HashMap::new();
-    let mut ends = HashMap::new();
+    let mut starts = HashMap::default();
+    let mut ends = HashMap::default();
     let mut fragments = std::mem::take(&mut line.fragments);
     if line.rtl || fragments.iter().any(|fragment| fragment.level > 0) {
         fragments = visual_fragments(fragments, line.base_level());
@@ -9971,7 +9971,7 @@ pub(crate) fn repaint_motion(
         viewport,
         root_font_size: root_font_size(document, stylesheet, viewport, next_state),
     });
-    let mut styles = HashMap::new();
+    let mut styles = HashMap::default();
     for &node in nodes {
         // their backgrounds reach the canvas, which a box patch does not
         if document
@@ -9985,7 +9985,7 @@ pub(crate) fn repaint_motion(
     }
     // the wake belongs to the frame drawn now, not the last one
     crate::css::take_animation_wake();
-    let mut moved = HashMap::new();
+    let mut moved = HashMap::default();
     for (node, last_style) in styles {
         let (next_style, font_size) = stylesheet.computed_style(document, node, next_state)?;
         moved.insert(node, (last_style, next_style, font_size));

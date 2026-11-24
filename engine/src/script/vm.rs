@@ -997,7 +997,7 @@ impl ScriptRuntime {
     // the runs outside this one first, then this run's frames
     fn sample_script(&mut self, frames: &[Box<Frame>]) {
         thread_local! {
-            static LABELS: RefCell<HashMap<usize, Rc<str>>> = RefCell::new(HashMap::new());
+            static LABELS: RefCell<HashMap<usize, Rc<str>>> = RefCell::new(HashMap::default());
         }
         let label = |code: &Rc<Code>| {
             LABELS.with(|labels| {

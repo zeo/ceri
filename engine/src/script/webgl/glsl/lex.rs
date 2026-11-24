@@ -2,7 +2,7 @@
 // directives choose lines and define object-like and function-like macros, and the lines
 // kept become tokens with macros expanded
 
-use std::collections::HashMap;
+use crate::hashing::HashMap;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Tok {
@@ -204,7 +204,7 @@ pub(crate) fn preprocess(
     let stripped = strip_comments(source)?;
     // a backslash before a line end joins the lines, counted as two for line numbers
     let joined = stripped.replace("\\\r\n", "\u{1}").replace("\\\n", "\u{1}");
-    let mut macros: HashMap<String, Macro> = HashMap::new();
+    let mut macros: HashMap<String, Macro> = HashMap::default();
     let mut output = Vec::new();
     let mut version = 100;
     let mut extensions = Vec::new();

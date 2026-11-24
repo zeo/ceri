@@ -427,7 +427,7 @@ impl Draw<'_> {
         // distinct ids, so a vertex shared by many triangles is shaded once
         let mut order: Vec<u32> = Vec::new();
         let mut places: Vec<u32> = Vec::with_capacity(self.indices.len());
-        let mut seen: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut seen: std::collections::HashMap<u32, u32> = std::collections::HashMap::default();
         for &id in self.indices {
             if id == u32::MAX {
                 places.push(u32::MAX);

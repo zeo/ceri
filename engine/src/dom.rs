@@ -1,6 +1,6 @@
+use crate::hashing::{HashMap, HashSet};
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::{Rc, Weak};
 
@@ -461,18 +461,18 @@ impl Document {
             selector_changes: std::collections::VecDeque::new(),
             changes_lost: 0,
             orphans: Vec::new(),
-            started_scripts: std::collections::HashSet::new(),
-            template_contents: HashMap::new(),
-            shadow_roots: HashMap::new(),
-            shadow_hosts: HashMap::new(),
+            started_scripts: std::collections::HashSet::default(),
+            template_contents: HashMap::default(),
+            shadow_roots: HashMap::default(),
+            shadow_hosts: HashMap::default(),
             live_ranges: LiveRanges::default(),
             mutations: None,
             element_changes: None,
             content_security_policy: Rc::default(),
-            blocked_styles: HashSet::new(),
-            sheet_rules: HashMap::new(),
-            adopted_sheets: HashMap::new(),
-            disabled_sheets: HashSet::new(),
+            blocked_styles: HashSet::default(),
+            sheet_rules: HashMap::default(),
+            adopted_sheets: HashMap::default(),
+            disabled_sheets: HashSet::default(),
             script_fonts: Vec::new(),
             script_fonts_stamp: 0,
         };
@@ -1940,7 +1940,7 @@ impl Document {
 
     // the flat UTF-16 offset of every connected text node, from one walk
     pub fn text_node_offsets(&self) -> HashMap<NodeId, usize> {
-        let mut offsets = HashMap::new();
+        let mut offsets = HashMap::default();
         let mut position = 0;
         for node in self.descendants(self.root) {
             if let Some(text) = self.text(node) {

@@ -8,7 +8,7 @@ use super::exec::{ALL, LANES, Machine, Op, SamplerKind};
 use super::parse::{
     Declaration, Expr, ExprKind, External, Parameter, Stmt, Storage, SwitchItem, TypeSpec,
 };
-use std::collections::HashMap;
+use crate::hashing::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -1914,8 +1914,8 @@ impl Compiler {
                 self.declare_variables(declaration, false)
             }
             Stmt::Block(statements) => {
-                self.scopes.push(HashMap::new());
-                self.structs.push(HashMap::new());
+                self.scopes.push(HashMap::default());
+                self.structs.push(HashMap::default());
                 let code = self.statements(statements);
                 self.scopes.pop();
                 self.structs.pop();
@@ -1923,10 +1923,10 @@ impl Compiler {
             }
             Stmt::If(condition, then, otherwise) => {
                 let condition = self.condition(condition)?;
-                self.scopes.push(HashMap::new());
+                self.scopes.push(HashMap::default());
                 let then = self.statement(then)?;
                 self.scopes.pop();
-                self.scopes.push(HashMap::new());
+                self.scopes.push(HashMap::default());
                 let otherwise = match otherwise {
                     Some(otherwise) => self.statement(otherwise)?,
                     None => None,
@@ -1957,7 +1957,7 @@ impl Compiler {
             Stmt::While(condition, body) => self.looping(None, Some(condition), None, body, false),
             Stmt::DoWhile(body, condition) => self.looping(None, Some(condition), None, body, true),
             Stmt::For(init, condition, step, body) => {
-                self.scopes.push(HashMap::new());
+                self.scopes.push(HashMap::default());
                 let init = match init {
                     Some(init) => self.statement(init)?,
                     None => None,
@@ -2048,7 +2048,7 @@ impl Compiler {
             None => None,
         };
         self.loops += 1;
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
         let body = self.statement(body)?;
         self.scopes.pop();
         self.loops -= 1;
@@ -2104,7 +2104,7 @@ impl Compiler {
                 .fail("'switch' : init-expression in a switch statement must be a scalar integer");
         }
         self.switches += 1;
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
         // each case label and the statements from it to the next
         let mut labels: Vec<(Option<u32>, usize)> = Vec::new();
         let mut bodies: Vec<Option<Op>> = Vec::new();
@@ -2228,8 +2228,8 @@ impl Compiler {
         if declared.body.get().is_some() {
             return self.fail(format!("'{}' : function already has a body", function.name));
         }
-        self.scopes.push(HashMap::new());
-        self.structs.push(HashMap::new());
+        self.scopes.push(HashMap::default());
+        self.structs.push(HashMap::default());
         for (parameter, (ty, storage, slot)) in function.parameters.iter().zip(&declared.parameters)
         {
             if let Some(name) = &parameter.name {
@@ -2360,21 +2360,21 @@ pub(crate) fn compile(source: &str, stage: Stage, extensions_allowed: &[&str]) -
         version: preprocessed.version,
         extensions: preprocessed.extensions,
         initial: Vec::new(),
-        scopes: vec![HashMap::new()],
-        functions: HashMap::new(),
-        structs: vec![HashMap::new()],
+        scopes: vec![HashMap::default()],
+        functions: HashMap::default(),
+        structs: vec![HashMap::default()],
         returns: None,
         loops: 0,
         switches: 0,
         inputs: Vec::new(),
         outputs: Vec::new(),
         uniforms: Vec::new(),
-        builtins: HashMap::new(),
+        builtins: HashMap::default(),
         used_builtins: Vec::new(),
         line: 1,
     };
     compiler.builtin_variables();
-    compiler.scopes.push(HashMap::new());
+    compiler.scopes.push(HashMap::default());
     let mut global_code: Vec<Op> = Vec::new();
     let result: Result<()> = (|| {
         for external in &externals {

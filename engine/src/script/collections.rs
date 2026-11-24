@@ -5,7 +5,7 @@
 use super::object::{JsObject, ObjectClass, ObjectHandle, new_object};
 use super::operations::{is_callable, is_primitive};
 use super::*;
-use std::collections::HashMap;
+use crate::hashing::HashMap;
 use std::rc::Weak;
 
 // the identity a key hashes by: SameValueZero for primitives, the allocation for objects,
@@ -638,7 +638,7 @@ impl ScriptRuntime {
                 }
                 let items = self.iterate_to_vec(first)?;
                 let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
-                let mut index_of: HashMap<KeyId, usize> = HashMap::new();
+                let mut index_of: HashMap<KeyId, usize> = HashMap::default();
                 for (index, item) in items.into_iter().enumerate() {
                     let key = self.call_function(
                         callback.clone(),

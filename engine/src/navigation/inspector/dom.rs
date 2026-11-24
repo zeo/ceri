@@ -3,10 +3,11 @@
 
 use super::{Failure, frame_id};
 use crate::dom::{Document, Namespace, NodeId, NodeKind};
+use crate::hashing::{HashMap, HashSet};
 use crate::navigation::Page;
 use crate::script::{NodeArgument, NodeCall};
 use serde_json::{Value as Json, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
 #[derive(Default)]
 pub(super) struct Mirror {
@@ -290,7 +291,7 @@ impl Mirror {
                     let current: Vec<u64> = current.iter().map(|child| self.id(*child)).collect();
                     // the old children that keep their order stay; the rest leave and come back
                     let mut last = None;
-                    let mut stay = HashSet::new();
+                    let mut stay = HashSet::default();
                     for child in &current {
                         if let Some(position) = old.iter().position(|held| held == child)
                             && last.is_none_or(|last| position > last)

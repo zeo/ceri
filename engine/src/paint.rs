@@ -1509,7 +1509,7 @@ fn memoize_extents() -> MemoizedExtents {
         let mut extents = extents.borrow_mut();
         let began = extents.is_none();
         if began {
-            *extents = Some(std::collections::HashMap::new());
+            *extents = Some(std::collections::HashMap::default());
         }
         MemoizedExtents { began }
     })

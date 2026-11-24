@@ -1,6 +1,6 @@
+use crate::hashing::HashMap;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
