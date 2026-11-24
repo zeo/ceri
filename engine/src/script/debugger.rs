@@ -1,6 +1,8 @@
 // the devtools protocol's Debugger domain for a page: the scripts it compiled and where each came
 // from, breakpoints on their statements, and a pause that holds the engine thread while the
 // sessions look at the stack
+// it reads the interpreter's frames, boxed there
+#![allow(clippy::vec_box)]
 
 use super::compiler::{Code, Op};
 use super::inspector::frame_id;
@@ -739,7 +741,7 @@ impl ScriptRuntime {
         self.debugger.paused
     }
 
-    fn mirror_frames(&mut self, frames: &[Frame], base: usize) {
+    fn mirror_frames(&mut self, frames: &[Box<Frame>], base: usize) {
         let mirror = &mut self.debugger.mirror;
         let keep = mirror
             .len()
@@ -759,7 +761,7 @@ impl ScriptRuntime {
 
     // before each op: pauses at a breakpoint, a debugger statement, the statement a step or a
     // pause request was waiting for
-    pub(super) fn debug_step(&mut self, frames: &[Frame], base: usize) {
+    pub(super) fn debug_step(&mut self, frames: &[Box<Frame>], base: usize) {
         self.mirror_frames(frames, base);
         if self.debugger.paused {
             return;
@@ -804,7 +806,7 @@ impl ScriptRuntime {
     }
 
     // a thrown value on its way to a handler, or out of every run when no frame catches it
-    pub(super) fn debug_thrown(&mut self, frames: &[Frame], base: usize, thrown: &Value) {
+    pub(super) fn debug_thrown(&mut self, frames: &[Box<Frame>], base: usize, thrown: &Value) {
         if self.debugger.paused {
             return;
         }
