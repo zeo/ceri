@@ -304,7 +304,7 @@ impl EngineWorker {
         let target = devtools
             .as_ref()
             .map(|registration| registration.id.clone());
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("ceri-engine".to_string())
             .stack_size(ENGINE_STACK)
             .spawn(move || {
@@ -332,6 +332,18 @@ impl EngineWorker {
                 );
             })
             .map_err(|error| format!("could not start engine worker: {error}"))?;
+        // the heap a worker leaves behind is only abandoned once its thread has ended, so the
+        // release that hands a closed window's page back to the system runs after it
+        #[cfg(feature = "mimalloc")]
+        let _ = thread::Builder::new()
+            .name("ceri-release".to_string())
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let _ = worker.join();
+                crate::release_memory();
+            });
+        #[cfg(not(feature = "mimalloc"))]
+        drop(worker);
         match ready_receiver.recv() {
             Ok(Ok(())) => Ok(Self {
                 commands,
