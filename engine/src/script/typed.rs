@@ -880,7 +880,7 @@ impl ScriptRuntime {
             }
             M::BufferIsView => Ok(Value::Bool(
                 matches!(first, Value::TypedArray(_))
-                    || matches!(&first, Value::Object(object) if matches!(object.borrow().class, ObjectClass::DataView { .. })),
+                    || matches!(&first, Value::Object(object) if matches!(object.borrow().class, ObjectClass::DataView(_))),
             )),
             M::BufferByteLength => match &this {
                 Value::Bytes(bytes) => Ok(Value::Number(bytes.borrow().len() as f64)),
@@ -936,12 +936,12 @@ impl ScriptRuntime {
                 let prototype = self.intrinsics.data_view_prototype.clone();
                 Ok(Value::Object(new_object(JsObject::with_prototype(
                     Some(prototype),
-                    ObjectClass::DataView {
+                    ObjectClass::DataView(Box::new(crate::script::object::DataViewRange {
                         buffer: buffer.clone(),
                         start: offset,
                         end,
                         tracking,
-                    },
+                    })),
                 ))))
             }
             M::ViewBuffer
@@ -951,12 +951,9 @@ impl ScriptRuntime {
             | M::ViewSet(_) => {
                 let view = match &this {
                     Value::Object(object) => match &object.borrow().class {
-                        ObjectClass::DataView {
-                            buffer,
-                            start,
-                            end,
-                            tracking,
-                        } => Some((buffer.clone(), *start, *end, *tracking)),
+                        ObjectClass::DataView(view) => {
+                            Some((view.buffer.clone(), view.start, view.end, view.tracking))
+                        }
                         _ => None,
                     },
                     _ => None,
@@ -1034,8 +1031,8 @@ impl ScriptRuntime {
 
     fn kind_of_constructor(&mut self, constructor: &Value) -> Result<ElementKind, ScriptError> {
         if let Value::Object(object) = constructor
-            && let ObjectClass::Native(Native::Typed(TypedMethod::Constructor(kind))) =
-                object.borrow().class
+            && let ObjectClass::Native(native) = &object.borrow().class
+            && let Native::Typed(TypedMethod::Constructor(kind)) = **native
         {
             return Ok(kind);
         }

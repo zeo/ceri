@@ -657,11 +657,11 @@ impl ScriptRuntime {
             ),
             Value::String(value) => (
                 self.intrinsics.string_prototype.clone(),
-                ObjectClass::String(value.to_string()),
+                ObjectClass::String(value.clone()),
             ),
             Value::Symbol(value) => (
                 self.intrinsics.symbol_prototype.clone(),
-                ObjectClass::Symbol(value.to_string()),
+                ObjectClass::Symbol(value.clone()),
             ),
             Value::BigInt(value) => (
                 self.intrinsics.bigint_prototype.clone(),
@@ -872,7 +872,7 @@ impl ScriptRuntime {
     }
 
     fn is_default_has_instance(&self, checker: &Value) -> bool {
-        matches!(checker, Value::Object(object) if matches!(object.borrow().class, ObjectClass::Native(Native::FunctionHasInstance)))
+        matches!(checker, Value::Object(object) if matches!(object.borrow().class, ObjectClass::Native(ref native) if matches!(**native, Native::FunctionHasInstance)))
     }
 
     pub(super) fn ordinary_has_instance(
@@ -2550,7 +2550,7 @@ impl ScriptRuntime {
         }
         let method = self.get_property(value, "@@iterator")?;
         Ok(
-            matches!(&method, Value::Object(object) if matches!(object.borrow().class, ObjectClass::Native(Native::ArrayValues))),
+            matches!(&method, Value::Object(object) if matches!(object.borrow().class, ObjectClass::Native(ref native) if matches!(**native, Native::ArrayValues))),
         )
     }
 

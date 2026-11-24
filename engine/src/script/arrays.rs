@@ -178,7 +178,7 @@ impl ScriptRuntime {
         if let Value::Object(object) = &constructor {
             if matches!(
                 object.borrow().class,
-                ObjectClass::Native(Native::ArrayConstructor)
+                ObjectClass::Native(ref native) if matches!(**native, Native::ArrayConstructor)
             ) {
                 return Ok(Self::new_array(values));
             }
@@ -192,7 +192,7 @@ impl ScriptRuntime {
             Value::Object(object)
                 if matches!(
                     object.borrow().class,
-                    ObjectClass::Native(Native::ArrayConstructor)
+                    ObjectClass::Native(ref native) if matches!(**native, Native::ArrayConstructor)
                 ) =>
             {
                 return Ok(Self::new_array(values));

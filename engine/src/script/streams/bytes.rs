@@ -72,12 +72,13 @@ pub(super) fn view_of(value: &Value) -> Option<View> {
             })
         }
         Value::Object(object) => match &object.borrow().class {
-            ObjectClass::DataView {
-                buffer,
-                start,
-                end,
-                tracking,
-            } => {
+            ObjectClass::DataView(view) => {
+                let crate::script::object::DataViewRange {
+                    buffer,
+                    start,
+                    end,
+                    tracking,
+                } = &**view;
                 let range = typed::view_range(&buffer.borrow(), *start, *end, *tracking, 1);
                 Some(View {
                     buffer: buffer.clone(),
@@ -200,12 +201,12 @@ impl ScriptRuntime {
             ViewKind::Typed(kind) => typed::new_typed(kind, buffer, offset, offset + length),
             ViewKind::Data => Value::Object(new_object(JsObject::with_prototype(
                 Some(self.intrinsics.data_view_prototype.clone()),
-                ObjectClass::DataView {
+                ObjectClass::DataView(Box::new(crate::script::object::DataViewRange {
                     buffer,
                     start: offset,
                     end: offset + length,
                     tracking: false,
-                },
+                })),
             ))),
         }
     }

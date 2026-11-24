@@ -191,12 +191,13 @@ impl ScriptRuntime {
                 Some((bytes, array.kind.size(), Some(array.kind)))
             }
             Value::Object(object) => match &object.borrow().class {
-                ObjectClass::DataView {
-                    buffer,
-                    start,
-                    end,
-                    tracking,
-                } => {
+                ObjectClass::DataView(view) => {
+                    let crate::script::object::DataViewRange {
+                        buffer,
+                        start,
+                        end,
+                        tracking,
+                    } = &**view;
                     let buffer = buffer.borrow();
                     let range =
                         super::super::typed::view_range(&buffer, *start, *end, *tracking, 1);

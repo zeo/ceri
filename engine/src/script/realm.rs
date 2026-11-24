@@ -489,7 +489,7 @@ impl Builder {
     pub(super) fn function(&self, native: Native, name: &str, length: u32) -> ObjectHandle {
         let mut object = JsObject::with_prototype(
             Some(self.function_prototype.clone()),
-            ObjectClass::Native(native),
+            ObjectClass::Native(Rc::new(native)),
         );
         object.define(
             "length".to_string(),
@@ -581,7 +581,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     let object_prototype = new_object(JsObject::with_prototype(None, ObjectClass::Ordinary));
     let function_prototype = new_object(JsObject::with_prototype(
         Some(object_prototype.clone()),
-        ObjectClass::Native(Native::FunctionPrototype),
+        ObjectClass::Native(Rc::new(Native::FunctionPrototype)),
     ));
     let build = Builder {
         function_prototype: function_prototype.clone(),
@@ -906,7 +906,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
 
     let string_prototype = new_object(JsObject::with_prototype(
         Some(object_prototype.clone()),
-        ObjectClass::String(String::new()),
+        ObjectClass::String(JsStr::default()),
     ));
     build.method(&string_prototype, "toString", Native::StringToString, 0);
     build.method(&string_prototype, "valueOf", Native::StringToString, 0);
@@ -2492,7 +2492,7 @@ impl ScriptRuntime {
         match this {
             Value::Symbol(key) => Ok(key.to_string()),
             Value::Object(object) => match &object.borrow().class {
-                ObjectClass::Symbol(key) => Ok(key.clone()),
+                ObjectClass::Symbol(key) => Ok(key.to_string()),
                 _ => Err(runtime_error("not a symbol")),
             },
             _ => Err(runtime_error("not a symbol")),
@@ -3092,7 +3092,7 @@ impl ScriptRuntime {
                 match &this {
                     Value::String(text) => Ok(Value::String(text.clone())),
                     Value::Object(object) => match &object.borrow().class {
-                        ObjectClass::String(text) => Ok(Value::String(text.clone().into())),
+                        ObjectClass::String(text) => Ok(Value::String(text.clone())),
                         _ => Err(runtime_error(
                             "String.prototype.toString requires that 'this' be a String",
                         )),

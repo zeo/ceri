@@ -109,6 +109,15 @@ pub(super) enum ArrayIterationKind {
     Entries,
 }
 
+// a DataView's buffer and the bytes it covers, boxed as a rare class kept narrow
+#[derive(Clone)]
+pub(super) struct DataViewRange {
+    pub(super) buffer: super::BytesHandle,
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) tracking: bool,
+}
+
 // the internal kind of an object, which decides how it is called, printed and compared
 #[derive(Clone, Default)]
 pub(super) enum ObjectClass {
@@ -139,14 +148,15 @@ pub(super) enum ObjectClass {
     PerfEntries(Rc<Vec<super::geometry::PerformanceEntry>>),
     Boolean(bool),
     Number(f64),
-    String(String),
-    Symbol(String),
+    String(super::JsStr),
+    Symbol(super::JsStr),
     BigInt(Rc<super::bigint::BigInt>),
     Error,
     Generator(Rc<RefCell<super::vm::GeneratorState>>),
     AsyncGenerator(Rc<RefCell<super::vm::AsyncGeneratorData>>),
     // a function implemented by the engine, such as Object.keys
-    Native(super::realm::Native),
+    // behind a pointer, as the widest natives would otherwise widen every object
+    Native(Rc<super::realm::Native>),
     RegExp(Rc<super::pattern::RegExpData>),
     Proxy(Rc<super::reflect::ProxyData>),
     Date(f64),
@@ -163,12 +173,7 @@ pub(super) enum ObjectClass {
     Observer(u32),
     // a live Map or Set iterator
     Cursor(Rc<RefCell<super::collections::Cursor>>),
-    DataView {
-        buffer: super::BytesHandle,
-        start: usize,
-        end: usize,
-        tracking: bool,
-    },
+    DataView(Box<DataViewRange>),
     TextDecoder(Rc<RefCell<super::encoding::DecoderState>>),
     Intl(Rc<super::intl::IntlState>),
     Url(Rc<RefCell<super::urls::UrlState>>),
@@ -958,4 +963,11 @@ mod tests {
         assert!(object.contains_key("hidden"));
         assert_eq!(object.keys().count(), 39);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn an_object_fits_the_allocator_class_below_its_old_one() {
+    assert_eq!(std::mem::size_of::<ObjectClass>(), 16);
+    assert_eq!(std::mem::size_of::<JsObject>(), 64);
 }

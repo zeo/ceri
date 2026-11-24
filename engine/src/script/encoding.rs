@@ -191,12 +191,13 @@ impl ScriptRuntime {
                 Ok(array.buffer.borrow()[super::typed::byte_range(&array)].to_vec())
             }
             Value::Object(object) => match &object.borrow().class {
-                ObjectClass::DataView {
-                    buffer,
-                    start,
-                    end,
-                    tracking,
-                } => {
+                ObjectClass::DataView(view) => {
+                    let crate::script::object::DataViewRange {
+                        buffer,
+                        start,
+                        end,
+                        tracking,
+                    } = &**view;
                     let buffer = buffer.borrow();
                     let range = super::typed::view_range(&buffer, *start, *end, *tracking, 1);
                     Ok(range.map_or(Vec::new(), |(start, end)| buffer[start..end].to_vec()))

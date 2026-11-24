@@ -319,7 +319,7 @@ impl ScriptRuntime {
                         Outgoing::Binary(self.buffer_source_bytes(&value)?)
                     }
                     Value::Object(ref object)
-                        if matches!(object.borrow().class, ObjectClass::DataView { .. }) =>
+                        if matches!(object.borrow().class, ObjectClass::DataView(_)) =>
                     {
                         Outgoing::Binary(self.buffer_source_bytes(&first)?)
                     }

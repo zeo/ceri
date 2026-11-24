@@ -14883,7 +14883,7 @@ fn array_display(array: &ArrayHandle, visiting: &mut Vec<*const RefCell<ArrayDat
 fn object_display(object: &ObjectHandle) -> String {
     let borrowed = object.borrow();
     match &borrowed.class {
-        ObjectClass::String(text) => text.clone(),
+        ObjectClass::String(text) => text.to_string(),
         ObjectClass::Number(number) => number_to_string(*number),
         ObjectClass::Boolean(value) => value.to_string(),
         ObjectClass::Function(_) | ObjectClass::Bound { .. } | ObjectClass::Native(_) => {

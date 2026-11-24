@@ -487,7 +487,11 @@ impl ScriptRuntime {
                     return self.prepare_call(target, this, all, None);
                 }
                 ObjectClass::Native(native) => {
-                    return Ok(Prepared::Done(self.call_native(native, this, arguments)?));
+                    return Ok(Prepared::Done(self.call_native(
+                        Rc::unwrap_or_clone(native),
+                        this,
+                        arguments,
+                    )?));
                 }
                 ObjectClass::Proxy(proxy) => {
                     if !proxy.callable {
@@ -579,9 +583,11 @@ impl ScriptRuntime {
                     return self.prepare_construct(target, all, new_target);
                 }
                 ObjectClass::Native(native) => {
-                    return Ok(Prepared::Done(
-                        self.construct_native(native, arguments, new_target)?,
-                    ));
+                    return Ok(Prepared::Done(self.construct_native(
+                        Rc::unwrap_or_clone(native),
+                        arguments,
+                        new_target,
+                    )?));
                 }
                 ObjectClass::Proxy(proxy) => {
                     if !proxy.constructor {
@@ -2085,7 +2091,7 @@ impl ScriptRuntime {
                     let direct = matches!(
                         callee.resolve(),
                         Value::Object(ref object)
-                            if matches!(object.borrow().class, ObjectClass::Native(Native::Eval))
+                            if matches!(object.borrow().class, ObjectClass::Native(ref native) if matches!(**native, Native::Eval))
                     );
                     if !direct {
                         return self.call_in_loop(frames, callee, this, arguments);
