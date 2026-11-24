@@ -1,6 +1,6 @@
 use crate::csp::{Directive, Initiator, Policies};
 use crate::css::{
-    AnimatableProperty, ColorScheme, StyleContext, StyleState, Stylesheet, TransitionState,
+    AnimatableProperty, ColorScheme, Shared, StyleContext, StyleState, Stylesheet, TransitionState,
 };
 use crate::dom::{AccessibilityNode, Document, NodeId, ScriptSource, StylesheetSource};
 use crate::font::FontSet;
@@ -1051,13 +1051,14 @@ pub struct Browser {
     hovered_thumb: Option<NodeId>,
     // query container sizes from the last layout, which container queries read
     container_sizes:
-        std::cell::RefCell<std::collections::BTreeMap<NodeId, crate::media::ContainerSize>>,
+        std::cell::RefCell<Shared<std::collections::BTreeMap<NodeId, crate::media::ContainerSize>>>,
     // the pointer shape for the last pointer position
     cursor: crate::css::Cursor,
-    transitions: BTreeMap<(NodeId, AnimatableProperty), TransitionState>,
+    transitions: Shared<BTreeMap<(NodeId, AnimatableProperty), TransitionState>>,
     declared: BTreeMap<(NodeId, AnimatableProperty), String>,
     // each element's running keyframe animation, so it plays from when it was applied
     animations: BTreeMap<NodeId, AnimationRun>,
+    animation_starts: Shared<BTreeMap<NodeId, u64>>,
     motion_clock: Option<u64>,
     // what the last motion sample read: the document's selector version, which text edits
     // leave alone as they change no declared value, the sheet, the state without the clock
@@ -1066,7 +1067,7 @@ pub struct Browser {
     // each motion candidate's kept cascade at the last scan and the transitions it declared,
     // with the custom properties that scan read, so an element neither changed is not read again
     motion_nodes: HashMap<NodeId, MotionNode>,
-    motion_custom: HashMap<NodeId, BTreeMap<String, String>>,
+    motion_custom: Shared<HashMap<NodeId, BTreeMap<String, String>>>,
     host_runtime_info: Option<HostRuntimeInfo>,
     host_bridge: Option<crate::script::HostBridge>,
     waker: Option<crate::bridge::Waker>,
@@ -1361,13 +1362,14 @@ impl Browser {
             hovered_thumb: None,
             container_sizes: std::cell::RefCell::default(),
             cursor: crate::css::Cursor::Default,
-            transitions: BTreeMap::new(),
+            transitions: Shared::default(),
             declared: BTreeMap::new(),
             animations: BTreeMap::new(),
+            animation_starts: Shared::default(),
             motion_clock: None,
             motion_read: None,
             motion_nodes: HashMap::default(),
-            motion_custom: HashMap::default(),
+            motion_custom: Shared::default(),
             host_runtime_info: None,
             host_bridge: None,
             waker: None,
@@ -1983,9 +1985,13 @@ impl Browser {
         let stylesheet = self.stylesheet(page);
         let has_motion = stylesheet.has_transitions() || stylesheet.has_animations();
         if !has_motion || self.preferences.reduced_motion {
-            self.transitions.clear();
+            self.transitions = Shared::default();
             self.declared.clear();
             self.animations.clear();
+            self.animation_starts = Shared::default();
+            let mut inputs = page.layout_inputs.borrow_mut();
+            inputs.extras.transitions = Shared::default();
+            inputs.extras.animation_starts = Shared::default();
             return Ok(false);
         }
         let clock = page.runtime.now();
@@ -2093,7 +2099,7 @@ impl Browser {
                                 ));
                             }
                             if transition.duration > 0 {
-                                self.transitions.insert(
+                                self.transitions.make_mut().insert(
                                     key,
                                     TransitionState {
                                         from: previous.clone(),
@@ -2116,8 +2122,8 @@ impl Browser {
                                     ));
                                 }
                                 changed = true;
-                            } else {
-                                self.transitions.remove(&key);
+                            } else if self.transitions.contains_key(&key) {
+                                self.transitions.make_mut().remove(&key);
                             }
                         }
                         None => {}
@@ -2192,8 +2198,20 @@ impl Browser {
             }
         }
         // a finished transition is dropped, so the page stops asking for frames
-        self.transitions
-            .retain(|key, active| seen.contains(key) && clock <= active.finishes);
+        if !self.transitions.is_empty() {
+            if self
+                .transitions
+                .iter()
+                .any(|(key, active)| !seen.contains(key) || clock > active.finishes)
+            {
+                self.transitions
+                    .make_mut()
+                    .retain(|key, active| seen.contains(key) && clock <= active.finishes);
+            }
+            if self.transitions.is_empty() {
+                self.transitions = Shared::default();
+            }
+        }
         self.declared.retain(|key, _| seen.contains(key));
         let removed = self
             .animations
@@ -2204,6 +2222,29 @@ impl Browser {
         events.extend(removed);
         self.animations
             .retain(|node, _| seen_animations.contains(node));
+        let starts_changed = self.animation_starts.len() != self.animations.len()
+            || self
+                .animations
+                .iter()
+                .any(|(node, run)| self.animation_starts.get(node) != Some(&run.started));
+        if starts_changed {
+            self.animation_starts = if self.animations.is_empty() {
+                Shared::default()
+            } else {
+                Shared::new(
+                    self.animations
+                        .iter()
+                        .map(|(node, run)| (*node, run.started))
+                        .collect(),
+                )
+            };
+        }
+        // keep script's layout inputs in sync so geometry reads and frame layout share state
+        {
+            let mut inputs = page.layout_inputs.borrow_mut();
+            inputs.extras.transitions = self.transitions.clone();
+            inputs.extras.animation_starts = self.animation_starts.clone();
+        }
         // events run script, which may write what the memo assumed fixed
         drop(styles);
         drop(document);
@@ -3083,34 +3124,30 @@ impl Browser {
         style_state.forced_colors = self.preferences.forced_colors;
         style_state.clock = page.runtime.now();
         style_state.transitions = self.transitions.clone();
-        style_state.animation_starts = self
-            .animations
-            .iter()
-            .map(|(node, run)| (*node, run.started))
-            .collect();
+        style_state.animation_starts = self.animation_starts.clone();
         let _fonts = crate::font::use_fonts(self.fonts.clone(), self.viewport.device_pixel_ratio);
         // found once per change to the document's elements, not walked for on every frame
         let lists = page.runtime.element_lists();
-        if let Some(base) = self.current_url.as_ref() {
-            for &node in &lists[4] {
-                let image = document
-                    .attribute(node, "src")
-                    .and_then(|source| self.image_for(page, base, source));
-                if let Some(image) = image {
-                    style_state
-                        .image_sizes
-                        .insert(node, (image.width, image.height));
+        if !lists[2].is_empty() || !lists[3].is_empty() || !lists[4].is_empty() {
+            let mut image_sizes = BTreeMap::new();
+            if let Some(base) = self.current_url.as_ref() {
+                for &node in &lists[4] {
+                    let image = document
+                        .attribute(node, "src")
+                        .and_then(|source| self.image_for(page, base, source));
+                    if let Some(image) = image {
+                        image_sizes.insert(node, (image.width, image.height));
+                    }
                 }
             }
-        }
-        for &node in &lists[2] {
-            let size = crate::script::canvas_size(&document, node);
-            style_state.image_sizes.insert(node, size);
-        }
-        for &node in &lists[3] {
-            style_state
-                .image_sizes
-                .insert(node, page.runtime.video_size(node));
+            for &node in &lists[2] {
+                let size = crate::script::canvas_size(&document, node);
+                image_sizes.insert(node, size);
+            }
+            for &node in &lists[3] {
+                image_sizes.insert(node, page.runtime.video_size(node));
+            }
+            style_state.image_sizes = Shared::from_value(image_sizes);
         }
         style_state.container_sizes = self.container_sizes.borrow().clone();
         let mut keyed_state = style_state.clone();
@@ -3118,7 +3155,7 @@ impl Browser {
         if page.animation_wake.get().is_none() && keyed_state.transitions.is_empty() {
             keyed_state.clock = 0;
         }
-        let key = LayoutKey {
+        let mut key = LayoutKey {
             document: (
                 self.current_document_id,
                 Rc::as_ptr(&page.document),
@@ -3145,11 +3182,7 @@ impl Browser {
                 && last.viewport == key.viewport
                 && last.scale == key.scale
                 && last.selections == key.selections
-                && last.state
-                    == StyleState {
-                        scroll_offsets: last.state.scroll_offsets.clone(),
-                        ..key.state.clone()
-                    };
+                && last.state.eq_ignoring_scroll(&key.state);
             scroll_only
                 .then(|| crate::layout::rescroll(&cached.layout, &key.state.scroll_offsets))?
                 .map(|layout| (Rc::new(layout), cached.motion.clone(), cached.generation))
@@ -3175,11 +3208,7 @@ impl Browser {
                 && last.scale == key.scale
                 && last.selections == key.selections
                 && key.state.transitions.is_empty()
-                && last.state
-                    == StyleState {
-                        clock,
-                        ..key.state.clone()
-                    };
+                && last.state.eq_ignoring_clock(&key.state);
             (same_but_clock && clock <= key.state.clock && key.state.clock < wake)
                 .then(|| cached.layout.clone())
         });
@@ -3195,11 +3224,7 @@ impl Browser {
                 && last.viewport == key.viewport
                 && last.scale == key.scale
                 && last.selections == key.selections
-                && last.state
-                    == StyleState {
-                        clock,
-                        ..key.state.clone()
-                    };
+                && last.state.eq_ignoring_clock(&key.state);
             let nodes = cached.motion.as_ref().filter(|_| clock_only)?;
             let last_state = StyleState {
                 clock,
@@ -3228,37 +3253,52 @@ impl Browser {
             });
             return Ok(layout);
         }
-        crate::css::take_animation_wake();
-        crate::css::record_motion();
         // a script that read a box since the document last changed has made this layout already
-        let measured = page.runtime.measured_layout(
-            document.version(),
-            SheetIdentity::of(stylesheet),
-            &style_state,
-        );
+        let sheet_id = SheetIdentity::of(stylesheet);
+        let measured = page
+            .runtime
+            .measured_layout(document.version(), sheet_id.clone(), &style_state);
         let reused = measured.is_some();
-        let mut layout = match measured {
-            Some(layout) => {
+        let (mut layout, motion, wake_at, timeless) = match measured {
+            Some((layout, wake_at, motion)) => {
                 crate::profile::count("frame: layout taken from a script read");
-                layout
+                let timeless = wake_at.is_none() && style_state.transitions.is_empty();
+                (layout, motion, wake_at, timeless)
             }
-            None => build_layout(&document, stylesheet, viewport, &style_state),
+            None => {
+                let reported = crate::css::clock_reads();
+                crate::css::take_animation_wake();
+                crate::css::record_motion();
+                let mut layout = build_layout(&document, stylesheet, viewport, &style_state);
+                // container queries read sizes from a layout, so a change in them lays out once more
+                if stylesheet.has_container_queries() {
+                    let measured = Shared::from_value(crate::layout::take_layout_containers());
+                    if measured != style_state.container_sizes {
+                        style_state.container_sizes = measured;
+                        page.populate_custom_properties(&document, &mut style_state);
+                        layout = build_layout(&document, stylesheet, viewport, &style_state);
+                    }
+                }
+                let motion = crate::css::take_motion();
+                let wake_at = crate::css::take_animation_wake()
+                    .map(|delay| style_state.clock.saturating_add(delay));
+                let timeless =
+                    crate::css::clock_reads() == reported && style_state.transitions.is_empty();
+                (Rc::new(layout), motion, wake_at, timeless)
+            }
         };
-        // container queries read sizes from a layout, so a change in them lays out once more;
-        // a layout a script read made has settled its sizes already
         if stylesheet.has_container_queries() {
-            let measured = crate::layout::take_layout_containers();
-            if !reused && measured != style_state.container_sizes {
-                style_state.container_sizes = measured;
-                page.populate_custom_properties(&document, &mut style_state);
-                layout = build_layout(&document, stylesheet, viewport, &style_state);
-            }
             *self.container_sizes.borrow_mut() = style_state.container_sizes.clone();
         }
-        let motion = crate::css::take_motion();
-        page.animation_wake.set(
-            crate::css::take_animation_wake().map(|delay| style_state.clock.saturating_add(delay)),
-        );
+        page.animation_wake.set(wake_at);
+        // keep the cached key aligned with the animation wake discovered by this layout
+        key.state.clock = if page.animation_wake.get().is_none() && style_state.transitions.is_empty()
+        {
+            0
+        } else {
+            style_state.clock
+        };
+        key.state.container_sizes = style_state.container_sizes.clone();
         page.layout_inputs.borrow_mut().extras = StyleState {
             hovered: self.hovered_node,
             color_scheme: style_state.color_scheme,
@@ -3270,11 +3310,23 @@ impl Browser {
             container_sizes: style_state.container_sizes.clone(),
             ..StyleState::default()
         };
-        layout.prose_selections = key.selections.clone();
+        if layout.prose_selections != key.selections {
+            Rc::make_mut(&mut layout).prose_selections = key.selections.clone();
+        }
         if let Some(base) = self.current_url.as_ref() {
             self.attach_image_layers(page, base, &document, &mut layout);
         }
-        let layout = Rc::new(layout);
+        if !reused {
+            page.runtime.adopt_measured_layout(
+                document.version(),
+                sheet_id,
+                style_state,
+                timeless,
+                wake_at,
+                motion.clone(),
+                layout.clone(),
+            );
+        }
         *self.layout_cache.borrow_mut() = Some(CachedLayout {
             key,
             layout: layout.clone(),
@@ -3493,10 +3545,17 @@ impl Browser {
         page: &Page,
         base: &AppUrl,
         document: &Document,
-        layout: &mut LayoutDocument,
+        layout: &mut Rc<LayoutDocument>,
     ) {
         let mut sources = Vec::new();
         collect_image_sources(&layout.root, &mut sources);
+        if sources.is_empty() {
+            if !layout.images.is_empty() {
+                Rc::make_mut(layout).images.clear();
+            }
+            return;
+        }
+        let mut images = Vec::with_capacity(sources.len());
         for (node, background) in sources {
             let reference = match background {
                 Some(source) => crate::image::image_source_url(source).map(|url| url.to_string()),
@@ -3507,11 +3566,14 @@ impl Browser {
             else {
                 continue;
             };
-            layout.images.push(ImageLayer {
+            images.push(ImageLayer {
                 node,
                 image,
                 background,
             });
+        }
+        if layout.images != images {
+            Rc::make_mut(layout).images = images;
         }
     }
 

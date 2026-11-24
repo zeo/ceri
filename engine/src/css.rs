@@ -871,10 +871,10 @@ struct Matching {
     focused: Option<NodeId>,
     focus_visible: bool,
     active: Option<NodeId>,
-    checked: BTreeSet<NodeId>,
-    unchecked: BTreeSet<NodeId>,
-    disabled: BTreeSet<NodeId>,
-    control_values: BTreeMap<NodeId, String>,
+    checked: Shared<BTreeSet<NodeId>>,
+    unchecked: Shared<BTreeSet<NodeId>>,
+    disabled: Shared<BTreeSet<NodeId>>,
+    control_values: Shared<BTreeMap<NodeId, String>>,
     // what each of the sheets' media query lists answers, which is all of the viewport a
     // cascade reads
     media: Vec<bool>,
@@ -882,9 +882,9 @@ struct Matching {
     forced_colors: Option<SystemColors>,
     reduced_motion: bool,
     root: Option<NodeId>,
-    container_sizes: BTreeMap<NodeId, crate::media::ContainerSize>,
-    top_layer: Vec<NodeId>,
-    forced: BTreeMap<NodeId, BTreeSet<&'static str>>,
+    container_sizes: Shared<BTreeMap<NodeId, crate::media::ContainerSize>>,
+    top_layer: Shared<Vec<NodeId>>,
+    forced: Shared<BTreeMap<NodeId, BTreeSet<&'static str>>>,
 }
 
 impl StyleState {
@@ -975,12 +975,14 @@ impl Matching {
             unchecked: state.unchecked.clone(),
             disabled: state.disabled.clone(),
             control_values: state.control_values.clone(),
-            media: sheet
-                .media
-                .iter()
-                .chain(&user_agent_sheet().media)
-                .map(|list| list.matches(state))
-                .collect(),
+            media: with_user_agent_sheet(|ua| {
+                sheet
+                    .media
+                    .iter()
+                    .chain(&ua.media)
+                    .map(|list| list.matches(state))
+                    .collect()
+            }),
             color_scheme: state.color_scheme,
             forced_colors: state.forced_colors,
             reduced_motion: state.reduced_motion,
@@ -1029,7 +1031,7 @@ fn share_cascade(
     let hash = cascade
         .iter()
         .fold(0u64, |sum, (property, (_, order, value))| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            let mut hasher = crate::hashing::Fast::default();
             (property, order, value).hash(&mut hasher);
             sum.wrapping_add(hasher.finish())
         });
@@ -1059,7 +1061,7 @@ thread_local! {
 // what it found
 type CustomPropertyPass = (
     (u64, u64, u64, StyleState),
-    HashMap<NodeId, BTreeMap<String, String>>,
+    Shared<HashMap<NodeId, BTreeMap<String, String>>>,
     Option<NodeId>,
 );
 
@@ -1143,7 +1145,7 @@ fn note_animation_wake(delay: u64) {
 
 // the elements a layout pass sampled motion for, and whether any of it can move a box
 #[derive(Default)]
-struct Motion {
+pub(crate) struct Motion {
     nodes: BTreeSet<NodeId>,
     relayout: bool,
 }
@@ -1166,6 +1168,17 @@ const REPAINT_ONLY: [&str; 8] = [
 
 pub(crate) fn record_motion() {
     MOTION.with(|motion| *motion.borrow_mut() = Some(Motion::default()));
+}
+
+pub(crate) fn push_motion() -> Option<Motion> {
+    MOTION.with(|motion| motion.borrow_mut().replace(Motion::default()))
+}
+
+pub(crate) fn pop_motion(outer: Option<Motion>) -> Option<BTreeSet<NodeId>> {
+    MOTION
+        .with(|motion| std::mem::replace(&mut *motion.borrow_mut(), outer))
+        .filter(|motion| !motion.relayout)
+        .map(|motion| motion.nodes)
 }
 
 // the elements whose motion only repaints them, or none when some motion needs a layout
@@ -1546,6 +1559,124 @@ pub(crate) struct TransitionState {
     pub(crate) timing: Timing,
 }
 
+// rc-backed collection shared across copies of style state; empty instances reuse one
+// thread-local allocation and equality short-circuits on pointer identity
+pub(crate) struct Shared<T>(Rc<T>);
+
+impl<T> Shared<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(Rc::new(value))
+    }
+
+    pub(crate) fn make_mut(&mut self) -> &mut T
+    where
+        T: Clone,
+    {
+        Rc::make_mut(&mut self.0)
+    }
+}
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(Rc::clone(&self.0))
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Shared<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.0, formatter)
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: PartialEq> PartialEq for Shared<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl<T: Eq> Eq for Shared<T> {}
+
+impl<T: PartialEq> PartialEq<T> for Shared<T> {
+    fn eq(&self, other: &T) -> bool {
+        *self.0 == *other
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Shared<T>
+where
+    &'a T: IntoIterator,
+{
+    type Item = <&'a T as IntoIterator>::Item;
+    type IntoIter = <&'a T as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        (&*self.0).into_iter()
+    }
+}
+
+pub(crate) trait EmptyShared: Sized {
+    fn empty_shared() -> Shared<Self>;
+    fn is_empty_value(&self) -> bool;
+}
+
+impl<T: EmptyShared> Default for Shared<T> {
+    fn default() -> Self {
+        T::empty_shared()
+    }
+}
+
+impl<T: EmptyShared> Shared<T> {
+    pub(crate) fn from_value(value: T) -> Self {
+        if value.is_empty_value() {
+            T::empty_shared()
+        } else {
+            Self(Rc::new(value))
+        }
+    }
+}
+
+macro_rules! impl_empty_shared {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl EmptyShared for $ty {
+                fn empty_shared() -> Shared<Self> {
+                    thread_local! {
+                        static EMPTY: Rc<$ty> = Rc::new(<$ty>::default());
+                    }
+                    EMPTY.with(|empty| Shared(Rc::clone(empty)))
+                }
+
+                fn is_empty_value(&self) -> bool {
+                    self.is_empty()
+                }
+            }
+        )*
+    };
+}
+
+impl_empty_shared!(
+    BTreeSet<NodeId>,
+    BTreeMap<NodeId, (f32, f32)>,
+    BTreeMap<NodeId, String>,
+    BTreeMap<NodeId, (usize, usize, bool)>,
+    BTreeMap<(NodeId, AnimatableProperty), TransitionState>,
+    HashMap<NodeId, BTreeMap<String, String>>,
+    BTreeMap<NodeId, (u32, u32)>,
+    BTreeMap<NodeId, u64>,
+    BTreeMap<NodeId, Vec<ScriptAnimation>>,
+    BTreeMap<NodeId, crate::media::ContainerSize>,
+    Vec<NodeId>,
+    BTreeMap<NodeId, BTreeSet<&'static str>>,
+);
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct StyleState {
     pub(crate) hovered: Option<NodeId>,
@@ -1555,16 +1686,16 @@ pub(crate) struct StyleState {
     pub(crate) focus_visible: bool,
     // the element the primary pointer button is pressed on
     pub(crate) active: Option<NodeId>,
-    pub(crate) checked: BTreeSet<NodeId>,
-    pub(crate) unchecked: BTreeSet<NodeId>,
+    pub(crate) checked: Shared<BTreeSet<NodeId>>,
+    pub(crate) unchecked: Shared<BTreeSet<NodeId>>,
     // checkboxes script set indeterminate, which show a dash whatever their checkedness
-    pub(crate) indeterminate: BTreeSet<NodeId>,
+    pub(crate) indeterminate: Shared<BTreeSet<NodeId>>,
     // popovers on show, which sit in the top layer too
-    pub(crate) popovers: BTreeSet<NodeId>,
-    pub(crate) disabled: BTreeSet<NodeId>,
-    pub(crate) scroll_offsets: BTreeMap<NodeId, (f32, f32)>,
-    pub(crate) control_values: BTreeMap<NodeId, String>,
-    pub(crate) text_selections: BTreeMap<NodeId, (usize, usize, bool)>,
+    pub(crate) popovers: Shared<BTreeSet<NodeId>>,
+    pub(crate) disabled: Shared<BTreeSet<NodeId>>,
+    pub(crate) scroll_offsets: Shared<BTreeMap<NodeId, (f32, f32)>>,
+    pub(crate) control_values: Shared<BTreeMap<NodeId, String>>,
+    pub(crate) text_selections: Shared<BTreeMap<NodeId, (usize, usize, bool)>>,
     pub(crate) viewport_width: f32,
     pub(crate) viewport_height: f32,
     pub(crate) color_scheme: ColorScheme,
@@ -1572,22 +1703,22 @@ pub(crate) struct StyleState {
     pub(crate) forced_colors: Option<SystemColors>,
     pub(crate) reduced_motion: bool,
     pub(crate) clock: u64,
-    pub(crate) transitions: BTreeMap<(NodeId, AnimatableProperty), TransitionState>,
-    pub(crate) custom_properties: HashMap<NodeId, BTreeMap<String, String>>,
+    pub(crate) transitions: Shared<BTreeMap<(NodeId, AnimatableProperty), TransitionState>>,
+    pub(crate) custom_properties: Shared<HashMap<NodeId, BTreeMap<String, String>>>,
     pub(crate) root: Option<NodeId>,
     // natural pixel sizes of decoded images, keyed by their element
-    pub(crate) image_sizes: BTreeMap<NodeId, (u32, u32)>,
+    pub(crate) image_sizes: Shared<BTreeMap<NodeId, (u32, u32)>>,
     // when each element's current animation began, on the page clock
-    pub(crate) animation_starts: BTreeMap<NodeId, u64>,
+    pub(crate) animation_starts: Shared<BTreeMap<NodeId, u64>>,
     // the animations script made with Element.animate, oldest first, on each element
-    pub(crate) script_animations: Rc<BTreeMap<NodeId, Vec<ScriptAnimation>>>,
+    pub(crate) script_animations: Shared<BTreeMap<NodeId, Vec<ScriptAnimation>>>,
     // query containers and their content sizes from the last layout
-    pub(crate) container_sizes: BTreeMap<NodeId, crate::media::ContainerSize>,
+    pub(crate) container_sizes: Shared<BTreeMap<NodeId, crate::media::ContainerSize>>,
     // modal dialogs above the page, bottom first
-    pub(crate) top_layer: Vec<NodeId>,
+    pub(crate) top_layer: Shared<Vec<NodeId>>,
     // the user action pseudo-classes devtools holds on for an element, whatever the pointer
     // and focus do
-    pub(crate) forced: BTreeMap<NodeId, BTreeSet<&'static str>>,
+    pub(crate) forced: Shared<BTreeMap<NodeId, BTreeSet<&'static str>>>,
 }
 
 // the pseudo-classes devtools can hold on, by their names
@@ -1627,6 +1758,95 @@ impl StyleState {
 
     pub(crate) fn is_disabled(&self, element: &Element, node: NodeId) -> bool {
         self.disabled.contains(&node) || element.attrs.contains_key("disabled")
+    }
+
+    pub(crate) fn eq_ignoring_clock(&self, other: &Self) -> bool {
+        self.hovered == other.hovered
+            && self.hovered_part == other.hovered_part
+            && self.focused == other.focused
+            && self.focus_visible == other.focus_visible
+            && self.active == other.active
+            && self.checked == other.checked
+            && self.unchecked == other.unchecked
+            && self.indeterminate == other.indeterminate
+            && self.popovers == other.popovers
+            && self.disabled == other.disabled
+            && self.scroll_offsets == other.scroll_offsets
+            && self.control_values == other.control_values
+            && self.text_selections == other.text_selections
+            && self.viewport_width == other.viewport_width
+            && self.viewport_height == other.viewport_height
+            && self.color_scheme == other.color_scheme
+            && self.forced_colors == other.forced_colors
+            && self.reduced_motion == other.reduced_motion
+            && self.transitions == other.transitions
+            && self.custom_properties == other.custom_properties
+            && self.root == other.root
+            && self.image_sizes == other.image_sizes
+            && self.animation_starts == other.animation_starts
+            && self.script_animations == other.script_animations
+            && self.container_sizes == other.container_sizes
+            && self.top_layer == other.top_layer
+            && self.forced == other.forced
+    }
+
+    pub(crate) fn eq_ignoring_scroll(&self, other: &Self) -> bool {
+        self.hovered == other.hovered
+            && self.hovered_part == other.hovered_part
+            && self.focused == other.focused
+            && self.focus_visible == other.focus_visible
+            && self.active == other.active
+            && self.checked == other.checked
+            && self.unchecked == other.unchecked
+            && self.indeterminate == other.indeterminate
+            && self.popovers == other.popovers
+            && self.disabled == other.disabled
+            && self.control_values == other.control_values
+            && self.text_selections == other.text_selections
+            && self.viewport_width == other.viewport_width
+            && self.viewport_height == other.viewport_height
+            && self.color_scheme == other.color_scheme
+            && self.forced_colors == other.forced_colors
+            && self.reduced_motion == other.reduced_motion
+            && self.clock == other.clock
+            && self.transitions == other.transitions
+            && self.custom_properties == other.custom_properties
+            && self.root == other.root
+            && self.image_sizes == other.image_sizes
+            && self.animation_starts == other.animation_starts
+            && self.script_animations == other.script_animations
+            && self.container_sizes == other.container_sizes
+            && self.top_layer == other.top_layer
+            && self.forced == other.forced
+    }
+
+    // matches everything a layout reads besides clock, custom properties and root
+    pub(crate) fn eq_for_measured(&self, other: &Self) -> bool {
+        self.hovered == other.hovered
+            && self.hovered_part == other.hovered_part
+            && self.focused == other.focused
+            && self.focus_visible == other.focus_visible
+            && self.active == other.active
+            && self.checked == other.checked
+            && self.unchecked == other.unchecked
+            && self.indeterminate == other.indeterminate
+            && self.popovers == other.popovers
+            && self.disabled == other.disabled
+            && self.scroll_offsets == other.scroll_offsets
+            && self.control_values == other.control_values
+            && self.text_selections == other.text_selections
+            && self.viewport_width == other.viewport_width
+            && self.viewport_height == other.viewport_height
+            && self.color_scheme == other.color_scheme
+            && self.forced_colors == other.forced_colors
+            && self.reduced_motion == other.reduced_motion
+            && self.transitions == other.transitions
+            && self.image_sizes == other.image_sizes
+            && self.animation_starts == other.animation_starts
+            && self.script_animations == other.script_animations
+            && self.container_sizes == other.container_sizes
+            && self.top_layer == other.top_layer
+            && self.forced == other.forced
     }
 }
 
@@ -2174,8 +2394,11 @@ pub struct Stylesheet {
     rules: Vec<Rule>,
     keyframes: Vec<Keyframes>,
     index: RuleIndex,
-    // rules that declare a transition or an animation, checked before a full cascade
-    motion_rules: Vec<usize>,
+    // indexed rules that declare a transition or an animation, checked before a full cascade
+    motion_index: RuleIndex,
+    has_transitions: bool,
+    has_animations: bool,
+    has_container_queries: bool,
     // a number no differently parsed sheet has
     identity: u64,
     // the compounds that carry :hover, or none where one sits inside another pseudo-class
@@ -2366,8 +2589,14 @@ struct RuleIndex {
 
 impl RuleIndex {
     fn build(rules: &[Rule]) -> Self {
+        let positions: Vec<usize> = (0..rules.len()).collect();
+        Self::build_subset(rules, &positions)
+    }
+
+    fn build_subset(rules: &[Rule], positions: &[usize]) -> Self {
         let mut index = Self::default();
-        for (position, rule) in rules.iter().enumerate() {
+        for &position in positions {
+            let rule = &rules[position];
             for selector in &rule.selectors {
                 let Some(subject) = selector.parts.last().map(|part| &part.compound) else {
                     continue;
@@ -2398,6 +2627,31 @@ impl RuleIndex {
             bucket.dedup();
         }
         index
+    }
+
+    fn any_candidate(&self, subject: &Element, mut check: impl FnMut(usize) -> bool) -> bool {
+        if self.universal.iter().any(|&index| check(index)) {
+            return true;
+        }
+        if let Some(bucket) = self.by_tag.get(&subject.name)
+            && bucket.iter().any(|&index| check(index))
+        {
+            return true;
+        }
+        if let Some(id) = subject.attr("id")
+            && let Some(bucket) = self.by_id.get(id)
+            && bucket.iter().any(|&index| check(index))
+        {
+            return true;
+        }
+        for class in subject.classes() {
+            if let Some(bucket) = self.by_class.get(class)
+                && bucket.iter().any(|&index| check(index))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     // whether any rule could match the element, without building the list
@@ -2925,6 +3179,23 @@ impl Stylesheet {
         unshift_rules(&mut rules, &shifts);
         let index = RuleIndex::build(&rules);
         let motion_rules = motion_rules(&rules);
+        let motion_index = RuleIndex::build_subset(&rules, &motion_rules);
+        let has_transitions = rules.iter().any(|rule| {
+            rule.declarations
+                .iter()
+                .any(|declaration| declaration.property == "transition")
+        });
+        let has_animations = !keyframes.is_empty()
+            && rules.iter().any(|rule| {
+                rule.declarations.iter().any(|declaration| {
+                    declaration.property == "animation" || declaration.property == "animation-name"
+                })
+            });
+        let has_container_queries = rules.iter().any(|rule| {
+            rule.conditions
+                .iter()
+                .any(|condition| matches!(condition, RuleCondition::Container(_)))
+        });
         let styled_pseudo = styled_pseudo_elements(&rules);
         Ok(Self {
             identity: next_identity(),
@@ -2938,7 +3209,10 @@ impl Stylesheet {
             rules,
             keyframes,
             index,
-            motion_rules,
+            motion_index,
+            has_transitions,
+            has_animations,
+            has_container_queries,
             shadow_sheets: RefCell::default(),
             styled_pseudo_elements: styled_pseudo,
             font_faces,
@@ -2954,6 +3228,23 @@ impl Stylesheet {
         unshift_rules(&mut rules, &shifts);
         let index = RuleIndex::build(&rules);
         let motion_rules = motion_rules(&rules);
+        let motion_index = RuleIndex::build_subset(&rules, &motion_rules);
+        let has_transitions = rules.iter().any(|rule| {
+            rule.declarations
+                .iter()
+                .any(|declaration| declaration.property == "transition")
+        });
+        let has_animations = !keyframes.is_empty()
+            && rules.iter().any(|rule| {
+                rule.declarations.iter().any(|declaration| {
+                    declaration.property == "animation" || declaration.property == "animation-name"
+                })
+            });
+        let has_container_queries = rules.iter().any(|rule| {
+            rule.conditions
+                .iter()
+                .any(|condition| matches!(condition, RuleCondition::Container(_)))
+        });
         let styled_pseudo = styled_pseudo_elements(&rules);
         (
             Self {
@@ -2968,7 +3259,10 @@ impl Stylesheet {
                 rules,
                 keyframes,
                 index,
-                motion_rules,
+                motion_index,
+                has_transitions,
+                has_animations,
+                has_container_queries,
                 shadow_sheets: RefCell::default(),
                 styled_pseudo_elements: styled_pseudo,
                 font_faces,
@@ -3065,9 +3359,9 @@ impl Stylesheet {
             document.version(),
             StyleState {
                 clock: 0,
-                transitions: BTreeMap::new(),
-                animation_starts: BTreeMap::new(),
-                custom_properties: Default::default(),
+                transitions: Shared::default(),
+                animation_starts: Shared::default(),
+                custom_properties: Shared::default(),
                 root: None,
                 ..state.clone()
             },
@@ -3095,7 +3389,7 @@ impl Stylesheet {
 
     fn populate_custom_properties_afresh(&self, document: &Document, state: &mut StyleState) {
         let _profile = crate::profile::scope("style: custom properties");
-        state.custom_properties.clear();
+        state.custom_properties = Shared::default();
         let top = document
             .element_children(document.root())
             .collect::<Vec<_>>();
@@ -3118,11 +3412,13 @@ impl Stylesheet {
                 })
             });
         let inherited = BTreeMap::new();
+        let mut custom = HashMap::default();
         // only cascades are asked for here, and they read none of what this pass writes
         let _styles = memoize_styles();
         for node in top {
-            self.populate_element_custom_properties(document, node, &inherited, state);
+            self.populate_element_custom_properties(document, node, &inherited, state, &mut custom);
         }
+        state.custom_properties = Shared::from_value(custom);
     }
 
     fn populate_element_custom_properties(
@@ -3130,7 +3426,8 @@ impl Stylesheet {
         document: &Document,
         node: NodeId,
         inherited: &BTreeMap<String, String>,
-        state: &mut StyleState,
+        state: &StyleState,
+        custom: &mut HashMap<NodeId, BTreeMap<String, String>>,
     ) {
         // most elements declare none and pass on the map they inherited as it is
         let mut own = None;
@@ -3150,13 +3447,11 @@ impl Stylesheet {
             }
         }
         if own.is_some() || inherited.is_empty() {
-            state
-                .custom_properties
-                .insert(node, own.clone().unwrap_or_default());
+            custom.insert(node, own.clone().unwrap_or_default());
         }
         let properties = own.as_ref().unwrap_or(inherited);
         for child in document.element_children(node).collect::<Vec<_>>() {
-            self.populate_element_custom_properties(document, child, properties, state);
+            self.populate_element_custom_properties(document, child, properties, state, custom);
         }
     }
 
@@ -3584,11 +3879,7 @@ impl Stylesheet {
     }
 
     pub(crate) fn has_transitions(&self) -> bool {
-        self.rules.iter().any(|rule| {
-            rule.declarations
-                .iter()
-                .any(|declaration| declaration.property == "transition")
-        })
+        self.has_transitions
     }
 
     // an element's style with the inherited values of its ancestors, as layout computes it,
@@ -3707,40 +3998,42 @@ impl Stylesheet {
             return Vec::new();
         };
         let mut matched = Vec::new();
-        for (user_agent, sheet) in [(true, user_agent_sheet()), (false, self)] {
-            for position in sheet.index.candidates(element) {
-                let Some(rule) = sheet.rules.get(position) else {
-                    continue;
-                };
-                if !rule.applies(document, node, state) {
-                    continue;
-                }
-                let matching: Vec<_> = (0..rule.selectors.len())
-                    .filter(|&index| rule.selectors[index].matches(document, node, pseudo, state))
-                    .collect();
-                let Some(specificity) = matching
-                    .iter()
-                    .map(|&index| rule.selectors[index].specificity())
-                    .max()
-                else {
-                    continue;
-                };
-                let rank = (
-                    user_agent,
-                    specificity.ranked(false, rule.layer),
-                    rule.order,
-                );
-                matched.push((
-                    rank,
-                    MatchedRule {
+        with_user_agent_sheet(|ua| {
+            for (user_agent, sheet) in [(true, ua), (false, self)] {
+                for position in sheet.index.candidates(element) {
+                    let Some(rule) = sheet.rules.get(position) else {
+                        continue;
+                    };
+                    if !rule.applies(document, node, state) {
+                        continue;
+                    }
+                    let matching: Vec<_> = (0..rule.selectors.len())
+                        .filter(|&index| rule.selectors[index].matches(document, node, pseudo, state))
+                        .collect();
+                    let Some(specificity) = matching
+                        .iter()
+                        .map(|&index| rule.selectors[index].specificity())
+                        .max()
+                    else {
+                        continue;
+                    };
+                    let rank = (
                         user_agent,
-                        header: rule.header.clone(),
-                        block: rule.block.clone(),
-                        matching,
-                    },
-                ));
+                        specificity.ranked(false, rule.layer),
+                        rule.order,
+                    );
+                    matched.push((
+                        rank,
+                        MatchedRule {
+                            user_agent,
+                            header: rule.header.clone(),
+                            block: rule.block.clone(),
+                            matching,
+                        },
+                    ));
+                }
             }
-        }
+        });
         matched.sort_by_key(|((user_agent, specificity, order), _)| {
             (!*user_agent, *specificity, *order)
         });
@@ -3880,7 +4173,7 @@ impl Stylesheet {
         {
             return true;
         }
-        self.motion_rules.iter().any(|&index| {
+        self.motion_index.any_candidate(element, |index| {
             let rule = &self.rules[index];
             rule.applies(document, node, state)
                 && rule
@@ -3893,7 +4186,7 @@ impl Stylesheet {
     // whether this sheet or the user agent's styles the pseudo-element
     pub(crate) fn styles_pseudo(&self, pseudo: PseudoElement) -> bool {
         self.styled_pseudo_elements.contains(&pseudo)
-            || user_agent_sheet().styled_pseudo_elements.contains(&pseudo)
+            || with_user_agent_sheet(|ua| ua.styled_pseudo_elements.contains(&pseudo))
     }
 
     pub(crate) fn font_faces(&self) -> &[FontFaceRule] {
@@ -3924,33 +4217,35 @@ impl Stylesheet {
             .filter(|node| !entered.contains(node))
             .chain(entered.iter().filter(|node| !left.contains(node)));
         let mut roots = Vec::new();
-        for &node in changed {
-            let Some(element) = document.element(node) else {
-                continue;
-            };
-            for sheet in [self, user_agent_sheet()] {
-                for hover in sheet.hovers.as_ref()? {
-                    let fits = hover.tag.as_deref().is_none_or(|tag| tag == element.name)
-                        && hover
-                            .id
-                            .as_deref()
-                            .is_none_or(|id| element.attr("id") == Some(id))
-                        && hover.classes.iter().all(|class| element.has_class(class));
-                    let root = match document.parent(node) {
-                        Some(parent) if !hover.subject => parent,
-                        _ => node,
-                    };
-                    if fits && !roots.contains(&root) {
-                        roots.push(root);
+        with_user_agent_sheet(|ua| {
+            for &node in changed {
+                let Some(element) = document.element(node) else {
+                    continue;
+                };
+                for sheet in [self, ua] {
+                    for hover in sheet.hovers.as_ref()? {
+                        let fits = hover.tag.as_deref().is_none_or(|tag| tag == element.name)
+                            && hover
+                                .id
+                                .as_deref()
+                                .is_none_or(|id| element.attr("id") == Some(id))
+                            && hover.classes.iter().all(|class| element.has_class(class));
+                        let root = match document.parent(node) {
+                            Some(parent) if !hover.subject => parent,
+                            _ => node,
+                        };
+                        if fits && !roots.contains(&root) {
+                            roots.push(root);
+                        }
                     }
                 }
             }
-        }
-        Some(roots)
+            Some(roots)
+        })
     }
 
     pub(crate) fn selector_reach(&self) -> SelectorReach {
-        self.reach.max(user_agent_sheet().reach)
+        self.reach.max(with_user_agent_sheet(|ua| ua.reach))
     }
 
     // drops the kept cascades a write since the stamp can reach: the written element, what lies
@@ -4013,35 +4308,37 @@ impl Stylesheet {
         document: &Document,
         written: impl Iterator<Item = NodeId>,
     ) -> Option<Vec<NodeId>> {
-        let sheets = [self, user_agent_sheet()];
-        let anchors: Vec<&HoverUse> = sheets
-            .iter()
-            .map(|sheet| sheet.has_anchors.as_ref())
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-        let mut roots = Vec::new();
-        for node in written {
-            for above in std::iter::once(node).chain(document.ancestors(node)) {
-                let Some(element) = document.element(above) else {
-                    continue;
-                };
-                let anchored = anchors.iter().any(|anchor| {
-                    anchor.tag.as_deref().is_none_or(|tag| tag == element.name)
-                        && anchor
-                            .id
-                            .as_deref()
-                            .is_none_or(|id| element.attr("id") == Some(id))
-                        && anchor.classes.iter().all(|class| element.has_class(class))
-                });
-                let root = document.parent(above).unwrap_or(above);
-                if anchored && !roots.contains(&root) {
-                    roots.push(root);
+        with_user_agent_sheet(|ua| {
+            let sheets = [self, ua];
+            let anchors: Vec<&HoverUse> = sheets
+                .iter()
+                .map(|sheet| sheet.has_anchors.as_ref())
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            let mut roots = Vec::new();
+            for node in written {
+                for above in std::iter::once(node).chain(document.ancestors(node)) {
+                    let Some(element) = document.element(above) else {
+                        continue;
+                    };
+                    let anchored = anchors.iter().any(|anchor| {
+                        anchor.tag.as_deref().is_none_or(|tag| tag == element.name)
+                            && anchor
+                                .id
+                                .as_deref()
+                                .is_none_or(|id| element.attr("id") == Some(id))
+                            && anchor.classes.iter().all(|class| element.has_class(class))
+                    });
+                    let root = document.parent(above).unwrap_or(above);
+                    if anchored && !roots.contains(&root) {
+                        roots.push(root);
+                    }
                 }
             }
-        }
-        Some(roots)
+            Some(roots)
+        })
     }
 
     // what a write reaches besides through :has(), once has_reach has accounted for that
@@ -4054,27 +4351,25 @@ impl Stylesheet {
 
     // whether an attribute change the document names so can restyle the element's siblings
     pub(crate) fn reaches_siblings(&self, changed: &[String]) -> bool {
-        [self, user_agent_sheet()].iter().any(|sheet| {
-            let keys = &sheet.sibling_keys;
-            keys.contains("*")
-                || changed
-                    .iter()
-                    .any(|change| change == "*" && !keys.is_empty() || keys.contains(change))
+        with_user_agent_sheet(|ua| {
+            [self, ua].iter().any(|sheet| {
+                let keys = &sheet.sibling_keys;
+                keys.contains("*")
+                    || changed
+                        .iter()
+                        .any(|change| change == "*" && !keys.is_empty() || keys.contains(change))
+            })
         })
     }
 
     // whether everything its selectors read moves the document's selector version, with the
     // user agent's sheet beside it
     pub(crate) fn follows_versions(&self) -> bool {
-        !self.reads_unversioned && !user_agent_sheet().reads_unversioned
+        !self.reads_unversioned && with_user_agent_sheet(|ua| !ua.reads_unversioned)
     }
 
     pub(crate) fn has_container_queries(&self) -> bool {
-        self.rules.iter().any(|rule| {
-            rule.conditions
-                .iter()
-                .any(|condition| matches!(condition, RuleCondition::Container(_)))
-        })
+        self.has_container_queries
     }
 
     pub(crate) fn has_keyframes(&self, name: &str) -> bool {
@@ -4082,12 +4377,7 @@ impl Stylesheet {
     }
 
     pub(crate) fn has_animations(&self) -> bool {
-        !self.keyframes.is_empty()
-            && self.rules.iter().any(|rule| {
-                rule.declarations.iter().any(|declaration| {
-                    declaration.property == "animation" || declaration.property == "animation-name"
-                })
-            })
+        self.has_animations
     }
 
     // the cascade of an element or one of its generated boxes, kept from one layout to the
@@ -4099,16 +4389,7 @@ impl Stylesheet {
         pseudo: Option<PseudoElement>,
         state: &StyleState,
     ) -> Rc<Cascade> {
-        let cascade = || {
-            Rc::new(
-                self.cascade(document, node, pseudo, state)
-                    .into_iter()
-                    .map(|(property, (rank, order, value))| {
-                        (property.into_owned(), (rank, order, value.into_owned()))
-                    })
-                    .collect::<Cascade>(),
-            )
-        };
+        let cascade = || Rc::new(self.cascade(document, node, pseudo, state));
         // a shadow tree's sheet is its style elements' text, which no version follows
         if !self.follows_versions() {
             crate::profile::count("style: cascade unkept, sheet reads unversioned state");
@@ -4188,120 +4469,121 @@ impl Stylesheet {
         values
     }
 
-    fn cascade<'a>(
-        &'a self,
-        document: &'a Document,
+    fn cascade(
+        &self,
+        document: &Document,
         node: NodeId,
         pseudo: Option<PseudoElement>,
         state: &StyleState,
-    ) -> HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> {
+    ) -> Cascade {
         let _profile = crate::profile::scope("style: cascade");
-        let mut values: HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)> =
-            HashMap::default();
         // a generated box carries the id, classes and tag of the element that owns it
         let Some(element) = document.element(node) else {
-            return values;
+            return HashMap::default();
         };
-        // a shadow tree is styled by its own style elements, and its host also takes the
-        // :host rules there, below anything the outer document says
-        let shadows = document.has_shadow_roots();
-        let root = if shadows {
-            document.tree_root(node)
-        } else {
-            document.root()
-        };
-        let in_shadow = shadows && document.shadow_host(root).is_some();
-        values = if in_shadow {
-            self.shadow_sheet(document, root)
-                .map(|sheet| {
-                    sheet
-                        .matched_declarations(element, document, node, pseudo, state, false)
-                        .into_iter()
-                        .map(|(property, (specificity, order, value))| {
-                            (
-                                Cow::Owned(property),
-                                (specificity, order, Cow::Owned(value)),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            // the user agent's rules go in first and lose to any author rule for a property
-            let mut values = HashMap::default();
-            let target = CascadeTarget {
-                element,
-                document,
-                node,
-                pseudo,
-                state,
-                host_only: false,
+        with_user_agent_sheet(|ua| {
+            let mut values: HashMap<Cow<'_, str>, (Specificity, usize, Cow<'_, str>)> =
+                HashMap::default();
+            // a shadow tree is styled by its own style elements, and its host also takes the
+            // :host rules there, below anything the outer document says
+            let shadows = document.has_shadow_roots();
+            let root = if shadows {
+                document.tree_root(node)
+            } else {
+                document.root()
             };
-            user_agent_sheet().collect_declarations(target, &mut values);
-            self.collect_declarations(target, &mut values);
-            values
-        };
-        if shadows
-            && let Some(shadow) = document.shadow_root(node)
-            && let Some(sheet) = self.shadow_sheet(document, shadow)
-        {
-            for (property, (specificity, order, value)) in
-                sheet.matched_declarations(element, document, node, pseudo, state, true)
-            {
-                values.entry(Cow::Owned(property)).or_insert((
-                    specificity,
-                    order,
-                    Cow::Owned(value),
-                ));
-            }
-        }
-        if in_shadow {
-            for (property, value) in user_agent_sheet()
-                .borrowed_declarations(element, document, node, pseudo, state, false)
-            {
-                values.entry(property).or_insert(value);
-            }
-        }
-        // svg presentation attributes beat the user agent's rules and lose to every author rule
-        if element.namespace == Namespace::Svg && pseudo.is_none() {
-            let author = Specificity(1 << LAYER_SHIFT, 0, 0);
-            for (property, value) in presentation_hints(element) {
-                if values
-                    .get(property)
-                    .is_none_or(|current| current.0 < author)
-                {
-                    values.insert(Cow::Borrowed(property), (Specificity(0, 0, 0), 0, value));
+            let in_shadow = shadows && document.shadow_host(root).is_some();
+            if in_shadow {
+                if let Some(sheet) = self.shadow_sheet(document, root) {
+                    for (property, (specificity, order, value)) in
+                        sheet.matched_declarations(element, document, node, pseudo, state, false)
+                    {
+                        values.insert(
+                            Cow::Owned(property),
+                            (specificity, order, Cow::Owned(value)),
+                        );
+                    }
                 }
-            }
-        }
-        let mut inline_dropped = Vec::new();
-        if let Some(inline) = element
-            .attr("style")
-            .filter(|_| pseudo.is_none() && !document.style_blocked(node))
-            && let Ok(declarations) = parse_declarations(inline, Some(&mut inline_dropped))
-        {
-            for (position, declaration) in declarations.into_iter().enumerate() {
-                let specificity = if declaration.important {
-                    Specificity::INLINE_IMPORTANT
-                } else {
-                    Specificity::INLINE
+            } else {
+                // the user agent's rules go in first and lose to any author rule for a property
+                let target = CascadeTarget {
+                    element,
+                    document,
+                    node,
+                    pseudo,
+                    state,
+                    host_only: false,
                 };
-                let replace = values
-                    .get(declaration.property.as_str())
-                    .is_none_or(|current| specificity >= current.0);
-                if replace {
-                    values.insert(
-                        Cow::Owned(declaration.property),
-                        (
-                            specificity,
-                            (usize::MAX >> 1) | position,
-                            Cow::Owned(declaration.value),
-                        ),
-                    );
+                ua.collect_declarations(target, &mut values);
+                self.collect_declarations(target, &mut values);
+            }
+            if shadows
+                && let Some(shadow) = document.shadow_root(node)
+                && let Some(sheet) = self.shadow_sheet(document, shadow)
+            {
+                for (property, (specificity, order, value)) in
+                    sheet.matched_declarations(element, document, node, pseudo, state, true)
+                {
+                    values.entry(Cow::Owned(property)).or_insert((
+                        specificity,
+                        order,
+                        Cow::Owned(value),
+                    ));
                 }
             }
-        }
-        values
+            if in_shadow {
+                for (property, value) in
+                    ua.borrowed_declarations(element, document, node, pseudo, state, false)
+                {
+                    values.entry(property).or_insert(value);
+                }
+            }
+            // svg presentation attributes beat the user agent's rules and lose to every author rule
+            if element.namespace == Namespace::Svg && pseudo.is_none() {
+                let author = Specificity(1 << LAYER_SHIFT, 0, 0);
+                for (property, value) in presentation_hints(element) {
+                    if values
+                        .get(property)
+                        .is_none_or(|current| current.0 < author)
+                    {
+                        values.insert(Cow::Borrowed(property), (Specificity(0, 0, 0), 0, value));
+                    }
+                }
+            }
+            let mut inline_dropped = Vec::new();
+            if let Some(inline) = element
+                .attr("style")
+                .filter(|_| pseudo.is_none() && !document.style_blocked(node))
+                && let Ok(declarations) = parse_declarations(inline, Some(&mut inline_dropped))
+            {
+                for (position, declaration) in declarations.into_iter().enumerate() {
+                    let specificity = if declaration.important {
+                        Specificity::INLINE_IMPORTANT
+                    } else {
+                        Specificity::INLINE
+                    };
+                    let replace = values
+                        .get(declaration.property.as_str())
+                        .is_none_or(|current| specificity >= current.0);
+                    if replace {
+                        values.insert(
+                            Cow::Owned(declaration.property),
+                            (
+                                specificity,
+                                (usize::MAX >> 1) | position,
+                                Cow::Owned(declaration.value),
+                            ),
+                        );
+                    }
+                }
+            }
+            values
+                .into_iter()
+                .map(|(property, (rank, order, value))| {
+                    (property.into_owned(), (rank, order, value.into_owned()))
+                })
+                .collect()
+        })
     }
 }
 
@@ -7363,18 +7645,18 @@ select:disabled { opacity: 0.7 }
 "#;
 
 thread_local! {
-    // parsed once for each thread that styles, and kept for its life so rules can borrow it
-    static USER_AGENT_SHEET: &'static Stylesheet = {
+    // parsed once per engine thread and dropped cleanly when the thread exits
+    static USER_AGENT_SHEET: Stylesheet = {
         let mut sheet = Stylesheet::parse(USER_AGENT_CSS).expect("the user agent stylesheet parses");
         for rule in &mut sheet.rules {
             rule.layer = USER_AGENT_LAYER;
         }
-        Box::leak(Box::new(sheet))
+        sheet
     };
 }
 
-fn user_agent_sheet() -> &'static Stylesheet {
-    USER_AGENT_SHEET.with(|sheet| *sheet)
+fn with_user_agent_sheet<R>(f: impl FnOnce(&Stylesheet) -> R) -> R {
+    USER_AGENT_SHEET.with(f)
 }
 
 // what the cascade is collecting declarations for
@@ -9897,7 +10179,7 @@ mod tests {
                 &placed(&card, &[]),
                 &StyleState {
                     clock,
-                    transitions: BTreeMap::from([(
+                    transitions: Shared::new(BTreeMap::from([(
                         (card_node, AnimatableProperty::Transform),
                         TransitionState {
                             from: "translate(0px, 0px)".to_string(),
@@ -9908,7 +10190,7 @@ mod tests {
                             duration: 400,
                             timing: Timing::Linear,
                         },
-                    )]),
+                    )])),
                     ..StyleState::default()
                 },
             ))
@@ -10599,7 +10881,7 @@ mod tests {
             hovered: Some(button),
             ..StyleState::default()
         };
-        state.disabled.insert(disabled_button);
+        state.disabled.make_mut().insert(disabled_button);
         let style = |node: NodeId, state: &StyleState| {
             stylesheet.style_for(document_context(&document, node, state))
         };
@@ -10610,7 +10892,7 @@ mod tests {
             Color::opaque(255, 255, 0)
         );
         assert_eq!(style(button, &state).background, Color::opaque(0, 128, 0));
-        state.unchecked.insert(input);
+        state.unchecked.make_mut().insert(input);
         assert_eq!(style(input, &state).color, Color::BLACK);
     }
 

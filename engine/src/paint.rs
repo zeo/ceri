@@ -6508,7 +6508,7 @@ mod tests {
         let list = document
             .find_element_by_id("list")
             .expect("the list exists");
-        state.scroll_offsets.insert(list, (0.0, scrolled));
+        state.scroll_offsets.make_mut().insert(list, (0.0, scrolled));
         let stylesheet =
             Stylesheet::parse(&format!("{DAMAGE_STYLE}{extra}")).expect("stylesheet should parse");
         crate::layout::layout_with_state(
@@ -6615,8 +6615,11 @@ mod tests {
         let scroller = document
             .find_element_by_id("list")
             .expect("the list exists");
-        state.scroll_offsets.insert(scroller, (0.0, list));
-        state.scroll_offsets.insert(document.root(), (0.0, root));
+        state.scroll_offsets.make_mut().insert(scroller, (0.0, list));
+        state
+            .scroll_offsets
+            .make_mut()
+            .insert(document.root(), (0.0, root));
         let stylesheet = Stylesheet::parse(SCROLL_STYLE).expect("stylesheet should parse");
         crate::layout::layout_with_state(
             &document,

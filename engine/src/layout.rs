@@ -2976,7 +2976,7 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
             scale: crate::font::device_scale().to_bits(),
             state: StyleState {
                 clock: 0,
-                custom_properties: HashMap::default(),
+                custom_properties: crate::css::Shared::default(),
                 hovered: None,
                 ..state.clone()
             },
@@ -11586,9 +11586,11 @@ mod tests {
         };
         state
             .control_values
+            .make_mut()
             .insert(document.node_at(&[0]), "live".to_string());
         state
             .text_selections
+            .make_mut()
             .insert(document.node_at(&[0]), (1, 3, true));
         let result = layout_with_state(
             &document,
@@ -11639,6 +11641,7 @@ mod tests {
         let mut state = StyleState::default();
         state
             .control_values
+            .make_mut()
             .insert(document.node_at(&[0]), "live".to_string());
         let live = layout_with_state(
             &document,
@@ -11692,6 +11695,7 @@ mod tests {
         };
         state
             .text_selections
+            .make_mut()
             .insert(document.node_at(&[0]), (1, 3, false));
         let result = layout_with_state(
             &document,
@@ -11722,9 +11726,11 @@ mod tests {
         };
         state
             .control_values
+            .make_mut()
             .insert(document.node_at(&[0]), "live\nvalue".to_string());
         state
             .text_selections
+            .make_mut()
             .insert(document.node_at(&[0]), (1, 7, false));
         let result = layout_with_state(
             &document,
@@ -11755,9 +11761,11 @@ mod tests {
         let mut state = StyleState::default();
         state
             .control_values
+            .make_mut()
             .insert(document.node_at(&[0]), "abcdef".to_string());
         state
             .control_values
+            .make_mut()
             .insert(document.node_at(&[1]), "abcdef".to_string());
         let result = layout_with_state(
             &document,
@@ -12193,6 +12201,7 @@ mod tests {
         let mut state = StyleState::default();
         state
             .scroll_offsets
+            .make_mut()
             .insert(document.node_at(&[1]), (1000.0, 1000.0));
         let result = layout_with_state(
             &document,
@@ -12225,6 +12234,7 @@ mod tests {
         let mut state = StyleState::default();
         state
             .scroll_offsets
+            .make_mut()
             .insert(document.node_at(&[1]), (20.0, 30.0));
         let result = layout_with_state(
             &document,
@@ -13104,6 +13114,7 @@ mod tests {
         let mut state = StyleState::default();
         state
             .scroll_offsets
+            .make_mut()
             .insert(document.node_at(&[1]), (0.0, 30.0));
         let result = layout_with_state(
             &document,
@@ -13130,6 +13141,7 @@ mod tests {
         let mut state = StyleState::default();
         state
             .scroll_offsets
+            .make_mut()
             .insert(document.node_at(&[1]), (0.0, 20.0));
         let result = layout_with_state(
             &document,
@@ -13231,8 +13243,14 @@ mod tests {
             .expect("the list exists");
         let offsets = |list_offset: f32, root: f32| {
             let mut state = StyleState::default();
-            state.scroll_offsets.insert(list, (0.0, list_offset));
-            state.scroll_offsets.insert(document.root(), (0.0, root));
+            state
+                .scroll_offsets
+                .make_mut()
+                .insert(list, (0.0, list_offset));
+            state
+                .scroll_offsets
+                .make_mut()
+                .insert(document.root(), (0.0, root));
             state
         };
         let size = Size {
@@ -13272,7 +13290,10 @@ mod tests {
         .expect("document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState::default();
-        state.scroll_offsets.insert(document.root(), (0.0, 20.0));
+        state
+            .scroll_offsets
+            .make_mut()
+            .insert(document.root(), (0.0, 20.0));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -13300,7 +13321,10 @@ mod tests {
         .expect("document should parse");
         let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
         let mut state = StyleState::default();
-        state.scroll_offsets.insert(document.root(), (0.0, 30.0));
+        state
+            .scroll_offsets
+            .make_mut()
+            .insert(document.root(), (0.0, 30.0));
         let result = layout_with_state(
             &document,
             &stylesheet,
@@ -13429,7 +13453,7 @@ mod tests {
         let dialog = document.find_element_by_id("box").expect("dialog");
         let stylesheet = Stylesheet::parse("").expect("stylesheet should parse");
         let state = StyleState {
-            top_layer: vec![dialog],
+            top_layer: crate::css::Shared::new(vec![dialog]),
             ..StyleState::default()
         };
         let viewport = Size {

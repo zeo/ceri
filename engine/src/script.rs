@@ -101,7 +101,7 @@ pub(crate) use websocket::accept_key;
 
 use crate::Color;
 use crate::csp::{Directive, Initiator, Policies};
-use crate::css::StyleState;
+use crate::css::{Shared, StyleState};
 use crate::dom::{
     AccessibilityNode, Boundary, Document, DomError, Element, LiveRange, NodeId, NodeKind,
 };
@@ -706,8 +706,12 @@ impl Default for ViewportMetrics {
 type ControlLists = (u64, Rc<[Vec<NodeId>; 5]>);
 
 // the document and selector versions a disabled set was found at, and the set
-type DisabledControls = ((u64, u64), BTreeSet<NodeId>);
-type CheckedControls = ((u64, u64, u64, u64), BTreeSet<NodeId>, BTreeSet<NodeId>);
+type DisabledControls = ((u64, u64), Shared<BTreeSet<NodeId>>);
+type CheckedControls = (
+    (u64, u64, u64),
+    Shared<BTreeSet<NodeId>>,
+    Shared<BTreeSet<NodeId>>,
+);
 
 pub struct ScriptRuntime {
     document: Rc<RefCell<Document>>,
@@ -769,6 +773,7 @@ pub struct ScriptRuntime {
     // the checked and unchecked sets selectors match against, kept while the tree, its
     // attributes and the controls' own state stand, as a frame asks for them several times
     checked_controls: RefCell<Option<CheckedControls>>,
+    checked_version: u64,
     computed_styles: Option<geometry::KeptComputed>,
     // the last getComputedStyle object, whose keys the next one takes when they match
     computed_style_template: Option<JsObject>,
@@ -1995,6 +2000,7 @@ impl ScriptRuntime {
             controls: RefCell::new(None),
             disabled_controls: RefCell::new(None),
             checked_controls: RefCell::new(None),
+            checked_version: 0,
             computed_styles: None,
             computed_style_template: None,
             generation,
@@ -2158,7 +2164,9 @@ impl ScriptRuntime {
                 .borrow()
                 .attribute(option, "selected")
                 .is_some();
-            self.option_selected.insert(option, selected);
+            if self.option_selected.insert(option, selected) != Some(selected) {
+                self.checked_version = self.checked_version.wrapping_add(1);
+            }
         }
     }
 
@@ -2328,10 +2336,17 @@ impl ScriptRuntime {
         self.attribute_handlers.retain(|(node, _), _| !gone(*node));
         self.custom_states.retain(|node, _| !gone(*node));
         self.control_values.retain(|node, _| !gone(*node));
+        let checked_before = self.control_checked.len();
         self.control_checked.retain(|node, _| !gone(*node));
         self.dirty_checked_controls.retain(|node| !gone(*node));
         self.indeterminate.retain(|node| !gone(*node));
+        let options_before = self.option_selected.len();
         self.option_selected.retain(|node, _| !gone(*node));
+        if self.control_checked.len() != checked_before
+            || self.option_selected.len() != options_before
+        {
+            self.checked_version = self.checked_version.wrapping_add(1);
+        }
         self.dirty_options.retain(|node| !gone(*node));
         self.dirty_controls.retain(|node| !gone(*node));
         self.last_user_edit.retain(|node| !gone(*node));
@@ -3595,7 +3610,7 @@ impl ScriptRuntime {
         }
     }
 
-    fn disabled_controls(&self, controls: &[NodeId]) -> BTreeSet<NodeId> {
+    fn disabled_controls(&self, controls: &[NodeId]) -> Shared<BTreeSet<NodeId>> {
         let version = {
             let document = self.document.borrow();
             (document.version(), document.selector_version())
@@ -3604,11 +3619,13 @@ impl ScriptRuntime {
         match cached.as_ref() {
             Some((found_at, disabled)) if *found_at == version => disabled.clone(),
             _ => {
-                let disabled: BTreeSet<NodeId> = controls
-                    .iter()
-                    .copied()
-                    .filter(|&control| self.is_disabled(control))
-                    .collect();
+                let disabled = Shared::from_value(
+                    controls
+                        .iter()
+                        .copied()
+                        .filter(|&control| self.is_disabled(control))
+                        .collect::<BTreeSet<NodeId>>(),
+                );
                 *cached = Some((version, disabled.clone()));
                 disabled
             }
@@ -3616,23 +3633,35 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn style_state(&self, hovered_path: Option<NodeId>) -> StyleState {
-        StyleState {
-            scroll_offsets: self.scroll_offsets.clone(),
-            text_selections: self
-                .text_selections
-                .iter()
-                .map(|(control, selection)| {
-                    (
-                        *control,
+        let scroll_offsets = if self.scroll_offsets.is_empty() {
+            Shared::default()
+        } else {
+            Shared::new(self.scroll_offsets.clone())
+        };
+        let text_selections = if self.text_selections.is_empty() {
+            Shared::default()
+        } else {
+            Shared::new(
+                self.text_selections
+                    .iter()
+                    .map(|(control, selection)| {
                         (
-                            selection.start,
-                            selection.end,
-                            selection.direction == SelectionDirection::Backward,
-                        ),
-                    )
-                })
-                .collect(),
-            script_animations: Rc::new(self.animation_snapshot()),
+                            *control,
+                            (
+                                selection.start,
+                                selection.end,
+                                selection.direction == SelectionDirection::Backward,
+                            ),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let script_animations = Shared::from_value(self.animation_snapshot());
+        StyleState {
+            scroll_offsets,
+            text_selections,
+            script_animations,
             ..self.selector_state(hovered_path)
         }
     }
@@ -3642,35 +3671,40 @@ impl ScriptRuntime {
         let mut state = StyleState {
             hovered: hovered_path,
             focused: self.focused_element,
-            top_layer: self.top_layer_elements(),
-            popovers: self.popovers.iter().copied().collect(),
+            top_layer: Shared::from_value(self.top_layer_elements()),
+            popovers: if self.popovers.is_empty() {
+                Shared::default()
+            } else {
+                Shared::new(self.popovers.iter().copied().collect())
+            },
             focus_visible: self
                 .focused_element
                 .is_some_and(|node| !self.pointer_modality || self.is_text_control(node)),
             active: self.active_node,
-            forced: self.forced_pseudo_classes.clone(),
-            control_values: self.control_values.clone().into_iter().collect(),
+            forced: if self.forced_pseudo_classes.is_empty() {
+                Shared::default()
+            } else {
+                Shared::new(self.forced_pseudo_classes.clone())
+            },
+            control_values: if self.control_values.is_empty() {
+                Shared::default()
+            } else {
+                Shared::new(self.control_values.clone().into_iter().collect())
+            },
+            indeterminate: if self.indeterminate.is_empty() {
+                Shared::default()
+            } else {
+                Shared::new(self.indeterminate.clone())
+            },
             ..StyleState::default()
         };
-        state.indeterminate = self.indeterminate.clone();
         let controls = self.element_lists();
-        // what the sets follow from: the tree and its attributes, by the document's versions,
-        // and each control's own state, folded in any order
         let stamp = {
-            use std::hash::{Hash, Hasher};
-            let fold = |states: &HashMap<NodeId, bool>| {
-                states.iter().fold(states.len() as u64, |sum, entry| {
-                    let mut hasher = crate::hashing::Fast::default();
-                    entry.hash(&mut hasher);
-                    sum.wrapping_add(hasher.finish())
-                })
-            };
             let document = self.document.borrow();
             (
                 document.version(),
                 document.selector_version(),
-                fold(&self.control_checked),
-                fold(&self.option_selected),
+                self.checked_version,
             )
         };
         let kept = self
@@ -3696,6 +3730,7 @@ impl ScriptRuntime {
                     unchecked.insert(option);
                 }
             }
+            let (checked, unchecked) = (Shared::from_value(checked), Shared::from_value(unchecked));
             *self.checked_controls.borrow_mut() = Some((stamp, checked.clone(), unchecked.clone()));
             (checked, unchecked)
         });
@@ -3976,6 +4011,7 @@ impl ScriptRuntime {
                 let checked = self.is_control_checked(node);
                 self.indeterminate.remove(&node);
                 self.control_checked.insert(node, !checked);
+                self.checked_version = self.checked_version.wrapping_add(1);
                 self.dirty_checked_controls.insert(node);
                 true
             }
@@ -3990,6 +4026,7 @@ impl ScriptRuntime {
                     }
                 }
                 self.control_checked.insert(node, true);
+                self.checked_version = self.checked_version.wrapping_add(1);
                 if !was_checked {
                     self.dirty_checked_controls.insert(node);
                 }
@@ -4162,10 +4199,13 @@ impl ScriptRuntime {
                 self.option_selected.insert(*option, selected);
                 self.dirty_options.remove(option);
             }
+            self.checked_version = self.checked_version.wrapping_add(1);
             self.normalize_select_selection(node, false);
         }
         self.control_values.remove(&node);
-        self.control_checked.remove(&node);
+        if self.control_checked.remove(&node).is_some() {
+            self.checked_version = self.checked_version.wrapping_add(1);
+        }
         self.dirty_controls.remove(&node);
         self.last_user_edit.remove(&node);
         self.dirty_checked_controls.remove(&node);
@@ -6556,7 +6596,9 @@ impl ScriptRuntime {
 
     fn set_option_selected_raw(&mut self, node: NodeId, selected: bool, dirty: bool) {
         let changed = self.is_option_selected(node) != selected;
-        self.option_selected.insert(node, selected);
+        if self.option_selected.insert(node, selected) != Some(selected) {
+            self.checked_version = self.checked_version.wrapping_add(1);
+        }
         if dirty && changed {
             self.dirty_options.insert(node);
         }
@@ -6867,6 +6909,7 @@ impl ScriptRuntime {
         }
         if !self.dirty_checked_controls.contains(&node) {
             self.control_checked.insert(node, checked);
+            self.checked_version = self.checked_version.wrapping_add(1);
         }
         true
     }
@@ -7325,6 +7368,7 @@ impl ScriptRuntime {
             && !self.dirty_checked_controls.contains(&node)
         {
             self.control_checked.insert(node, true);
+            self.checked_version = self.checked_version.wrapping_add(1);
         }
         if changed && name.eq_ignore_ascii_case("value") && !self.dirty_controls.contains(&node) {
             self.control_values.remove(&node);
@@ -7478,6 +7522,7 @@ impl ScriptRuntime {
             }
         }
         self.control_checked.insert(node, checked);
+        self.checked_version = self.checked_version.wrapping_add(1);
         self.dirty_checked_controls.insert(node);
         true
     }
@@ -7501,6 +7546,7 @@ impl ScriptRuntime {
             && !self.dirty_checked_controls.contains(&node)
         {
             self.control_checked.insert(node, false);
+            self.checked_version = self.checked_version.wrapping_add(1);
         }
         if changed && name.eq_ignore_ascii_case("value") && !self.dirty_controls.contains(&node) {
             self.control_values.remove(&node);

@@ -30,7 +30,7 @@ pub(crate) struct LayoutInputs {
     pub(crate) extras: StyleState,
 }
 
-// a layout of the document as it stood, with every node's boxes indexed
+// a layout of the document as it stood, shared with the frame and indexed lazily on box reads
 pub(super) struct MeasuredLayout {
     version: u64,
     // the sheet it was styled by, which devtools can replace while the document stays
@@ -40,8 +40,23 @@ pub(super) struct MeasuredLayout {
     timeless: bool,
     // the clock time an animation in it next changes what it shows, when it steps or waits
     holds_until: Option<u64>,
-    boxes: HashMap<NodeId, Vec<BoxGeometry>>,
-    layout: LayoutDocument,
+    // when the next animation step or tick is due, even if transitions also run
+    wake_at: Option<u64>,
+    // elements whose motion only repaints them, so frame layout keeps repaint_motion active
+    motion: Option<std::collections::BTreeSet<NodeId>>,
+    boxes: RefCell<Option<HashMap<NodeId, Vec<BoxGeometry>>>>,
+    layout: Rc<LayoutDocument>,
+}
+
+impl MeasuredLayout {
+    fn boxes(&self) -> std::cell::Ref<'_, HashMap<NodeId, Vec<BoxGeometry>>> {
+        if self.boxes.borrow().is_none() {
+            *self.boxes.borrow_mut() = Some(self.layout.box_index());
+        }
+        std::cell::Ref::map(self.boxes.borrow(), |boxes| {
+            boxes.as_ref().expect("box index was just built")
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -427,14 +442,17 @@ impl ScriptRuntime {
         state.image_sizes = extras.image_sizes.clone();
         // a canvas and a video know their own sizes before the page has first laid out
         let lists = self.element_lists();
-        let document = self.document.borrow();
-        for &node in &lists[2] {
-            let size = super::canvas_size(&document, node);
-            state.image_sizes.insert(node, size);
-        }
-        drop(document);
-        for &node in &lists[3] {
-            state.image_sizes.insert(node, self.video_size(node));
+        if !lists[2].is_empty() || !lists[3].is_empty() {
+            let image_sizes = state.image_sizes.make_mut();
+            let document = self.document.borrow();
+            for &node in &lists[2] {
+                let size = super::canvas_size(&document, node);
+                image_sizes.insert(node, size);
+            }
+            drop(document);
+            for &node in &lists[3] {
+                image_sizes.insert(node, self.video_size(node));
+            }
         }
         // the last measurement knows container sizes the page's own layout may not yet
         state.container_sizes = self.measured.borrow().as_ref().map_or_else(
@@ -474,11 +492,7 @@ impl ScriptRuntime {
         let version = self.document.borrow().version();
         let stylesheet = crate::navigation::SheetIdentity::of(&inputs.stylesheet);
         let stale = self.measured.borrow().as_ref().is_none_or(|measured| {
-            let only_the_clock = measured.state
-                == StyleState {
-                    clock: measured.state.clock,
-                    ..state.clone()
-                };
+            let only_the_clock = measured.state.eq_ignoring_clock(&state);
             // a stepping animation shows the same thing until its next step
             let held = measured
                 .holds_until
@@ -492,12 +506,7 @@ impl ScriptRuntime {
                 "measure: again, document changed"
             } else if measured.stylesheet != stylesheet {
                 "measure: again, sheet changed"
-            } else if measured.state
-                == (StyleState {
-                    clock: measured.state.clock,
-                    ..state.clone()
-                })
-            {
+            } else if measured.state.eq_ignoring_clock(&state) {
                 "measure: again, clock moved under a timed layout"
             } else {
                 "measure: again, state changed"
@@ -507,59 +516,97 @@ impl ScriptRuntime {
             let mut state = state;
             let reported = crate::css::clock_reads();
             let outer_wake = crate::css::take_animation_wake();
+            let outer_motion = crate::css::push_motion();
             let mut layout = self.run_layout(&inputs, &state);
             // container queries read sizes from a layout, so a change in them lays out again
             if inputs.stylesheet.has_container_queries() {
-                let measured = crate::layout::take_layout_containers();
+                let measured =
+                    crate::css::Shared::from_value(crate::layout::take_layout_containers());
                 if measured != state.container_sizes {
                     state.container_sizes = measured;
                     layout = self.run_layout(&inputs, &state);
                 }
             }
+            let motion = crate::css::pop_motion(outer_motion);
             let wake = crate::css::take_animation_wake();
             crate::css::restore_animation_wake(match (outer_wake, wake) {
                 (Some(outer), Some(own)) => Some(outer.min(own)),
                 (outer, own) => outer.or(own),
             });
+            let wake_at = wake.map(|delay| state.clock.saturating_add(delay));
             *self.measured.borrow_mut() = Some(MeasuredLayout {
                 version,
                 stylesheet,
                 timeless: crate::css::clock_reads() == reported && state.transitions.is_empty(),
-                holds_until: wake
-                    .filter(|_| state.transitions.is_empty())
-                    .map(|delay| state.clock.saturating_add(delay)),
+                holds_until: wake_at.filter(|_| state.transitions.is_empty()),
+                wake_at,
+                motion,
                 state,
-                boxes: layout.box_index(),
-                layout,
+                boxes: RefCell::new(None),
+                layout: Rc::new(layout),
             });
         }
         std::cell::Ref::filter_map(self.measured.borrow(), Option::as_ref).ok()
     }
 
     // the layout a script's read of a box last made, when the frame about to be laid out is
-    // that same layout: the same document, sheet and state
+    // that same layout: the same document, sheet, state and effective clock
     pub(crate) fn measured_layout(
         &self,
         version: u64,
         stylesheet: crate::navigation::SheetIdentity,
         state: &StyleState,
-    ) -> Option<LayoutDocument> {
+    ) -> Option<(
+        Rc<LayoutDocument>,
+        Option<u64>,
+        Option<std::collections::BTreeSet<NodeId>>,
+    )> {
         let measured = self.measured.borrow();
         let measured = measured.as_ref()?;
-        // custom properties and the root element they hang from follow from the document and
-        // sheet, and a layout that read no clock holds at any time
-        let same = measured.state
-            == StyleState {
-                clock: measured.state.clock,
-                custom_properties: measured.state.custom_properties.clone(),
-                root: measured.state.root,
-                ..state.clone()
-            };
-        (measured.version == version
-            && measured.stylesheet == stylesheet
-            && measured.timeless
-            && same)
-            .then(|| measured.layout.clone())
+        let same = measured.state.eq_for_measured(state);
+        let held = measured
+            .holds_until
+            .is_some_and(|until| (measured.state.clock..until).contains(&state.clock));
+        let same_moment = measured.timeless || measured.state.clock == state.clock || held;
+        (measured.version == version && measured.stylesheet == stylesheet && same && same_moment)
+            .then(|| {
+                (
+                    measured.layout.clone(),
+                    measured.wake_at,
+                    measured.motion.clone(),
+                )
+            })
+    }
+
+    // adopts a fresh frame layout so subsequent script reads share the same tree
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn adopt_measured_layout(
+        &self,
+        version: u64,
+        stylesheet: crate::navigation::SheetIdentity,
+        state: StyleState,
+        timeless: bool,
+        wake_at: Option<u64>,
+        motion: Option<std::collections::BTreeSet<NodeId>>,
+        layout: Rc<LayoutDocument>,
+    ) {
+        if state.viewport_width != self.viewport.width
+            || state.viewport_height != self.viewport.height
+        {
+            return;
+        }
+        let holds_until = wake_at.filter(|_| state.transitions.is_empty());
+        *self.measured.borrow_mut() = Some(MeasuredLayout {
+            version,
+            stylesheet,
+            timeless,
+            holds_until,
+            wake_at,
+            motion,
+            state,
+            boxes: RefCell::new(None),
+            layout,
+        });
     }
 
     // reads boxes through one measurement taken at the start, for a pass that runs no script
@@ -588,7 +635,8 @@ impl ScriptRuntime {
         let Some(measured) = self.measure() else {
             return Vec::new();
         };
-        if let Some(boxes) = measured.boxes.get(&node) {
+        let index = measured.boxes();
+        if let Some(boxes) = index.get(&node) {
             return boxes.clone();
         }
         // an inline element has no box of its own: it is the text and boxes inside it, one
@@ -600,7 +648,7 @@ impl ScriptRuntime {
         let mut lines: Vec<BoxGeometry> = Vec::new();
         for part in document
             .descendants(node)
-            .filter_map(|descendant| measured.boxes.get(&descendant))
+            .filter_map(|descendant| index.get(&descendant))
             .flatten()
         {
             let rect = part.rect;
