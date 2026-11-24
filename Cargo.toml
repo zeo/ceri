@@ -18,9 +18,15 @@ path = "src/main.rs"
 name = "ceri_bundle"
 path = "src/bin/ceri_bundle/main.rs"
 
+[features]
+# mimalloc as the allocator, faster for script and layout; an app that settles lower on the
+# system allocator depends on ceri with default-features = false
+default = ["mimalloc"]
+mimalloc = ["ceri-engine/mimalloc"]
+
 [dependencies]
 ceri-build = { path = "build" }
-ceri-engine = { path = "engine", features = ["windowed"] }
+ceri-engine = { path = "engine", default-features = false, features = ["windowed"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 
@@ -68,7 +74,7 @@ x11rb = "=0.13.2"
 
 # windows reaches the network through the platform stack, other targets use the engine client
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-ceri-engine = { path = "engine", features = ["windowed", "native-http"] }
+ceri-engine = { path = "engine", default-features = false, features = ["windowed", "native-http"] }
 
 [profile.release]
 codegen-units = 1
