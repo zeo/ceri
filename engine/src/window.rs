@@ -1222,9 +1222,9 @@ impl AppWindow {
                 }
             }
             WindowEvent::Resized(size) => {
-                // a minimized window reports no size, and its page keeps the one it had, as in
-                // chromium, instead of laying out at a pixel wide and again on restore
-                let sized = size.width > 0 && size.height > 0;
+                // a minimized window reports no size, or on windows its caption's size, and its
+                // page keeps the one it had, as in chromium, instead of laying out again twice
+                let sized = size.width > 0 && size.height > 0 && !self.minimized();
                 #[cfg(target_os = "windows")]
                 if sized
                     && let Some(output) = &mut self.output
@@ -1644,7 +1644,7 @@ impl AppWindow {
     }
 
     fn redraw(&mut self) {
-        if !self.poll_worker() {
+        if !self.poll_worker() || self.minimized() {
             return;
         }
         let Some(size) = self.window.as_ref().map(|window| window.inner_size()) else {
@@ -1775,6 +1775,12 @@ impl AppWindow {
                 self.submit(display);
             }
         }
+    }
+
+    fn minimized(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.is_minimized() == Some(true))
     }
 
     fn window_scale(&self) -> f32 {
