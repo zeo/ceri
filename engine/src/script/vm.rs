@@ -1915,9 +1915,23 @@ impl ScriptRuntime {
                 Op::SetProp(name) => {
                     let value = Self::pop(frame);
                     let object = Self::pop(frame);
-                    let key = frame.code.names[name as usize].clone();
-                    let strict = frame.code.strict;
-                    self.set_property(&object, &key, value.clone(), strict)?;
+                    let cache = &frame.code.property_caches[name as usize];
+                    let written = match &object {
+                        Value::Object(handle) => handle.try_borrow_mut().is_ok_and(|mut target| {
+                            target.cached_set(cache, value.clone()).is_ok()
+                        }),
+                        _ => false,
+                    };
+                    if !written {
+                        let key = frame.code.names[name as usize].clone();
+                        let strict = frame.code.strict;
+                        self.set_property(&object, &key, value.clone(), strict)?;
+                        if let Value::Object(handle) = &object
+                            && let Ok(target) = handle.try_borrow()
+                        {
+                            target.note_position(&key, cache);
+                        }
+                    }
                     frames.last_mut().expect("frame").stack.push(value);
                 }
                 Op::SetIndex => {

@@ -20160,6 +20160,36 @@ mod tests {
         );
     }
     #[test]
+    fn writes_through_the_property_cache_keep_every_rule_of_assignment() {
+        let document = document(r#"<main><p id="status">idle</p></main>"#);
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                "use strict";
+                const out = [];
+                const write = (target, value) => { try { target.v = value; return target.v; } catch (error) { return error.name; } };
+                const plain = { v: 0 };
+                for (let i = 1; i < 4; i++) write(plain, i);
+                out.push(write(plain, 5));
+                Object.defineProperty(plain, "v", { writable: false }); out.push(write(plain, 6));
+                const proto = { set v(x) { out.push("setter " + x); } };
+                const child = Object.create(proto); out.push(write(child, 1));
+                const owned = Object.create(proto); Object.defineProperty(owned, "v", { value: 1, writable: true, enumerable: true, configurable: true }); out.push(write(owned, 2)); out.push(write(owned, 3));
+                const frozen = { v: 1 }; write(frozen, 2); Object.freeze(frozen); out.push(write(frozen, 3));
+                const deleted = { v: 1 }; write(deleted, 2); delete deleted.v; out.push(write(deleted, 4));
+                const seen = []; const proxy = new Proxy({ v: 1 }, { set(target, key, value) { seen.push(value); target[key] = value; return true; } }); write(proxy, 7); write(proxy, 8); out.push(seen.join("+"));
+                const getter = { get v() { return "g"; } }; out.push(write(getter, 1));
+                document.getElementById("status").textContent = out.join(",");
+                "#,
+            )
+            .expect("script should run");
+        assert_eq!(
+            status_text(&document).as_deref(),
+            Some("5,TypeError,setter 1,,2,3,TypeError,4,7+8,TypeError")
+        );
+    }
+    #[test]
     fn reads_through_a_prototype_follow_every_change_to_it() {
         let document = document(r#"<main><p id="status">idle</p></main>"#);
         let mut runtime = ScriptRuntime::new(document.clone());

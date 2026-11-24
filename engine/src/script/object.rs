@@ -503,6 +503,38 @@ impl JsObject {
         }
     }
 
+    // writes an ordinary object's own writable data property where the cache noted it, which
+    // a write to it settles without looking up the prototypes for a setter; the value comes
+    // back when the write needs the full path
+    pub(super) fn cached_set(&mut self, cache: &PropertyCache, value: Value) -> Result<(), Value> {
+        if !matches!(self.class, ObjectClass::Ordinary) {
+            return Err(value);
+        }
+        let index = match cache.0.borrow().as_ref() {
+            Some(Cached::Own(shape, index))
+                if std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&self.shape)) =>
+            {
+                *index
+            }
+            _ => return Err(value),
+        };
+        let plain = matches!(
+            self.properties.get(index),
+            Some(Property {
+                slot: Slot::Data(current),
+                writable: true,
+                ..
+            }) if !matches!(current, Value::Binding(..))
+        );
+        if !plain {
+            return Err(value);
+        }
+        if let Slot::Data(slot) = &mut self.properties.own()[index].slot {
+            *slot = value;
+        }
+        Ok(())
+    }
+
     // a method read off Array.prototype through an array with no prototype or property of
     // its own
     pub(super) fn cached_array_method(
