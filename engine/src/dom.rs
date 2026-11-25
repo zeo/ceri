@@ -1614,6 +1614,49 @@ impl Document {
         self.shadow_hosts.get(&root).copied()
     }
 
+    // how many shadow boundaries lie between node's tree and the document root
+    pub(crate) fn shadow_depth(&self, node: NodeId) -> u32 {
+        if !self.has_shadow_roots() {
+            return 0;
+        }
+        let mut depth = 0_u32;
+        let mut root = self.tree_root(node);
+        while let Some((host, _)) = self.shadow_host(root) {
+            depth += 1;
+            root = self.tree_root(host);
+        }
+        depth
+    }
+
+    // parses an element's exportparts attribute into (inner_name, outer_name) pairs
+    pub(crate) fn exportparts_mappings(element: &Element) -> Vec<(&str, &str)> {
+        let Some(raw) = element.attr("exportparts") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            if let Some((left, right)) = entry.split_once(':') {
+                let inner = left.trim();
+                let outer = right.trim();
+                if !inner.is_empty()
+                    && !outer.is_empty()
+                    && !inner.contains(char::is_whitespace)
+                    && !outer.contains(char::is_whitespace)
+                    && !outer.contains(':')
+                {
+                    out.push((inner, outer));
+                }
+            } else if !entry.contains(char::is_whitespace) {
+                out.push((entry, entry));
+            }
+        }
+        out
+    }
+
     // the parent, or the host for a shadow root, which events and inheritance follow
     pub fn composed_parent(&self, id: NodeId) -> Option<NodeId> {
         self.parent(id)

@@ -11821,6 +11821,7 @@ mod tests {
                 has_sticky: false,
                 has_stacking_descendant: false,
                 has_backdrop_filter: false,
+                has_auto_visibility: false,
             },
             images: Vec::new(),
             prose_selections: vec![crate::layout::ProseSpan {
@@ -12527,6 +12528,7 @@ mod tests {
                 has_sticky: false,
                 has_stacking_descendant: false,
                 has_backdrop_filter: false,
+                has_auto_visibility: false,
             },
             images: Vec::new(),
             prose_selections: Vec::new(),
@@ -12693,6 +12695,7 @@ mod tests {
                 has_sticky: false,
                 has_stacking_descendant: false,
                 has_backdrop_filter: false,
+                has_auto_visibility: false,
             },
             images: Vec::new(),
             prose_selections: Vec::new(),

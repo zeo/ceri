@@ -6,8 +6,8 @@ use crate::css::{
     StyleState, Stylesheet, TextAlign, inherited_text,
 };
 use crate::css::{
-    Clear, ContentSize, Cursor, Float, ListStyleType, OverflowWrap, ScrollbarWidth, SpaceCollapse,
-    VerticalAlign, Visibility,
+    Clear, ContentSize, ContentVisibility, Cursor, Float, ListStyleType, OverflowWrap,
+    ScrollbarWidth, SpaceCollapse, VerticalAlign, Visibility,
 };
 use crate::dom::{Document, Element, Namespace, NodeId, NodeKind};
 use crate::font::{FontStack, FontStyle};
@@ -191,6 +191,7 @@ pub struct LayoutBox {
     pub(crate) has_sticky: bool,
     pub(crate) has_stacking_descendant: bool,
     pub(crate) has_backdrop_filter: bool,
+    pub(crate) has_auto_visibility: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -556,10 +557,305 @@ fn establishes_formatting_context(style: &Style) -> bool {
     style.float != Float::None
         || style.position.is_out_of_flow()
         || style.overflow.clips()
+        || style.content_visibility != ContentVisibility::Visible
         || !matches!(
             style.display,
             Display::Block | Display::Inline | Display::ListItem
         )
+}
+
+fn effective_overflow(style: &Style) -> (Overflow, [Overflow; 2]) {
+    let mut axes = style.overflow_axes();
+    if style.content_visibility != ContentVisibility::Visible {
+        for axis in &mut axes {
+            if *axis == Overflow::Visible {
+                *axis = Overflow::Clip;
+            }
+        }
+    }
+    let overflow = match axes {
+        axes if axes.contains(&Overflow::Auto) => Overflow::Auto,
+        axes if axes.contains(&Overflow::Hidden) => Overflow::Hidden,
+        axes if axes.contains(&Overflow::Clip) => Overflow::Clip,
+        _ => Overflow::Visible,
+    };
+    (overflow, axes)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ViewportWindow {
+    clip: Rect,
+    scroll: (f32, f32),
+}
+
+thread_local! {
+    // remembered content-box sizes for contain-intrinsic-*: auto <length>
+    static REMEMBERED_SIZES: std::cell::RefCell<HashMap<(u64, NodeId), (f32, f32)>> =
+        std::cell::RefCell::default();
+    // viewport clip and cumulative ancestor scroll offset during a layout pass
+    static VIEWPORT_WINDOW: std::cell::Cell<Option<ViewportWindow>> =
+        const { std::cell::Cell::new(None) };
+}
+
+struct ViewportWindowGuard {
+    previous: Option<ViewportWindow>,
+}
+
+impl ViewportWindowGuard {
+    fn enter(window: ViewportWindow) -> Self {
+        let previous = VIEWPORT_WINDOW.with(|cell| cell.replace(Some(window)));
+        Self { previous }
+    }
+}
+
+impl Drop for ViewportWindowGuard {
+    fn drop(&mut self) {
+        VIEWPORT_WINDOW.with(|cell| cell.set(self.previous));
+    }
+}
+
+fn remembered_size(document: &Document, node: NodeId) -> Option<(f32, f32)> {
+    REMEMBERED_SIZES.with(|sizes| sizes.borrow().get(&(document.identity(), node)).copied())
+}
+
+fn record_remembered_size(document: &Document, node: NodeId, style: &Style, size: (f32, f32)) {
+    let key = (document.identity(), node);
+    let axes = style.contain_intrinsic_axes();
+    if axes[0].auto || axes[1].auto {
+        REMEMBERED_SIZES.with(|sizes| {
+            sizes.borrow_mut().insert(key, size);
+        });
+    } else {
+        REMEMBERED_SIZES.with(|sizes| {
+            let mut map = sizes.borrow_mut();
+            if !map.is_empty() {
+                map.remove(&key);
+            }
+        });
+    }
+}
+
+fn resolve_contain_intrinsic(
+    style: &Style,
+    axis: usize,
+    document: &Document,
+    node: Option<NodeId>,
+    font_size: f32,
+) -> Option<f32> {
+    let spec = style.contain_intrinsic_axes()[axis];
+    if spec.auto
+        && let Some((width, height)) = node.and_then(|id| remembered_size(document, id))
+    {
+        return Some(if axis == 0 { width } else { height });
+    }
+    if spec.length == Length::Auto {
+        return None;
+    }
+    spec.length
+        .resolve(0.0, font_size)
+        .map(|value| value.max(0.0))
+}
+
+fn is_composed_inclusive_ancestor(
+    document: &Document,
+    ancestor: NodeId,
+    descendant: NodeId,
+) -> bool {
+    if !document.has_shadow_roots() {
+        return document.is_inclusive_ancestor(ancestor, descendant);
+    }
+    let mut current = Some(descendant);
+    while let Some(node) = current {
+        if node == ancestor {
+            return true;
+        }
+        current = document.composed_parent(node);
+    }
+    false
+}
+
+fn intersects_viewport(rect: Rect, clip: Rect) -> bool {
+    if clip.width <= 0.0 || clip.height <= 0.0 {
+        return false;
+    }
+    let x_hit = if rect.width > 0.0 {
+        rect.x < clip.right() && rect.right() > clip.x
+    } else {
+        rect.x >= clip.x && rect.x <= clip.right()
+    };
+    let y_hit = if rect.height > 0.0 {
+        rect.y < clip.bottom() && rect.bottom() > clip.y
+    } else {
+        rect.y >= clip.y && rect.y <= clip.bottom()
+    };
+    x_hit && y_hit
+}
+
+fn estimate_visual_offset(
+    style: &Style,
+    containing: ContainingBlock,
+    width: f32,
+    height: f32,
+    font_size: f32,
+) -> (f32, f32) {
+    let translate = (
+        style.translate.0.resolve(width, font_size).unwrap_or(0.0),
+        style.translate.1.resolve(height, font_size).unwrap_or(0.0),
+    );
+    if style.position != Position::Relative {
+        return translate;
+    }
+    let inset = resolve_insets(style.inset, containing, font_size);
+    (
+        translate.0
+            + inset
+                .left
+                .or_else(|| inset.right.map(|value| -value))
+                .unwrap_or(0.0),
+        translate.1
+            + inset
+                .top
+                .or_else(|| inset.bottom.map(|value| -value))
+                .unwrap_or(0.0),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn should_skip_contents(
+    node: Subject<'_>,
+    style: &Style,
+    style_state: &StyleState,
+    mode: LayoutMode,
+    viewport: Size,
+    containing_block: ContainingBlock,
+    border_rect: Rect,
+    font_size: f32,
+) -> bool {
+    match style.content_visibility {
+        ContentVisibility::Visible => false,
+        ContentVisibility::Hidden => true,
+        ContentVisibility::Auto => {
+            if let Some(own) = node.own() {
+                if style_state.focused.is_some_and(|focused| {
+                    is_composed_inclusive_ancestor(node.document, own, focused)
+                }) {
+                    return false;
+                }
+                if style_state
+                    .top_layer
+                    .iter()
+                    .any(|&top| is_composed_inclusive_ancestor(node.document, own, top))
+                {
+                    return false;
+                }
+            }
+            let window = if mode == LayoutMode::Fixed {
+                ViewportWindow {
+                    clip: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: viewport.width,
+                        height: viewport.height,
+                    },
+                    scroll: (0.0, 0.0),
+                }
+            } else {
+                VIEWPORT_WINDOW
+                    .with(|cell| cell.get())
+                    .unwrap_or(ViewportWindow {
+                        clip: Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: viewport.width,
+                            height: viewport.height,
+                        },
+                        scroll: (0.0, 0.0),
+                    })
+            };
+            let offset = estimate_visual_offset(
+                style,
+                containing_block,
+                border_rect.width,
+                border_rect.height,
+                font_size,
+            );
+            let screen = Rect {
+                x: border_rect.x + offset.0 - window.scroll.0,
+                y: border_rect.y + offset.1 - window.scroll.1,
+                width: border_rect.width,
+                height: border_rect.height,
+            };
+            !intersects_viewport(screen, window.clip)
+        }
+    }
+}
+
+fn child_viewport_window(
+    node: Subject<'_>,
+    style: &Style,
+    style_state: &StyleState,
+    bounds: (LayoutMode, Size, Rect),
+    height_limits: (Option<f32>, f32, f32),
+    scroll_override: Option<(f32, f32)>,
+) -> Option<ViewportWindow> {
+    let (mode, viewport, rect) = bounds;
+    let (explicit_height, max_height, vertical_inner) = height_limits;
+    let (overflow, _) = effective_overflow(style);
+    if mode != LayoutMode::Fixed && !overflow.clips() {
+        return None;
+    }
+    let parent = if mode == LayoutMode::Fixed {
+        ViewportWindow {
+            clip: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: viewport.width,
+                height: viewport.height,
+            },
+            scroll: (0.0, 0.0),
+        }
+    } else {
+        VIEWPORT_WINDOW.with(|cell| cell.get())?
+    };
+    if !overflow.clips() {
+        return Some(parent);
+    }
+    let clip_height = explicit_height
+        .map(|height| height + vertical_inner)
+        .or_else(|| {
+            max_height
+                .is_finite()
+                .then_some(max_height + vertical_inner)
+        })
+        .unwrap_or(1_000_000.0);
+    let container_rect = Rect {
+        x: rect.x - parent.scroll.0,
+        y: rect.y - parent.scroll.1,
+        width: rect.width,
+        height: clip_height,
+    };
+    let clip = intersect_rect(Some(parent.clip), container_rect).unwrap_or(Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+    });
+    let own_scroll = if matches!(overflow, Overflow::Auto | Overflow::Hidden) {
+        scroll_override.unwrap_or_else(|| {
+            node.own()
+                .and_then(|id| style_state.scroll_offsets.get(&id).copied())
+                .unwrap_or((0.0, 0.0))
+        })
+    } else {
+        (0.0, 0.0)
+    };
+    Some(ViewportWindow {
+        clip,
+        scroll: (
+            parent.scroll.0 + own_scroll.0,
+            parent.scroll.1 + own_scroll.1,
+        ),
+    })
 }
 
 struct InlineFragment {
@@ -692,7 +988,13 @@ impl<'a> Subject<'a> {
     }
 
     // text and element children in order, with generated boxes first and last
-    fn children(self, generated: &'a [Option<String>; 2]) -> Vec<Child<'a>> {
+    fn children(
+        self,
+        generated: &'a [Option<String>; 2],
+        stylesheet: &Stylesheet,
+        parent: &ParentStyle,
+        state: &StyleState,
+    ) -> Vec<Child<'a>> {
         let mut items = Vec::new();
         if let Some((_, content)) = self.generated {
             if !content.is_empty() {
@@ -714,19 +1016,70 @@ impl<'a> Subject<'a> {
             })
         };
         items.extend(generated_box(PseudoElement::Before, &generated[0]));
-        for &child in self.document.flat_children(self.node).iter() {
-            match self.document.kind(child) {
-                Some(NodeKind::Text(text)) => items.push(Child::Text(Some(child), text)),
-                Some(NodeKind::Element(_))
-                    if !TOP_LAYER.with(|layer| layer.borrow().contains(&child)) =>
-                {
-                    items.push(Child::Element(Subject::new(self.document, child)))
-                }
-                _ => {}
-            }
-        }
+        push_flat_children(
+            self.document,
+            self.node,
+            stylesheet,
+            parent,
+            state,
+            &mut items,
+            0,
+        );
         items.extend(generated_box(PseudoElement::After, &generated[1]));
         items
+    }
+}
+
+fn push_flat_children<'a>(
+    document: &'a Document,
+    parent_node: NodeId,
+    stylesheet: &Stylesheet,
+    parent: &ParentStyle,
+    state: &StyleState,
+    items: &mut Vec<Child<'a>>,
+    depth: usize,
+) {
+    let expand_slots = document.has_shadow_roots() && depth < 32;
+    for &child in document.flat_children(parent_node).iter() {
+        match document.kind(child) {
+            Some(NodeKind::Text(text)) => items.push(Child::Text(Some(child), text)),
+            Some(NodeKind::Element(element))
+                if !TOP_LAYER.with(|layer| layer.borrow().contains(&child)) =>
+            {
+                // shadow slots default to display: contents semantics unless explicitly boxed
+                if expand_slots
+                    && element.name == "slot"
+                    && document.shadow_host(document.tree_root(child)).is_some()
+                {
+                    let slot = Subject::new(document, child);
+                    let slot_style = stylesheet.style_for(slot.style_context(parent, state));
+                    match slot_style.display {
+                        Display::None => continue,
+                        Display::Inline => {
+                            let slot_font = slot_style
+                                .font_size
+                                .resolve(parent.font_size, parent.font_size)
+                                .unwrap_or(parent.font_size)
+                                .max(0.0);
+                            let slot_parent = parent.child(&slot_style, slot_font, 1.0);
+                            push_flat_children(
+                                document,
+                                child,
+                                stylesheet,
+                                &slot_parent,
+                                state,
+                                items,
+                                depth + 1,
+                            );
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                items.push(Child::Element(Subject::new(document, child)));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1059,6 +1412,7 @@ pub fn layout_with_state(
         has_sticky: false,
         has_stacking_descendant: false,
         has_backdrop_filter: false,
+        has_auto_visibility: false,
     };
     // the root element's scrollbar styles draw the viewport's bars
     if let Some(html) = document.document_element() {
@@ -1081,10 +1435,22 @@ pub fn layout_with_state(
         root.scrollbar =
             scrollbar_for(stylesheet, (document, html), &style, font_size, style_state);
     }
-    root.children = layout_document_children(document, stylesheet, viewport, style_state);
+    let requested_root_scroll = style_state
+        .scroll_offsets
+        .get(&document.root())
+        .copied()
+        .unwrap_or((0.0, 0.0));
+    root.children = layout_document_children(
+        document,
+        stylesheet,
+        viewport,
+        style_state,
+        requested_root_scroll,
+    );
     root.has_sticky = root.children.iter().any(|child| child.has_sticky);
     root.has_stacking_descendant = box_has_stacking(&root.children);
     root.has_backdrop_filter = root.children.iter().any(|child| child.has_backdrop_filter);
+    root.has_auto_visibility = root.children.iter().any(|child| child.has_auto_visibility);
     flush_child_shifts(&mut root, (0.0, 0.0));
     finalize_scroll(&mut root, ResolvedEdges::default(), style_state);
     // a classic vertical scrollbar takes its width from the initial and fixed containing
@@ -1095,10 +1461,32 @@ pub fn layout_with_state(
             ..viewport
         };
         CONTAINERS.with(|containers| containers.borrow_mut().clear());
-        root.children = layout_document_children(document, stylesheet, scrollport, style_state);
+        root.children = layout_document_children(
+            document,
+            stylesheet,
+            scrollport,
+            style_state,
+            root.scroll_offset,
+        );
         root.has_sticky = root.children.iter().any(|child| child.has_sticky);
         root.has_stacking_descendant = box_has_stacking(&root.children);
         root.has_backdrop_filter = root.children.iter().any(|child| child.has_backdrop_filter);
+        root.has_auto_visibility = root.children.iter().any(|child| child.has_auto_visibility);
+        flush_child_shifts(&mut root, (0.0, 0.0));
+        finalize_scroll(&mut root, ResolvedEdges::default(), style_state);
+    } else if root.has_auto_visibility && root.scroll_offset != requested_root_scroll {
+        CONTAINERS.with(|containers| containers.borrow_mut().clear());
+        root.children = layout_document_children(
+            document,
+            stylesheet,
+            viewport,
+            style_state,
+            root.scroll_offset,
+        );
+        root.has_sticky = root.children.iter().any(|child| child.has_sticky);
+        root.has_stacking_descendant = box_has_stacking(&root.children);
+        root.has_backdrop_filter = root.children.iter().any(|child| child.has_backdrop_filter);
+        root.has_auto_visibility = root.children.iter().any(|child| child.has_auto_visibility);
         flush_child_shifts(&mut root, (0.0, 0.0));
         finalize_scroll(&mut root, ResolvedEdges::default(), style_state);
     }
@@ -1115,7 +1503,17 @@ fn layout_document_children(
     stylesheet: &Stylesheet,
     viewport: Size,
     style_state: &StyleState,
+    root_scroll: (f32, f32),
 ) -> Vec<Rc<LayoutBox>> {
+    let _viewport_window = ViewportWindowGuard::enter(ViewportWindow {
+        clip: Rect {
+            x: 0.0,
+            y: 0.0,
+            width: viewport.width,
+            height: viewport.height,
+        },
+        scroll: root_scroll,
+    });
     let viewport_block = viewport_block(viewport);
     let mut children = Vec::new();
     let mut cursor_y = 0.0_f32;
@@ -2180,6 +2578,9 @@ fn append_positioned_to(
         }
         if child.has_backdrop_filter {
             layout.has_backdrop_filter = true;
+        }
+        if child.has_auto_visibility {
+            layout.has_auto_visibility = true;
         }
     }
 }
@@ -3423,6 +3824,7 @@ pub(crate) fn forget_kept_answers() {
             *kept = KeptAnswers::default();
         }
     });
+    REMEMBERED_SIZES.with(|sizes| sizes.borrow_mut().clear());
 }
 
 // a layout that takes nothing from the one before it and leaves the kept answers as they were
@@ -3578,7 +3980,13 @@ fn layout_element_rc(input: ElementLayoutInput<'_, '_>) -> Option<Rc<LayoutBox>>
     let layout = layout_element_fresh_with_style(input, style).map(Rc::new);
     let momentary = style_momentary || crate::css::moment_reports() != reported;
     let refers = crate::svg::reference_reads() != looked_up;
-    if placed() > 0 {
+    // content-visibility: auto depends on the active viewport window, which can change within one pass
+    if placed() > 0
+        || style.content_visibility == ContentVisibility::Auto
+        || layout
+            .as_ref()
+            .is_some_and(|layout| layout.has_auto_visibility)
+    {
         return layout;
     }
     KEPT.with(|kept| {
@@ -3618,8 +4026,28 @@ fn layout_element_fresh_with_style(
     if style.display == Display::None {
         return None;
     }
+    let settle_clamped_scroll = |layout: LayoutBox, gutter: f32| -> Option<LayoutBox> {
+        if !layout.has_auto_visibility
+            || !matches!(layout.overflow, Overflow::Auto | Overflow::Hidden)
+        {
+            return Some(layout);
+        }
+        let requested = input
+            .node
+            .own()
+            .and_then(|id| input.context.style_state.scroll_offsets.get(&id).copied())
+            .unwrap_or((0.0, 0.0));
+        if (layout.scroll_offset.0 - requested.0).abs() > 0.5
+            || (layout.scroll_offset.1 - requested.1).abs() > 0.5
+        {
+            layout_element_with_gutter(input.clone(), style, gutter, Some(layout.scroll_offset))
+        } else {
+            Some(layout)
+        }
+    };
     if style.overflow_axes()[1] != Overflow::Auto {
-        return layout_element_with_gutter(input, style, 0.0);
+        let layout = layout_element_with_gutter(input.clone(), style, 0.0, None)?;
+        return settle_clamped_scroll(layout, 0.0);
     }
     // a vertical scrollbar sits between the border and the padding, so the content box gives
     // up its width and the content lays out again. a box lays out first with the scrollbar it
@@ -3628,16 +4056,16 @@ fn layout_element_fresh_with_style(
     let node = (input.node.document.identity(), input.node.node);
     let last = GUTTERS.with(|gutters| gutters.borrow().get(&node).copied());
     if let Some(last) = last {
-        let layout = layout_element_with_gutter(input.clone(), style, last)?;
+        let layout = layout_element_with_gutter(input.clone(), style, last, None)?;
         if wanted_gutter(&layout) == Some(last) {
-            return Some(layout);
+            return settle_clamped_scroll(layout, last);
         }
     }
-    let layout = layout_element_with_gutter(input.clone(), style, 0.0)?;
+    let layout = layout_element_with_gutter(input.clone(), style, 0.0, None)?;
     let (gutter, layout) = match wanted_gutter(&layout) {
         Some(gutter) => (
             Some(gutter),
-            layout_element_with_gutter(input, style, gutter)?,
+            layout_element_with_gutter(input.clone(), style, gutter, None)?,
         ),
         None => (None, layout),
     };
@@ -3656,7 +4084,7 @@ fn layout_element_fresh_with_style(
             }
         }
     });
-    Some(layout)
+    settle_clamped_scroll(layout, gutter.unwrap_or(0.0))
 }
 
 thread_local! {
@@ -3680,6 +4108,7 @@ fn layout_element_with_gutter(
     input: ElementLayoutInput<'_, '_>,
     style: Style,
     gutter: f32,
+    scroll_override: Option<(f32, f32)>,
 ) -> Option<LayoutBox> {
     let ElementLayoutInput {
         node,
@@ -3766,6 +4195,123 @@ fn layout_element_with_gutter(
             })
         })
         .or(control_size.1);
+    let min_width = style
+        .min_width
+        .resolve(containing_width, font_size)
+        .map(inner_width)
+        .unwrap_or(0.0);
+    let max_width = style
+        .max_width
+        .resolve(containing_width, font_size)
+        .map(inner_width)
+        .unwrap_or(f32::INFINITY);
+    let min_height = resolve_height(style.min_height, containing_height, font_size)
+        .map(inner_height)
+        .unwrap_or(0.0);
+    let max_height = resolve_height(style.max_height, containing_height, font_size)
+        .map(inner_height)
+        .unwrap_or(f32::INFINITY);
+    let has_auto_visibility = style.content_visibility == ContentVisibility::Auto;
+    let intrinsic_axes = style.contain_intrinsic_axes();
+    if has_auto_visibility || intrinsic_axes[0].auto || intrinsic_axes[1].auto {
+        crate::css::report_moment();
+    }
+    let skip_contents = match style.content_visibility {
+        ContentVisibility::Visible => false,
+        ContentVisibility::Hidden => true,
+        ContentVisibility::Auto => {
+            let est_w = size_override
+                .0
+                .or_else(|| {
+                    style
+                        .width
+                        .resolve(containing_width, font_size)
+                        .map(inner_width)
+                })
+                .or_else(|| {
+                    let stretch =
+                        mode != LayoutMode::Flow && style.content_size[0] == ContentSize::None;
+                    (stretch && inset.left.is_some() && inset.right.is_some()).then(|| {
+                        (position_block.width
+                            - inset.left.unwrap_or(0.0)
+                            - inset.right.unwrap_or(0.0)
+                            - horizontal_extras)
+                            .max(0.0)
+                    })
+                })
+                .or_else(|| {
+                    (mode != LayoutMode::Flow || style.content_size[0] != ContentSize::None).then(
+                        || {
+                            resolve_contain_intrinsic(
+                                &style,
+                                0,
+                                node.document,
+                                node.own(),
+                                font_size,
+                            )
+                            .unwrap_or(0.0)
+                        },
+                    )
+                })
+                .unwrap_or((containing_width - horizontal_extras).max(0.0))
+                .min(max_width)
+                .max(min_width)
+                .max(0.0)
+                + horizontal_inner;
+            let est_h = size_override
+                .1
+                .or_else(|| {
+                    explicit_height
+                        .or_else(|| {
+                            resolve_contain_intrinsic(
+                                &style,
+                                1,
+                                node.document,
+                                node.own(),
+                                font_size,
+                            )
+                        })
+                        .map(|height| height.min(max_height).max(min_height))
+                })
+                .unwrap_or(0.0)
+                .max(0.0)
+                + vertical_inner;
+            let (est_x, est_y) = if mode == LayoutMode::Flow {
+                (containing_x + margin.left, containing_y + margin.top)
+            } else {
+                let x = if let Some(left) = inset.left {
+                    position_block.x + left + margin.left
+                } else if let Some(right) = inset.right {
+                    position_block.x + position_block.width - right - margin.right - est_w
+                } else {
+                    position_block.x + margin.left
+                };
+                let y = if let Some(top) = inset.top {
+                    position_block.y + top + margin.top
+                } else if let Some(bottom) = inset.bottom {
+                    position_block.y + position_block.height - bottom - margin.bottom - est_h
+                } else {
+                    position_block.y + margin.top
+                };
+                (x, y)
+            };
+            should_skip_contents(
+                node,
+                &style,
+                style_state,
+                mode,
+                viewport,
+                containing_block,
+                Rect {
+                    x: est_x,
+                    y: est_y,
+                    width: est_w,
+                    height: est_h,
+                },
+                font_size,
+            )
+        }
+    };
     let content_width = style
         .width
         .resolve(containing_width, font_size)
@@ -3786,11 +4332,21 @@ fn layout_element_with_gutter(
                 .zip(explicit_height)
                 .map(|(ratio, height)| height * ratio)
         })
-        .or(control_size.0)
+        .or_else(|| (!skip_contents).then_some(control_size.0).flatten())
         .or_else(|| {
             // an out-of-flow box with an auto width shrinks to fit the room its insets leave,
             // as fit-content does in flow
             (mode != LayoutMode::Flow || style.content_size[0] != ContentSize::None).then(|| {
+                if skip_contents {
+                    return resolve_contain_intrinsic(
+                        &style,
+                        0,
+                        node.document,
+                        node.own(),
+                        font_size,
+                    )
+                    .unwrap_or(0.0);
+                }
                 let measure = |minimum: bool| {
                     intrinsic_width(
                         MaxContentInput {
@@ -3820,16 +4376,6 @@ fn layout_element_with_gutter(
         })
         .unwrap_or((containing_width - horizontal_extras).max(0.0))
         .max(0.0);
-    let min_width = style
-        .min_width
-        .resolve(containing_width, font_size)
-        .map(inner_width)
-        .unwrap_or(0.0);
-    let max_width = style
-        .max_width
-        .resolve(containing_width, font_size)
-        .map(inner_width)
-        .unwrap_or(f32::INFINITY);
     // a width handed down by a flex or grid container still answers to the box's own limits,
     // where a cell is as wide as its column whatever it asks for
     let content_width = match size_override.0 {
@@ -3852,12 +4398,6 @@ fn layout_element_with_gutter(
             (false, false) => {}
         }
     }
-    let min_height = resolve_height(style.min_height, containing_height, font_size)
-        .map(inner_height)
-        .unwrap_or(0.0);
-    let max_height = resolve_height(style.max_height, containing_height, font_size)
-        .map(inner_height)
-        .unwrap_or(f32::INFINITY);
     let explicit_height = size_override.1.or_else(|| {
         explicit_height
             .or_else(|| style.aspect_ratio.map(|ratio| content_width / ratio))
@@ -3896,6 +4436,91 @@ fn layout_element_with_gutter(
         width: border_box_width,
         height: 0.0,
     };
+    if skip_contents {
+        let intrinsic_height =
+            resolve_contain_intrinsic(&style, 1, node.document, node.own(), font_size)
+                .unwrap_or(0.0);
+        let content_height = explicit_height
+            .unwrap_or_else(|| intrinsic_height.min(max_height).max(min_height))
+            .max(0.0);
+        let rect = Rect {
+            height: content_height + vertical_inner,
+            ..rect
+        };
+        let (overflow, overflow_axes) = effective_overflow(&style);
+        let filters = crate::filter::Filters::of(&style, font_size);
+        let has_backdrop_filter = !filters.backdrop.is_empty();
+        let mut layout = LayoutBox {
+            node: node.node,
+            tag: name.to_string(),
+            rect,
+            background: style.background,
+            backgrounds: style.layers(),
+            masks: style.mask_layers(),
+            background_clip_text: style.background_clip_text,
+            object_fit: style.object_fit,
+            object_position: style.object_position.map(Box::new),
+            top_layer: false,
+            transform: None,
+            backface_hidden: style.backface_hidden,
+            clip_path: None,
+            radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
+            opacity: style.opacity * parent.opacity,
+            shadows: resolve_shadows(style.shadows, content_width, font_size),
+            filters,
+            border: BoxBorder::of(&style),
+            outline: box_outline(&style),
+            text: Vec::new(),
+            control: None,
+            selection: None,
+            selection_color: None,
+            control_selection: None,
+            control_focused: false,
+            control_text_origin: None,
+            control_value: None,
+            children: Vec::new(),
+            position: style.position,
+            visual_offset: (0.0, 0.0),
+            z_index: positioned_z_index(style),
+            creates_stacking_context: true,
+            sticky_inset: (style.position == Position::Sticky).then(|| Box::new(style.inset)),
+            font_size,
+            overflow,
+            overflow_axes,
+            visible: style.visibility == Visibility::Visible,
+            pointer_events: style.pointer_events,
+            selectable: style.selectable,
+            cursor: style.cursor,
+            floated: false,
+            inline: false,
+            scroll_content: Size::default(),
+            scroll_offset: (0.0, 0.0),
+            svg: None,
+            stable_gutter: style.scrollbar_gutter,
+            row_baseline: None,
+            scrollbar: scrollbar_for(
+                stylesheet,
+                (node.document, node.node),
+                &style,
+                font_size,
+                style_state,
+            ),
+            margin,
+            child_shift: (0.0, 0.0),
+            has_child_shift: false,
+            has_sticky: style.position == Position::Sticky,
+            has_stacking_descendant: false,
+            has_backdrop_filter,
+            has_auto_visibility,
+        };
+        if mode != LayoutMode::Flow {
+            position_layout_box(&mut layout, style, mode, position_block, font_size);
+        }
+        apply_relative_offset(&mut layout, style, containing_block, font_size);
+        apply_transform(&mut layout, &style, font_size);
+        finalize_scroll(&mut layout, padding, style_state);
+        return Some(layout);
+    }
     let local_containing_block = ContainingBlock {
         x: rect.x,
         y: rect.y,
@@ -3904,11 +4529,22 @@ fn layout_element_with_gutter(
             .map(|height| height.max(0.0) + vertical_inner)
             .unwrap_or(0.0),
     };
-    let descendant_block = if style.position == Position::Static {
+    let descendant_block = if style.position == Position::Static
+        && style.content_visibility == ContentVisibility::Visible
+    {
         containing_block
     } else {
         local_containing_block
     };
+    let _child_window = child_viewport_window(
+        node,
+        &style,
+        style_state,
+        (mode, viewport, rect),
+        (explicit_height, max_height, vertical_inner),
+        scroll_override,
+    )
+    .map(ViewportWindowGuard::enter);
     let content_x = rect.x + border.left + padding.left;
     let content_y = rect.y + border.top + padding.top;
     // size containment keeps a container's size from depending on its content, so its
@@ -3925,8 +4561,28 @@ fn layout_element_with_gutter(
         CONTAINERS.with(|containers| containers.borrow_mut().insert(node.node, size));
         crate::css::report_moment();
     }
+    let finish_rendered = |mut layout: LayoutBox| {
+        if style.content_visibility != ContentVisibility::Visible {
+            let (overflow, overflow_axes) = effective_overflow(&style);
+            layout.overflow = overflow;
+            layout.overflow_axes = overflow_axes;
+            layout.has_auto_visibility |= has_auto_visibility;
+        }
+        if let Some(own) = node.own() {
+            record_remembered_size(
+                node.document,
+                own,
+                &style,
+                (
+                    (layout.rect.width - horizontal_inner - gutter).max(0.0),
+                    (layout.rect.height - vertical_inner).max(0.0),
+                ),
+            );
+        }
+        Some(layout)
+    };
     if matches!(style.display, Display::Flex | Display::InlineFlex) {
-        return Some(layout_flex_element(FlexLayoutInput {
+        return finish_rendered(layout_flex_element(FlexLayoutInput {
             content_height: explicit_height,
             height_bounds: (min_height, max_height),
             parent_opacity: parent.opacity,
@@ -3950,7 +4606,7 @@ fn layout_element_with_gutter(
         }));
     }
     if matches!(style.display, Display::Table | Display::InlineTable) {
-        return Some(layout_table_element(GridLayoutInput {
+        return finish_rendered(layout_table_element(GridLayoutInput {
             content_height: explicit_height,
             height_bounds: (min_height, max_height),
             parent_opacity: parent.opacity,
@@ -3974,7 +4630,7 @@ fn layout_element_with_gutter(
         }));
     }
     if matches!(style.display, Display::Grid | Display::InlineGrid) {
-        return Some(layout_grid_element(GridLayoutInput {
+        return finish_rendered(layout_grid_element(GridLayoutInput {
             content_height: explicit_height,
             height_bounds: (min_height, max_height),
             parent_opacity: parent.opacity,
@@ -4038,8 +4694,10 @@ fn layout_element_with_gutter(
             state: style_state,
         })
     };
-    let pseudo_style =
-        |pseudo: PseudoElement| stylesheet.styles_pseudo(pseudo).then(|| part_style(pseudo));
+    let pseudo_style = |pseudo: PseudoElement| {
+        (stylesheet.styles_pseudo(pseudo) || node.document.has_shadow_roots())
+            .then(|| part_style(pseudo))
+    };
     let control_value = text_control_value(node, style_state);
     let control_placeholder = control_value
         .as_deref()
@@ -4221,7 +4879,7 @@ fn layout_element_with_gutter(
         );
     }
     let own_children = !matches!(name, "textarea" | "select");
-    for child in node.children(&generated) {
+    for child in node.children(&generated, stylesheet, &child_parent, style_state) {
         match child {
             Child::Text(text_node, value) if own_children => {
                 if !value.trim().is_empty()
@@ -4511,6 +5169,8 @@ fn layout_element_with_gutter(
     let filters = crate::filter::Filters::of(&style, font_size);
     let has_backdrop_filter =
         !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
+    let child_has_auto_visibility =
+        has_auto_visibility || children.iter().any(|child| child.has_auto_visibility);
     let mut layout = LayoutBox {
         node: node.node,
         tag: name.to_string(),
@@ -4580,6 +5240,7 @@ fn layout_element_with_gutter(
         has_sticky,
         has_stacking_descendant,
         has_backdrop_filter,
+        has_auto_visibility: child_has_auto_visibility,
     };
     // a checked box fills with the accent color, and a checked radio rings with it, unless
     // the page painted the box itself
@@ -4609,7 +5270,9 @@ fn layout_element_with_gutter(
         &mut layout,
         positioned,
         PositionedLayoutContext {
-            containing_block: if style.position == Position::Static {
+            containing_block: if style.position == Position::Static
+                && style.content_visibility == ContentVisibility::Visible
+            {
                 containing_block
             } else {
                 positioned_block
@@ -4622,7 +5285,7 @@ fn layout_element_with_gutter(
         },
     );
     finalize_scroll(&mut layout, padding, style_state);
-    Some(layout)
+    finish_rendered(layout)
 }
 
 // a flex or grid item: an element child, or a run of text the container wraps in an anonymous box
@@ -4763,6 +5426,7 @@ fn anonymous_box(
         has_sticky: false,
         has_stacking_descendant: false,
         has_backdrop_filter: false,
+        has_auto_visibility: false,
     }
 }
 
@@ -5339,7 +6003,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let mut sources = Vec::new();
     let mut positioned = Vec::new();
     let mut run: Vec<(Option<NodeId>, &str)> = Vec::new();
-    for child in node.children(&generated) {
+    for child in node.children(&generated, stylesheet, &child_parent, style_state) {
         match child {
             Child::Text(text_node, value) => run.push((text_node, value)),
             Child::Element(child) => {
@@ -5882,6 +6546,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let filters = crate::filter::Filters::of(&style, font_size);
     let has_backdrop_filter =
         !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
+    let has_auto_visibility = style.content_visibility == ContentVisibility::Auto
+        || children.iter().any(|child| child.has_auto_visibility);
     let mut layout = LayoutBox {
         node: node.node,
         tag: node.name().to_string(),
@@ -5943,6 +6609,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         has_sticky,
         has_stacking_descendant,
         has_backdrop_filter,
+        has_auto_visibility,
     };
     if row {
         layout.row_baseline = layout
@@ -6056,7 +6723,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let mut sources = Vec::new();
     let mut positioned = Vec::new();
     let mut run: Vec<(Option<NodeId>, &str)> = Vec::new();
-    for child in node.children(&generated) {
+    for child in node.children(&generated, stylesheet, &child_parent, style_state) {
         match child {
             Child::Text(text_node, value) => run.push((text_node, value)),
             Child::Element(child) => {
@@ -6554,6 +7221,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let filters = crate::filter::Filters::of(&style, font_size);
     let has_backdrop_filter =
         !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
+    let has_auto_visibility = style.content_visibility == ContentVisibility::Auto
+        || children.iter().any(|child| child.has_auto_visibility);
     let mut layout = LayoutBox {
         node: node.node,
         tag: node.name().to_string(),
@@ -6615,6 +7284,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         has_sticky,
         has_stacking_descendant,
         has_backdrop_filter,
+        has_auto_visibility,
     };
     if mode != LayoutMode::Flow {
         position_layout_box(
@@ -6747,7 +7417,12 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         }
         groups.len() - 1
     };
-    for child in node.children(&NO_GENERATED_CONTENT) {
+    for child in node.children(
+        &NO_GENERATED_CONTENT,
+        stylesheet,
+        &child_parent,
+        style_state,
+    ) {
         let Child::Element(child) = child else {
             continue;
         };
@@ -6774,7 +7449,12 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 let group = groups.len() - 1;
                 let group_parent = parent_of(&child_style, &child_parent);
                 let mut loose: Option<usize> = None;
-                for grandchild in child.children(&NO_GENERATED_CONTENT) {
+                for grandchild in child.children(
+                    &NO_GENERATED_CONTENT,
+                    stylesheet,
+                    &group_parent,
+                    style_state,
+                ) {
                     let Child::Element(grandchild) = grandchild else {
                         continue;
                     };
@@ -6998,7 +7678,9 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             let before_cells = crate::css::moment_reports();
             let before_refers = crate::svg::reference_reads();
             let row_parent = parent_of(&row_style, &child_parent);
-            for cell in row_node.children(&NO_GENERATED_CONTENT) {
+            for cell in
+                row_node.children(&NO_GENERATED_CONTENT, stylesheet, &row_parent, style_state)
+            {
                 let Child::Element(cell) = cell else {
                     continue;
                 };
@@ -7555,7 +8237,12 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     let row_parent = parent_of(&row_style, &child_parent);
                     let mut column = 0;
                     let mut built_cells = Vec::new();
-                    for cell in row_node.children(&NO_GENERATED_CONTENT) {
+                    for cell in row_node.children(
+                        &NO_GENERATED_CONTENT,
+                        stylesheet,
+                        &row_parent,
+                        style_state,
+                    ) {
                         let Child::Element(cell) = cell else {
                             continue;
                         };
@@ -7659,6 +8346,10 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     .children
                     .iter()
                     .any(|child| child.has_backdrop_filter);
+                row_box.has_auto_visibility = row_box
+                    .children
+                    .iter()
+                    .any(|child| child.has_auto_visibility);
                 Rc::new(row_box)
             };
             let row_box = if let Some((pass, stamp, works)) = kept_pass {
@@ -7892,6 +8583,10 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     .children
                     .iter()
                     .any(|child| child.has_backdrop_filter);
+                row_box.has_auto_visibility = row_box
+                    .children
+                    .iter()
+                    .any(|child| child.has_auto_visibility);
                 grouped_rows[row.group].push(Rc::new(row_box));
             }
             None => {
@@ -7925,6 +8620,10 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     .children
                     .iter()
                     .any(|child| child.has_backdrop_filter);
+                group_box.has_auto_visibility = group_box
+                    .children
+                    .iter()
+                    .any(|child| child.has_auto_visibility);
                 children.push(Rc::new(group_box));
             }
             None => children.extend(contents),
@@ -7955,6 +8654,8 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let filters = crate::filter::Filters::of(&style, font_size);
     let has_backdrop_filter =
         !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
+    let has_auto_visibility = style.content_visibility == ContentVisibility::Auto
+        || children.iter().any(|child| child.has_auto_visibility);
     let mut layout = LayoutBox {
         node: node.node,
         tag: node.name().to_string(),
@@ -8016,6 +8717,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         has_sticky,
         has_stacking_descendant,
         has_backdrop_filter,
+        has_auto_visibility,
     };
     if mode != LayoutMode::Flow {
         position_layout_box(
@@ -8498,6 +9200,11 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
     if own_width && let Some(width) = sized(style.width) {
         return extras + bounded(content_box(width).max(0.0));
     }
+    if style.content_visibility == ContentVisibility::Hidden {
+        let intrinsic = resolve_contain_intrinsic(&style, 0, node.document, node.own(), font_size)
+            .unwrap_or(0.0);
+        return extras + bounded(intrinsic);
+    }
     if let (Some(width), _) = control_content_size(
         node,
         &style,
@@ -8531,7 +9238,12 @@ fn measure_intrinsic_width(input: MaxContentInput<'_>, minimum: bool) -> f32 {
             text.space_collapse,
             SpaceCollapse::Preserve | SpaceCollapse::BreakSpaces
         );
-    let children = node.children(&NO_GENERATED_CONTENT);
+    let children = node.children(
+        &NO_GENERATED_CONTENT,
+        stylesheet,
+        &child_parent,
+        style_state,
+    );
     // a grid with columns of its own is as wide as they are: each the length it names, or
     // the widest of the items that land in it, taken in turn
     let columns = style.grid_template_columns.list();
@@ -9478,6 +10190,7 @@ fn creates_stacking_context(style: Style) -> bool {
         || style.masks.is_some_and(|masks| !masks.layers().is_empty())
         || style.filter.is_some()
         || style.backdrop_filter.is_some()
+        || style.content_visibility != ContentVisibility::Visible
         || matches!(style.position, Position::Fixed | Position::Sticky)
         || (style.position != Position::Static && style.z_index.is_some())
 }
@@ -9689,7 +10402,11 @@ pub(crate) fn rescroll(
             let requested = offsets.get(&layout.node).copied().unwrap_or_default();
             let offset = (requested.0.clamp(0.0, max_x), requested.1.clamp(0.0, max_y));
             if offset != layout.scroll_offset {
-                if layout.children.iter().any(|child| holds_sticky(child)) {
+                if layout
+                    .children
+                    .iter()
+                    .any(|child| holds_sticky(child) || child.has_auto_visibility)
+                {
                     return false;
                 }
                 let shift = (
@@ -9997,7 +10714,7 @@ fn append_inline_element(
     });
     line.push_edge(decoration, true, margin.left + border.left + padding.left);
     let generated = node.generated_content(stylesheet, style_state);
-    for child in node.children(&generated) {
+    for child in node.children(&generated, stylesheet, &child_parent, style_state) {
         match child {
             Child::Text(text_node, value) => {
                 let source = InlineSource {
@@ -10488,10 +11205,15 @@ fn append_atomic(
         } else {
             context.content_width
         };
+    let use_flow_origin = style.content_visibility == ContentVisibility::Auto;
     let atomic_input = ElementLayoutInput {
         node,
-        containing_x: 0.0,
-        containing_y: 0.0,
+        containing_x: if use_flow_origin {
+            context.content_x + line.left + line.used
+        } else {
+            0.0
+        },
+        containing_y: if use_flow_origin { line.y } else { 0.0 },
         containing_width,
         containing_height: None,
         size_override: (None, None),
@@ -10510,8 +11232,8 @@ fn append_atomic(
     let Some(mut laid_out) = layout_element(atomic_input.clone()) else {
         return;
     };
-    // fall back to flow origin when an out-of-flow descendant depends on it
-    if has_out_of_flow_descendant(&laid_out) {
+    // fall back to flow origin when an out-of-flow descendant or auto visibility depends on it
+    if !use_flow_origin && (has_out_of_flow_descendant(&laid_out) || laid_out.has_auto_visibility) {
         let Some(exact) = layout_element(ElementLayoutInput {
             containing_x: context.content_x + line.left + line.used,
             containing_y: line.y,
@@ -11751,6 +12473,7 @@ impl LayoutBox {
             has_sticky: _,
             has_stacking_descendant: _,
             has_backdrop_filter: _,
+            has_auto_visibility: _,
         } = self;
         let style_same = *node == other.node
             && *tag == other.tag
@@ -15088,5 +15811,351 @@ mod tests {
         visible_b.overflow = Overflow::Visible;
         visible_b.scroll_content.height += 12.0;
         assert_eq!(visible_a.paint_diff(&visible_b), PaintDiff::Same);
+    }
+
+    fn find_box_by_node(layout: &LayoutBox, node: NodeId) -> Option<&LayoutBox> {
+        if layout.node == node {
+            return Some(layout);
+        }
+        for child in &layout.children {
+            if let Some(found) = find_box_by_node(child, node) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn content_visibility_hidden_skips_contents_and_uses_contain_intrinsic_size() {
+        let document = Document::parse_markup(
+            r#"<style>
+                body { margin: 0; }
+                #sized {
+                    content-visibility: hidden;
+                    contain-intrinsic-size: 120px 80px;
+                    width: fit-content;
+                    padding: 4px;
+                    border: 2px solid #000000;
+                    background: #112233;
+                }
+                #empty {
+                    content-visibility: hidden;
+                    contain-intrinsic-size: none;
+                    padding: 5px;
+                    background: #445566;
+                }
+                .secret { width: 240px; height: 300px; background: #ff0000; }
+            </style>
+            <div id="sized"><div class="secret">hidden text</div></div>
+            <div id="empty"><div class="secret">collapsed</div></div>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let viewport = Size {
+            width: 300.0,
+            height: 200.0,
+        };
+        let state = StyleState::default();
+        let result = layout_with_state(&document, &stylesheet, viewport, &state);
+        assert_eq!(
+            result,
+            layout_afresh(&document, &stylesheet, viewport, &state)
+        );
+
+        let sized_id = document.find_element_by_id("sized").expect("sized");
+        let empty_id = document.find_element_by_id("empty").expect("empty");
+        let sized = find_box_by_node(&result.root, sized_id).expect("sized box");
+        assert!(sized.children.is_empty());
+        assert!(sized.text.is_empty());
+        assert!(sized.creates_stacking_context);
+        assert_eq!(sized.overflow, Overflow::Clip);
+        assert_eq!(sized.rect.width, 132.0);
+        assert_eq!(sized.rect.height, 92.0);
+
+        let empty = find_box_by_node(&result.root, empty_id).expect("empty box");
+        assert!(empty.children.is_empty());
+        assert_eq!(empty.rect.height, 10.0);
+
+        // own background paints while skipped child's red background does not
+        let canvas = result.paint();
+        let x = 20usize;
+        let y = 20usize;
+        let idx = (y * canvas.width() as usize + x) * 4;
+        assert_eq!(
+            &canvas.rgba_pixels()[idx..idx + 4],
+            &[0x11, 0x22, 0x33, 255]
+        );
+    }
+
+    #[test]
+    fn content_visibility_auto_skips_offscreen_preserves_scroll_height_and_remembers_size() {
+        forget_kept_answers();
+        let document = Document::parse_markup(
+            r#"<style>
+                body { margin: 0; }
+                section {
+                    content-visibility: auto;
+                    contain-intrinsic-size: auto 100px;
+                }
+                .inner { height: 160px; }
+            </style>
+            <section id="s0"><div id="in0" class="inner">row 0</div></section>
+            <section id="s1"><div id="in1" class="inner">row 1</div></section>
+            <section id="s2"><div id="in2" class="inner">row 2</div></section>
+            <section id="s3"><div id="in3" class="inner">row 3</div></section>
+            <section id="s4"><div id="in4" class="inner">row 4</div></section>
+            <section id="s5"><div id="in5" class="inner">row 5</div></section>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let viewport = Size {
+            width: 300.0,
+            height: 220.0,
+        };
+        let section_ids: Vec<NodeId> = (0..6)
+            .map(|i| {
+                document
+                    .find_element_by_id(&format!("s{i}"))
+                    .expect("section")
+            })
+            .collect();
+        let in5 = document.find_element_by_id("in5").expect("in5");
+
+        let at_top = layout_with_state(&document, &stylesheet, viewport, &StyleState::default());
+        assert!(at_top.root.has_auto_visibility);
+        let top_boxes: Vec<&LayoutBox> = section_ids
+            .iter()
+            .map(|&id| find_box_by_node(&at_top.root, id).expect("section box"))
+            .collect();
+        assert!(!top_boxes[0].children.is_empty());
+        assert_eq!(top_boxes[0].rect.height, 160.0);
+        assert!(!top_boxes[1].children.is_empty());
+        assert_eq!(top_boxes[1].rect.height, 160.0);
+        for skipped in &top_boxes[2..] {
+            assert!(skipped.children.is_empty());
+            assert_eq!(skipped.rect.height, 100.0);
+        }
+        assert_eq!(at_top.root.scroll_content.height, 720.0);
+
+        let scrolled_map = std::collections::BTreeMap::from([(document.root(), (0.0, 500.0))]);
+        assert!(rescroll(&at_top, &scrolled_map).is_none());
+
+        let mut scrolled_state = StyleState::default();
+        scrolled_state
+            .scroll_offsets
+            .make_mut()
+            .insert(document.root(), (0.0, 500.0));
+        let scrolled = layout_with_state(&document, &stylesheet, viewport, &scrolled_state);
+        let s0_scrolled = find_box_by_node(&scrolled.root, section_ids[0]).expect("s0");
+        assert!(s0_scrolled.children.is_empty());
+        assert_eq!(s0_scrolled.rect.height, 160.0);
+        // at scroll_y=500 (viewport [500, 720]), s3 and s4 materialize and push s5 to y=740
+        let s3_scrolled = find_box_by_node(&scrolled.root, section_ids[3]).expect("s3");
+        let s4_scrolled = find_box_by_node(&scrolled.root, section_ids[4]).expect("s4");
+        assert!(!s3_scrolled.children.is_empty());
+        assert_eq!(s3_scrolled.rect.height, 160.0);
+        assert!(!s4_scrolled.children.is_empty());
+        assert_eq!(s4_scrolled.rect.height, 160.0);
+
+        // overscrolling past the end still materializes the bottom after scroll clamping
+        let mut overscroll_state = StyleState::default();
+        overscroll_state
+            .scroll_offsets
+            .make_mut()
+            .insert(document.root(), (0.0, 9999.0));
+        let overscrolled = layout_with_state(&document, &stylesheet, viewport, &overscroll_state);
+        let s5_over = find_box_by_node(&overscrolled.root, section_ids[5]).expect("s5");
+        assert!(!s5_over.children.is_empty());
+        assert_eq!(s5_over.rect.height, 160.0);
+
+        // focusing a descendant inside an off-screen auto subtree makes it relevant
+        let focused_state = StyleState {
+            focused: Some(in5),
+            ..StyleState::default()
+        };
+        let focused = layout_with_state(&document, &stylesheet, viewport, &focused_state);
+        let s5_focused = find_box_by_node(&focused.root, section_ids[5]).expect("s5");
+        assert!(!s5_focused.children.is_empty());
+        assert_eq!(s5_focused.rect.height, 160.0);
+    }
+
+    #[test]
+    fn content_visibility_auto_respects_nested_scroll_container() {
+        forget_kept_answers();
+        let document = Document::parse_markup(
+            r#"<style>
+                body { margin: 0; }
+                #scroller { height: 120px; width: 240px; overflow: auto; }
+                .card {
+                    content-visibility: auto;
+                    contain-intrinsic-size: auto 80px;
+                }
+                .body { height: 100px; }
+            </style>
+            <div id="scroller">
+                <div id="c0" class="card"><div class="body">0</div></div>
+                <div id="c1" class="card"><div class="body">1</div></div>
+                <div id="c2" class="card"><div class="body">2</div></div>
+                <div id="c3" class="card"><div class="body">3</div></div>
+                <div id="c4" class="card"><div class="body">4</div></div>
+            </div>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let viewport = Size {
+            width: 300.0,
+            height: 300.0,
+        };
+        let scroller_id = document.find_element_by_id("scroller").expect("scroller");
+        let cards: Vec<NodeId> = (0..5)
+            .map(|i| document.find_element_by_id(&format!("c{i}")).expect("card"))
+            .collect();
+
+        let top = layout_with_state(&document, &stylesheet, viewport, &StyleState::default());
+        let scroller_top = find_box_by_node(&top.root, scroller_id).expect("scroller box");
+        assert!(scroller_top.has_auto_visibility);
+        assert_eq!(scroller_top.scroll_content.height, 440.0);
+        assert!(
+            !find_box_by_node(scroller_top, cards[0])
+                .unwrap()
+                .children
+                .is_empty()
+        );
+        assert!(
+            !find_box_by_node(scroller_top, cards[1])
+                .unwrap()
+                .children
+                .is_empty()
+        );
+        assert!(
+            find_box_by_node(scroller_top, cards[3])
+                .unwrap()
+                .children
+                .is_empty()
+        );
+        assert!(
+            find_box_by_node(scroller_top, cards[4])
+                .unwrap()
+                .children
+                .is_empty()
+        );
+
+        let moved = std::collections::BTreeMap::from([(scroller_id, (0.0, 260.0))]);
+        assert!(rescroll(&top, &moved).is_none());
+
+        let mut scrolled_state = StyleState::default();
+        scrolled_state
+            .scroll_offsets
+            .make_mut()
+            .insert(scroller_id, (0.0, 260.0));
+        let scrolled = layout_with_state(&document, &stylesheet, viewport, &scrolled_state);
+        let c0 = find_box_by_node(&scrolled.root, cards[0]).expect("c0");
+        assert!(c0.children.is_empty());
+        assert_eq!(c0.rect.height, 100.0);
+        // at scroll_y=260 (scrollport [260, 380]), c2 and c3 materialize
+        let c2 = find_box_by_node(&scrolled.root, cards[2]).expect("c2");
+        let c3 = find_box_by_node(&scrolled.root, cards[3]).expect("c3");
+        assert!(!c2.children.is_empty());
+        assert_eq!(c2.rect.height, 100.0);
+        assert!(!c3.children.is_empty());
+        assert_eq!(c3.rect.height, 100.0);
+
+        // nested container overscroll clamps and still materializes the bottom card
+        let mut over_state = StyleState::default();
+        over_state
+            .scroll_offsets
+            .make_mut()
+            .insert(scroller_id, (0.0, 9999.0));
+        let over = layout_with_state(&document, &stylesheet, viewport, &over_state);
+        let c4_over = find_box_by_node(&over.root, cards[4]).expect("c4");
+        assert!(!c4_over.children.is_empty());
+        assert_eq!(c4_over.rect.height, 100.0);
+    }
+
+    #[test]
+    fn shadow_dom_slotted_and_part_styles_render_through_layout_and_paint() {
+        let mut document = Document::parse_markup(
+            r#"<style>
+                body { margin: 0; }
+                x-shell { display: block; }
+                x-shell::part(outer-chip) { background-color: #2244cc; }
+                x-shell::part(outer-chip)::before { content: "P"; }
+            </style>
+            <x-shell id="shell"><div id="light" style="width: 40px; height: 20px;"></div></x-shell>"#,
+        )
+        .expect("document should parse");
+        let shell = document.find_element_by_id("shell").expect("shell");
+        let light = document.find_element_by_id("light").expect("light");
+
+        let outer_shadow = document.attach_shadow(shell, true).expect("outer shadow");
+        let outer_style = document.create_element("style");
+        let outer_css = document.create_text(
+            r#"
+            x-leaf { display: block; }
+            ::slotted(div) { background-color: #00aa44; }
+            ::slotted(div)::before { content: "ok"; }
+            "#,
+        );
+        document.append_child(outer_style, outer_css).unwrap();
+        document.append_child(outer_shadow, outer_style).unwrap();
+        let slot = document.create_element("slot");
+        document.append_child(outer_shadow, slot).unwrap();
+
+        let leaf = document.create_element("x-leaf");
+        document.set_attribute(leaf, "exportparts", "chip: outer-chip".to_string());
+        document.append_child(outer_shadow, leaf).unwrap();
+
+        let inner_shadow = document.attach_shadow(leaf, true).expect("inner shadow");
+        let chip = document.create_element("div");
+        document.set_attribute(chip, "part", "chip".to_string());
+        document.set_attribute(
+            chip,
+            "style",
+            "width: 40px; height: 20px; background-color: #ff0000;".to_string(),
+        );
+        document.append_child(inner_shadow, chip).unwrap();
+
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 80.0,
+                height: 80.0,
+            },
+        );
+        let light_box = find_box_by_node(&result.root, light).expect("slotted box");
+        assert_eq!(light_box.background, Color::opaque(0x00, 0xaa, 0x44));
+        assert!(
+            light_box.text.iter().any(|run| run.text.contains("ok"))
+                || light_box
+                    .children
+                    .iter()
+                    .any(|child| child.text.iter().any(|run| run.text.contains("ok")))
+        );
+
+        let chip_box = find_box_by_node(&result.root, chip).expect("exported part box");
+        assert_eq!(chip_box.background, Color::opaque(0x22, 0x44, 0xcc));
+        assert!(
+            chip_box.text.iter().any(|run| run.text.contains('P'))
+                || chip_box
+                    .children
+                    .iter()
+                    .any(|child| child.text.iter().any(|run| run.text.contains('P')))
+        );
+
+        let canvas = result.paint();
+        let px = |x: f32, y: f32| -> [u8; 4] {
+            let idx = (y as usize * canvas.width() as usize + x as usize) * 4;
+            canvas.rgba_pixels()[idx..idx + 4].try_into().unwrap()
+        };
+        assert_eq!(
+            px(light_box.rect.x + 30.0, light_box.rect.y + 10.0),
+            [0x00, 0xaa, 0x44, 255]
+        );
+        assert_eq!(
+            px(chip_box.rect.x + 30.0, chip_box.rect.y + 10.0),
+            [0x22, 0x44, 0xcc, 255]
+        );
     }
 }

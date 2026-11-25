@@ -418,6 +418,139 @@ pub(crate) enum Visibility {
     Collapse,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ContentVisibility {
+    #[default]
+    Visible,
+    Hidden,
+    Auto,
+}
+
+impl ContentVisibility {
+    fn parse(word: &str) -> Option<Self> {
+        Some(match word.trim().to_ascii_lowercase().as_str() {
+            "visible" => Self::Visible,
+            "hidden" => Self::Hidden,
+            "auto" => Self::Auto,
+            _ => return None,
+        })
+    }
+}
+
+// one axis of contain-intrinsic-size; auto length represents none
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ContainIntrinsic {
+    pub(crate) auto: bool,
+    pub(crate) length: Length,
+}
+
+impl Default for ContainIntrinsic {
+    fn default() -> Self {
+        Self {
+            auto: false,
+            length: Length::Auto,
+        }
+    }
+}
+
+// compact handle keeping contain-intrinsic-size pairs outside style
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ContainIntrinsicSize(std::num::NonZeroU32);
+
+thread_local! {
+    static CONTAIN_INTRINSIC_SIZES: RefCell<Vec<[ContainIntrinsic; 2]>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+impl ContainIntrinsicSize {
+    fn intern(pair: [ContainIntrinsic; 2]) -> Option<Self> {
+        if pair == [ContainIntrinsic::default(); 2] {
+            return None;
+        }
+        CONTAIN_INTRINSIC_SIZES.with(|table| {
+            let mut table = table.borrow_mut();
+            if let Some(index) = table.iter().position(|existing| *existing == pair) {
+                return std::num::NonZeroU32::new(index as u32 + 1).map(Self);
+            }
+            table.push(pair);
+            std::num::NonZeroU32::new(table.len() as u32).map(Self)
+        })
+    }
+
+    pub(crate) fn axes(self) -> [ContainIntrinsic; 2] {
+        CONTAIN_INTRINSIC_SIZES.with(|table| {
+            table
+                .borrow()
+                .get(self.0.get() as usize - 1)
+                .copied()
+                .unwrap_or_default()
+        })
+    }
+}
+
+fn parse_intrinsic_length(token: &str) -> Option<Length> {
+    if token.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    if token != "0" && token.parse::<f64>().is_ok() {
+        return None;
+    }
+    let length = parse_length(token)?;
+    if length == Length::Auto || length.has_percent() {
+        return None;
+    }
+    // negative lengths are invalid for contain-intrinsic-*
+    if length.resolve(0.0, 16.0).is_some_and(|value| value < 0.0) {
+        return None;
+    }
+    Some(length)
+}
+
+fn parse_contain_intrinsic_axis(words: &[&str]) -> Option<(ContainIntrinsic, usize)> {
+    let first = *words.first()?;
+    if first.eq_ignore_ascii_case("none") {
+        return Some((ContainIntrinsic::default(), 1));
+    }
+    if first.eq_ignore_ascii_case("auto") {
+        let second = *words.get(1)?;
+        if second.eq_ignore_ascii_case("none") {
+            return Some((
+                ContainIntrinsic {
+                    auto: true,
+                    length: Length::Auto,
+                },
+                2,
+            ));
+        }
+        let length = parse_intrinsic_length(second)?;
+        return Some((ContainIntrinsic { auto: true, length }, 2));
+    }
+    let length = parse_intrinsic_length(first)?;
+    Some((
+        ContainIntrinsic {
+            auto: false,
+            length,
+        },
+        1,
+    ))
+}
+
+fn parse_contain_intrinsic_one(value: &str) -> Option<ContainIntrinsic> {
+    let words = split_words(value);
+    let (axis, consumed) = parse_contain_intrinsic_axis(&words)?;
+    (consumed == words.len()).then_some(axis)
+}
+
+fn parse_contain_intrinsic_size(value: &str) -> Option<[ContainIntrinsic; 2]> {
+    let words = split_words(value);
+    let (first, used1) = parse_contain_intrinsic_axis(&words)?;
+    if used1 == words.len() {
+        return Some([first, first]);
+    }
+    let (second, used2) = parse_contain_intrinsic_axis(&words[used1..])?;
+    (used1 + used2 == words.len()).then_some([first, second])
+}
+
 // the css cursor keywords, which hosts map to their own pointer shapes
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Cursor {
@@ -2321,6 +2454,9 @@ pub(crate) struct Style {
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
     pub visibility: Visibility,
+    pub(crate) content_visibility: ContentVisibility,
+    // width/inline-size and height/block-size intrinsic placeholder lengths
+    pub(crate) contain_intrinsic: Option<ContainIntrinsicSize>,
     pub cursor: Cursor,
     // app-region drag, carried down to descendants until one says no-drag, so a press on the
     // innermost element answers for the regions around it
@@ -2457,6 +2593,12 @@ impl Style {
         self.masks.map(LayerList::layers).unwrap_or_default()
     }
 
+    pub(crate) fn contain_intrinsic_axes(&self) -> [ContainIntrinsic; 2] {
+        self.contain_intrinsic
+            .map(ContainIntrinsicSize::axes)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn has_transform(&self) -> bool {
         self.transform.is_some()
             || self.translate_property.is_some()
@@ -2529,6 +2671,8 @@ impl Style {
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
             visibility: parent_text.visibility,
+            content_visibility: ContentVisibility::Visible,
+            contain_intrinsic: None,
             cursor: parent_text.cursor,
             drag_region: parent_text.drag_region,
             svg: crate::svg::Presentation {
@@ -2675,6 +2819,9 @@ pub struct Stylesheet {
     custom_prop_index: RuleIndex,
     // indexed pseudo-element rules that declare content, so most elements skip ::before/::after cascades
     generated_content_index: RuleIndex,
+    // (rule_index, selector_index) pairs for ::slotted() and ::part() selectors
+    slotted_selectors: Vec<(u32, u16)>,
+    part_selectors: Vec<(u32, u16)>,
     has_custom_properties: bool,
     has_transitions: bool,
     has_animations: bool,
@@ -3233,6 +3380,9 @@ impl RuleIndex {
                 let Some(subject) = selector.parts.last().map(|part| &part.compound) else {
                     continue;
                 };
+                if subject.shadow_pseudo.is_some() {
+                    continue;
+                }
                 let entry = SelectorEntry::new(position, selector_index, selector, subject);
                 let target = match subject.pseudo_element {
                     None => &mut index.normal,
@@ -3812,12 +3962,37 @@ impl Stylesheet {
     }
 }
 
+type ShadowSelectors = Vec<(u32, u16)>;
+
+fn collect_shadow_selectors(rules: &[Rule]) -> (ShadowSelectors, ShadowSelectors) {
+    let mut slotted = Vec::new();
+    let mut part = Vec::new();
+    for (rule_index, rule) in rules.iter().enumerate() {
+        for (selector_index, selector) in rule.selectors.iter().enumerate() {
+            let Some(subject) = selector.parts.last().map(|item| &item.compound) else {
+                continue;
+            };
+            match &subject.shadow_pseudo {
+                Some(ShadowPseudo::Slotted(_)) => {
+                    slotted.push((rule_index as u32, selector_index as u16));
+                }
+                Some(ShadowPseudo::Part { .. }) => {
+                    part.push((rule_index as u32, selector_index as u16));
+                }
+                None => {}
+            }
+        }
+    }
+    (slotted, part)
+}
+
 impl Stylesheet {
     pub fn parse(source: &str) -> Result<Self, String> {
         let (source, shifts) = strip_comments(source);
         let (mut rules, keyframes, font_faces) = parse_stylesheet(&source, None)?;
         unshift_rules(&mut rules, &shifts);
         let index = RuleIndex::build(&rules);
+        let (slotted_selectors, part_selectors) = collect_shadow_selectors(&rules);
         let motion_rules = motion_rules(&rules);
         let motion_index = RuleIndex::build_subset(&rules, &motion_rules);
         let custom_rules = custom_property_rules(&rules);
@@ -3864,6 +4039,8 @@ impl Stylesheet {
             motion_index,
             custom_prop_index,
             generated_content_index,
+            slotted_selectors,
+            part_selectors,
             has_custom_properties,
             has_transitions,
             has_animations,
@@ -3882,6 +4059,7 @@ impl Stylesheet {
             parse_stylesheet(&source, Some(&mut dropped)).unwrap_or_default();
         unshift_rules(&mut rules, &shifts);
         let index = RuleIndex::build(&rules);
+        let (slotted_selectors, part_selectors) = collect_shadow_selectors(&rules);
         let motion_rules = motion_rules(&rules);
         let motion_index = RuleIndex::build_subset(&rules, &motion_rules);
         let custom_rules = custom_property_rules(&rules);
@@ -3929,6 +4107,8 @@ impl Stylesheet {
                 motion_index,
                 custom_prop_index,
                 generated_content_index,
+                slotted_selectors,
+                part_selectors,
                 has_custom_properties,
                 has_transitions,
                 has_animations,
@@ -4419,6 +4599,13 @@ impl Stylesheet {
                 document, child, properties, state, shadows, custom,
             );
         }
+        if shadows && let Some(shadow) = document.shadow_root(node) {
+            for child in document.element_children(shadow) {
+                self.populate_element_custom_properties(
+                    document, child, properties, state, shadows, custom,
+                );
+            }
+        }
         if let Some(own) = own {
             custom.insert(node, own);
         }
@@ -4431,7 +4618,7 @@ impl Stylesheet {
         node: NodeId,
         state: &StyleState,
     ) -> [Option<String>; 2] {
-        if !self.has_generated_content() {
+        if !self.has_generated_content() && !document.has_shadow_roots() {
             return [None, None];
         }
         let mut check = [true, true];
@@ -4480,7 +4667,7 @@ impl Stylesheet {
 
     // the content string of a generated box, which is what decides whether it exists
     pub(crate) fn generated_content(&self, context: StyleContext<'_>) -> Option<String> {
-        if !self.has_generated_content() {
+        if !self.has_generated_content() && !context.document.has_shadow_roots() {
             return None;
         }
         let key = (context.node, context.pseudo);
@@ -5773,6 +5960,260 @@ impl Stylesheet {
         })
     }
 
+    fn collect_slotted_declarations(
+        &self,
+        document: &Document,
+        nodes: (NodeId, NodeId),
+        pseudo: Option<PseudoElement>,
+        state: &StyleState,
+        depth: u32,
+        out: &mut HashMap<String, (u32, Specificity, usize, String)>,
+    ) {
+        let (slotted, slot) = nodes;
+        for &(rule_idx, sel_idx) in &self.slotted_selectors {
+            let Some(rule) = self.rules.get(rule_idx as usize) else {
+                continue;
+            };
+            let selector = &rule.selectors[sel_idx as usize];
+            if !rule.applies(document, slot, state)
+                || !selector.matches_slotted(document, slotted, slot, pseudo, state)
+            {
+                continue;
+            }
+            let specificity = selector.specificity();
+            for (position, declaration) in rule.declarations.iter().enumerate() {
+                insert_shadow_declaration(
+                    out,
+                    &declaration.property,
+                    depth,
+                    specificity.ranked(declaration.important, rule.layer),
+                    (rule.order << 16) | position,
+                    &declaration.value,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_part_declarations(
+        &self,
+        document: &Document,
+        part_node: NodeId,
+        host: NodeId,
+        exposed_parts: &[&str],
+        pseudo: Option<PseudoElement>,
+        state: &StyleState,
+        depth: u32,
+        out: &mut HashMap<String, (u32, Specificity, usize, String)>,
+    ) {
+        for &(rule_idx, sel_idx) in &self.part_selectors {
+            let Some(rule) = self.rules.get(rule_idx as usize) else {
+                continue;
+            };
+            let selector = &rule.selectors[sel_idx as usize];
+            if !rule.applies(document, host, state)
+                || !selector.matches_part_selector(
+                    document,
+                    part_node,
+                    host,
+                    exposed_parts,
+                    pseudo,
+                    state,
+                )
+            {
+                continue;
+            }
+            let specificity = selector.specificity();
+            for (position, declaration) in rule.declarations.iter().enumerate() {
+                insert_shadow_declaration(
+                    out,
+                    &declaration.property,
+                    depth,
+                    specificity.ranked(declaration.important, rule.layer),
+                    (rule.order << 16) | position,
+                    &declaration.value,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill_shadow_cascade_borrowed<'a>(
+        &'a self,
+        ua: &'a Stylesheet,
+        element: &'a Element,
+        document: &Document,
+        node: NodeId,
+        pseudo: Option<PseudoElement>,
+        state: &StyleState,
+        values: &mut BorrowedCascade<'a>,
+    ) {
+        let mut scoped: HashMap<String, (u32, Specificity, usize, String)> = HashMap::default();
+        // user agent rules sit below every author declaration regardless of shadow depth
+        for (property, (spec, order, value)) in
+            ua.borrowed_declarations(element, document, node, pseudo, state, false)
+        {
+            insert_shadow_declaration(&mut scoped, &property, 0, spec, order, &value);
+        }
+        let root = document.tree_root(node);
+        let node_depth = document.shadow_depth(node);
+        let in_shadow = document.shadow_host(root).is_some();
+        if in_shadow {
+            if let Some(sheet) = self.shadow_sheet(document, root) {
+                for (property, (spec, order, value)) in
+                    sheet.matched_declarations(element, document, node, pseudo, state, false)
+                {
+                    insert_shadow_declaration(
+                        &mut scoped,
+                        &property,
+                        node_depth,
+                        spec,
+                        order,
+                        &value,
+                    );
+                }
+            }
+        } else {
+            for (property, (spec, order, value)) in
+                self.borrowed_declarations(element, document, node, pseudo, state, false)
+            {
+                insert_shadow_declaration(&mut scoped, &property, 0, spec, order, &value);
+            }
+        }
+        // :host rules inside a host's shadow root belong to the inner shadow context
+        if let Some(shadow) = document.shadow_root(node)
+            && let Some(sheet) = self.shadow_sheet(document, shadow)
+        {
+            for (property, (spec, order, value)) in
+                sheet.matched_declarations(element, document, node, pseudo, state, true)
+            {
+                insert_shadow_declaration(
+                    &mut scoped,
+                    &property,
+                    node_depth + 1,
+                    spec,
+                    order,
+                    &value,
+                );
+            }
+        }
+        // ::slotted() rules in every shadow tree whose slot this element is assigned to
+        let mut assigned = document.assigned_slot(node);
+        while let Some(slot) = assigned {
+            let slot_root = document.tree_root(slot);
+            if document.shadow_host(slot_root).is_some()
+                && let Some(sheet) = self.shadow_sheet(document, slot_root)
+                && !sheet.slotted_selectors.is_empty()
+            {
+                let slot_depth = document.shadow_depth(slot);
+                sheet.collect_slotted_declarations(
+                    document,
+                    (node, slot),
+                    pseudo,
+                    state,
+                    slot_depth,
+                    &mut scoped,
+                );
+            }
+            assigned = document.assigned_slot(slot);
+        }
+        // ::part() rules from enclosing host trees, following exportparts across nested shadows
+        if in_shadow && let Some(raw_parts) = element.attr("part") {
+            let mut exposed: Vec<&str> = raw_parts.split_ascii_whitespace().collect();
+            let mut current = node;
+            while !exposed.is_empty() {
+                let current_root = document.tree_root(current);
+                let Some((host, _)) = document.shadow_host(current_root) else {
+                    break;
+                };
+                let host_root = document.tree_root(host);
+                let host_depth = document.shadow_depth(host);
+                if document.shadow_host(host_root).is_some() {
+                    if let Some(sheet) = self.shadow_sheet(document, host_root)
+                        && !sheet.part_selectors.is_empty()
+                    {
+                        sheet.collect_part_declarations(
+                            document,
+                            node,
+                            host,
+                            &exposed,
+                            pseudo,
+                            state,
+                            host_depth,
+                            &mut scoped,
+                        );
+                    }
+                } else if !self.part_selectors.is_empty() {
+                    self.collect_part_declarations(
+                        document,
+                        node,
+                        host,
+                        &exposed,
+                        pseudo,
+                        state,
+                        host_depth,
+                        &mut scoped,
+                    );
+                }
+                let Some(host_el) = document.element(host) else {
+                    break;
+                };
+                let mappings = Document::exportparts_mappings(host_el);
+                if mappings.is_empty() {
+                    break;
+                }
+                let mut next = Vec::new();
+                for (inner_name, outer_name) in mappings {
+                    if exposed.contains(&inner_name) && !next.contains(&outer_name) {
+                        next.push(outer_name);
+                    }
+                }
+                exposed = next;
+                current = host;
+            }
+        }
+        // svg presentation attributes beat user agent rules and lose to author rules
+        if element.namespace == Namespace::Svg && pseudo.is_none() {
+            let author = Specificity(1 << LAYER_SHIFT, 0, 0);
+            for (property, value) in presentation_hints(element) {
+                if scoped
+                    .get(property)
+                    .is_none_or(|current| current.1 < author)
+                {
+                    scoped.insert(
+                        property.to_string(),
+                        (node_depth, Specificity(0, 0, 0), 0, value.into_owned()),
+                    );
+                }
+            }
+        }
+        let mut inline_dropped = Vec::new();
+        if let Some(inline) = element
+            .attr("style")
+            .filter(|_| pseudo.is_none() && !document.style_blocked(node))
+            && let Ok(declarations) = parse_declarations(inline, Some(&mut inline_dropped))
+        {
+            for (position, declaration) in declarations.into_iter().enumerate() {
+                let specificity = if declaration.important {
+                    Specificity::INLINE_IMPORTANT
+                } else {
+                    Specificity::INLINE
+                };
+                insert_shadow_declaration(
+                    &mut scoped,
+                    &declaration.property,
+                    node_depth,
+                    specificity,
+                    (usize::MAX >> 1) | position,
+                    &declaration.value,
+                );
+            }
+        }
+        for (property, (_, spec, order, value)) in scoped {
+            values.insert(Cow::Owned(property), (spec, order, Cow::Owned(value)));
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn fill_cascade_borrowed<'a>(
         &'a self,
@@ -5784,60 +6225,21 @@ impl Stylesheet {
         state: &StyleState,
         values: &mut BorrowedCascade<'a>,
     ) {
-        // a shadow tree is styled by its own style elements, and its host also takes the
-        // :host rules there, below anything the outer document says
-        let shadows = document.has_shadow_roots();
-        let root = if shadows {
-            document.tree_root(node)
-        } else {
-            document.root()
+        if document.has_shadow_roots() {
+            self.fill_shadow_cascade_borrowed(ua, element, document, node, pseudo, state, values);
+            return;
+        }
+        // the user agent's rules go in first and lose to any author rule for a property
+        let target = CascadeTarget {
+            element,
+            document,
+            node,
+            pseudo,
+            state,
+            host_only: false,
         };
-        let in_shadow = shadows && document.shadow_host(root).is_some();
-        if in_shadow {
-            if let Some(sheet) = self.shadow_sheet(document, root) {
-                for (property, (specificity, order, value)) in
-                    sheet.matched_declarations(element, document, node, pseudo, state, false)
-                {
-                    values.insert(
-                        Cow::Owned(property),
-                        (specificity, order, Cow::Owned(value)),
-                    );
-                }
-            }
-        } else {
-            // the user agent's rules go in first and lose to any author rule for a property
-            let target = CascadeTarget {
-                element,
-                document,
-                node,
-                pseudo,
-                state,
-                host_only: false,
-            };
-            ua.collect_declarations(target, values);
-            self.collect_declarations(target, values);
-        }
-        if shadows
-            && let Some(shadow) = document.shadow_root(node)
-            && let Some(sheet) = self.shadow_sheet(document, shadow)
-        {
-            for (property, (specificity, order, value)) in
-                sheet.matched_declarations(element, document, node, pseudo, state, true)
-            {
-                values.entry(Cow::Owned(property)).or_insert((
-                    specificity,
-                    order,
-                    Cow::Owned(value),
-                ));
-            }
-        }
-        if in_shadow {
-            for (property, value) in
-                ua.borrowed_declarations(element, document, node, pseudo, state, false)
-            {
-                values.entry(property).or_insert(value);
-            }
-        }
+        ua.collect_declarations(target, values);
+        self.collect_declarations(target, values);
         // svg presentation attributes beat the user agent's rules and lose to every author rule
         if element.namespace == Namespace::Svg && pseudo.is_none() {
             let author = Specificity(1 << LAYER_SHIFT, 0, 0);
@@ -5877,6 +6279,55 @@ impl Stylesheet {
                 }
             }
         }
+    }
+}
+
+// compares declarations across shadow encapsulation contexts per css cascading 4
+fn shadow_declaration_wins(
+    candidate: (u32, Specificity, usize),
+    current: (u32, Specificity, usize),
+) -> bool {
+    let (c_depth, c_spec, c_order) = candidate;
+    let (e_depth, e_spec, e_order) = current;
+    let c_imp = (c_spec.0 & IMPORTANT) != 0;
+    let e_imp = (e_spec.0 & IMPORTANT) != 0;
+    if c_imp != e_imp {
+        return c_imp;
+    }
+    let c_ua = !c_imp && c_spec.0 < (1 << LAYER_SHIFT);
+    let e_ua = !e_imp && e_spec.0 < (1 << LAYER_SHIFT);
+    if c_ua != e_ua {
+        return !c_ua;
+    }
+    if !c_ua && c_depth != e_depth {
+        // outer tree wins for normal declarations; inner tree wins for !important
+        return if c_imp {
+            c_depth > e_depth
+        } else {
+            c_depth < e_depth
+        };
+    }
+    (c_spec, c_order) >= (e_spec, e_order)
+}
+
+fn insert_shadow_declaration(
+    scoped: &mut HashMap<String, (u32, Specificity, usize, String)>,
+    property: &str,
+    depth: u32,
+    spec: Specificity,
+    order: usize,
+    value: &str,
+) {
+    let wins = scoped
+        .get(property)
+        .is_none_or(|&(e_depth, e_spec, e_order, _)| {
+            shadow_declaration_wins((depth, spec, order), (e_depth, e_spec, e_order))
+        });
+    if wins {
+        scoped.insert(
+            property.to_string(),
+            (depth, spec, order, value.to_string()),
+        );
     }
 }
 
@@ -6062,6 +6513,15 @@ enum Combinator {
 }
 
 #[derive(Clone, Debug)]
+enum ShadowPseudo {
+    Slotted(Box<CompoundSelector>),
+    Part {
+        names: Vec<String>,
+        pseudo_classes: Vec<PseudoClass>,
+    },
+}
+
+#[derive(Clone, Debug)]
 struct CompoundSelector {
     tag: Option<String>,
     id: Option<String>,
@@ -6070,6 +6530,7 @@ struct CompoundSelector {
     attributes: Vec<AttributeSelector>,
     pseudo_classes: Vec<PseudoClass>,
     pseudo_element: Option<PseudoElement>,
+    shadow_pseudo: Option<ShadowPseudo>,
     part_hover: bool,
 }
 
@@ -6373,6 +6834,14 @@ impl Selector {
         if parts.is_empty() || combinator.is_some() {
             return Err(format!("selector has no final compound: {source}"));
         }
+        // pseudo-elements (including ::slotted and ::part) cannot be followed by combinators
+        if parts[..parts.len() - 1].iter().any(|part| {
+            part.compound.pseudo_element.is_some() || part.compound.shadow_pseudo.is_some()
+        }) {
+            return Err(format!(
+                "combinator cannot follow a pseudo-element: {source}"
+            ));
+        }
         let ancestor_bloom = compute_ancestor_bloom(&parts);
         let specificity = parts
             .iter()
@@ -6432,10 +6901,72 @@ impl Selector {
         let Some(last) = self.parts.last() else {
             return false;
         };
-        last.compound.pseudo_element == pseudo
+        last.compound.shadow_pseudo.is_none()
+            && last.compound.pseudo_element == pseudo
             && (!last.compound.part_hover
                 || pseudo.is_some_and(|part| state.hovered_part == Some((node, part))))
             && self.matches_part(self.parts.len() - 1, document, node, state)
+    }
+
+    fn matches_slotted(
+        &self,
+        document: &Document,
+        slotted: NodeId,
+        slot: NodeId,
+        pseudo: Option<PseudoElement>,
+        state: &StyleState,
+    ) -> bool {
+        let Some(last) = self.parts.last() else {
+            return false;
+        };
+        let Some(ShadowPseudo::Slotted(inner)) = &last.compound.shadow_pseudo else {
+            return false;
+        };
+        if last.compound.pseudo_element != pseudo {
+            return false;
+        }
+        let Some(slotted_el) = document.element(slotted) else {
+            return false;
+        };
+        inner.matches(slotted_el, document, slotted, state)
+            && self.matches_part(self.parts.len() - 1, document, slot, state)
+    }
+
+    fn matches_part_selector(
+        &self,
+        document: &Document,
+        part_node: NodeId,
+        host: NodeId,
+        exposed_parts: &[&str],
+        pseudo: Option<PseudoElement>,
+        state: &StyleState,
+    ) -> bool {
+        let Some(last) = self.parts.last() else {
+            return false;
+        };
+        let Some(ShadowPseudo::Part {
+            names,
+            pseudo_classes,
+        }) = &last.compound.shadow_pseudo
+        else {
+            return false;
+        };
+        if last.compound.pseudo_element != pseudo {
+            return false;
+        }
+        if !names
+            .iter()
+            .all(|wanted| exposed_parts.iter().any(|&exposed| exposed == wanted))
+        {
+            return false;
+        }
+        let Some(part_el) = document.element(part_node) else {
+            return false;
+        };
+        pseudo_classes
+            .iter()
+            .all(|class| class.matches(part_el, document, part_node, state))
+            && self.matches_part(self.parts.len() - 1, document, host, state)
     }
 
     fn matches_part(
@@ -6717,19 +7248,76 @@ impl CompoundSelector {
                         specificity.2 + pseudo_specificity.2,
                     )
                 });
+        let shadow_specificity = match &self.shadow_pseudo {
+            Some(ShadowPseudo::Slotted(inner)) => {
+                let s = inner.specificity();
+                Specificity(s.0, s.1, s.2 + 1)
+            }
+            Some(ShadowPseudo::Part { pseudo_classes, .. }) => {
+                pseudo_classes
+                    .iter()
+                    .fold(Specificity(0, 0, 1), |specificity, pseudo| {
+                        let s = pseudo.specificity();
+                        Specificity(
+                            specificity.0 + s.0,
+                            specificity.1 + s.1,
+                            specificity.2 + s.2,
+                        )
+                    })
+            }
+            None => Specificity(0, 0, 0),
+        };
         Specificity(
-            u32::from(self.id.is_some()) + pseudo_specificity.0,
+            u32::from(self.id.is_some()) + pseudo_specificity.0 + shadow_specificity.0,
             (self.classes.len() + self.attributes.len()) as u32
                 + u32::from(self.part_hover)
-                + pseudo_specificity.1,
+                + pseudo_specificity.1
+                + shadow_specificity.1,
             u32::from(self.tag.is_some())
                 + u32::from(self.pseudo_element.is_some())
-                + pseudo_specificity.2,
+                + pseudo_specificity.2
+                + shadow_specificity.2,
         )
     }
 }
 
 impl PseudoClass {
+    // structural and tree-inspecting pseudo-classes are disallowed after ::part()
+    fn allowed_after_part(&self) -> bool {
+        match self {
+            Self::Root
+            | Self::FirstChild
+            | Self::LastChild
+            | Self::OnlyChild
+            | Self::NthChild(..)
+            | Self::NthLastChild(..)
+            | Self::FirstOfType
+            | Self::LastOfType
+            | Self::OnlyOfType
+            | Self::NthOfType(_)
+            | Self::NthLastOfType(_)
+            | Self::Empty
+            | Self::Has(_)
+            | Self::Host(_) => false,
+            Self::Not(selectors) | Self::Is(selectors) | Self::Where(selectors) => {
+                selectors.iter().all(|selector| {
+                    selector.parts.len() == 1
+                        && selector.parts[0].compound.tag.is_none()
+                        && selector.parts[0].compound.id.is_none()
+                        && selector.parts[0].compound.classes.is_empty()
+                        && selector.parts[0].compound.attributes.is_empty()
+                        && selector.parts[0].compound.pseudo_element.is_none()
+                        && selector.parts[0].compound.shadow_pseudo.is_none()
+                        && selector.parts[0]
+                            .compound
+                            .pseudo_classes
+                            .iter()
+                            .all(Self::allowed_after_part)
+                })
+            }
+            _ => true,
+        }
+    }
     // the selectors inside a functional pseudo-class
     fn inner(&self) -> Vec<&Selector> {
         match self {
@@ -6986,16 +7574,27 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
         attributes: Vec::new(),
         pseudo_classes: Vec::new(),
         pseudo_element: None,
+        shadow_pseudo: None,
         part_hover: false,
     };
     let start = *cursor;
     while *cursor < source.len() {
         match source.as_bytes()[*cursor] {
             b'#' => {
+                if selector.shadow_pseudo.is_some() || selector.pseudo_element.is_some() {
+                    return Err(format!(
+                        "id selector cannot follow pseudo-element: {source}"
+                    ));
+                }
                 *cursor += 1;
                 selector.id = Some(parse_selector_name(source, cursor)?);
             }
             b'.' => {
+                if selector.shadow_pseudo.is_some() || selector.pseudo_element.is_some() {
+                    return Err(format!(
+                        "class selector cannot follow pseudo-element: {source}"
+                    ));
+                }
                 *cursor += 1;
                 let class = parse_selector_name(source, cursor)?;
                 selector.class_bloom |= crate::dom::class_bloom_mask(&class);
@@ -7007,7 +7606,60 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                 if double {
                     *cursor += 1;
                 }
-                let name = parse_selector_name(source, cursor)?;
+                let name = parse_selector_name(source, cursor)?.to_ascii_lowercase();
+                if double && name == "slotted" {
+                    if selector.shadow_pseudo.is_some() || selector.pseudo_element.is_some() {
+                        return Err(format!("selector has two pseudo elements: {source}"));
+                    }
+                    if source.as_bytes().get(*cursor) != Some(&b'(') {
+                        return Err(format!("::slotted requires an argument: {source}"));
+                    }
+                    let argument = parse_function_argument(source, cursor)?;
+                    let trimmed = argument.trim();
+                    let mut inner_cursor = 0;
+                    let inner = parse_compound_selector(trimmed, &mut inner_cursor)?;
+                    skip_selector_whitespace(trimmed, &mut inner_cursor);
+                    if inner_cursor != trimmed.len()
+                        || inner.pseudo_element.is_some()
+                        || inner.shadow_pseudo.is_some()
+                    {
+                        return Err(format!("invalid ::slotted() selector: {source}"));
+                    }
+                    selector.shadow_pseudo = Some(ShadowPseudo::Slotted(Box::new(inner)));
+                    continue;
+                }
+                if double && name == "part" {
+                    if selector.shadow_pseudo.is_some() || selector.pseudo_element.is_some() {
+                        return Err(format!("selector has two pseudo elements: {source}"));
+                    }
+                    if source.as_bytes().get(*cursor) != Some(&b'(') {
+                        return Err(format!("::part requires an argument: {source}"));
+                    }
+                    let argument = parse_function_argument(source, cursor)?;
+                    let trimmed = argument.trim();
+                    let mut inner_cursor = 0;
+                    let mut names = Vec::new();
+                    while inner_cursor < trimmed.len() {
+                        skip_selector_whitespace(trimmed, &mut inner_cursor);
+                        if inner_cursor >= trimmed.len() {
+                            break;
+                        }
+                        names.push(parse_selector_name(trimmed, &mut inner_cursor)?);
+                        if inner_cursor < trimmed.len()
+                            && !trimmed.as_bytes()[inner_cursor].is_ascii_whitespace()
+                        {
+                            return Err(format!("invalid ::part() argument: {source}"));
+                        }
+                    }
+                    if names.is_empty() {
+                        return Err(format!("empty ::part() selector: {source}"));
+                    }
+                    selector.shadow_pseudo = Some(ShadowPseudo::Part {
+                        names,
+                        pseudo_classes: Vec::new(),
+                    });
+                    continue;
+                }
                 let element = match name.as_str() {
                     "before" => Some(PseudoElement::Before),
                     "after" => Some(PseudoElement::After),
@@ -7030,9 +7682,7 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                     | "spelling-error"
                     | "grammar-error"
                     | "target-text"
-                    | "highlight"
-                    | "part"
-                    | "slotted" => Some(PseudoElement::Unrendered),
+                    | "highlight" => Some(PseudoElement::Unrendered),
                     vendor if double && vendor.starts_with('-') => Some(PseudoElement::Unrendered),
                     _ => None,
                 };
@@ -7131,9 +7781,37 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                         _ => return Err(format!("unsupported pseudo-class: :{name}")),
                     }
                 };
-                selector.pseudo_classes.push(pseudo);
+                if selector.pseudo_element.is_some() {
+                    return Err(format!(
+                        "pseudo-class cannot follow pseudo-element: {source}"
+                    ));
+                }
+                if let Some(shadow) = &mut selector.shadow_pseudo {
+                    match shadow {
+                        ShadowPseudo::Part { pseudo_classes, .. } => {
+                            if !pseudo.allowed_after_part() {
+                                return Err(format!(
+                                    "structural pseudo-class disallowed after ::part(): {source}"
+                                ));
+                            }
+                            pseudo_classes.push(pseudo);
+                        }
+                        ShadowPseudo::Slotted(_) => {
+                            return Err(format!(
+                                "pseudo-class cannot follow ::slotted(): {source}"
+                            ));
+                        }
+                    }
+                } else {
+                    selector.pseudo_classes.push(pseudo);
+                }
             }
             b'[' => {
+                if selector.shadow_pseudo.is_some() || selector.pseudo_element.is_some() {
+                    return Err(format!(
+                        "attribute selector cannot follow pseudo-element: {source}"
+                    ));
+                }
                 *cursor += 1;
                 skip_selector_whitespace(source, cursor);
                 let name = parse_selector_name(source, cursor)?;
@@ -7184,10 +7862,20 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
                 };
                 selector.attributes.push(attribute);
             }
-            b'*' => *cursor += 1,
+            b'*' => {
+                if selector.shadow_pseudo.is_some() || selector.pseudo_element.is_some() {
+                    return Err(format!(
+                        "universal selector cannot follow pseudo-element: {source}"
+                    ));
+                }
+                *cursor += 1;
+            }
             byte if byte.is_ascii_whitespace() || matches!(byte, b'>' | b'+' | b'~') => break,
             _ => {
-                if selector.tag.is_some() {
+                if selector.tag.is_some()
+                    || selector.shadow_pseudo.is_some()
+                    || selector.pseudo_element.is_some()
+                {
                     return Err(format!("invalid compound selector: {source}"));
                 }
                 selector.tag = Some(parse_selector_name(source, cursor)?.to_ascii_lowercase());
@@ -8219,6 +8907,18 @@ fn reset_property(style: &mut Style, from: &Style, property: &str) {
             style.overflow_x = from.overflow_x;
             style.overflow_y = from.overflow_y;
         }
+        "content-visibility" => style.content_visibility = from.content_visibility,
+        "contain-intrinsic-size" => style.contain_intrinsic = from.contain_intrinsic,
+        "contain-intrinsic-width" | "contain-intrinsic-inline-size" => {
+            let mut axes = style.contain_intrinsic_axes();
+            axes[0] = from.contain_intrinsic_axes()[0];
+            style.contain_intrinsic = ContainIntrinsicSize::intern(axes);
+        }
+        "contain-intrinsic-height" | "contain-intrinsic-block-size" => {
+            let mut axes = style.contain_intrinsic_axes();
+            axes[1] = from.contain_intrinsic_axes()[1];
+            style.contain_intrinsic = ContainIntrinsicSize::intern(axes);
+        }
         "width" => {
             style.width = from.width;
             style.content_size[0] = from.content_size[0];
@@ -8551,6 +9251,12 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "vector-effect",
     "vertical-align",
     "visibility",
+    "content-visibility",
+    "contain-intrinsic-size",
+    "contain-intrinsic-width",
+    "contain-intrinsic-height",
+    "contain-intrinsic-inline-size",
+    "contain-intrinsic-block-size",
     "width",
     "z-index",
 ];
@@ -8762,6 +9468,27 @@ pub(crate) fn supports_declaration(property: &str, value: &str) -> bool {
         ),
         "font-feature-settings" => crate::font::parse_feature_settings(value).is_some(),
         "filter" | "backdrop-filter" => parse_filter_list(value).is_some(),
+        "content-visibility" => {
+            let lower = value.trim().to_ascii_lowercase();
+            CSS_WIDE_KEYWORDS.contains(&lower.as_str())
+                || lower.contains("var(")
+                || ContentVisibility::parse(value).is_some()
+        }
+        "contain-intrinsic-size" => {
+            let lower = value.trim().to_ascii_lowercase();
+            CSS_WIDE_KEYWORDS.contains(&lower.as_str())
+                || lower.contains("var(")
+                || parse_contain_intrinsic_size(value).is_some()
+        }
+        "contain-intrinsic-width"
+        | "contain-intrinsic-height"
+        | "contain-intrinsic-inline-size"
+        | "contain-intrinsic-block-size" => {
+            let lower = value.trim().to_ascii_lowercase();
+            CSS_WIDE_KEYWORDS.contains(&lower.as_str())
+                || lower.contains("var(")
+                || parse_contain_intrinsic_one(value).is_some()
+        }
         _ => true,
     }
 }
@@ -9125,6 +9852,30 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 "collapse" => Visibility::Collapse,
                 _ => Visibility::Visible,
             };
+        }
+        "content-visibility" => {
+            if let Some(cv) = ContentVisibility::parse(value) {
+                style.content_visibility = cv;
+            }
+        }
+        "contain-intrinsic-size" => {
+            if let Some(pair) = parse_contain_intrinsic_size(value) {
+                style.contain_intrinsic = ContainIntrinsicSize::intern(pair);
+            }
+        }
+        "contain-intrinsic-width" | "contain-intrinsic-inline-size" => {
+            if let Some(axis) = parse_contain_intrinsic_one(value) {
+                let mut axes = style.contain_intrinsic_axes();
+                axes[0] = axis;
+                style.contain_intrinsic = ContainIntrinsicSize::intern(axes);
+            }
+        }
+        "contain-intrinsic-height" | "contain-intrinsic-block-size" => {
+            if let Some(axis) = parse_contain_intrinsic_one(value) {
+                let mut axes = style.contain_intrinsic_axes();
+                axes[1] = axis;
+                style.contain_intrinsic = ContainIntrinsicSize::intern(axes);
+            }
         }
         "cursor" => style.cursor = Cursor::parse(value).unwrap_or(style.cursor),
         "app-region" | "-webkit-app-region" => match value.trim().to_ascii_lowercase().as_str() {
@@ -10471,6 +11222,10 @@ pub(crate) fn inherited_custom_properties<'a>(
 ) -> Option<&'a BTreeMap<String, String>> {
     if state.custom_properties.is_empty() {
         return None;
+    }
+    if document.has_shadow_roots() {
+        return std::iter::successors(Some(node), |&current| document.composed_parent(current))
+            .find_map(|candidate| state.custom_properties.get(&candidate));
     }
     std::iter::once(node)
         .chain(document.ancestors(node))
@@ -12360,5 +13115,339 @@ mod tests {
                 ("& .z", " top: 0 "),
             ]
         );
+    }
+
+    #[test]
+    fn parses_content_visibility_and_contain_intrinsic_size() {
+        let sheet = Stylesheet::parse(
+            r#"
+            #vis { content-visibility: visible; contain-intrinsic-size: none; }
+            #hid { content-visibility: hidden; contain-intrinsic-size: 320px 180px; }
+            #auto { content-visibility: auto; contain-intrinsic-size: auto 500px; }
+            #both { content-visibility: auto; contain-intrinsic-size: auto 240px auto none; }
+            #logical { contain-intrinsic-inline-size: 120px; contain-intrinsic-block-size: auto 90px; }
+            #bad { content-visibility: bogus; contain-intrinsic-size: auto; contain-intrinsic-width: -5px; contain-intrinsic-height: 50%; }
+            "#,
+        )
+        .expect("stylesheet should parse");
+        let doc = Document::parse_markup(
+            "<div id='vis'></div><div id='hid'></div><div id='auto'></div><div id='both'></div><div id='logical'></div><div id='bad'></div>",
+        )
+        .expect("document should parse");
+        let state = StyleState::default();
+        let style = |id: &str| {
+            let node = doc.find_element_by_id(id).expect("node exists");
+            sheet.style_for(document_context(&doc, node, &state))
+        };
+
+        let vis = style("vis");
+        assert_eq!(vis.content_visibility, ContentVisibility::Visible);
+        assert_eq!(
+            vis.contain_intrinsic_axes(),
+            [ContainIntrinsic::default(); 2]
+        );
+
+        let hid = style("hid");
+        assert_eq!(hid.content_visibility, ContentVisibility::Hidden);
+        assert_eq!(
+            hid.contain_intrinsic_axes(),
+            [
+                ContainIntrinsic {
+                    auto: false,
+                    length: Length::px(320.0),
+                },
+                ContainIntrinsic {
+                    auto: false,
+                    length: Length::px(180.0),
+                },
+            ]
+        );
+
+        let auto = style("auto");
+        assert_eq!(auto.content_visibility, ContentVisibility::Auto);
+        assert_eq!(
+            auto.contain_intrinsic_axes(),
+            [
+                ContainIntrinsic {
+                    auto: true,
+                    length: Length::px(500.0),
+                },
+                ContainIntrinsic {
+                    auto: true,
+                    length: Length::px(500.0),
+                },
+            ]
+        );
+
+        let both = style("both");
+        assert_eq!(
+            both.contain_intrinsic_axes(),
+            [
+                ContainIntrinsic {
+                    auto: true,
+                    length: Length::px(240.0),
+                },
+                ContainIntrinsic {
+                    auto: true,
+                    length: Length::Auto,
+                },
+            ]
+        );
+
+        let logical = style("logical");
+        assert_eq!(
+            logical.contain_intrinsic_axes(),
+            [
+                ContainIntrinsic {
+                    auto: false,
+                    length: Length::px(120.0),
+                },
+                ContainIntrinsic {
+                    auto: true,
+                    length: Length::px(90.0),
+                },
+            ]
+        );
+
+        let bad = style("bad");
+        assert_eq!(bad.content_visibility, ContentVisibility::Visible);
+        assert_eq!(
+            bad.contain_intrinsic_axes(),
+            [ContainIntrinsic::default(); 2]
+        );
+
+        assert!(supports_declaration("content-visibility", "auto"));
+        assert!(supports_declaration("content-visibility", "hidden"));
+        assert!(!supports_declaration("content-visibility", "bogus"));
+        assert!(supports_declaration("contain-intrinsic-size", "auto 500px"));
+        assert!(supports_declaration(
+            "contain-intrinsic-size",
+            "300px auto none"
+        ));
+        assert!(supports_declaration(
+            "contain-intrinsic-block-size",
+            "auto 10em"
+        ));
+        assert!(!supports_declaration("contain-intrinsic-size", "auto"));
+        assert!(!supports_declaration("contain-intrinsic-width", "-10px"));
+        assert!(!supports_declaration("contain-intrinsic-height", "50%"));
+    }
+
+    #[test]
+    fn slotted_selector_matching_specificity_and_context_cascade() {
+        let mut doc = Document::parse_markup(
+            "<x-card id='host'><span id='a' class='badge'>A</span><h2 id='hdr' slot='header'>H</h2><em id='em'>E</em></x-card>",
+        )
+        .expect("document should parse");
+        let host = doc.find_element_by_id("host").expect("host");
+        let span_a = doc.find_element_by_id("a").expect("a");
+        let hdr = doc.find_element_by_id("hdr").expect("hdr");
+        let em = doc.find_element_by_id("em").expect("em");
+
+        let shadow = doc.attach_shadow(host, true).expect("shadow root");
+        let style_el = doc.create_element("style");
+        let shadow_css = doc.create_text(
+            r#"
+            ::slotted(span) { color: #ff0000; background-color: #111111; }
+            ::slotted(.badge) { color: #00ff00; }
+            slot[name="header"]::slotted(h2) { color: #0000ff; }
+            slot[name="other"]::slotted(h2) { color: #ff00ff; }
+            ::slotted(em) { color: #123456 !important; }
+            ::slotted(span)::before { content: ">"; }
+            "#,
+        );
+        doc.append_child(style_el, shadow_css).unwrap();
+        doc.append_child(shadow, style_el).unwrap();
+        let named_slot = doc.create_element("slot");
+        doc.set_attribute(named_slot, "name", "header".to_string());
+        let default_slot = doc.create_element("slot");
+        doc.append_child(shadow, named_slot).unwrap();
+        doc.append_child(shadow, default_slot).unwrap();
+
+        // outer normal beats ::slotted() normal; ::slotted() !important beats outer !important
+        let outer = Stylesheet::parse(
+            "span { background-color: #222222; } em { color: #654321 !important; }",
+        )
+        .expect("outer sheet");
+        let state = StyleState::default();
+        let style_of = |node: NodeId| outer.style_for(document_context(&doc, node, &state));
+
+        let a_style = style_of(span_a);
+        assert_eq!(a_style.color, Color::opaque(0, 255, 0));
+        assert_eq!(a_style.background, Color::opaque(0x22, 0x22, 0x22));
+        assert_eq!(style_of(hdr).color, Color::opaque(0, 0, 255));
+        assert_eq!(style_of(em).color, Color::opaque(0x12, 0x34, 0x56));
+        assert_eq!(
+            outer.generated_content_pair(&doc, span_a, &state),
+            [Some(">".to_string()), None]
+        );
+
+        // nested slot forwarding across two shadow trees
+        let inner_host = doc.create_element("x-inner");
+        doc.append_child(shadow, inner_host).unwrap();
+        let forwarded_slot = doc.create_element("slot");
+        doc.set_attribute(forwarded_slot, "name", "fwd".to_string());
+        doc.append_child(inner_host, forwarded_slot).unwrap();
+        let inner_shadow = doc.attach_shadow(inner_host, true).expect("inner shadow");
+        let inner_style = doc.create_element("style");
+        let inner_css = doc.create_text("::slotted(.fwd-item) { color: #abcdef; }");
+        doc.append_child(inner_style, inner_css).unwrap();
+        doc.append_child(inner_shadow, inner_style).unwrap();
+        let inner_slot = doc.create_element("slot");
+        doc.append_child(inner_shadow, inner_slot).unwrap();
+        let fwd_item = doc.create_element("p");
+        doc.set_attribute(fwd_item, "slot", "fwd".to_string());
+        doc.set_attribute(fwd_item, "class", "fwd-item".to_string());
+        doc.append_child(host, fwd_item).unwrap();
+        assert_eq!(
+            outer
+                .style_for(document_context(&doc, fwd_item, &state))
+                .color,
+            Color::opaque(0xab, 0xcd, 0xef)
+        );
+
+        // invalid ::slotted() forms are rejected
+        for invalid in [
+            "::slotted()",
+            "::slotted(div span)",
+            "::slotted(div > span)",
+            "::slotted(div, span)",
+            "::slotted(span) b",
+            "::slotted(span::before)",
+            "::slotted(span):hover",
+        ] {
+            assert!(
+                Selector::parse(invalid).is_err(),
+                "expected invalid selector: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn part_selector_matching_exportparts_pseudo_classes_and_context_cascade() {
+        let mut doc = Document::parse_markup("<x-outer id='outer'></x-outer>")
+            .expect("document should parse");
+        let outer_host = doc.find_element_by_id("outer").expect("outer host");
+        let outer_shadow = doc.attach_shadow(outer_host, true).expect("outer shadow");
+
+        let outer_style = doc.create_element("style");
+        let outer_shadow_css = doc.create_text(
+            r#"
+            button { color: #111111; background-color: #222222 !important; }
+            x-inner::part(inner-btn) { color: #333333; }
+            "#,
+        );
+        doc.append_child(outer_style, outer_shadow_css).unwrap();
+        doc.append_child(outer_shadow, outer_style).unwrap();
+
+        let btn = doc.create_element("button");
+        doc.set_attribute(btn, "part", "btn primary".to_string());
+        doc.append_child(outer_shadow, btn).unwrap();
+
+        let inner_host = doc.create_element("x-inner");
+        doc.set_attribute(
+            inner_host,
+            "exportparts",
+            "inner-btn: forwarded-btn, badge, tag: x-tag".to_string(),
+        );
+        doc.append_child(outer_shadow, inner_host).unwrap();
+
+        let inner_shadow = doc.attach_shadow(inner_host, true).expect("inner shadow");
+        let inner_style = doc.create_element("style");
+        let inner_css = doc.create_text("button { color: #444444; }");
+        doc.append_child(inner_style, inner_css).unwrap();
+        doc.append_child(inner_shadow, inner_style).unwrap();
+
+        let inner_btn = doc.create_element("button");
+        doc.set_attribute(inner_btn, "part", "inner-btn badge".to_string());
+        doc.append_child(inner_shadow, inner_btn).unwrap();
+
+        let secret = doc.create_element("span");
+        doc.set_attribute(secret, "part", "secret".to_string());
+        doc.append_child(inner_shadow, secret).unwrap();
+
+        let page_sheet = Stylesheet::parse(
+            r#"
+            x-outer { --brand: #778899; }
+            x-outer::part(btn primary) { color: var(--brand); background-color: #999999 !important; }
+            x-outer::part(btn missing) { color: #ff0000; }
+            x-outer:hover::part(btn):focus { color: #00cc00; }
+            x-outer::part(btn)::before { content: "["; }
+            x-outer::part(forwarded-btn badge) { color: #aa5500; }
+            x-outer::part(secret) { color: #ff0000; }
+            "#,
+        )
+        .expect("page sheet should parse");
+
+        let mut state = StyleState::default();
+        page_sheet.populate_custom_properties(&doc, &mut state);
+
+        // outer ::part() normal beats shadow internal normal; shadow !important beats outer !important
+        let btn_style = page_sheet.style_for(document_context(&doc, btn, &state));
+        assert_eq!(btn_style.color, Color::opaque(0x77, 0x88, 0x99));
+        assert_eq!(btn_style.background, Color::opaque(0x22, 0x22, 0x22));
+        assert_eq!(
+            page_sheet.generated_content_pair(&doc, btn, &state),
+            [Some("[".to_string()), None]
+        );
+
+        // host :hover and part :focus evaluate on host and part element respectively
+        state.hovered = Some(outer_host);
+        state.focused = Some(btn);
+        assert_eq!(
+            page_sheet
+                .style_for(document_context(&doc, btn, &state))
+                .color,
+            Color::opaque(0, 0xcc, 0)
+        );
+
+        // forwarded multi-part via exportparts beats outer shadow ::part() and inner normal
+        assert_eq!(
+            page_sheet
+                .style_for(document_context(&doc, inner_btn, &state))
+                .color,
+            Color::opaque(0xaa, 0x55, 0)
+        );
+
+        // unexported nested part is not reachable from outer document
+        assert_eq!(
+            page_sheet
+                .style_for(document_context(&doc, secret, &state))
+                .color,
+            Color::BLACK
+        );
+
+        // specificity per css shadow parts 1: ::part() contributes (0, 0, 1)
+        assert_eq!(
+            Selector::parse("x-outer::part(btn)").unwrap().specificity(),
+            Specificity(0, 0, 2)
+        );
+        assert_eq!(
+            Selector::parse("x-outer::part(btn):hover")
+                .unwrap()
+                .specificity(),
+            Specificity(0, 1, 2)
+        );
+        assert_eq!(
+            Selector::parse(".card::part(btn)").unwrap().specificity(),
+            Specificity(0, 1, 1)
+        );
+
+        // invalid ::part() forms are rejected
+        for invalid in [
+            "x-outer::part()",
+            "x-outer::part(a, b)",
+            "x-outer::part(a)::part(b)",
+            "x-outer::part(a) span",
+            "x-outer::part(a).cls",
+            "x-outer::part(a):first-child",
+            "x-outer::part(a):nth-child(2)",
+            "x-outer::part(a):has(span)",
+        ] {
+            assert!(
+                Selector::parse(invalid).is_err(),
+                "expected invalid selector: {invalid}"
+            );
+        }
     }
 }
