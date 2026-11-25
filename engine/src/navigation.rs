@@ -1082,6 +1082,8 @@ pub struct Browser {
     selection_unit: Option<SelectionUnit>,
     // hit testing, cursor lookup and paint after one input all read the same layout
     layout_cache: RefCell<Option<CachedLayout>>,
+    // wall time and page clock of the last full layout, for expiring layout caches during idle animations
+    last_full_layout: Cell<Option<(std::time::Instant, u64)>>,
     // the last frame and what it was painted from, so the next paints only what changed
     painted: RefCell<Option<Painted>>,
 }
@@ -1329,6 +1331,9 @@ impl Browser {
         self.motion_since = 0;
         self.motion_nodes.clear();
         self.motion_custom = Shared::default();
+        self.rest_layout_caches();
+        crate::paint::forget_backdrop();
+        crate::paint::forget_layers();
         if let Some(page) = self.page.take() {
             let Page { runtime, .. } = page;
             runtime.release_heap();
@@ -1387,6 +1392,7 @@ impl Browser {
             fonts: Rc::new(FontSet::builtin()),
             selection_unit: None,
             layout_cache: RefCell::new(None),
+            last_full_layout: Cell::new(None),
             painted: RefCell::new(None),
         }
     }
@@ -3312,6 +3318,7 @@ impl Browser {
         if let Some(cached) = self.layout_cache.borrow().as_ref()
             && cached.key == key
         {
+            self.maybe_rest_layout_caches(style_state.clock);
             return Ok(cached.layout.clone());
         }
         if let Some(cached) = self.layout_cache.borrow().as_ref() {
@@ -3355,6 +3362,7 @@ impl Browser {
                 .then(|| cached.layout.clone())
         });
         if let Some(layout) = unchanged_until_wake {
+            self.maybe_rest_layout_caches(style_state.clock);
             return Ok(layout);
         }
         page.populate_custom_properties(&document, &mut style_state);
@@ -3393,6 +3401,7 @@ impl Browser {
                 motion,
                 generation: next_generation(),
             });
+            self.maybe_rest_layout_caches(style_state.clock);
             return Ok(layout);
         }
         // a script that read a box since the document last changed has made this layout already
@@ -3458,6 +3467,7 @@ impl Browser {
         if let Some(base) = self.current_url.as_ref() {
             self.attach_image_layers(page, base, &document, &mut layout);
         }
+        let layout_clock = style_state.clock;
         if !reused {
             page.runtime.adopt_measured_layout(
                 document.version(),
@@ -3469,6 +3479,8 @@ impl Browser {
                 layout.clone(),
             );
         }
+        self.last_full_layout
+            .set(Some((std::time::Instant::now(), layout_clock)));
         *self.layout_cache.borrow_mut() = Some(CachedLayout {
             key,
             layout: layout.clone(),
@@ -3482,6 +3494,30 @@ impl Browser {
         self.paint_scaled(viewport, 1.0)
     }
 
+    fn rest_layout_caches(&self) {
+        self.last_full_layout.set(None);
+        crate::layout::forget_kept_answers();
+        crate::css::forget_custom_property_passes();
+        if let Some(page) = self.page.as_ref() {
+            self.stylesheet(page).forget_cascades();
+        }
+    }
+
+    // release layout and cascade caches after five idle layout seconds even while paint-only
+    // animations keep producing frames so host rest() never fires
+    fn maybe_rest_layout_caches(&self, clock: u64) {
+        const LAYOUT_REST_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+        const LAYOUT_REST_CLOCK_MS: u64 = 5_000;
+        if let Some((at, layout_clock)) = self.last_full_layout.get()
+            && at.elapsed() >= LAYOUT_REST_AFTER
+            && clock.saturating_sub(layout_clock) >= LAYOUT_REST_CLOCK_MS
+        {
+            self.rest_layout_caches();
+            crate::paint::forget_layers();
+            crate::release_memory();
+        }
+    }
+
     // drops what is held only to make the next frame cheaper while frames follow each
     // other closely: the second canvas and the layout answers kept from the last layout
     pub(crate) fn rest(&self) {
@@ -3489,8 +3525,9 @@ impl Browser {
             painted.spare = None;
             painted.behind.clear();
         }
-        crate::layout::forget_kept_answers();
+        self.rest_layout_caches();
         crate::paint::forget_backdrop();
+        crate::paint::forget_layers();
         crate::release_memory();
     }
 
@@ -13136,6 +13173,43 @@ A</div>
         assert_eq!(
             checked.body().children[1].background,
             Color::opaque(0, 0, 255)
+        );
+    }
+
+    #[test]
+    fn layout_idle_rest_expires_caches_during_opacity_pulse() {
+        let mut browser = Browser::new(bundle(
+            r##"<style>
+                @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+                #badge { width: 40px; height: 20px; background: #cc4422; animation: pulse 1000ms linear infinite; }
+            </style><div id="badge">off</div>"##,
+        ));
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let viewport = Size {
+            width: 240.0,
+            height: 180.0,
+        };
+        browser.sample_transitions(viewport).expect("sample");
+        let initial = browser.layout(viewport).expect("initial layout");
+        assert!(browser.last_full_layout.get().is_some());
+
+        // backdate the recorded wall instant so the five-second layout idle rest triggers
+        browser.last_full_layout.set(Some((
+            std::time::Instant::now() - std::time::Duration::from_secs(6),
+            0,
+        )));
+        browser.advance_time(5_500).expect("advance time");
+        browser.sample_transitions(viewport).expect("sample");
+        let pulsed = browser.layout(viewport).expect("pulsed layout");
+        assert!(
+            browser.last_full_layout.get().is_none(),
+            "paint-only motion should expire layout caches once five idle seconds pass"
+        );
+        assert_ne!(
+            initial.body().children[0].opacity,
+            pulsed.body().children[0].opacity
         );
     }
 }

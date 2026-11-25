@@ -1239,11 +1239,7 @@ impl Canvas {
     fn transparent(bounds: Rect, scale: f32) -> Canvas {
         let width = (bounds.width * scale).ceil().max(1.0) as u32;
         let height = (bounds.height * scale).ceil().max(1.0) as u32;
-        let mut pixels = LAYER_BUFFERS
-            .with(|pool| pool.borrow_mut().pop())
-            .unwrap_or_default();
-        pixels.clear();
-        pixels.resize(width as usize * height as usize * 4, 0);
+        let pixels = take_layer_buffer(width as usize * height as usize * 4);
         Canvas {
             width,
             height,
@@ -1778,11 +1774,7 @@ impl Canvas {
     fn layer(&self, bounds: DeviceBounds) -> Canvas {
         let width = bounds.right - bounds.left;
         let height = bounds.bottom - bounds.top;
-        let mut pixels = LAYER_BUFFERS
-            .with(|pool| pool.borrow_mut().pop())
-            .unwrap_or_default();
-        pixels.clear();
-        pixels.resize(width as usize * height as usize * 4, 0);
+        let pixels = take_layer_buffer(width as usize * height as usize * 4);
         Canvas {
             width,
             height,
@@ -1810,11 +1802,7 @@ impl Canvas {
         let bottom = ((rect.y + rect.height - self.shift.1) * self.scale).ceil();
         let width = (right - left).max(1.0) as u32;
         let height = (bottom - top).max(1.0) as u32;
-        let mut pixels = LAYER_BUFFERS
-            .with(|pool| pool.borrow_mut().pop())
-            .unwrap_or_default();
-        pixels.clear();
-        pixels.resize(width as usize * height as usize * 4, 0);
+        let pixels = take_layer_buffer(width as usize * height as usize * 4);
         Canvas {
             width,
             height,
@@ -1909,19 +1897,56 @@ impl Canvas {
     }
 }
 
-const MAX_POOLED_LAYERS: usize = 8;
-// larger buffers go back to the allocator, so one big layer does not stay resident
+const MAX_POOLED_LAYERS: usize = 4;
+// cap individual and aggregate pooled layer buffers so idle views do not pin multi-megabyte scratch
 const MAX_POOLED_LAYER_BYTES: usize = 4 * 1024 * 1024;
+const MAX_POOLED_LAYER_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
+fn take_layer_buffer(len: usize) -> Vec<u8> {
+    let mut pixels = LAYER_BUFFERS.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        // prefer the smallest buffer that already fits so small blurs do not claim full-window buffers
+        let index = pool
+            .iter()
+            .enumerate()
+            .filter(|(_, buffer)| buffer.capacity() >= len)
+            .min_by_key(|(_, buffer)| buffer.capacity())
+            .or_else(|| {
+                pool.iter()
+                    .enumerate()
+                    .max_by_key(|(_, buffer)| buffer.capacity())
+            })
+            .map(|(index, _)| index);
+        index
+            .map(|index| pool.swap_remove(index))
+            .unwrap_or_default()
+    });
+    pixels.clear();
+    pixels.resize(len, 0);
+    pixels
+}
 
 fn recycle_layer(pixels: Vec<u8>) {
-    if pixels.capacity() > MAX_POOLED_LAYER_BYTES {
+    let capacity = pixels.capacity();
+    if capacity == 0 || capacity > MAX_POOLED_LAYER_BYTES {
         return;
     }
     LAYER_BUFFERS.with(|pool| {
         let mut pool = pool.borrow_mut();
-        if pool.len() < MAX_POOLED_LAYERS {
+        let held: usize = pool.iter().map(Vec::capacity).sum();
+        if pool.len() < MAX_POOLED_LAYERS
+            && held.saturating_add(capacity) <= MAX_POOLED_LAYER_TOTAL_BYTES
+        {
             pool.push(pixels);
         }
+    });
+}
+
+pub(crate) fn forget_layers() {
+    LAYER_BUFFERS.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        pool.clear();
+        pool.shrink_to_fit();
     });
 }
 // a transformed subtree larger than this renders at reduced resolution instead of failing
@@ -6460,10 +6485,7 @@ fn box_blur_passes(layer: &mut Canvas, radius: usize, passes: usize) {
         return;
     }
     let len = layer.pixels.len();
-    let mut buffer = LAYER_BUFFERS
-        .with(|pool| pool.borrow_mut().pop())
-        .unwrap_or_default();
-    buffer.resize(len, 0);
+    let mut buffer = take_layer_buffer(len);
     let window = (radius * 2 + 1) as u32;
     // exact reciprocal division for sum <= 255 * window when window < 4096
     let fast_inv = (window < 4096).then(|| (1_u64 << 32).div_ceil(u64::from(window)));
@@ -8836,5 +8858,26 @@ mod tests {
         );
         document.root.control_selection = Some(Box::new((0, 0, false)));
         assert_ne!(paint(&document).rgba_pixels(), canvas.rgba_pixels());
+    }
+
+    #[test]
+    fn layer_pool_caps_total_bytes_and_clears_on_forget() {
+        forget_layers();
+        recycle_layer(Vec::with_capacity(2 * 1024 * 1024));
+        recycle_layer(Vec::with_capacity(2 * 1024 * 1024));
+        recycle_layer(Vec::with_capacity(2 * 1024 * 1024));
+        LAYER_BUFFERS.with(|pool| {
+            let pool = pool.borrow();
+            let total: usize = pool.iter().map(Vec::capacity).sum();
+            assert!(total <= MAX_POOLED_LAYER_TOTAL_BYTES);
+            assert_eq!(pool.len(), 2);
+        });
+        let small = take_layer_buffer(4096);
+        assert_eq!(small.len(), 4096);
+        recycle_layer(small);
+        forget_layers();
+        LAYER_BUFFERS.with(|pool| {
+            assert!(pool.borrow().is_empty());
+        });
     }
 }

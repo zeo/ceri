@@ -1209,6 +1209,14 @@ thread_local! {
     static CUSTOM_PROPERTY_PASSES: RefCell<Vec<CustomPropertyPass>> = const { RefCell::new(Vec::new()) };
 }
 
+pub(crate) fn forget_custom_property_passes() {
+    CUSTOM_PROPERTY_PASSES.with(|passes| {
+        let mut passes = passes.borrow_mut();
+        passes.clear();
+        passes.shrink_to_fit();
+    });
+}
+
 // the sheet, document and version a custom property pass read, with the state it read, and
 // what it found
 struct CustomPropertyPass {
@@ -5204,6 +5212,10 @@ impl Stylesheet {
 
     pub(crate) fn has_animations(&self) -> bool {
         self.has_animations
+    }
+
+    pub(crate) fn forget_cascades(&self) {
+        *self.cascades.borrow_mut() = Cascades::default();
     }
 
     // the cascade of an element or one of its generated boxes, kept from one layout to the
