@@ -9,6 +9,10 @@ use ceri_engine::{
 #[derive(Default)]
 pub(crate) struct DesktopVideo;
 
+pub(crate) fn warm_gpu() {
+    platform::warm_gpu();
+}
+
 impl MediaDecoder for DesktopVideo {
     fn open(&self, source: &MediaSource) -> Result<Box<dyn VideoReader>, String> {
         Ok(Box::new(platform::Reader::open(source)?))
@@ -272,6 +276,109 @@ mod platform {
     const AUDIO: u32 = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
     // media foundation keeps time in units of 100 nanoseconds
     const TICKS: f64 = 10_000_000.0;
+    // a frame whose time is this close to a seek target counts as at it
+    const NEAR: f64 = 0.0005;
+    // short forward seeks step from the current stream cursor instead of flushing the codec
+    const FORWARD_STEP: f64 = 0.5;
+
+    #[derive(Clone, Copy)]
+    pub(super) struct CpuUnpack {
+        ly: i32,
+        rv: i32,
+        rb: i32,
+        gu: i32,
+        gv: i32,
+        gb: i32,
+        bu: i32,
+        bb: i32,
+    }
+
+    impl CpuUnpack {
+        pub(super) fn from_rows(rows: [[f32; 4]; 4]) -> Self {
+            const SCALE: f32 = 16_384.0;
+            const CHROMA: f32 = SCALE / 16.0;
+            let bias = |offset: f32| (offset * 255.0 * SCALE).round() as i32 + (SCALE as i32 / 2);
+            Self {
+                ly: (rows[0][0] * SCALE).round() as i32,
+                rv: (rows[0][2] * CHROMA).round() as i32,
+                rb: bias(rows[0][3]),
+                gu: (rows[1][1] * CHROMA).round() as i32,
+                gv: (rows[1][2] * CHROMA).round() as i32,
+                gb: bias(rows[1][3]),
+                bu: (rows[2][1] * CHROMA).round() as i32,
+                bb: bias(rows[2][3]),
+            }
+        }
+    }
+
+    // unpacks an nv12 buffer into bgra with the same centered-chroma bilinear sampling and colour
+    // matrix as the gpu unpack shader, matching chromium's chroma siting
+    pub(super) fn unpack_nv12(
+        y_plane: &[u8],
+        uv_plane: &[u8],
+        pitch: usize,
+        coded: (u32, u32),
+        picture: Area,
+        matrix: CpuUnpack,
+    ) -> Result<Vec<u8>, String> {
+        let (cw, ch) = ((coded.0 / 2) as usize, (coded.1 / 2) as usize);
+        if cw == 0 || ch == 0 || pitch < coded.0 as usize {
+            return Err("the nv12 frame is smaller than its picture".to_string());
+        }
+        let (left, top) = (picture.left as usize, picture.top as usize);
+        let (width, height) = (picture.width as usize, picture.height as usize);
+        if width == 0 || height == 0 {
+            return Err("the nv12 frame has an empty picture".to_string());
+        }
+        if left + width > coded.0 as usize || top + height > coded.1 as usize {
+            return Err("the picture aperture exceeds the nv12 surface".to_string());
+        }
+        let y_needed = (top + height - 1) * pitch + left + width;
+        let max_cy = ((top + height - 1) / 2 + 1).min(ch - 1);
+        let uv_needed = max_cy * pitch + cw * 2;
+        if y_plane.len() < y_needed || uv_plane.len() < uv_needed {
+            return Err("the nv12 buffer is truncated".to_string());
+        }
+        let mut bgra = vec![0u8; width * height * 4];
+        let mut uv_row = vec![0u16; cw * 2];
+        for row in 0..height {
+            let sy = top + row;
+            let cy0 = sy / 2;
+            let cy1 = if sy & 1 == 0 {
+                cy0.saturating_sub(1)
+            } else {
+                (cy0 + 1).min(ch - 1)
+            };
+            let uv0 = &uv_plane[cy0 * pitch..cy0 * pitch + cw * 2];
+            let uv1 = &uv_plane[cy1 * pitch..cy1 * pitch + cw * 2];
+            for i in 0..cw * 2 {
+                uv_row[i] = u16::from(uv0[i]) * 3 + u16::from(uv1[i]);
+            }
+            let y_line = &y_plane[sy * pitch + left..sy * pitch + left + width];
+            let out = &mut bgra[row * width * 4..(row + 1) * width * 4];
+            for (col, (&y_byte, pixel)) in y_line.iter().zip(out.chunks_exact_mut(4)).enumerate() {
+                let sx = left + col;
+                let cx0 = sx / 2;
+                let cx1 = if sx & 1 == 0 {
+                    cx0.saturating_sub(1)
+                } else {
+                    (cx0 + 1).min(cw - 1)
+                };
+                let u16 = i32::from(uv_row[cx0 * 2]) * 3 + i32::from(uv_row[cx1 * 2]);
+                let v16 = i32::from(uv_row[cx0 * 2 + 1]) * 3 + i32::from(uv_row[cx1 * 2 + 1]);
+                let y_term = matrix.ly * i32::from(y_byte);
+                let b = ((y_term + matrix.bu * u16 + matrix.bb) >> 14).clamp(0, 255) as u8;
+                let g = ((y_term + matrix.gu * u16 + matrix.gv * v16 + matrix.gb) >> 14)
+                    .clamp(0, 255) as u8;
+                let r = ((y_term + matrix.rv * v16 + matrix.rb) >> 14).clamp(0, 255) as u8;
+                pixel[0] = b;
+                pixel[1] = g;
+                pixel[2] = r;
+                pixel[3] = 255;
+            }
+        }
+        Ok(bgra)
+    }
 
     struct Stream {
         reader: IMFSourceReader,
@@ -283,6 +390,8 @@ mod platform {
         // set when the decoder hands frames over as gpu surfaces
         gpu: Option<&'static Gpu>,
         converter: Option<Converter>,
+        // set on software nv12 streams to unpack directly with gpu-matching chroma siting
+        cpu_unpack: Option<CpuUnpack>,
         // the first frame, decoded while open checked that the gpu path works
         pending: Option<VideoFrame>,
         // seconds the mp4 edit list moves pictures by
@@ -295,6 +404,8 @@ mod platform {
         upgrade: Option<MediaSource>,
         // presentation time of the last delivered frame, so mid-stream gpu upgrade resumes after it
         last_time: Option<f64>,
+        // true before any frame has been pulled, while the reader still sits at the start
+        at_start: bool,
         // declared last so the reader is released before the apartment closes
         _apartment: Apartment,
     }
@@ -332,18 +443,22 @@ mod platform {
         GPU.get_or_init(|| unsafe { Gpu::new() }).as_ref()
     }
 
-    // starts d3d11 device initialization off the decode thread once the first software frame has
-    // landed, avoiding windows loader-lock contention with media foundation dlls on cold open
-    fn warm_gpu() {
+    // starts d3d11, media foundation, and unpack shader initialization off the caller thread
+    pub(super) fn warm_gpu() {
         if GPU.get().is_some() {
             return;
         }
         GPU_WARMUP.call_once(|| {
             let _ = std::thread::Builder::new()
                 .name("ceri-video-gpu".into())
-                .stack_size(256 * 1024)
                 .spawn(|| {
-                    let _ = gpu();
+                    let _apartment = apartment();
+                    let _ = mfreadwrite();
+                    if let Some(gpu) = gpu() {
+                        // safety: device is live for the process lifetime and shader compilation is
+                        // synchronized by the unpacking oncelock
+                        let _ = unsafe { gpu.unpacking_pipeline() };
+                    }
                 });
         });
     }
@@ -569,16 +684,8 @@ mod platform {
             buffer.ok_or_else(|| "Direct3D returned no buffer".to_string())
         }
 
-        // an nv12 texture this device can read drawn into a bgra one through the rows
-        unsafe fn unpack(
-            &self,
-            rows: &ID3D11Buffer,
-            source: &ID3D11Texture2D,
-            target: &ID3D11Texture2D,
-            (width, height): (u32, u32),
-        ) -> Result<(), String> {
-            let (vertices, pixels, between) = self
-                .unpacking
+        unsafe fn unpacking_pipeline(&self) -> Result<&Unpacking, String> {
+            self.unpacking
                 .get_or_init(|| unsafe {
                     let (vertices, pixels) = shaders(&self.device, UNPACK)?;
                     let described = D3D11_SAMPLER_DESC {
@@ -598,7 +705,18 @@ mod platform {
                     Ok((vertices, pixels, sampler))
                 })
                 .as_ref()
-                .map_err(Clone::clone)?;
+                .map_err(Clone::clone)
+        }
+
+        // an nv12 texture this device can read drawn into a bgra one through the rows
+        unsafe fn unpack(
+            &self,
+            rows: &ID3D11Buffer,
+            source: &ID3D11Texture2D,
+            target: &ID3D11Texture2D,
+            (width, height): (u32, u32),
+        ) -> Result<(), String> {
+            let (vertices, pixels, between) = unsafe { self.unpacking_pipeline()? };
             // the planes of an nv12 texture are read as one and two channel textures
             let plane = |format| {
                 let described = D3D11_SHADER_RESOURCE_VIEW_DESC {
@@ -775,7 +893,7 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
 
     // the rows that take y, u and v as the surface holds them to r, g and b for the 8 bit
     // colour spaces the shader draws, then the shown part's corner and the surface's size
-    fn unpacking_rows(
+    pub(super) fn unpacking_rows(
         space: DXGI_COLOR_SPACE_TYPE,
         shown: Area,
         surface: (u32, u32),
@@ -1593,11 +1711,11 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
     }
 
     #[derive(Clone, Copy)]
-    struct Area {
-        left: u32,
-        top: u32,
-        width: u32,
-        height: u32,
+    pub(super) struct Area {
+        pub(super) left: u32,
+        pub(super) top: u32,
+        pub(super) width: u32,
+        pub(super) height: u32,
     }
 
     // the visible part of a frame, which codecs padding to whole macroblocks keep smaller
@@ -1655,8 +1773,8 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
     }
 
     impl Reader {
-        // opens immediately in software when d3d11 is cold so the first video frame lands without
-        // waiting on driver startup or loader lock; codecs that decode on gpu only wait for warmup
+        // opens immediately in software when d3d11 is cold while kicking off background gpu warmup,
+        // and uses hardware decoding directly once gpu initialization finishes
         pub(super) fn open(source: &MediaSource) -> Result<Self, String> {
             if let Some(gpu) = GPU.get().and_then(Option::as_ref) {
                 if let Ok(reader) = Self::open_on(source, Some(gpu)) {
@@ -1664,6 +1782,7 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                 }
                 return Self::open_on(source, None);
             }
+            warm_gpu();
             match Self::open_on(source, None) {
                 Ok(mut reader) => {
                     if GPU.get().is_none() {
@@ -1687,6 +1806,7 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                 stream,
                 upgrade: None,
                 last_time: None,
+                at_start: true,
                 _apartment: apartment,
             })
         }
@@ -1696,6 +1816,16 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
             let mut reader = Self::open_on(source, None)?;
             reader.upgrade = Some(source.clone());
             Ok(reader)
+        }
+
+        #[cfg(test)]
+        pub(super) fn uses_cpu_nv12(&self) -> bool {
+            self.stream.cpu_unpack.is_some()
+        }
+
+        #[cfg(test)]
+        pub(super) fn has_pending(&self) -> bool {
+            self.stream.pending.is_some()
         }
 
         fn upgrade_for_seek(&mut self, seconds: f64) -> bool {
@@ -1714,7 +1844,7 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
             let Ok(mut stream) = Stream::open(&source, Some(gpu), false) else {
                 return false;
             };
-            if seek(&stream.reader, seconds - stream.shift).is_err() {
+            if seconds > FORWARD_STEP && seek(&stream.reader, seconds - stream.shift).is_err() {
                 return false;
             }
             let Ok(first) = stream.next() else {
@@ -1754,35 +1884,53 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
             gpu: Option<&'static Gpu>,
             probe_first: bool,
         ) -> Result<Self, String> {
+            match gpu {
+                Some(gpu) => Self::open_mode(source, Some(gpu), false, probe_first),
+                None => Self::open_mode(source, None, false, probe_first)
+                    .or_else(|_| Self::open_mode(source, None, true, probe_first)),
+            }
+        }
+
+        fn open_mode(
+            source: &MediaSource,
+            gpu: Option<&'static Gpu>,
+            video_processing: bool,
+            probe_first: bool,
+        ) -> Result<Self, String> {
             let mf = mfplat()?;
             // SAFETY: every call below follows the source reader's documented contract, on
             // interfaces this function created and still holds
             unsafe {
-                let mut raw_attributes: *mut c_void = std::ptr::null_mut();
-                (mf.create_attributes)(&mut raw_attributes, 2)
-                    .ok()
-                    .map_err(text)?;
-                let attributes: IMFAttributes = (!raw_attributes.is_null())
-                    .then(|| IMFAttributes::from_raw(raw_attributes))
-                    .ok_or("media foundation gave no attribute store")?;
-                match gpu {
-                    Some(gpu) => {
-                        attributes
-                            .SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &gpu.manager)
-                            .map_err(text)?;
-                        attributes
-                            .SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)
-                            .map_err(text)?;
+                let attributes = if gpu.is_some() || video_processing {
+                    let mut raw_attributes: *mut c_void = std::ptr::null_mut();
+                    (mf.create_attributes)(&mut raw_attributes, 2)
+                        .ok()
+                        .map_err(text)?;
+                    let attributes: IMFAttributes = (!raw_attributes.is_null())
+                        .then(|| IMFAttributes::from_raw(raw_attributes))
+                        .ok_or("media foundation gave no attribute store")?;
+                    match gpu {
+                        Some(gpu) => {
+                            attributes
+                                .SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &gpu.manager)
+                                .map_err(text)?;
+                            attributes
+                                .SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)
+                                .map_err(text)?;
+                        }
+                        None => attributes
+                            // the advanced processor would also resample to the frame rate the
+                            // container claims, which webm files often get wrong
+                            .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+                            .map_err(text)?,
                     }
-                    None => attributes
-                        // the advanced processor would also resample to the frame rate the
-                        // container claims, which webm files often get wrong
-                        .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
-                        .map_err(text)?,
-                }
+                    Some(attributes)
+                } else {
+                    None
+                };
                 let reader = source_reader(
                     source,
-                    Some(&attributes),
+                    attributes.as_ref(),
                     VIDEO,
                     "the media has no video stream",
                 )?;
@@ -1794,10 +1942,6 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                     .GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO)
                     .map_or((1, 1), split);
                 let (width, height) = natural_size(shown.width, shown.height, aspect);
-                let headers = headers(source);
-                let shift = edit_shift(&headers, b"vide").unwrap_or(0.0);
-                let duration = fragmented_end(&headers, b"vide")
-                    .map_or_else(|| duration(&reader), |end| end + shift);
                 let mut raw_output: *mut c_void = std::ptr::null_mut();
                 (mf.create_media_type)(&mut raw_output).ok().map_err(text)?;
                 let output = (!raw_output.is_null())
@@ -1821,9 +1965,19 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                     Some(_) => {
                         deliver(&MFVideoFormat_NV12).or_else(|_| deliver(&MFVideoFormat_P010))
                     }
+                    None if !video_processing => {
+                        if hdr {
+                            return Err("hdr software decoding needs video processing".to_string());
+                        }
+                        deliver(&MFVideoFormat_NV12)
+                    }
                     None => deliver(&MFVideoFormat_RGB32),
                 }
                 .map_err(text)?;
+                let headers = headers(source);
+                let shift = edit_shift(&headers, b"vide").unwrap_or(0.0);
+                let duration = fragmented_end(&headers, b"vide")
+                    .map_or_else(|| duration(&reader), |end| end + shift);
                 let mut opened = Self {
                     reader,
                     info: MediaInfo {
@@ -1836,10 +1990,16 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                     picture: shown,
                     gpu,
                     converter: None,
+                    cpu_unpack: None,
                     pending: None,
                     shift,
                 };
                 opened.take_format()?;
+                if gpu.is_none() && !video_processing && opened.cpu_unpack.is_none() {
+                    return Err(
+                        "the colour space is unsupported by software nv12 unpack".to_string()
+                    );
+                }
                 if probe_first {
                     opened.pending = opened.next()?;
                 }
@@ -1852,11 +2012,19 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
             unsafe {
                 let current = self.reader.GetCurrentMediaType(VIDEO).map_err(text)?;
                 (self.picture, self.coded) = picture(&current)?;
+                let subtype = current.GetGUID(&MF_MT_SUBTYPE).ok();
+                let is_nv12 = subtype == Some(MFVideoFormat_NV12);
+                let default_stride = if is_nv12 {
+                    self.coded.0 as i32
+                } else {
+                    self.coded.0 as i32 * 4
+                };
                 self.stride = current
                     .GetUINT32(&MF_MT_DEFAULT_STRIDE)
-                    .map_or(self.coded.0 as i32 * 4, |stride| stride as i32);
+                    .map_or(default_stride, |stride| stride as i32);
+                let native = self.reader.GetNativeMediaType(VIDEO, 0).ok();
                 if let Some(gpu) = self.gpu {
-                    let native = self.reader.GetNativeMediaType(VIDEO, 0).ok();
+                    self.cpu_unpack = None;
                     self.converter = Some(Converter::new(
                         gpu,
                         &current,
@@ -1864,6 +2032,12 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                         self.picture,
                         self.coded,
                     )?);
+                } else if is_nv12 {
+                    let space = color_space(&current, native.as_ref(), self.picture.height);
+                    self.cpu_unpack =
+                        unpacking_rows(space, self.picture, self.coded).map(CpuUnpack::from_rows);
+                } else {
+                    self.cpu_unpack = None;
                 }
             }
             Ok(())
@@ -1897,6 +2071,9 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
         }
 
         fn copy(&self, buffer: &IMFMediaBuffer) -> Result<Vec<u8>, String> {
+            if let Some(matrix) = self.cpu_unpack {
+                return self.copy_nv12(buffer, matrix);
+            }
             let Area {
                 left,
                 top,
@@ -1944,6 +2121,58 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
             }
             Ok(bgra)
         }
+
+        fn copy_nv12(&self, buffer: &IMFMediaBuffer, matrix: CpuUnpack) -> Result<Vec<u8>, String> {
+            let coded_h = self.coded.1 as usize;
+            let uv_rows = coded_h / 2;
+            // safety: the lock pins the buffer while y and uv planes are read, and every lock is
+            // unlocked before returning; media foundation lays uv immediately after pitch * coded_h
+            unsafe {
+                if let Ok(planar) = buffer.cast::<IMF2DBuffer>() {
+                    let mut first = std::ptr::null_mut();
+                    let mut pitch = 0;
+                    planar.Lock2D(&mut first, &mut pitch).map_err(text)?;
+                    let unpacked = if pitch > 0 && pitch as usize >= self.coded.0 as usize {
+                        let pitch = pitch as usize;
+                        let y_len = pitch * coded_h;
+                        let uv_len = pitch * uv_rows;
+                        let y_plane = std::slice::from_raw_parts(first, y_len);
+                        let uv_plane = std::slice::from_raw_parts(first.add(y_len), uv_len);
+                        unpack_nv12(y_plane, uv_plane, pitch, self.coded, self.picture, matrix)
+                    } else {
+                        Err("the decoder gave a frame narrower than its picture".to_string())
+                    };
+                    planar.Unlock2D().map_err(text)?;
+                    return unpacked;
+                }
+                let mut start = std::ptr::null_mut();
+                let mut length = 0;
+                buffer
+                    .Lock(&mut start, None, Some(&mut length))
+                    .map_err(text)?;
+                let pitch = self.stride.unsigned_abs() as usize;
+                let y_len = pitch * coded_h;
+                let uv_len = pitch * uv_rows;
+                let unpacked = if self.stride > 0
+                    && pitch >= self.coded.0 as usize
+                    && length as usize >= y_len + uv_len
+                {
+                    let bytes = std::slice::from_raw_parts(start, length as usize);
+                    unpack_nv12(
+                        &bytes[..y_len],
+                        &bytes[y_len..y_len + uv_len],
+                        pitch,
+                        self.coded,
+                        self.picture,
+                        matrix,
+                    )
+                } else {
+                    Err("the decoder gave a frame narrower than its picture".to_string())
+                };
+                buffer.Unlock().map_err(text)?;
+                unpacked
+            }
+        }
     }
 
     impl VideoReader for Reader {
@@ -1952,15 +2181,33 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
         }
 
         fn seek(&mut self, seconds: f64) -> Result<(), String> {
-            self.stream.pending = None;
-            self.last_time = None;
-            if self.upgrade_for_seek(seconds) {
+            let target = seconds.max(0.0);
+            if self.upgrade_for_seek(target) {
+                self.last_time = None;
+                self.at_start = false;
                 return Ok(());
             }
-            seek(&self.stream.reader, seconds - self.stream.shift)
+            if let Some(frame) = &self.stream.pending
+                && frame.time <= target + NEAR
+                && target - frame.time <= FORWARD_STEP
+            {
+                // keep the probed start frame so short initial seeks avoid flushing the decoder
+                self.last_time = None;
+                return Ok(());
+            }
+            if self.stream.pending.is_none() && self.at_start && target <= FORWARD_STEP {
+                // a freshly opened reader already sits at the stream start
+                self.last_time = None;
+                return Ok(());
+            }
+            self.stream.pending = None;
+            self.last_time = None;
+            self.at_start = false;
+            seek(&self.stream.reader, target - self.stream.shift)
         }
 
         fn read(&mut self) -> Result<Option<VideoFrame>, String> {
+            self.at_start = false;
             if let Some(frame) = self.stream.pending.take() {
                 self.last_time = Some(frame.time);
                 return Ok(Some(frame));
@@ -1971,9 +2218,6 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
             let frame = self.stream.next()?;
             if let Some(frame) = &frame {
                 self.last_time = Some(frame.time);
-                if self.upgrade.is_some() {
-                    warm_gpu();
-                }
             }
             Ok(frame)
         }
@@ -2130,7 +2374,12 @@ mod mp4 {
                     }
                     let mut data = vec![0; body as usize];
                     file.read_exact(&mut data).ok()?;
+                    // a non-fragmented movie has no mvex child and carries no moof boxes after moov
+                    let stop = kind == *b"moov" && child(&data, b"mvex").is_none();
                     found.push((kind, data));
+                    if stop {
+                        return None;
+                    }
                 } else {
                     file.seek(SeekFrom::Current(i64::try_from(body).ok()?))
                         .ok()?;
@@ -2291,6 +2540,8 @@ mod platform {
     use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
     use std::sync::OnceLock;
     use std::time::{Duration, Instant};
+
+    pub(super) fn warm_gpu() {}
 
     pub(super) const TYPES: &[&str] = &[
         "video/mp4",
@@ -3277,5 +3528,139 @@ mod tests {
         assert_eq!(DesktopVideo.can_play("VIDEO/WEBM"), "maybe");
         assert_eq!(DesktopVideo.can_play("audio/mpeg"), "maybe");
         assert_eq!(DesktopVideo.can_play("video/x-unknown"), "");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn software_nv12_unpack_matches_gpu_chroma_siting_on_edges() {
+        use super::platform::{Area, CpuUnpack, unpack_nv12, unpacking_rows};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
+
+        let coded = (8u32, 8u32);
+        let pitch = 16usize;
+        let picture = Area {
+            left: 2,
+            top: 2,
+            width: 6,
+            height: 4,
+        };
+        let rows = unpacking_rows(DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, picture, coded)
+            .expect("bt.709 studio rows");
+        let mut y_plane = vec![0u8; pitch * coded.1 as usize];
+        let mut uv_plane = vec![128u8; pitch * (coded.1 as usize / 2)];
+        for sy in 0..coded.1 as usize {
+            for sx in 0..coded.0 as usize {
+                y_plane[sy * pitch + sx] = (20 + sx * 24 + sy * 12) as u8;
+            }
+        }
+        // sharp red/blue chroma boundary between chroma columns 1 and 2 and rows 1 and 2
+        for cy in 0..(coded.1 / 2) as usize {
+            for cx in 0..(coded.0 / 2) as usize {
+                let (u, v) = if cx < 2 && cy < 2 {
+                    (90u8, 235u8)
+                } else {
+                    (230u8, 105u8)
+                };
+                uv_plane[cy * pitch + cx * 2] = u;
+                uv_plane[cy * pitch + cx * 2 + 1] = v;
+            }
+        }
+        let bgra = unpack_nv12(
+            &y_plane,
+            &uv_plane,
+            pitch,
+            coded,
+            picture,
+            CpuUnpack::from_rows(rows),
+        )
+        .expect("nv12 unpack");
+        assert_eq!(bgra.len(), (picture.width * picture.height * 4) as usize);
+        let (cw, ch) = ((coded.0 / 2) as f32, (coded.1 / 2) as f32);
+        for row in 0..picture.height as usize {
+            for col in 0..picture.width as usize {
+                let (sx, sy) = (picture.left as usize + col, picture.top as usize + row);
+                let y = f32::from(y_plane[sy * pitch + sx]) / 255.0;
+                // exact d3d11 linear sample of chroma at (sx + 0.5) / coded.0
+                let tx = ((sx as f32 + 0.5) / coded.0 as f32 * cw - 0.5).clamp(0.0, cw - 1.0);
+                let ty = ((sy as f32 + 0.5) / coded.1 as f32 * ch - 0.5).clamp(0.0, ch - 1.0);
+                let (x0, y0) = (tx.floor() as usize, ty.floor() as usize);
+                let (x1, y1) = ((x0 + 1).min(cw as usize - 1), (y0 + 1).min(ch as usize - 1));
+                let (fx, fy) = (tx - x0 as f32, ty - y0 as f32);
+                let sample = |offset: usize| {
+                    let c00 = f32::from(uv_plane[y0 * pitch + x0 * 2 + offset]) / 255.0;
+                    let c10 = f32::from(uv_plane[y0 * pitch + x1 * 2 + offset]) / 255.0;
+                    let c01 = f32::from(uv_plane[y1 * pitch + x0 * 2 + offset]) / 255.0;
+                    let c11 = f32::from(uv_plane[y1 * pitch + x1 * 2 + offset]) / 255.0;
+                    (c00 * (1.0 - fx) + c10 * fx) * (1.0 - fy) + (c01 * (1.0 - fx) + c11 * fx) * fy
+                };
+                let (u, v) = (sample(0), sample(1));
+                let chan = |r: [f32; 4]| {
+                    ((r[0] * y + r[1] * u + r[2] * v + r[3]).clamp(0.0, 1.0) * 255.0).round() as u8
+                };
+                let at = (row * picture.width as usize + col) * 4;
+                assert!(bgra[at + 2].abs_diff(chan(rows[0])) <= 1);
+                assert!(bgra[at + 1].abs_diff(chan(rows[1])) <= 1);
+                assert!(bgra[at].abs_diff(chan(rows[2])) <= 1);
+                assert_eq!(bgra[at + 3], 255);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn software_reader_uses_direct_nv12_and_short_forward_seek_keeps_pending() {
+        use super::platform::{Reader, gpu};
+        use ceri_engine::VideoReader;
+
+        let source = MediaSource::File(reel());
+        let software = Reader::open_on(&source, None).expect("software open");
+        assert!(
+            software.uses_cpu_nv12(),
+            "h.264 should decode directly to nv12"
+        );
+
+        let Some(gpu) = gpu() else {
+            return;
+        };
+        let mut hardware = Reader::open_on(&source, Some(gpu)).expect("gpu open");
+        assert!(
+            hardware.has_pending(),
+            "gpu open probes frame 0 into pending"
+        );
+        hardware.seek(0.15).expect("short forward seek");
+        assert!(
+            hardware.has_pending(),
+            "short forward seek should keep pending frame 0 without flushing"
+        );
+        let first = hardware
+            .read()
+            .expect("read frame 0")
+            .expect("frame 0 present");
+        assert!(first.time.abs() < 0.01, "{}", first.time);
+        let second = hardware
+            .read()
+            .expect("read frame 1")
+            .expect("frame 1 present");
+        assert!((second.time - 0.1).abs() < 0.01, "{}", second.time);
+    }
+
+    #[test]
+    fn non_fragmented_mp4_headers_stop_at_moov() {
+        let mut bytes = Vec::new();
+        let push_box = |out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]| {
+            out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(body);
+        };
+        push_box(&mut bytes, b"ftyp", b"isom\0\0\0\0");
+        push_box(&mut bytes, b"moov", b"\0\0\0\x08mvhd");
+        push_box(&mut bytes, b"mdat", &[0u8; 64]);
+        push_box(&mut bytes, b"moof", &[0u8; 16]);
+        let found = super::mp4::headers(&MediaSource::Bytes {
+            body: bytes.into(),
+            mime_type: "video/mp4".to_string(),
+        });
+        assert_eq!(found.len(), 1);
+        assert_eq!(&found[0].0, b"moov");
     }
 }

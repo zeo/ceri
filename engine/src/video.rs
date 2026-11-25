@@ -159,6 +159,16 @@ pub trait VideoReader: Send {
 const AHEAD: usize = 3;
 // a frame whose time is this close to a seek target counts as at it
 const NEAR: f64 = 0.0005;
+// short forward seeks step through the active stream instead of flushing the codec
+const FORWARD_STEP: f64 = 0.5;
+
+#[derive(Clone, Copy, PartialEq)]
+struct Seek {
+    id: u64,
+    target: f64,
+    // step forward from the decoder's current position instead of calling reader.seek
+    forward: bool,
+}
 
 pub(crate) struct Track(Arc<Shared>);
 
@@ -173,7 +183,7 @@ pub(crate) struct TrackState {
     frames: VecDeque<(f64, Picture)>,
     // the seek the frames answer, and a newer one not reached yet
     pub(crate) reached: u64,
-    wanted: Option<(u64, f64)>,
+    wanted: Option<Seek>,
     pub(crate) ended: bool,
     closed: bool,
     // the last paint showed the frames as a plane, so a surface needs no reading back
@@ -232,7 +242,34 @@ impl Track {
 
     pub(crate) fn seek(&self, id: u64, seconds: f64) {
         let mut state = self.lock();
-        state.wanted = Some((id, seconds));
+        if state.wanted.is_none()
+            && let (Some((front, _)), Some((back, _))) = (state.frames.front(), state.frames.back())
+            && *front <= seconds + NEAR
+        {
+            if *back > seconds + NEAR || state.ended {
+                while state.frames.len() >= 2 && state.frames[1].0 <= seconds + NEAR {
+                    state.frames.pop_front();
+                }
+                state.reached = id;
+                return;
+            }
+            if seconds - *back <= FORWARD_STEP {
+                while state.frames.len() > 1 {
+                    state.frames.pop_front();
+                }
+                state.wanted = Some(Seek {
+                    id,
+                    target: seconds,
+                    forward: true,
+                });
+                return;
+            }
+        }
+        state.wanted = Some(Seek {
+            id,
+            target: seconds,
+            forward: false,
+        });
         state.frames.clear();
         state.ended = false;
     }
@@ -290,7 +327,10 @@ fn decode(
             (state.wanted, state.planed)
         };
         let (frames, ended) = match wanted {
-            Some((_, target)) => seek_to(&mut *reader, target, || shared.lock().wanted != wanted),
+            Some(seek) => seek_to(&mut *reader, seek.target, seek.forward, || {
+                let state = shared.lock();
+                state.closed || state.wanted != wanted
+            }),
             None => match reader.read() {
                 Ok(Some(frame)) => (vec![frame], false),
                 Ok(None) | Err(_) => (Vec::new(), true),
@@ -301,12 +341,53 @@ fn decode(
             .filter_map(|frame| Some((frame.time, to_picture(frame, planed)?)))
             .collect::<Vec<_>>();
         let mut state = shared.lock();
+        if state.closed {
+            return;
+        }
+        if wanted.is_none()
+            && let Some(Seek {
+                id,
+                target,
+                forward: true,
+            }) = state.wanted
+        {
+            // consume an in-flight sequential read in order instead of discarding it and flushing
+            if let Some((at, picture)) = frames.into_iter().next() {
+                if at <= target + NEAR {
+                    state.frames.clear();
+                    state.frames.push_back((at, picture));
+                } else {
+                    state.frames.push_back((at, picture));
+                    state.wanted = None;
+                    state.reached = id;
+                    state.ended = ended;
+                    drop(state);
+                    wake();
+                    continue;
+                }
+            }
+            if ended {
+                state.wanted = None;
+                state.reached = id;
+                state.ended = true;
+                drop(state);
+                wake();
+            }
+            continue;
+        }
         if state.wanted != wanted {
             continue;
         }
-        if let Some((id, _)) = wanted {
+        if let Some(seek) = wanted {
             state.wanted = None;
-            state.reached = id;
+            state.reached = seek.id;
+            if seek.forward
+                && frames
+                    .first()
+                    .is_some_and(|(at, _)| *at <= seek.target + NEAR)
+            {
+                state.frames.clear();
+            }
         }
         state.frames.extend(frames);
         state.ended = ended;
@@ -315,13 +396,15 @@ fn decode(
     }
 }
 
-// decodes on from the key frame before target to the frame showing at it, and the one after
+// decodes on from the key frame before target (or from the current cursor on a short forward
+// step) to the frame showing at target, and the one after
 fn seek_to(
     reader: &mut dyn VideoReader,
     target: f64,
+    forward: bool,
     superseded: impl Fn() -> bool,
 ) -> (Vec<VideoFrame>, bool) {
-    if reader.seek(target).is_err() {
+    if !forward && reader.seek(target).is_err() {
         return (Vec::new(), true);
     }
     let mut last = None;
@@ -436,5 +519,119 @@ mod tests {
         assert_ne!(read.pixels, blank.pixels);
         assert!(Arc::ptr_eq(&read, &picture.pixels()));
         assert_eq!(surface.0.load(Ordering::Relaxed), 2);
+    }
+
+    struct CountingDecoder {
+        seeks: Arc<AtomicUsize>,
+        frames: usize,
+        step: f64,
+    }
+
+    struct CountingReader {
+        seeks: Arc<AtomicUsize>,
+        index: usize,
+        frames: usize,
+        step: f64,
+    }
+
+    impl MediaDecoder for CountingDecoder {
+        fn open(&self, _source: &MediaSource) -> Result<Box<dyn VideoReader>, String> {
+            Ok(Box::new(CountingReader {
+                seeks: self.seeks.clone(),
+                index: 0,
+                frames: self.frames,
+                step: self.step,
+            }))
+        }
+    }
+
+    impl VideoReader for CountingReader {
+        fn info(&self) -> MediaInfo {
+            MediaInfo {
+                duration: self.frames as f64 * self.step,
+                width: 2,
+                height: 2,
+            }
+        }
+
+        fn seek(&mut self, seconds: f64) -> Result<(), String> {
+            self.seeks.fetch_add(1, Ordering::Relaxed);
+            self.index = ((seconds / self.step).floor().max(0.0) as usize).min(self.frames);
+            Ok(())
+        }
+
+        fn read(&mut self) -> Result<Option<VideoFrame>, String> {
+            if self.index >= self.frames {
+                return Ok(None);
+            }
+            let time = self.index as f64 * self.step;
+            self.index += 1;
+            Ok(Some(VideoFrame {
+                time,
+                width: 2,
+                height: 2,
+                bgra: vec![255; 16],
+                surface: None,
+            }))
+        }
+    }
+
+    fn wait_until(mut check: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !check() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn forward_seeks_reuse_buffered_and_upcoming_frames_without_flushing() {
+        let seeks = Arc::new(AtomicUsize::new(0));
+        let decoder = Arc::new(CountingDecoder {
+            seeks: seeks.clone(),
+            frames: 30,
+            step: 0.1,
+        });
+        let track = Track::open(
+            decoder,
+            MediaSource::Bytes {
+                body: Vec::new().into(),
+                mime_type: "video/mp4".into(),
+            },
+            None,
+        );
+        wait_until(|| track.lock().frames.len() >= AHEAD);
+
+        // target inside already buffered [0.0, 0.1, 0.2] lands synchronously with zero reader seeks
+        track.seek(1, 0.12);
+        {
+            let mut state = track.lock();
+            assert_eq!(state.reached, 1);
+            let (at, _) = state.take_frame(0.12, true).expect("buffered frame");
+            assert!((at - 0.1).abs() < 1e-6, "{at}");
+        }
+        assert_eq!(seeks.load(Ordering::Relaxed), 0);
+
+        // target just ahead of the buffered tail steps forward without calling reader.seek
+        wait_until(|| !track.lock().frames.is_empty());
+        track.seek(2, 0.42);
+        wait_until(|| {
+            let state = track.lock();
+            state.reached == 2 && !state.frames.is_empty()
+        });
+        {
+            let mut state = track.lock();
+            let (at, _) = state.take_frame(0.42, true).expect("stepped frame");
+            assert!((at - 0.4).abs() < 1e-6, "{at}");
+        }
+        assert_eq!(seeks.load(Ordering::Relaxed), 0);
+
+        // backward seek still invokes reader.seek
+        track.seek(3, 0.05);
+        wait_until(|| {
+            let state = track.lock();
+            state.reached == 3 && !state.frames.is_empty()
+        });
+        assert_eq!(seeks.load(Ordering::Relaxed), 1);
     }
 }

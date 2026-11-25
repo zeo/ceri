@@ -30,6 +30,8 @@ pub(super) struct MediaState {
     decoder: Option<Arc<dyn MediaDecoder>>,
     waker: Option<crate::bridge::Waker>,
     elements: HashMap<NodeId, MediaElement>,
+    // set when a connected media element leaves the document so detached trees collect promptly
+    reap_detached: bool,
 }
 
 impl MediaState {
@@ -43,12 +45,42 @@ impl MediaState {
             }
         }
     }
+
+    pub(super) fn take_reap_detached(
+        &mut self,
+        candidates: &[NodeId],
+        document: &Document,
+    ) -> bool {
+        let flagged = std::mem::take(&mut self.reap_detached);
+        if flagged || self.elements.is_empty() || candidates.is_empty() {
+            return flagged;
+        }
+        self.elements.keys().any(|&node| {
+            if document.is_connected(node) {
+                return false;
+            }
+            let mut current = Some(node);
+            while let Some(id) = current {
+                if candidates.contains(&id) {
+                    return true;
+                }
+                current = document.parent(id);
+            }
+            false
+        })
+    }
 }
 
 struct MediaElement {
     // runs of the load algorithm; a task queued for an older one does nothing
     generation: u64,
     url: Option<String>,
+    source: Option<MediaSource>,
+    pictures: bool,
+    // true when sound decoding was skipped for a muted video and should open if unmuted
+    sound_deferred: bool,
+    // true when active decoders were released on dom removal and should reopen on reuse
+    dormant: bool,
     track: Option<Track>,
     sound: Option<Sound>,
     info: Option<MediaInfo>,
@@ -90,6 +122,10 @@ impl MediaElement {
         Self {
             generation: 0,
             url: None,
+            source: None,
+            pictures: false,
+            sound_deferred: false,
+            dormant: false,
             track: None,
             sound: None,
             info: None,
@@ -176,6 +212,25 @@ impl MediaElement {
     // what the decoder thread brought since the last look, and where the clock now stands
     fn advance(&mut self, now: u64, connected: bool, autoplay: bool, looped: bool) -> Advance {
         let mut step = Advance::default();
+        // a media element taken out of the document pauses and releases active decoders so rapid
+        // unmount churn never accumulates live hardware decoder sessions or threads
+        let removed = std::mem::replace(&mut self.connected, connected) && !connected;
+        if removed {
+            step.removed = true;
+            if self.track.is_some() || self.sound.is_some() {
+                self.track = None;
+                self.sound = None;
+                self.dormant = self.source.is_some();
+            }
+            if !self.paused {
+                self.paused = true;
+                self.settle_clock(now);
+                step.cues
+                    .extend([Cue::Event("timeupdate"), Cue::Event("pause")]);
+                step.aborted = true;
+            }
+            return step;
+        }
         if self.track.is_none() && self.sound.is_none() {
             return step;
         }
@@ -188,6 +243,16 @@ impl MediaElement {
             // either may fail alone, for a video without sound or sound without pictures
             let pictures = pictures.flatten().and_then(Result::ok);
             let sound = sound.flatten().and_then(Result::ok);
+            if self.sound_deferred
+                && self.sound.is_none()
+                && pictures.as_ref().is_none_or(|info| info.duration.is_nan())
+            {
+                if pictures.is_none() {
+                    self.track = None;
+                }
+                step.open_sound = true;
+                return step;
+            }
             if pictures.is_none() {
                 self.track = None;
             }
@@ -217,27 +282,43 @@ impl MediaElement {
                 .extend([Cue::Event("durationchange"), Cue::Event("loadedmetadata")]);
         }
         let (mut exhausted, mut landed) = (true, true);
+        let mut drop_track = false;
         if let Some(track) = &self.track {
             let mut state = track.lock();
-            let mut done = false;
-            if state.reached == self.seek {
-                let time = self.current_time(now);
-                if let Some((at, picture)) = state.take_frame(time, !self.shown) {
-                    self.frame = Some(picture);
-                    self.frame_time = at;
-                    self.shown = true;
-                    self.presented += 1;
-                    step.frames += 1;
+            if matches!(state.opened, Some(Err(_))) {
+                drop_track = true;
+            } else {
+                let mut done = false;
+                if state.reached == self.seek {
+                    let time = self.current_time(now);
+                    if let Some((at, picture)) = state.take_frame(time, !self.shown) {
+                        self.frame = Some(picture);
+                        self.frame_time = at;
+                        self.shown = true;
+                        self.presented += 1;
+                        step.frames += 1;
+                    }
+                    done = state.exhausted();
                 }
-                done = state.exhausted();
+                exhausted &= done;
+                landed &= self.shown || done;
             }
-            exhausted &= done;
-            landed &= self.shown || done;
         }
+        if drop_track {
+            self.track = None;
+        }
+        let mut drop_sound = false;
         if let Some(sound) = &self.sound {
             let state = sound.lock();
-            exhausted &= state.exhausted();
-            landed &= state.ready(self.seek);
+            if matches!(state.opened, Some(Err(_))) {
+                drop_sound = true;
+            } else {
+                exhausted &= state.exhausted();
+                landed &= state.ready(self.seek);
+            }
+        }
+        if drop_sound {
+            self.sound = None;
         }
         if let Some(start) = self.start_at.take() {
             step.cues.extend(self.begin_seek(now, start));
@@ -285,15 +366,6 @@ impl MediaElement {
                 step.cues.push(Cue::Event("timeupdate"));
             }
         }
-        // a media element taken out of the document pauses
-        let removed = std::mem::replace(&mut self.connected, connected) && !connected;
-        if removed && !self.paused {
-            self.paused = true;
-            self.settle_clock(now);
-            step.cues
-                .extend([Cue::Event("timeupdate"), Cue::Event("pause")]);
-            step.aborted = true;
-        }
         step
     }
 
@@ -320,6 +392,10 @@ struct Advance {
     failed: bool,
     // pending play() promises are rejected
     aborted: bool,
+    // a previously connected element left the document
+    removed: bool,
+    // a muted video needs sound opened to resolve missing video metadata
+    open_sound: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -543,6 +619,7 @@ impl ScriptRuntime {
             let base = self.base_url.as_ref()?;
             images::image_key(base, reference).filter(|_| !reference.trim().is_empty())
         });
+        let connected = self.document.borrow().is_connected(node);
         let element = self
             .media
             .elements
@@ -559,7 +636,7 @@ impl ScriptRuntime {
             muted: element.muted,
             preserves_pitch: element.preserves_pitch,
             default_rate: element.default_rate,
-            connected: element.connected,
+            connected,
             rate: element.default_rate,
             ..MediaElement::new()
         };
@@ -611,6 +688,13 @@ impl ScriptRuntime {
         let source = url.and_then(|url| self.media_source(&url));
         let decoder = self.media.decoder.clone();
         let waker = self.media.waker.clone();
+        let (connected, muted_attribute) = {
+            let document = self.document.borrow();
+            (
+                document.is_connected(node),
+                document.attribute(node, "muted").is_some(),
+            )
+        };
         let Some(element) = self
             .media
             .elements
@@ -623,11 +707,102 @@ impl ScriptRuntime {
             self.fail_media(node);
             return Ok(Value::Undefined);
         };
-        if let Some(decoder) = decoder.clone().filter(|_| pictures) {
-            element.track = Some(Track::open(decoder, source.clone(), waker.clone()));
+        element.source = Some(source.clone());
+        element.pictures = pictures;
+        let removed = std::mem::replace(&mut element.connected, connected) && !connected;
+        if removed {
+            element.dormant = true;
+            self.media.reap_detached = true;
+            return Ok(Value::Undefined);
         }
-        element.sound = Some(Sound::open(decoder, source, waker));
+        element.dormant = false;
+        let muted = element.muted.unwrap_or(muted_attribute);
+        if let Some(decoder) = decoder.clone().filter(|_| pictures) {
+            element.track = Some(Track::open(decoder.clone(), source.clone(), waker.clone()));
+            if muted {
+                element.sound_deferred = true;
+            } else {
+                element.sound_deferred = false;
+                element.sound = Some(Sound::open(Some(decoder), source, waker));
+            }
+        } else {
+            element.sound_deferred = false;
+            element.sound = Some(Sound::open(decoder, source, waker));
+        }
         Ok(Value::Undefined)
+    }
+
+    fn open_deferred_sound(&mut self, node: NodeId) {
+        let now = self.clock;
+        let decoder = self.media.decoder.clone();
+        let waker = self.media.waker.clone();
+        let Some(element) = self.media.elements.get_mut(&node) else {
+            return;
+        };
+        if !element.sound_deferred || element.sound.is_some() || element.dormant {
+            return;
+        }
+        element.sound_deferred = false;
+        let Some(source) = element.source.clone() else {
+            return;
+        };
+        let sound = Sound::open(decoder, source, waker);
+        if element.info.is_some() {
+            let position = element.current_time(now);
+            if element.seek > 0 || position > 0.0 {
+                sound.seek(element.seek, position);
+            }
+        }
+        element.sound = Some(sound);
+    }
+
+    fn wake_media(&mut self, node: NodeId) {
+        let now = self.clock;
+        let muted_attribute = self.document.borrow().attribute(node, "muted").is_some();
+        let decoder = self.media.decoder.clone();
+        let waker = self.media.waker.clone();
+        let Some(element) = self.media.elements.get_mut(&node) else {
+            return;
+        };
+        if !element.dormant {
+            return;
+        }
+        element.dormant = false;
+        let Some(source) = element.source.clone() else {
+            return;
+        };
+        let muted = element.muted.unwrap_or(muted_attribute);
+        let seek_pos = element.info.is_some().then(|| element.current_time(now));
+        if let Some(decoder) = decoder.clone().filter(|_| element.pictures) {
+            let track = Track::open(decoder.clone(), source.clone(), waker.clone());
+            if let Some(pos) = seek_pos
+                && (element.seek > 0 || pos > 0.0)
+            {
+                track.seek(element.seek, pos);
+            }
+            element.track = Some(track);
+            if muted {
+                element.sound_deferred = true;
+            } else {
+                element.sound_deferred = false;
+                let sound = Sound::open(Some(decoder), source, waker);
+                if let Some(pos) = seek_pos
+                    && (element.seek > 0 || pos > 0.0)
+                {
+                    sound.seek(element.seek, pos);
+                }
+                element.sound = Some(sound);
+            }
+        } else {
+            element.sound_deferred = false;
+            let sound = Sound::open(decoder, source, waker);
+            if let Some(pos) = seek_pos
+                && (element.seek > 0 || pos > 0.0)
+            {
+                sound.seek(element.seek, pos);
+            }
+            element.sound = Some(sound);
+        }
     }
 
     fn fail_media(&mut self, node: NodeId) {
@@ -636,6 +811,9 @@ impl ScriptRuntime {
         };
         element.track = None;
         element.sound = None;
+        element.source = None;
+        element.sound_deferred = false;
+        element.dormant = false;
         element.error = Some(MEDIA_ERR_SRC_NOT_SUPPORTED);
         element.network = NETWORK_NO_SOURCE;
         self.reject_waiters(node, unsupported);
@@ -685,7 +863,9 @@ impl ScriptRuntime {
             .media
             .elements
             .iter()
-            .filter(|(_, element)| element.track.is_some() || element.sound.is_some())
+            .filter(|(_, element)| {
+                element.track.is_some() || element.sound.is_some() || element.dormant
+            })
             .map(|(node, _)| *node)
             .collect::<Vec<_>>();
         let mut frames = 0;
@@ -699,9 +879,30 @@ impl ScriptRuntime {
                     document.attribute(node, "muted").is_some(),
                 )
             };
+            if connected
+                && self
+                    .media
+                    .elements
+                    .get(&node)
+                    .is_some_and(|element| element.dormant)
+            {
+                self.wake_media(node);
+            }
             let element = self.media.elements.get_mut(&node).expect("listed above");
             let step = element.advance(now, connected, autoplay, looped);
             let muted = element.muted.unwrap_or(muted);
+            let need_sound = step.open_sound
+                || (!muted
+                    && element.sound_deferred
+                    && element.sound.is_none()
+                    && !element.dormant);
+            if step.removed {
+                self.media.reap_detached = true;
+            }
+            if need_sound {
+                self.open_deferred_sound(node);
+            }
+            let element = self.media.elements.get_mut(&node).expect("listed above");
             let audio = &self.audio;
             element.follow_sound(now, muted, |rate, render| audio.open(Some(rate), render));
             frames += step.frames;
@@ -775,10 +976,17 @@ impl ScriptRuntime {
             },
             ("currentTime", Set) => {
                 let time = self.media_number(first, "currentTime")?;
-                let element = self.media.elements.get_mut(&node).expect("inserted above");
-                if element.ready == HAVE_NOTHING {
+                let ready = self
+                    .media
+                    .elements
+                    .get(&node)
+                    .map_or(HAVE_NOTHING, |element| element.ready);
+                if ready == HAVE_NOTHING {
+                    let element = self.media.elements.get_mut(&node).expect("inserted above");
                     element.start_at = Some(time);
                 } else {
+                    self.wake_media(node);
+                    let element = self.media.elements.get_mut(&node).expect("inserted above");
                     let cues = element.begin_seek(now, time);
                     self.queue_cues(node, cues);
                 }
@@ -838,6 +1046,9 @@ impl ScriptRuntime {
             ("muted", Set) => {
                 let muted = first.truthy();
                 let was = element.muted.replace(muted).unwrap_or(muted_attribute);
+                if !muted {
+                    self.open_deferred_sound(node);
+                }
                 if was != muted {
                     self.queue_cues(node, vec![Cue::Event("volumechange")]);
                 }
@@ -967,6 +1178,8 @@ impl ScriptRuntime {
             .is_none_or(|element| element.network == NETWORK_EMPTY)
         {
             self.load_media(node);
+        } else {
+            self.wake_media(node);
         }
         let promise = Self::pending_promise();
         let element = self.media.elements.get_mut(&node).expect("loaded above");
@@ -1013,5 +1226,200 @@ impl ScriptRuntime {
             abort_error("The play() request was interrupted by a call to pause().")
         });
         self.queue_cues(node, vec![Cue::Event("timeupdate"), Cue::Event("pause")]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sound::{AudioChunk, AudioInfo, AudioReader};
+    use crate::video::{VideoFrame, VideoReader};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ChurnDecoder {
+        active_video: Arc<AtomicUsize>,
+        video_opens: Arc<AtomicUsize>,
+        audio_opens: Arc<AtomicUsize>,
+    }
+
+    struct ChurnVideo {
+        active: Arc<AtomicUsize>,
+        index: usize,
+    }
+
+    impl Drop for ChurnVideo {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    impl VideoReader for ChurnVideo {
+        fn info(&self) -> MediaInfo {
+            MediaInfo {
+                duration: 1.0,
+                width: 4,
+                height: 4,
+            }
+        }
+
+        fn seek(&mut self, seconds: f64) -> Result<(), String> {
+            self.index = ((seconds * 60.0).floor().max(0.0) as usize).min(60);
+            Ok(())
+        }
+
+        fn read(&mut self) -> Result<Option<VideoFrame>, String> {
+            if self.index >= 60 {
+                return Ok(None);
+            }
+            let time = self.index as f64 / 60.0;
+            self.index += 1;
+            Ok(Some(VideoFrame {
+                time,
+                width: 4,
+                height: 4,
+                bgra: vec![255; 64],
+                surface: None,
+            }))
+        }
+    }
+
+    struct ChurnAudio(bool);
+
+    impl AudioReader for ChurnAudio {
+        fn info(&self) -> AudioInfo {
+            AudioInfo {
+                rate: 48_000,
+                channels: 1,
+                duration: 1.0,
+            }
+        }
+
+        fn seek(&mut self, _seconds: f64) -> Result<(), String> {
+            self.0 = false;
+            Ok(())
+        }
+
+        fn read(&mut self) -> Result<Option<AudioChunk>, String> {
+            if self.0 {
+                return Ok(None);
+            }
+            self.0 = true;
+            Ok(Some(AudioChunk {
+                time: 0.0,
+                samples: vec![0.0; 480],
+            }))
+        }
+    }
+
+    impl MediaDecoder for ChurnDecoder {
+        fn open(&self, _source: &MediaSource) -> Result<Box<dyn VideoReader>, String> {
+            self.video_opens.fetch_add(1, Ordering::Relaxed);
+            self.active_video.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(ChurnVideo {
+                active: self.active_video.clone(),
+                index: 0,
+            }))
+        }
+
+        fn open_audio(&self, _source: &MediaSource) -> Result<Box<dyn AudioReader>, String> {
+            self.audio_opens.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(ChurnAudio(false)))
+        }
+    }
+
+    fn pump_until(runtime: &mut ScriptRuntime, mut done: impl FnMut(&mut ScriptRuntime) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !done(runtime) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out pumping media"
+            );
+            runtime.pump().expect("pump runtime");
+            runtime.advance_time(16).expect("advance runtime clock");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn muted_video_defers_sound_and_unmount_churn_drops_decoders_immediately() {
+        let document = Rc::new(RefCell::new(
+            Document::parse("<!doctype html><body><p id='s'></p></body>").expect("html"),
+        ));
+        let mut resources = ResourceBundle::default();
+        resources
+            .insert("/clip.mp4", "video/mp4", b"clip".to_vec())
+            .expect("clip resource");
+        let base = AppUrl::parse("https://app.ceri.invalid/").expect("base url");
+        let mut runtime = ScriptRuntime::with_resources(document.clone(), resources, base);
+        let active_video = Arc::new(AtomicUsize::new(0));
+        let video_opens = Arc::new(AtomicUsize::new(0));
+        let audio_opens = Arc::new(AtomicUsize::new(0));
+        runtime.set_media_decoder(
+            Some(Arc::new(ChurnDecoder {
+                active_video: active_video.clone(),
+                video_opens: video_opens.clone(),
+                audio_opens: audio_opens.clone(),
+            })),
+            None,
+        );
+
+        let status = document
+            .borrow()
+            .find_element_by_id("s")
+            .expect("status element");
+        let read_status = || document.borrow().element_text_content(status);
+
+        // 40 rapid open/seek/unmount cycles must never accumulate live decoders or open sound
+        for _ in 0..40 {
+            runtime
+                .execute(
+                    "window.v = document.createElement('video'); \
+                     window.v.muted = true; \
+                     window.v.src = '/clip.mp4'; \
+                     window.v.currentTime = 0.0375; \
+                     window.v.onseeked = () => { document.getElementById('s').textContent = String(window.v.readyState); }; \
+                     document.getElementById('s').textContent = '0'; \
+                     document.body.appendChild(window.v);",
+                )
+                .expect("mount video");
+            pump_until(&mut runtime, |_| read_status().as_deref() == Some("4"));
+            assert_eq!(audio_opens.load(Ordering::Relaxed), 0);
+            runtime
+                .execute("window.v.remove();")
+                .expect("unmount video");
+            pump_until(&mut runtime, |_| active_video.load(Ordering::Relaxed) == 0);
+        }
+        assert_eq!(video_opens.load(Ordering::Relaxed), 40);
+        assert_eq!(audio_opens.load(Ordering::Relaxed), 0);
+
+        // reconnecting a removed video reopens lazily and unmuting opens sound lazily
+        runtime
+            .execute("document.body.appendChild(window.v); window.v.muted = false;")
+            .expect("reconnect and unmute");
+        pump_until(&mut runtime, |_| {
+            active_video.load(Ordering::Relaxed) == 1 && audio_opens.load(Ordering::Relaxed) == 1
+        });
+        runtime
+            .execute("window.v.remove(); window.v = null;")
+            .expect("final remove");
+        pump_until(&mut runtime, |rt| {
+            active_video.load(Ordering::Relaxed) == 0 && rt.media.elements.is_empty()
+        });
+
+        // a never-connected video element still loads and seeks without releasing its decoder
+        runtime
+            .execute(
+                "window.d = document.createElement('video'); \
+                 window.d.muted = true; \
+                 window.d.src = '/clip.mp4'; \
+                 window.d.currentTime = 0.2; \
+                 window.d.onseeked = () => { document.getElementById('s').textContent = 'detached:' + window.d.readyState; }; \
+                 document.getElementById('s').textContent = '0';",
+            )
+            .expect("detached video");
+        pump_until(&mut runtime, |_| {
+            read_status().as_deref() == Some("detached:4")
+        });
+        assert_eq!(active_video.load(Ordering::Relaxed), 1);
     }
 }

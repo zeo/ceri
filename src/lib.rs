@@ -35,6 +35,12 @@ pub use shortcut::{GlobalShortcuts, ShortcutState};
 pub use taskbar::Progress;
 pub use tray::{MenuItem, Tray, TrayConfig, TrayEvent};
 
+// warms hardware video decoding on a background thread when an app knows a window will play
+// video, keeping tray-only and non-video apps free of gpu and media libraries
+pub fn warm_video() {
+    video::warm_gpu();
+}
+
 #[doc(hidden)]
 pub mod __command {
     pub use crate::commands::{Answer, AnswerResult, AnswerValue, Arguments};

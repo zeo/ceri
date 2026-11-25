@@ -2354,7 +2354,10 @@ impl ScriptRuntime {
     // frees detached trees that no script value reaches, along with their runtime state
     fn collect_detached_nodes(&mut self) {
         let mut candidates = self.document.borrow_mut().take_orphans();
-        if self.retained_orphans.len() >= self.orphan_recheck_at {
+        let has_detached_media = self
+            .media
+            .take_reap_detached(&candidates, &self.document.borrow());
+        if has_detached_media || self.retained_orphans.len() >= self.orphan_recheck_at {
             candidates.append(&mut self.retained_orphans);
         }
         if candidates.is_empty() {
@@ -2414,7 +2417,8 @@ impl ScriptRuntime {
                 && !gc_retried
                 && self.nested_runs == 0
                 && self.gc_inhibit == 0
-                && (heap::gc_due(self.heap_id)
+                && (has_detached_media
+                    || heap::gc_due(self.heap_id)
                     || (heap::live_count(self.heap_id) < 16_384
                         && heap::allocs_since_gc(self.heap_id) > 0))
             {
