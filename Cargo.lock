@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "ceri"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "arboard",
  "ceri-build",
@@ -242,11 +242,11 @@ dependencies = [
 
 [[package]]
 name = "ceri-build"
-version = "0.1.11"
+version = "0.1.12"
 
 [[package]]
 name = "ceri-engine"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "brotli-decompressor",
  "libmimalloc-sys",
