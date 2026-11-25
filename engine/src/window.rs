@@ -139,28 +139,26 @@ impl Output {
                 let mut buffer = surface
                     .buffer_mut()
                     .map_err(|error| format!("window surface buffer failed: {error}"))?;
-                let changed = match revision.changed {
-                    // a buffer presented last holds the shown revision outside the box
-                    Some((base, boxes)) if buffer.age() == 1 && *shown == Some((base, size)) => {
-                        let [left, top, right, bottom] = boxes.bounds();
-                        [left, top, right.min(size.0), bottom.min(size.1)]
-                    }
-                    _ => [0, 0, size.0, size.1],
-                };
+                let boxes = damage_boxes(revision, *shown, buffer.age() == 1, size);
                 *shown = None;
-                present_frame(frame, size, changed, &mut buffer);
-                let [left, top, right, bottom] = changed;
-                if let (Some(columns), Some(rows)) = (
-                    NonZeroU32::new(right.saturating_sub(left)),
-                    NonZeroU32::new(bottom.saturating_sub(top)),
-                ) {
-                    buffer
-                        .present_with_damage(&[softbuffer::Rect {
+                let mut rects = Vec::with_capacity(boxes.len());
+                for changed in boxes {
+                    present_frame(frame, size, changed, &mut buffer);
+                    let [left, top, right, bottom] = changed;
+                    if let (Some(columns), Some(rows)) =
+                        (NonZeroU32::new(right - left), NonZeroU32::new(bottom - top))
+                    {
+                        rects.push(softbuffer::Rect {
                             x: left,
                             y: top,
                             width: columns,
                             height: rows,
-                        }])
+                        });
+                    }
+                }
+                if !rects.is_empty() {
+                    buffer
+                        .present_with_damage(&rects)
                         .map_err(|error| format!("window surface present failed: {error}"))?;
                 }
                 *shown = Some((revision.id, size));
@@ -504,16 +502,22 @@ impl LayeredSurface {
             return Ok(());
         }
         let resized = self.resize(size.0, size.1)?;
-        let changed = match revision.changed {
-            Some((base, boxes)) if !resized && self.shown == Some((base, size)) => {
-                let [left, top, right, bottom] = boxes.bounds();
-                [left, top, right.min(size.0), bottom.min(size.1)]
-            }
-            _ => [0, 0, size.0, size.1],
-        };
-        let whole = changed == [0, 0, size.0, size.1];
-        if changed[0] < changed[2] && changed[1] < changed[3] {
+        let boxes = damage_boxes(revision, self.shown, !resized, size);
+        let mut dirty: Option<[u32; 4]> = None;
+        for changed in boxes {
             pack_layered_frame(frame, size, changed, self.pixels_mut());
+            dirty = Some(match dirty {
+                Some(all) => [
+                    all[0].min(changed[0]),
+                    all[1].min(changed[1]),
+                    all[2].max(changed[2]),
+                    all[3].max(changed[3]),
+                ],
+                None => changed,
+            });
+        }
+        if let Some(changed) = dirty {
+            let whole = changed == [0, 0, size.0, size.1];
             self.commit((!whole).then_some(changed))?;
         } else if !self.presented {
             self.commit(None)?;
@@ -1016,6 +1020,10 @@ where
         startup: Some(windows),
         windows: HashMap::default(),
         lifecycle,
+        #[cfg(target_os = "windows")]
+        had_window: false,
+        #[cfg(target_os = "windows")]
+        tsf_suspended: false,
     };
     event_loop
         .run_app(&mut app)
@@ -1050,6 +1058,10 @@ struct App<F> {
     startup: Option<Vec<WindowConfig>>,
     windows: HashMap<WindowId, AppWindow>,
     lifecycle: Lifecycle,
+    #[cfg(target_os = "windows")]
+    had_window: bool,
+    #[cfg(target_os = "windows")]
+    tsf_suspended: bool,
 }
 
 type Spawn = Rc<dyn Fn(Size, Option<String>) -> Result<EngineWorker, String>>;
@@ -1079,8 +1091,9 @@ struct AppWindow {
     display: Option<InputEvent>,
     page_shown: bool,
     zoom: f32,
-    window: Option<Rc<Window>>,
+    // dropped before the native window so surfaces release before destroywindow
     output: Option<Output>,
+    window: Option<Rc<Window>>,
     handle: Option<NativeHandle>,
     cursor: (f32, f32),
     // buttons the page saw go down and not yet up
@@ -1118,6 +1131,13 @@ where
             return;
         }
         crate::resume_active_memory();
+        #[cfg(target_os = "windows")]
+        {
+            self.had_window = true;
+            if self.tsf_suspended && set_tsf_active(true) {
+                self.tsf_suspended = false;
+            }
+        }
         let viewport = Size {
             width: config.width.max(1) as f32,
             height: config.height.max(1) as f32,
@@ -1284,6 +1304,22 @@ where
             && !self.lifecycle.keep_running
         {
             event_loop.exit();
+        }
+    }
+
+    fn trim_if_idle(&mut self) {
+        if self.windows.is_empty()
+            && self.startup.is_none()
+            && self.control.published().opening == 0
+        {
+            self.windows.shrink_to_fit();
+            self.context.clear();
+            #[cfg(target_os = "windows")]
+            if self.had_window && !self.tsf_suspended && set_tsf_active(false) {
+                self.tsf_suspended = true;
+            }
+            trim_idle_platform();
+            crate::trim_idle_memory();
         }
     }
 }
@@ -2061,7 +2097,10 @@ impl AppWindow {
     }
 
     fn answer_region(&mut self, region: RegionPress) {
-        let Some(window) = &self.window else {
+        if background_mode() {
+            return;
+        }
+        let Some(window) = self.window.clone() else {
             return;
         };
         match region {
@@ -2079,6 +2118,7 @@ impl AppWindow {
                 {
                     eprintln!("ceri: {error}");
                 }
+                self.publish();
             }
             RegionPress::ToggleMaximize => {}
         }
@@ -2328,10 +2368,7 @@ where
             window.request_redraw();
         }
         self.sweep(event_loop);
-        if self.windows.is_empty() && self.control.published().opening == 0 {
-            self.context.clear();
-            crate::trim_idle_memory();
-        }
+        self.trim_if_idle();
     }
 
     fn window_event(
@@ -2366,13 +2403,7 @@ where
                 }
             }
             Request::Trim => {
-                if self.windows.is_empty()
-                    && self.startup.is_none()
-                    && self.control.published().opening == 0
-                {
-                    self.context.clear();
-                    crate::trim_idle_memory();
-                }
+                self.trim_if_idle();
                 return;
             }
             Request::Open(config) => {
@@ -2605,6 +2636,133 @@ fn wait_in_backlog(backlog: &mut std::collections::VecDeque<InputEvent>, event: 
     backlog.push_back(event);
 }
 
+// deactivates the thread's text services framework manager when no window stays open so windows
+// releases its directui, directcomposition, d3d11 and warp input stack even while hidden tray or
+// event loop windows remain on the thread, and reactivates it when a window reopens
+#[cfg(target_os = "windows")]
+fn set_tsf_active(active: bool) -> bool {
+    use std::ffi::c_void;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::core::{HRESULT, s, w};
+
+    type FarProc = unsafe extern "system" fn() -> isize;
+    type GetThreadMgrFn = unsafe extern "system" fn(*mut *mut c_void) -> HRESULT;
+    type ActivateFn = unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT;
+    type DeactivateFn = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+    type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
+
+    // safety: only queries already-loaded msctf.dll; vtable slots 2, 3 and 4 match
+    // iunknown release, itfthreadmgr activate and itfthreadmgr deactivate per msctf.h
+    unsafe {
+        let Ok(module) = GetModuleHandleW(w!("msctf.dll")) else {
+            return active;
+        };
+        let Some(proc) = GetProcAddress(module, s!("TF_GetThreadMgr")) else {
+            return active;
+        };
+        let get_mgr = std::mem::transmute::<FarProc, GetThreadMgrFn>(proc);
+        let mut mgr: *mut c_void = std::ptr::null_mut();
+        if get_mgr(&mut mgr).is_err() || mgr.is_null() {
+            return active;
+        }
+        let vtbl = *(mgr as *const *const *const c_void);
+        let release: ReleaseFn = std::mem::transmute(*vtbl.add(2));
+        let ok = if active {
+            let activate: ActivateFn = std::mem::transmute(*vtbl.add(3));
+            let mut client_id = 0u32;
+            activate(mgr, &mut client_id).is_ok()
+        } else {
+            let deactivate: DeactivateFn = std::mem::transmute(*vtbl.add(4));
+            deactivate(mgr).is_ok()
+        };
+        release(mgr);
+        ok
+    }
+}
+
+// releases unused com in-process servers (such as tsf, directui and d3d11 loaded on first focus)
+// and decommits idle pages across all win32 heaps once no window stays open
+#[cfg(target_os = "windows")]
+fn trim_idle_platform() {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::Win32::System::Memory::{
+        GetProcessHeaps, HEAP_FLAGS, HeapCompact, HeapOptimizeResources, HeapSetInformation,
+    };
+    use windows::core::{s, w};
+
+    type FarProc = unsafe extern "system" fn() -> isize;
+    type FreeUnusedExFn = unsafe extern "system" fn(u32, u32);
+
+    // only query already-loaded modules so tray-only runs never load com
+    let free_unused = |module| unsafe {
+        let handle = GetModuleHandleW(module).ok()?;
+        let proc = GetProcAddress(handle, s!("CoFreeUnusedLibrariesEx"))?;
+        Some(std::mem::transmute::<FarProc, FreeUnusedExFn>(proc))
+    };
+    if let Some(free) = free_unused(w!("combase.dll")).or_else(|| free_unused(w!("ole32.dll"))) {
+        // two passes let cascaded com server unloads drop their own dependencies immediately
+        unsafe {
+            free(0, 0);
+            free(0, 0);
+        }
+    }
+
+    #[repr(C)]
+    struct HeapOptimizeResourcesInfo {
+        version: u32,
+        flags: u32,
+    }
+    let info = HeapOptimizeResourcesInfo {
+        version: 1,
+        flags: 0,
+    };
+    // safety: version 1 matches heap_optimize_resources_current_version and none targets all heaps
+    unsafe {
+        let _ = HeapSetInformation(
+            None,
+            HeapOptimizeResources,
+            Some((&raw const info).cast()),
+            size_of::<HeapOptimizeResourcesInfo>(),
+        );
+        let mut heaps = [HANDLE::default(); 64];
+        let count = GetProcessHeaps(&mut heaps) as usize;
+        for &heap in &heaps[..count.min(heaps.len())] {
+            if !heap.is_invalid() {
+                let _ = HeapCompact(heap, HEAP_FLAGS(0));
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn trim_idle_platform() {}
+
+// clips each repainted box to the surface, or returns the full surface when reuse is not valid
+fn damage_boxes(
+    revision: crate::paint::Revision,
+    shown: Option<(u64, (u32, u32))>,
+    can_reuse: bool,
+    size: (u32, u32),
+) -> Vec<[u32; 4]> {
+    let clip = |[left, top, right, bottom]: [u32; 4]| {
+        let left = left.min(size.0);
+        let top = top.min(size.1);
+        let right = right.min(size.0);
+        let bottom = bottom.min(size.1);
+        (left < right && top < bottom).then_some([left, top, right, bottom])
+    };
+    match revision.changed {
+        Some((base, boxes)) if can_reuse && shown == Some((base, size)) => {
+            if clip(boxes.bounds()).is_none() {
+                return Vec::new();
+            }
+            boxes.iter().filter_map(clip).collect()
+        }
+        _ => clip([0, 0, size.0, size.1]).into_iter().collect(),
+    }
+}
+
 // copies the left, top, right and bottom box of the canvas into a surface buffer
 fn present_frame(
     frame: &Frame,
@@ -2614,8 +2772,13 @@ fn present_frame(
 ) {
     let pixels = frame.canvas.rgba_pixels();
     let stride = frame.canvas.bytes_per_row();
-    let (left, width) = (left as usize, width as usize);
-    let right = (right.min(frame.canvas.width()) as usize).max(left);
+    let width = width as usize;
+    let limit = (frame.canvas.width() as usize).min(width);
+    let left = (left as usize).min(limit);
+    let right = (right as usize).min(limit);
+    if left >= right {
+        return;
+    }
     for row in top as usize..bottom.min(frame.canvas.height()) as usize {
         let source = &pixels[row * stride + left * 4..row * stride + right * 4];
         let target = &mut buffer[row * width + left..row * width + right];
@@ -2765,8 +2928,8 @@ fn forced_palette() -> Option<crate::css::SystemColors> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Monitor, ResizeDirection, centred, layout_viewport, pack_layered_frame, present_frame,
-        present_stale_software, resize_direction,
+        Monitor, ResizeDirection, centred, damage_boxes, layout_viewport, pack_layered_frame,
+        present_frame, present_stale_software, resize_direction,
     };
 
     #[test]
@@ -2880,6 +3043,124 @@ mod tests {
         assert_eq!(&partial[0..4], &[77, 77, 77, 77]);
         assert_eq!(&partial[16..20], &bgra);
         assert_eq!(&partial[20..24], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn multi_rect_damage_converts_only_disjoint_dirty_boxes() {
+        let mut resources = crate::navigation::ResourceBundle::default();
+        resources
+            .insert(
+                "/index.html",
+                "text/html; charset=utf-8",
+                br#"<style>
+                    body { margin: 0; background: #fff; }
+                    #a { position: absolute; left: 0; top: 0; width: 10px; height: 10px; background: #102030; }
+                    #b { position: absolute; left: 170px; top: 170px; width: 10px; height: 10px; background: #102030; }
+                    .hot { background: #ff0000 !important; }
+                </style><div id="a"></div><div id="b"></div>"#
+                    .to_vec(),
+            )
+            .expect("html resource");
+        let viewport = crate::layout::Size {
+            width: 200.0,
+            height: 200.0,
+        };
+        let mut browser = crate::navigation::Browser::new(resources);
+        browser
+            .navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let (first, _) = browser
+            .paint_planes(viewport, 1.0, false)
+            .expect("first paint");
+        let base_id = first.revision().id;
+        {
+            let doc = browser.document().expect("document");
+            let mut doc = doc.borrow_mut();
+            let a = doc.find_element_by_id("a").expect("a");
+            let b = doc.find_element_by_id("b").expect("b");
+            doc.set_attribute(a, "class", "hot".to_string());
+            doc.set_attribute(b, "class", "hot".to_string());
+        }
+        let (second, _) = browser
+            .paint_planes(viewport, 1.0, false)
+            .expect("second paint");
+        let boxes = damage_boxes(
+            second.revision(),
+            Some((base_id, (200, 200))),
+            true,
+            (200, 200),
+        );
+        assert_eq!(
+            boxes.len(),
+            2,
+            "two distant mutations stay two boxes: {boxes:?}"
+        );
+        // verify the disjoint boxes do not include the untouched center at (100, 100)
+        assert!(
+            !boxes
+                .iter()
+                .any(|&[l, t, r, b]| (l..r).contains(&100) && (t..b).contains(&100)),
+            "{boxes:?}"
+        );
+
+        let frame = crate::host::Frame {
+            sequence: 1,
+            viewport,
+            scale: 1.0,
+            title: None,
+            fullscreen: false,
+            background: [255, 255, 255],
+            canvas: second.clone(),
+            planes: Vec::new(),
+        };
+        let mut buffer = vec![0x00_aa_bb_ccu32; 200 * 200];
+        let mut layered = vec![77u8; 200 * 200 * 4];
+        for rect in &boxes {
+            present_frame(&frame, (200, 200), *rect, &mut buffer);
+            pack_layered_frame(&frame, (200, 200), *rect, &mut layered);
+        }
+        assert_eq!(buffer[5 * 200 + 5], 0x00_ff_00_00);
+        assert_eq!(buffer[175 * 200 + 175], 0x00_ff_00_00);
+        assert_eq!(buffer[100 * 200 + 100], 0x00_aa_bb_cc);
+        assert_eq!(
+            &layered[(5 * 200 + 5) * 4..(5 * 200 + 5) * 4 + 4],
+            &[0, 0, 255, 255]
+        );
+        assert_eq!(
+            &layered[(175 * 200 + 175) * 4..(175 * 200 + 175) * 4 + 4],
+            &[0, 0, 255, 255]
+        );
+        assert_eq!(
+            &layered[(100 * 200 + 100) * 4..(100 * 200 + 100) * 4 + 4],
+            &[77, 77, 77, 77]
+        );
+
+        // fallback to full surface when base revision or buffer age does not match
+        assert_eq!(
+            damage_boxes(
+                second.revision(),
+                Some((base_id, (200, 200))),
+                false,
+                (200, 200)
+            ),
+            vec![[0, 0, 200, 200]]
+        );
+        assert_eq!(
+            damage_boxes(
+                second.revision(),
+                Some((base_id + 999, (200, 200))),
+                true,
+                (200, 200)
+            ),
+            vec![[0, 0, 200, 200]]
+        );
+        // out-of-range left past canvas width is a safe no-op
+        present_frame(
+            &frame,
+            (220, 200),
+            [205, 0, 220, 10],
+            &mut vec![0; 220 * 200],
+        );
     }
 
     #[test]

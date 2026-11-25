@@ -365,6 +365,12 @@ impl EngineWorker {
                     crate::release_after_worker_exit();
                     if let Some(on_exit) = on_exit {
                         on_exit();
+                        // catch async com, tsf and dwm teardown that finishes after window destruction
+                        #[cfg(all(target_os = "windows", feature = "windowed"))]
+                        {
+                            thread::sleep(Duration::from_millis(600));
+                            on_exit();
+                        }
                     }
                 });
         } else {
@@ -823,9 +829,16 @@ fn answer(host: &mut EngineHost, command: EngineWorkerCommand) -> Option<EngineW
                 Inbound::Message { session, text } => {
                     // whatever the session ran may have changed the page
                     host.dirty = true;
-                    if let Some((id, answer)) = host.automation_call(&text) {
-                        host.browser.answer_inspector(session, id, answer);
-                        return None;
+                    if let Some(reply) = host.automation_call(&text) {
+                        host.browser
+                            .answer_inspector(session, reply.id, reply.answer);
+                        return reply
+                            .input
+                            .filter(|result| result.cursor.is_some() || result.region.is_some())
+                            .map(|result| EngineWorkerEvent::Input {
+                                request_id: 0,
+                                result: Ok(result),
+                            });
                     }
                     if let Some(url) = host.browser.inspect(session, &text) {
                         return Some(EngineWorkerEvent::Navigated {
@@ -2754,11 +2767,13 @@ mod tests {
         let mut call = |host: &mut EngineHost, method: &str, params: Json| {
             id += 1;
             let message = json!({ "id": id, "method": method, "params": params });
-            let (answered, answer) = host
+            let reply = host
                 .automation_call(&message.to_string())
                 .unwrap_or_else(|| panic!("the host should answer {method}"));
-            assert_eq!(answered, id);
-            answer.unwrap_or_else(|error| panic!("{method} failed: {error:?}"))
+            assert_eq!(reply.id, id);
+            reply
+                .answer
+                .unwrap_or_else(|error| panic!("{method} failed: {error:?}"))
         };
         let status = |host: &EngineHost| {
             let document = host.browser().document().expect("document should exist");
@@ -2856,20 +2871,20 @@ mod tests {
         );
         let webp =
             json!({ "id": 98, "method": "Page.captureScreenshot", "params": { "format": "webp" } });
-        let (_, answer) = host
+        let reply = host
             .automation_call(&webp.to_string())
             .expect("the host answers screenshots");
-        assert!(answer.is_err());
+        assert!(reply.answer.is_err());
         // a clip on the last half pixel takes the edge pixel, where it used to panic
         let edge =
             json!({ "clip": { "x": 159.5, "y": 99.5, "width": 1, "height": 1, "scale": 1 } });
         assert_eq!(shot(&mut host, &mut call, edge), (1, 1));
         // a runaway scale is refused instead of overflowing the image size
         let message = json!({ "id": 99, "method": "Page.captureScreenshot", "params": { "clip": { "x": 0, "y": 0, "width": 10, "height": 10, "scale": 1e9 } } });
-        let (_, answer) = host
+        let reply = host
             .automation_call(&message.to_string())
             .expect("the host answers screenshots");
-        assert!(answer.is_err());
+        assert!(reply.answer.is_err());
         assert!(
             host.automation_call(r#"{"id":9,"method":"Page.navigate","params":{}}"#)
                 .is_none()
@@ -2909,10 +2924,12 @@ mod tests {
         };
         let call = |host: &mut EngineHost, method: &str, params: Json| {
             let message = json!({ "id": 1, "method": method, "params": params });
-            let (_, answer) = host
+            let reply = host
                 .automation_call(&message.to_string())
                 .expect("the host answers input");
-            answer.unwrap_or_else(|error| panic!("{method} failed: {error:?}"));
+            reply
+                .answer
+                .unwrap_or_else(|error| panic!("{method} failed: {error:?}"));
         };
         let click = |count: u64| {
             [
@@ -3917,5 +3934,86 @@ mod tests {
         host.input(InputEvent::Click { x, y })
             .expect("input should apply");
         assert_eq!(status(&host).as_deref(), Some("idle click"));
+    }
+
+    #[test]
+    fn devtools_mouse_presses_on_drag_regions_forward_region_actions_to_the_window() {
+        use crate::devtools::Inbound;
+
+        let browser = Browser::new(bundle(
+            r#"<div style="display: flex; width: 200px; height: 32px; -webkit-app-region: drag">
+                <div style="width: 120px; height: 32px"></div>
+                <button id="btn" style="width: 80px; height: 32px; -webkit-app-region: no-drag; border: 0; padding: 0">x</button>
+            </div>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 200.0,
+                height: 80.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("page should load");
+        let (outgoing, messages) = std::sync::mpsc::channel();
+        host.browser.attach_inspector(1, outgoing);
+
+        let mut dispatch = |id: u64, kind: &str, x: f32, y: f32, click_count: u64| {
+            let text = json!({
+                "id": id,
+                "method": "Input.dispatchMouseEvent",
+                "params": {
+                    "type": kind,
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "clickCount": click_count,
+                }
+            })
+            .to_string();
+            let event = answer(
+                &mut host,
+                EngineWorkerCommand::Inspector(Inbound::Message { session: 1, text }),
+            );
+            let reply = messages.try_recv().expect("cdp should receive a reply");
+            assert!(reply.contains(&format!(r#""id":{id}"#)), "{reply}");
+            assert!(reply.contains(r#""result":{}"#), "{reply}");
+            event
+        };
+
+        let first = dispatch(1, "mousePressed", 40.0, 16.0, 1);
+        assert!(
+            matches!(
+                first,
+                Some(EngineWorkerEvent::Input {
+                    request_id: 0,
+                    result: Ok(InputResult {
+                        region: Some(RegionPress::Move),
+                        ..
+                    }),
+                })
+            ),
+            "{first:?}"
+        );
+        assert!(dispatch(2, "mouseReleased", 40.0, 16.0, 1).is_none());
+
+        let second = dispatch(3, "mousePressed", 40.0, 16.0, 2);
+        assert!(
+            matches!(
+                second,
+                Some(EngineWorkerEvent::Input {
+                    request_id: 0,
+                    result: Ok(InputResult {
+                        region: Some(RegionPress::ToggleMaximize),
+                        ..
+                    }),
+                })
+            ),
+            "{second:?}"
+        );
+        assert!(dispatch(4, "mouseReleased", 40.0, 16.0, 2).is_none());
+
+        // a no-drag control inside the strip does not emit a window region press
+        assert!(dispatch(5, "mousePressed", 160.0, 16.0, 2).is_none());
     }
 }

@@ -1,7 +1,7 @@
 // the devtools protocol calls a window's host answers: input as the window would deliver it,
 // and screenshots of what it would show
 
-use super::{EngineHost, InputEvent, KeyModifiers, PointerButton, Press};
+use super::{EngineHost, InputEvent, InputResult, KeyModifiers, PointerButton, Press};
 use crate::png::encode_png;
 use crate::script::base64;
 use serde_json::{Value as Json, json};
@@ -10,9 +10,25 @@ type Failure = (i64, String);
 
 const MAX_SHOT_SIDE: usize = 16_384;
 
+pub(super) struct AutomationReply {
+    pub(super) id: u64,
+    pub(super) answer: Result<Json, Failure>,
+    pub(super) input: Option<InputResult>,
+}
+
+fn merge_input(first: InputResult, second: InputResult) -> InputResult {
+    InputResult {
+        handled: first.handled || second.handled,
+        tasks_run: first.tasks_run + second.tasks_run,
+        frame_requested: first.frame_requested || second.frame_requested,
+        cursor: second.cursor.or(first.cursor),
+        region: second.region.or(first.region),
+    }
+}
+
 impl EngineHost {
-    // the id and answer of a message the host owns, or none for the browser to answer
-    pub(super) fn automation_call(&mut self, text: &str) -> Option<(u64, Result<Json, Failure>)> {
+    // the id, answer and any host input result of a message the host owns, or none for the browser
+    pub(super) fn automation_call(&mut self, text: &str) -> Option<AutomationReply> {
         let message = serde_json::from_str::<Json>(text).ok()?;
         let method = message["method"].as_str()?;
         if !method.starts_with("Input.")
@@ -22,27 +38,30 @@ impl EngineHost {
         }
         let id = message["id"].as_u64()?;
         let params = &message["params"];
-        let answer = match method {
-            "Page.captureScreenshot" => self.screenshot(params),
-            "Page.getLayoutMetrics" => self.layout_metrics(),
-            "Input.dispatchMouseEvent" => self.mouse(params),
-            "Input.dispatchKeyEvent" => self.key(params),
+        let finish_input = |result: Result<InputResult, Failure>| match result {
+            Ok(input) => (Ok(json!({})), Some(input)),
+            Err(error) => (Err(error), None),
+        };
+        let (answer, input) = match method {
+            "Page.captureScreenshot" => (self.screenshot(params), None),
+            "Page.getLayoutMetrics" => (self.layout_metrics(), None),
+            "Input.dispatchMouseEvent" => finish_input(self.mouse(params)),
+            "Input.dispatchKeyEvent" => finish_input(self.key(params)),
             "Input.insertText" => {
                 let text = params["text"].as_str().unwrap_or_default().to_string();
-                self.deliver(InputEvent::TextInput { text })
+                finish_input(self.deliver(InputEvent::TextInput { text }))
             }
-            _ => Err((-32601, format!("'{method}' wasn't found"))),
+            _ => (Err((-32601, format!("'{method}' wasn't found"))), None),
         };
-        Some((id, answer))
+        Some(AutomationReply { id, answer, input })
     }
 
-    fn deliver(&mut self, event: InputEvent) -> Result<Json, Failure> {
+    fn deliver(&mut self, event: InputEvent) -> Result<InputResult, Failure> {
         self.input(event)
-            .map(|_| json!({}))
             .map_err(|error| (-32000, error.to_string()))
     }
 
-    fn mouse(&mut self, params: &Json) -> Result<Json, Failure> {
+    fn mouse(&mut self, params: &Json) -> Result<InputResult, Failure> {
         let (x, y) = (number(&params["x"])?, number(&params["y"])?);
         let button = match params["button"].as_str().unwrap_or("none") {
             "left" => Some(PointerButton::Primary),
@@ -70,10 +89,12 @@ impl EngineHost {
             // a window follows a primary release with its click, and so does this
             "mouseReleased" => {
                 let button = pressed(button)?;
-                self.deliver(InputEvent::PointerUp { x, y, button })?;
+                let up = self.deliver(InputEvent::PointerUp { x, y, button })?;
                 match button {
-                    PointerButton::Primary => self.deliver(InputEvent::Click { x, y }),
-                    _ => Ok(json!({})),
+                    PointerButton::Primary => {
+                        Ok(merge_input(up, self.deliver(InputEvent::Click { x, y })?))
+                    }
+                    _ => Ok(up),
                 }
             }
             "mouseWheel" => self.deliver(InputEvent::Scroll {
@@ -86,7 +107,7 @@ impl EngineHost {
         }
     }
 
-    fn key(&mut self, params: &Json) -> Result<Json, Failure> {
+    fn key(&mut self, params: &Json) -> Result<InputResult, Failure> {
         let flags = params["modifiers"].as_u64().unwrap_or_default();
         let modifiers = KeyModifiers {
             alt: flags & 1 != 0,
@@ -106,7 +127,7 @@ impl EngineHost {
             // a keyDown carrying text is a raw key and its character, as a window gets them;
             // enter's "\r" and other control text are the key's own action, not typed text
             "keyDown" | "rawKeyDown" => {
-                self.deliver(InputEvent::Key {
+                let down = self.deliver(InputEvent::Key {
                     key,
                     code,
                     modifiers,
@@ -114,8 +135,11 @@ impl EngineHost {
                     pressed: true,
                 })?;
                 match kind == "keyDown" && !text.is_empty() && !text.chars().all(char::is_control) {
-                    true => self.deliver(InputEvent::TextInput { text }),
-                    false => Ok(json!({})),
+                    true => Ok(merge_input(
+                        down,
+                        self.deliver(InputEvent::TextInput { text })?,
+                    )),
+                    false => Ok(down),
                 }
             }
             "keyUp" => self.deliver(InputEvent::Key {
