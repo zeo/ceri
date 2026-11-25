@@ -5,9 +5,9 @@ use crate::css::{
 };
 use crate::image::Image;
 use crate::layout::{
-    BoxBorder, ControlPaint, CornerRadii, ImageLayer, LayoutBox, LayoutDocument, ProseSpan, Rect,
-    ResolvedEdges, SQUARE_CORNERS, Scrollbar, StackingContextEntry, TextRun, ThumbPlacement,
-    for_each_paint_order, overflow_clip_rect, part_box, scrollbar_metrics,
+    BoxBorder, ControlPaint, CornerRadii, ImageLayer, LayoutBox, LayoutDocument, PaintDiff,
+    ProseSpan, Rect, ResolvedEdges, SQUARE_CORNERS, Scrollbar, StackingContextEntry, TextRun,
+    ThumbPlacement, for_each_paint_order, overflow_clip_rect, part_box, scrollbar_metrics,
     stacking_context_entries, thumb_placement, translate_rect, user_scroll_range,
     visual_offset_for, visual_rect_for,
 };
@@ -752,16 +752,6 @@ impl Canvas {
             }
             _ => None,
         };
-        enum BlendLut {
-            Gray(Box<[[u8; 256]; 2]>),
-            Rgba(Box<[[u8; 256]; 4]>),
-        }
-        struct DownColumns {
-            non_zero: Vec<(u32, Color)>,
-            uniform: Option<Color>,
-            stride_step: Option<usize>,
-            blend_lut: Option<BlendLut>,
-        }
         let mut columns: Option<DownColumns> = None;
         let whole_all = device.contains_whole_rect(left, top, right, bottom);
         // rows clear of all four corner curves and half a pixel inside top/bottom share one whole_run
@@ -778,6 +768,20 @@ impl Canvas {
                 (0.0, 0.0, None)
             }
         };
+        if matches!(steady, Steady::DownColumns)
+            && whole_all
+            && unmasked_all
+            && paint.covers_all_rows()
+        {
+            let cols = DownColumns::build(
+                paint,
+                left..right,
+                top as f32 + 0.5,
+                (bottom - top) as usize,
+            );
+            cols.paint_unmasked_rows(self, top..bottom, left..right, left..right, stride);
+            return;
+        }
         for pixel_y in top..bottom {
             let row = pixel_y as f32 + 0.5;
             // most of a row lies whole inside the shape, where only the paint is asked for
@@ -902,320 +906,10 @@ impl Canvas {
                     if !paint.covers_row(row) {
                         continue;
                     }
-                    let DownColumns {
-                        non_zero,
-                        uniform,
-                        stride_step,
-                        blend_lut,
-                    } = columns.get_or_insert_with(|| {
-                        let non_zero: Vec<(u32, Color)> = (left..right)
-                            .filter_map(|px| {
-                                let color = color_at(px);
-                                (color.alpha != 0).then_some((px, color))
-                            })
-                            .collect();
-                        let uniform = non_zero.first().and_then(|&(_, first)| {
-                            non_zero
-                                .iter()
-                                .all(|&(_, color)| color == first)
-                                .then_some(first)
-                        });
-                        // detect constant horizontal stride (e.g. repeating 90deg stripe gradients)
-                        let stride_step = (uniform.is_some() && non_zero.len() >= 2)
-                            .then(|| {
-                                let step = non_zero[1].0 - non_zero[0].0;
-                                (step > 0
-                                    && non_zero
-                                        .windows(2)
-                                        .all(|pair| pair[1].0 - pair[0].0 == step))
-                                .then_some(step as usize)
-                            })
-                            .flatten();
-                        // precompute exact 256-entry blend tables when blending many strided pixels
-                        let blend_lut = uniform.and_then(|color| {
-                            let rows = (bottom - pixel_y) as usize;
-                            if color.alpha == 255 || non_zero.len().saturating_mul(rows) < 256 {
-                                return None;
-                            }
-                            let alpha = u16::from(color.alpha);
-                            let inverse = 255 - alpha;
-                            let make_lut = |src: u16| -> [u8; 256] {
-                                std::array::from_fn(|dst| {
-                                    let sum = src + dst as u16 * inverse;
-                                    ((sum + 1 + (sum >> 8)) >> 8) as u8
-                                })
-                            };
-                            let a_lut = make_lut(alpha * 255);
-                            if color.red == color.green && color.green == color.blue {
-                                let rgb_lut = make_lut(u16::from(color.red) * alpha);
-                                Some(BlendLut::Gray(Box::new([rgb_lut, a_lut])))
-                            } else {
-                                Some(BlendLut::Rgba(Box::new([
-                                    make_lut(u16::from(color.red) * alpha),
-                                    make_lut(u16::from(color.green) * alpha),
-                                    make_lut(u16::from(color.blue) * alpha),
-                                    a_lut,
-                                ])))
-                            }
-                        });
-                        DownColumns {
-                            non_zero,
-                            uniform,
-                            stride_step,
-                            blend_lut,
-                        }
+                    let cols = columns.get_or_insert_with(|| {
+                        DownColumns::build(paint, left..right, row, (bottom - pixel_y) as usize)
                     });
-                    if non_zero.is_empty() || whole.is_empty() {
-                        continue;
-                    }
-                    let slice_range = |range: std::ops::Range<u32>| -> &[(u32, Color)] {
-                        if range.is_empty() {
-                            return &[];
-                        }
-                        if range.start == left && range.end == right {
-                            return non_zero;
-                        }
-                        let lo = non_zero.partition_point(|&(px, _)| px < range.start);
-                        let hi = lo + non_zero[lo..].partition_point(|&(px, _)| px < range.end);
-                        &non_zero[lo..hi]
-                    };
-                    let unmasked = if unmasked_all {
-                        whole.clone()
-                    } else {
-                        self.masks_whole_run(row, whole.clone())
-                    };
-                    for &(pixel_x, color) in slice_range(whole.start..unmasked.start) {
-                        self.blend_pixel(pixel_x, pixel_y, color);
-                    }
-                    for &(pixel_x, color) in slice_range(unmasked.end..whole.end) {
-                        self.blend_pixel(pixel_x, pixel_y, color);
-                    }
-                    let active = slice_range(unmasked);
-                    if !active.is_empty() {
-                        let row_pixels = &mut self.pixels
-                            [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
-                        let pixels = row_pixels.as_chunks_mut::<4>().0;
-                        if let Some(color) = *uniform {
-                            if color.alpha == 255 {
-                                let rgba = [color.red, color.green, color.blue, 255];
-                                if let Some(step) = *stride_step {
-                                    let first_x = active[0].0 as usize;
-                                    let last_x = active[active.len() - 1].0 as usize;
-                                    for pixel in pixels[first_x..=last_x].iter_mut().step_by(step) {
-                                        *pixel = rgba;
-                                    }
-                                } else {
-                                    for &(pixel_x, _) in active {
-                                        pixels[pixel_x as usize] = rgba;
-                                    }
-                                }
-                            } else if let Some(lut) = blend_lut.as_ref() {
-                                match lut {
-                                    BlendLut::Gray(tables) => {
-                                        let [rgb, a] = &**tables;
-                                        let first_x = active[0].0 as usize;
-                                        let mut last_in = u32::from_ne_bytes(pixels[first_x]);
-                                        let mut last_out = [
-                                            rgb[usize::from(pixels[first_x][0])],
-                                            rgb[usize::from(pixels[first_x][1])],
-                                            rgb[usize::from(pixels[first_x][2])],
-                                            a[usize::from(pixels[first_x][3])],
-                                        ];
-                                        if let Some(step) = *stride_step {
-                                            let last_x = active[active.len() - 1].0 as usize;
-                                            let span = &mut pixels[first_x..=last_x];
-                                            if step == 3 {
-                                                let (chunks, rem) = span.as_chunks_mut::<3>();
-                                                for chunk in chunks {
-                                                    let pixel = &mut chunk[0];
-                                                    let current = u32::from_ne_bytes(*pixel);
-                                                    if current == last_in {
-                                                        *pixel = last_out;
-                                                    } else {
-                                                        last_in = current;
-                                                        last_out = [
-                                                            rgb[usize::from(pixel[0])],
-                                                            rgb[usize::from(pixel[1])],
-                                                            rgb[usize::from(pixel[2])],
-                                                            a[usize::from(pixel[3])],
-                                                        ];
-                                                        *pixel = last_out;
-                                                    }
-                                                }
-                                                if let Some(pixel) = rem.first_mut() {
-                                                    let current = u32::from_ne_bytes(*pixel);
-                                                    if current == last_in {
-                                                        *pixel = last_out;
-                                                    } else {
-                                                        *pixel = [
-                                                            rgb[usize::from(pixel[0])],
-                                                            rgb[usize::from(pixel[1])],
-                                                            rgb[usize::from(pixel[2])],
-                                                            a[usize::from(pixel[3])],
-                                                        ];
-                                                    }
-                                                }
-                                            } else {
-                                                for chunk in span.chunks_mut(step) {
-                                                    let pixel = &mut chunk[0];
-                                                    let current = u32::from_ne_bytes(*pixel);
-                                                    if current == last_in {
-                                                        *pixel = last_out;
-                                                    } else {
-                                                        last_in = current;
-                                                        last_out = [
-                                                            rgb[usize::from(pixel[0])],
-                                                            rgb[usize::from(pixel[1])],
-                                                            rgb[usize::from(pixel[2])],
-                                                            a[usize::from(pixel[3])],
-                                                        ];
-                                                        *pixel = last_out;
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            for &(pixel_x, _) in active {
-                                                let pixel = &mut pixels[pixel_x as usize];
-                                                let current = u32::from_ne_bytes(*pixel);
-                                                if current == last_in {
-                                                    *pixel = last_out;
-                                                } else {
-                                                    last_in = current;
-                                                    last_out = [
-                                                        rgb[usize::from(pixel[0])],
-                                                        rgb[usize::from(pixel[1])],
-                                                        rgb[usize::from(pixel[2])],
-                                                        a[usize::from(pixel[3])],
-                                                    ];
-                                                    *pixel = last_out;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    BlendLut::Rgba(tables) => {
-                                        let [r, g, b, a] = &**tables;
-                                        let first_x = active[0].0 as usize;
-                                        let mut last_in = u32::from_ne_bytes(pixels[first_x]);
-                                        let mut last_out = [
-                                            r[usize::from(pixels[first_x][0])],
-                                            g[usize::from(pixels[first_x][1])],
-                                            b[usize::from(pixels[first_x][2])],
-                                            a[usize::from(pixels[first_x][3])],
-                                        ];
-                                        if let Some(step) = *stride_step {
-                                            let last_x = active[active.len() - 1].0 as usize;
-                                            let span = &mut pixels[first_x..=last_x];
-                                            if step == 3 {
-                                                let (chunks, rem) = span.as_chunks_mut::<3>();
-                                                for chunk in chunks {
-                                                    let pixel = &mut chunk[0];
-                                                    let current = u32::from_ne_bytes(*pixel);
-                                                    if current == last_in {
-                                                        *pixel = last_out;
-                                                    } else {
-                                                        last_in = current;
-                                                        last_out = [
-                                                            r[usize::from(pixel[0])],
-                                                            g[usize::from(pixel[1])],
-                                                            b[usize::from(pixel[2])],
-                                                            a[usize::from(pixel[3])],
-                                                        ];
-                                                        *pixel = last_out;
-                                                    }
-                                                }
-                                                if let Some(pixel) = rem.first_mut() {
-                                                    let current = u32::from_ne_bytes(*pixel);
-                                                    if current == last_in {
-                                                        *pixel = last_out;
-                                                    } else {
-                                                        *pixel = [
-                                                            r[usize::from(pixel[0])],
-                                                            g[usize::from(pixel[1])],
-                                                            b[usize::from(pixel[2])],
-                                                            a[usize::from(pixel[3])],
-                                                        ];
-                                                    }
-                                                }
-                                            } else {
-                                                for chunk in span.chunks_mut(step) {
-                                                    let pixel = &mut chunk[0];
-                                                    let current = u32::from_ne_bytes(*pixel);
-                                                    if current == last_in {
-                                                        *pixel = last_out;
-                                                    } else {
-                                                        last_in = current;
-                                                        last_out = [
-                                                            r[usize::from(pixel[0])],
-                                                            g[usize::from(pixel[1])],
-                                                            b[usize::from(pixel[2])],
-                                                            a[usize::from(pixel[3])],
-                                                        ];
-                                                        *pixel = last_out;
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            for &(pixel_x, _) in active {
-                                                let pixel = &mut pixels[pixel_x as usize];
-                                                let current = u32::from_ne_bytes(*pixel);
-                                                if current == last_in {
-                                                    *pixel = last_out;
-                                                } else {
-                                                    last_in = current;
-                                                    last_out = [
-                                                        r[usize::from(pixel[0])],
-                                                        g[usize::from(pixel[1])],
-                                                        b[usize::from(pixel[2])],
-                                                        a[usize::from(pixel[3])],
-                                                    ];
-                                                    *pixel = last_out;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                let alpha = u16::from(color.alpha);
-                                let inverse = 255 - alpha;
-                                let (sr, sg, sb, sa) = (
-                                    u16::from(color.red) * alpha,
-                                    u16::from(color.green) * alpha,
-                                    u16::from(color.blue) * alpha,
-                                    alpha * 255,
-                                );
-                                if let Some(step) = *stride_step {
-                                    let first_x = active[0].0 as usize;
-                                    let last_x = active[active.len() - 1].0 as usize;
-                                    for pixel in pixels[first_x..=last_x].iter_mut().step_by(step) {
-                                        let r = sr + u16::from(pixel[0]) * inverse;
-                                        let g = sg + u16::from(pixel[1]) * inverse;
-                                        let b = sb + u16::from(pixel[2]) * inverse;
-                                        let a = sa + u16::from(pixel[3]) * inverse;
-                                        pixel[0] = ((r + 1 + (r >> 8)) >> 8) as u8;
-                                        pixel[1] = ((g + 1 + (g >> 8)) >> 8) as u8;
-                                        pixel[2] = ((b + 1 + (b >> 8)) >> 8) as u8;
-                                        pixel[3] = ((a + 1 + (a >> 8)) >> 8) as u8;
-                                    }
-                                } else {
-                                    for &(pixel_x, _) in active {
-                                        let pixel = &mut pixels[pixel_x as usize];
-                                        let r = sr + u16::from(pixel[0]) * inverse;
-                                        let g = sg + u16::from(pixel[1]) * inverse;
-                                        let b = sb + u16::from(pixel[2]) * inverse;
-                                        let a = sa + u16::from(pixel[3]) * inverse;
-                                        pixel[0] = ((r + 1 + (r >> 8)) >> 8) as u8;
-                                        pixel[1] = ((g + 1 + (g >> 8)) >> 8) as u8;
-                                        pixel[2] = ((b + 1 + (b >> 8)) >> 8) as u8;
-                                        pixel[3] = ((a + 1 + (a >> 8)) >> 8) as u8;
-                                    }
-                                }
-                            }
-                        } else {
-                            for &(pixel_x, color) in active {
-                                blend_rgba(&mut pixels[pixel_x as usize], color);
-                            }
-                        }
-                    }
+                    cols.paint_row(self, pixel_y, row, left..right, whole, unmasked_all, stride);
                 }
                 Steady::Nowhere => {
                     if whole.is_empty() {
@@ -1392,6 +1086,390 @@ impl Canvas {
                     }
                 }
             }
+        }
+    }
+
+    // paints one shape across multiple disjoint clips, sharing ramp setup and steady-axis samples
+    fn fill_shape_multi(&mut self, shape: Shape, paint: &Paint, clips: &[Rect]) {
+        if shape.width <= 0.0 || shape.height <= 0.0 || clips.is_empty() {
+            return;
+        }
+        if clips.len() == 1 {
+            self.fill_shape(shape, paint, Some(clips[0]));
+            return;
+        }
+        if shape.is_square()
+            && let Paint::Solid(color) = paint
+        {
+            for &clip in clips {
+                self.fill_rect_clipped(shape.x, shape.y, shape.width, shape.height, *color, clip);
+            }
+            return;
+        }
+        let steady = paint.steady();
+        if matches!(steady, Steady::Nowhere) {
+            for &clip in clips {
+                self.fill_shape(shape, paint, Some(clip));
+            }
+            return;
+        }
+        let _profile = crate::profile::scope("paint: shape");
+        let device = self.device_shape(shape);
+        let shape_left = device.x.floor().max(0.0) as u32;
+        let shape_top = device.y.floor().max(0.0) as u32;
+        let shape_right = (device.x + device.width)
+            .ceil()
+            .clamp(0.0, self.width as f32) as u32;
+        let shape_bottom = (device.y + device.height)
+            .ceil()
+            .clamp(0.0, self.height as f32) as u32;
+        if shape_left >= shape_right || shape_top >= shape_bottom {
+            return;
+        }
+        let mut boxes = [[0u32; 4]; ClipList::MAX];
+        let mut count = 0;
+        let (mut min_left, mut min_top, mut max_right, mut max_bottom) =
+            (u32::MAX, u32::MAX, 0u32, 0u32);
+        for &clip in clips {
+            let clip_device = self.device_shape(Shape::square(clip));
+            let [l, t, r, b] = narrow(
+                [shape_left, shape_top, shape_right, shape_bottom],
+                Some(clip_device),
+            );
+            let (l, r) = (l.min(self.width), r.min(self.width));
+            let (t, b) = (t.min(self.height), b.min(self.height));
+            if l < r && t < b && count < boxes.len() {
+                boxes[count] = [l, t, r, b];
+                count += 1;
+                min_left = min_left.min(l);
+                min_top = min_top.min(t);
+                max_right = max_right.max(r);
+                max_bottom = max_bottom.max(b);
+            }
+        }
+        if count == 0 {
+            return;
+        }
+        if count == 1 {
+            self.fill_shape(
+                shape,
+                paint,
+                Some(
+                    clips
+                        .iter()
+                        .copied()
+                        .find(|&clip| {
+                            let d = self.device_shape(Shape::square(clip));
+                            let [l, t, r, b] =
+                                narrow([shape_left, shape_top, shape_right, shape_bottom], Some(d));
+                            l.min(self.width) < r.min(self.width)
+                                && t.min(self.height) < b.min(self.height)
+                        })
+                        .unwrap_or(clips[0]),
+                ),
+            );
+            return;
+        }
+        let boxes = &boxes[..count];
+        let stride = self.width as usize * 4;
+        let top_corner = device.radii[0].1.max(device.radii[1].1).min(device.height);
+        let bot_corner = device.radii[2].1.max(device.radii[3].1).min(device.height);
+        let straight_top = device.y + top_corner.max(0.5);
+        let straight_bot = device.y + device.height - bot_corner.max(0.5);
+        let straight_mid =
+            (straight_top < straight_bot).then_some((straight_top + straight_bot) * 0.5);
+
+        match steady {
+            Steady::AlongRows => {
+                let mut whole_all = [false; ClipList::MAX];
+                let mut unmasked_all = [false; ClipList::MAX];
+                let mut straight_whole: [Option<std::ops::Range<u32>>; ClipList::MAX] =
+                    [const { None }; ClipList::MAX];
+                for (i, &[l, t, r, b]) in boxes.iter().enumerate() {
+                    whole_all[i] = device.contains_whole_rect(l, t, r, b);
+                    unmasked_all[i] = self.masks_cover_rect(l, t, r, b);
+                    if !whole_all[i]
+                        && let Some(mid) = straight_mid
+                    {
+                        straight_whole[i] = Some(device.whole_run(mid, l..r));
+                    }
+                }
+                for pixel_y in min_top..max_bottom {
+                    let row = pixel_y as f32 + 0.5;
+                    let mut cached_color: Option<Color> = None;
+                    for (i, &[left, top, right, bottom]) in boxes.iter().enumerate() {
+                        if pixel_y < top || pixel_y >= bottom {
+                            continue;
+                        }
+                        let whole = if whole_all[i] {
+                            left..right
+                        } else if let Some(ref straight) = straight_whole[i]
+                            && row >= straight_top
+                            && row <= straight_bot
+                        {
+                            straight.clone()
+                        } else {
+                            device.whole_run(row, left..right)
+                        };
+                        if whole.start > left || whole.end < right {
+                            if unmasked_all[i] {
+                                let row_pixels = &mut self.pixels
+                                    [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                                for pixel_x in (left..whole.start).chain(whole.end..right) {
+                                    let center = (pixel_x as f32 + 0.5, row);
+                                    let coverage = device.coverage(center);
+                                    if coverage <= 0.0 {
+                                        continue;
+                                    }
+                                    let color = paint.pixel_color(steady, center);
+                                    if color.alpha == 0 {
+                                        continue;
+                                    }
+                                    let at = pixel_x as usize * 4;
+                                    let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
+                                        .try_into()
+                                        .expect("four bytes per pixel");
+                                    blend_rgba(pixel, color.scale_alpha(coverage.min(1.0)));
+                                }
+                            } else {
+                                for pixel_x in (left..whole.start).chain(whole.end..right) {
+                                    let center = (pixel_x as f32 + 0.5, row);
+                                    let coverage = device.coverage(center);
+                                    if coverage <= 0.0 {
+                                        continue;
+                                    }
+                                    let color = paint.pixel_color(steady, center);
+                                    if color.alpha == 0 {
+                                        continue;
+                                    }
+                                    self.blend_pixel(
+                                        pixel_x,
+                                        pixel_y,
+                                        color.scale_alpha(coverage.min(1.0)),
+                                    );
+                                }
+                            }
+                        }
+                        if whole.is_empty() {
+                            continue;
+                        }
+                        let (drawn, color) = match paint {
+                            Paint::Solid(color) => {
+                                if color.alpha == 0 {
+                                    continue;
+                                }
+                                (whole, *color)
+                            }
+                            Paint::Ramp(ramp) => {
+                                let drawn = if ramp.repeat.0 {
+                                    whole
+                                } else {
+                                    let lo = (ramp.corner.0 - 0.5)
+                                        .floor()
+                                        .clamp(whole.start as f32, whole.end as f32)
+                                        as u32;
+                                    let hi = (ramp.corner.0 + ramp.size.0 * ramp.scale - 0.5)
+                                        .ceil()
+                                        .clamp(whole.start as f32, whole.end as f32)
+                                        as u32;
+                                    let mut start =
+                                        lo.saturating_sub(1).max(whole.start).min(whole.end);
+                                    let mut end = hi.saturating_add(2).min(whole.end);
+                                    let inside = |pixel: u32| {
+                                        (0.0..ramp.size.0).contains(
+                                            &((pixel as f32 + 0.5 - ramp.corner.0) / ramp.scale),
+                                        )
+                                    };
+                                    while start < end && !inside(start) {
+                                        start += 1;
+                                    }
+                                    while end > start && !inside(end - 1) {
+                                        end -= 1;
+                                    }
+                                    start..end
+                                };
+                                if drawn.is_empty() {
+                                    continue;
+                                }
+                                let color = *cached_color.get_or_insert_with(|| {
+                                    paint.color_at((drawn.start as f32 + 0.5, row))
+                                });
+                                if color.alpha == 0 {
+                                    continue;
+                                }
+                                (drawn, color)
+                            }
+                        };
+                        let at = pixel_y as usize * stride;
+                        if unmasked_all[i] {
+                            let run = at + drawn.start as usize * 4..at + drawn.end as usize * 4;
+                            fill_solid_span(&mut self.pixels[run], color);
+                        } else {
+                            let unmasked = self.masks_whole_run(row, drawn.clone());
+                            for pixel_x in drawn.start..unmasked.start {
+                                self.blend_pixel(pixel_x, pixel_y, color);
+                            }
+                            if !unmasked.is_empty() {
+                                let run = at + unmasked.start as usize * 4
+                                    ..at + unmasked.end as usize * 4;
+                                fill_solid_span(&mut self.pixels[run], color);
+                            }
+                            for pixel_x in unmasked.end..drawn.end {
+                                self.blend_pixel(pixel_x, pixel_y, color);
+                            }
+                        }
+                    }
+                }
+            }
+            Steady::DownColumns => {
+                let mut columns: Option<DownColumns> = None;
+                let total_rows = (max_bottom - min_top) as usize;
+                let covers_all = paint.covers_all_rows();
+                for &[left, top, right, bottom] in boxes {
+                    let unmasked_all = self.masks_cover_rect(left, top, right, bottom);
+                    let whole_all = device.contains_whole_rect(left, top, right, bottom);
+                    if whole_all && unmasked_all && covers_all {
+                        let cols = columns.get_or_insert_with(|| {
+                            DownColumns::build(
+                                paint,
+                                min_left..max_right,
+                                top as f32 + 0.5,
+                                total_rows,
+                            )
+                        });
+                        cols.paint_unmasked_rows(
+                            self,
+                            top..bottom,
+                            left..right,
+                            min_left..max_right,
+                            stride,
+                        );
+                        continue;
+                    }
+                    let straight_whole = (!whole_all)
+                        .then_some(straight_mid)
+                        .flatten()
+                        .map(|mid| device.whole_run(mid, left..right));
+                    let fast_mid = if unmasked_all
+                        && covers_all
+                        && straight_whole
+                            .as_ref()
+                            .is_some_and(|s| s.start == left && s.end == right)
+                    {
+                        let mut mid_top = top.max((straight_top - 0.5).ceil().max(0.0) as u32);
+                        let mut mid_bot = if straight_bot >= 0.5 {
+                            bottom.min((straight_bot - 0.5).floor() as u32 + 1)
+                        } else {
+                            top
+                        };
+                        while mid_top < mid_bot && (mid_top as f32 + 0.5) < straight_top {
+                            mid_top += 1;
+                        }
+                        while mid_bot > mid_top && ((mid_bot - 1) as f32 + 0.5) > straight_bot {
+                            mid_bot -= 1;
+                        }
+                        (mid_top < mid_bot).then_some(mid_top..mid_bot)
+                    } else {
+                        None
+                    };
+                    let paint_one_row =
+                        |this: &mut Self, columns: &mut Option<DownColumns>, pixel_y: u32| {
+                            let row = pixel_y as f32 + 0.5;
+                            let whole = if whole_all {
+                                left..right
+                            } else if let Some(ref straight) = straight_whole
+                                && row >= straight_top
+                                && row <= straight_bot
+                            {
+                                straight.clone()
+                            } else {
+                                device.whole_run(row, left..right)
+                            };
+                            if whole.start > left || whole.end < right {
+                                if unmasked_all {
+                                    let row_pixels = &mut this.pixels[pixel_y as usize * stride
+                                        ..(pixel_y as usize + 1) * stride];
+                                    for pixel_x in (left..whole.start).chain(whole.end..right) {
+                                        let center = (pixel_x as f32 + 0.5, row);
+                                        let coverage = device.coverage(center);
+                                        if coverage <= 0.0 {
+                                            continue;
+                                        }
+                                        let color = paint.pixel_color(steady, center);
+                                        if color.alpha == 0 {
+                                            continue;
+                                        }
+                                        let at = pixel_x as usize * 4;
+                                        let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
+                                            .try_into()
+                                            .expect("four bytes per pixel");
+                                        blend_rgba(pixel, color.scale_alpha(coverage.min(1.0)));
+                                    }
+                                } else {
+                                    for pixel_x in (left..whole.start).chain(whole.end..right) {
+                                        let center = (pixel_x as f32 + 0.5, row);
+                                        let coverage = device.coverage(center);
+                                        if coverage <= 0.0 {
+                                            continue;
+                                        }
+                                        let color = paint.pixel_color(steady, center);
+                                        if color.alpha == 0 {
+                                            continue;
+                                        }
+                                        this.blend_pixel(
+                                            pixel_x,
+                                            pixel_y,
+                                            color.scale_alpha(coverage.min(1.0)),
+                                        );
+                                    }
+                                }
+                            }
+                            if !paint.covers_row(row) {
+                                return;
+                            }
+                            let cols = columns.get_or_insert_with(|| {
+                                DownColumns::build(paint, min_left..max_right, row, total_rows)
+                            });
+                            cols.paint_row(
+                                this,
+                                pixel_y,
+                                row,
+                                min_left..max_right,
+                                whole,
+                                unmasked_all,
+                                stride,
+                            );
+                        };
+                    if let Some(mid) = fast_mid {
+                        for pixel_y in top..mid.start {
+                            paint_one_row(self, &mut columns, pixel_y);
+                        }
+                        let cols = columns.get_or_insert_with(|| {
+                            DownColumns::build(
+                                paint,
+                                min_left..max_right,
+                                mid.start as f32 + 0.5,
+                                total_rows,
+                            )
+                        });
+                        cols.paint_unmasked_rows(
+                            self,
+                            mid.clone(),
+                            left..right,
+                            min_left..max_right,
+                            stride,
+                        );
+                        for pixel_y in mid.end..bottom {
+                            paint_one_row(self, &mut columns, pixel_y);
+                        }
+                    } else {
+                        for pixel_y in top..bottom {
+                            paint_one_row(self, &mut columns, pixel_y);
+                        }
+                    }
+                }
+            }
+            Steady::Nowhere => unreachable!(),
         }
     }
 
@@ -1962,7 +2040,40 @@ impl Canvas {
         let mut straight_blurred_top: Option<BlurredRow> = None;
         let mut straight_blurred_bot: Option<BlurredRow> = None;
         let mut blurred = Blurred::new(shape, sigma, left..right);
-        for pixel_y in top..bottom {
+        // skip the entire hollow or interior frame band in one jump when it spans left..right
+        let skip_band = if inset
+            && hollow[0] < hollow[2]
+            && hollow[1] < hollow[3]
+            && left as f32 >= hollow[0]
+            && right as f32 <= hollow[2]
+        {
+            let mut s0 = (hollow[1].max(0.0) as u32).clamp(top, bottom);
+            while s0 < bottom && (s0 as f32) < hollow[1] {
+                s0 += 1;
+            }
+            let mut s1 = (hollow[3].max(0.0) as u32).clamp(s0, bottom);
+            while s1 > s0 && ((s1 - 1) as f32 + 1.0) > hollow[3] {
+                s1 -= 1;
+            }
+            s0..s1
+        } else if !inset
+            && let Some(ref straight) = straight_frame_whole
+            && straight.start <= left
+            && straight.end >= right
+        {
+            let mut s0 = ((frame_st - 0.5).ceil().max(0.0) as u32).clamp(top, bottom);
+            while s0 < bottom && (s0 as f32 + 0.5) < frame_st {
+                s0 += 1;
+            }
+            let mut s1 = (((frame_sb - 0.5).floor() + 1.0).max(0.0) as u32).clamp(s0, bottom);
+            while s1 > s0 && ((s1 - 1) as f32 + 0.5) > frame_sb {
+                s1 -= 1;
+            }
+            s0..s1
+        } else {
+            bottom..bottom
+        };
+        for pixel_y in (top..skip_band.start).chain(skip_band.end..bottom) {
             let row = pixel_y as f32;
             let y = row + 0.5;
             let frame_y_cov = if frame_square {
@@ -2559,6 +2670,529 @@ fn blend_rgba(pixel: &mut [u8; 4], color: Color) {
     pixel[3] = ((a + 1 + (a >> 8)) >> 8) as u8;
 }
 
+enum BlendLut {
+    Gray(Box<[[u8; 256]; 2]>),
+    Rgba(Box<[[u8; 256]; 4]>),
+}
+
+struct DownColumns {
+    non_zero: Vec<(u32, Color)>,
+    uniform: Option<Color>,
+    stride_step: Option<usize>,
+    blend_lut: Option<BlendLut>,
+}
+
+impl DownColumns {
+    fn build(paint: &Paint, range: std::ops::Range<u32>, row: f32, rows: usize) -> Self {
+        let non_zero: Vec<(u32, Color)> = range
+            .filter_map(|px| {
+                let color = paint.color_at((px as f32 + 0.5, row));
+                (color.alpha != 0).then_some((px, color))
+            })
+            .collect();
+        let uniform = non_zero.first().and_then(|&(_, first)| {
+            non_zero
+                .iter()
+                .all(|&(_, color)| color == first)
+                .then_some(first)
+        });
+        // detect constant horizontal stride (e.g. repeating 90deg stripe gradients)
+        let stride_step = (uniform.is_some() && non_zero.len() >= 2)
+            .then(|| {
+                let step = non_zero[1].0 - non_zero[0].0;
+                (step > 0
+                    && non_zero
+                        .windows(2)
+                        .all(|pair| pair[1].0 - pair[0].0 == step))
+                .then_some(step as usize)
+            })
+            .flatten();
+        // precompute exact 256-entry blend tables when blending many strided pixels
+        let blend_lut = uniform.and_then(|color| {
+            if color.alpha == 255 || non_zero.len().saturating_mul(rows) < 256 {
+                return None;
+            }
+            let alpha = u16::from(color.alpha);
+            let inverse = 255 - alpha;
+            let make_lut = |src: u16| -> [u8; 256] {
+                std::array::from_fn(|dst| {
+                    let sum = src + dst as u16 * inverse;
+                    ((sum + 1 + (sum >> 8)) >> 8) as u8
+                })
+            };
+            let a_lut = make_lut(alpha * 255);
+            if color.red == color.green && color.green == color.blue {
+                let rgb_lut = make_lut(u16::from(color.red) * alpha);
+                Some(BlendLut::Gray(Box::new([rgb_lut, a_lut])))
+            } else {
+                Some(BlendLut::Rgba(Box::new([
+                    make_lut(u16::from(color.red) * alpha),
+                    make_lut(u16::from(color.green) * alpha),
+                    make_lut(u16::from(color.blue) * alpha),
+                    a_lut,
+                ])))
+            }
+        });
+        Self {
+            non_zero,
+            uniform,
+            stride_step,
+            blend_lut,
+        }
+    }
+
+    fn slice_range(
+        &self,
+        range: std::ops::Range<u32>,
+        span_bounds: std::ops::Range<u32>,
+    ) -> &[(u32, Color)] {
+        if range.is_empty() || self.non_zero.is_empty() {
+            return &[];
+        }
+        if range.start == span_bounds.start && range.end == span_bounds.end {
+            return &self.non_zero;
+        }
+        let lo = self.non_zero.partition_point(|&(px, _)| px < range.start);
+        let hi = lo + self.non_zero[lo..].partition_point(|&(px, _)| px < range.end);
+        &self.non_zero[lo..hi]
+    }
+
+    fn stride_bounds(&self, range: std::ops::Range<u32>, step: usize) -> Option<(usize, usize)> {
+        if self.non_zero.is_empty() || range.is_empty() {
+            return None;
+        }
+        let base = self.non_zero[0].0;
+        let max_x = self.non_zero[self.non_zero.len() - 1].0;
+        let step = step as u32;
+        let first = if range.start <= base {
+            base
+        } else {
+            base + (range.start - base).div_ceil(step) * step
+        };
+        if first >= range.end || first > max_x {
+            return None;
+        }
+        let hi = max_x.min(range.end - 1);
+        let last = base + ((hi - base) / step) * step;
+        (first <= last).then_some((first as usize, last as usize))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_row(
+        &self,
+        canvas: &mut Canvas,
+        pixel_y: u32,
+        row: f32,
+        span_bounds: std::ops::Range<u32>,
+        whole: std::ops::Range<u32>,
+        unmasked_all: bool,
+        stride: usize,
+    ) {
+        if self.non_zero.is_empty() || whole.is_empty() {
+            return;
+        }
+        let unmasked = if unmasked_all {
+            whole.clone()
+        } else {
+            canvas.masks_whole_run(row, whole.clone())
+        };
+        if whole.start < unmasked.start {
+            for &(pixel_x, color) in
+                self.slice_range(whole.start..unmasked.start, span_bounds.clone())
+            {
+                canvas.blend_pixel(pixel_x, pixel_y, color);
+            }
+        }
+        if unmasked.end < whole.end {
+            for &(pixel_x, color) in self.slice_range(unmasked.end..whole.end, span_bounds.clone())
+            {
+                canvas.blend_pixel(pixel_x, pixel_y, color);
+            }
+        }
+        self.paint_unmasked_rows(canvas, pixel_y..pixel_y + 1, unmasked, span_bounds, stride);
+    }
+
+    fn paint_unmasked_rows(
+        &self,
+        canvas: &mut Canvas,
+        y_range: std::ops::Range<u32>,
+        x_range: std::ops::Range<u32>,
+        span_bounds: std::ops::Range<u32>,
+        stride: usize,
+    ) {
+        if self.non_zero.is_empty() || y_range.is_empty() || x_range.is_empty() {
+            return;
+        }
+        if let Some(color) = self.uniform {
+            if let Some(step) = self.stride_step {
+                let Some((first_x, last_x)) = self.stride_bounds(x_range, step) else {
+                    return;
+                };
+                if color.alpha == 255 {
+                    let rgba = [color.red, color.green, color.blue, 255];
+                    for pixel_y in y_range {
+                        let row_pixels = &mut canvas.pixels
+                            [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                        let pixels = row_pixels.as_chunks_mut::<4>().0;
+                        for pixel in pixels[first_x..=last_x].iter_mut().step_by(step) {
+                            *pixel = rgba;
+                        }
+                    }
+                    return;
+                }
+                if let Some(lut) = self.blend_lut.as_ref() {
+                    let seed = &canvas.pixels[y_range.start as usize * stride + first_x * 4
+                        ..y_range.start as usize * stride + first_x * 4 + 4];
+                    let seed = [seed[0], seed[1], seed[2], seed[3]];
+                    let mut last_in = u32::from_ne_bytes(seed);
+                    match lut {
+                        BlendLut::Gray(tables) => {
+                            let [rgb, a] = tables.as_ref();
+                            let mut last_out = [
+                                rgb[usize::from(seed[0])],
+                                rgb[usize::from(seed[1])],
+                                rgb[usize::from(seed[2])],
+                                a[usize::from(seed[3])],
+                            ];
+                            if step == 3 {
+                                for pixel_y in y_range {
+                                    let row_pixels = &mut canvas.pixels[pixel_y as usize * stride
+                                        ..(pixel_y as usize + 1) * stride];
+                                    let span =
+                                        &mut row_pixels.as_chunks_mut::<4>().0[first_x..=last_x];
+                                    let (chunks, rem) = span.as_chunks_mut::<3>();
+                                    let (blocks, tail) = chunks.as_chunks_mut::<4>();
+                                    for block in blocks {
+                                        let p0 = u32::from_ne_bytes(block[0][0]);
+                                        let p1 = u32::from_ne_bytes(block[1][0]);
+                                        let p2 = u32::from_ne_bytes(block[2][0]);
+                                        let p3 = u32::from_ne_bytes(block[3][0]);
+                                        if ((p0 ^ last_in)
+                                            | (p1 ^ last_in)
+                                            | (p2 ^ last_in)
+                                            | (p3 ^ last_in))
+                                            == 0
+                                        {
+                                            block[0][0] = last_out;
+                                            block[1][0] = last_out;
+                                            block[2][0] = last_out;
+                                            block[3][0] = last_out;
+                                        } else {
+                                            for chunk in block {
+                                                let pixel = &mut chunk[0];
+                                                let current = u32::from_ne_bytes(*pixel);
+                                                if current != last_in {
+                                                    last_in = current;
+                                                    last_out = [
+                                                        rgb[usize::from(pixel[0])],
+                                                        rgb[usize::from(pixel[1])],
+                                                        rgb[usize::from(pixel[2])],
+                                                        a[usize::from(pixel[3])],
+                                                    ];
+                                                }
+                                                *pixel = last_out;
+                                            }
+                                        }
+                                    }
+                                    for chunk in tail {
+                                        let pixel = &mut chunk[0];
+                                        let current = u32::from_ne_bytes(*pixel);
+                                        if current != last_in {
+                                            last_in = current;
+                                            last_out = [
+                                                rgb[usize::from(pixel[0])],
+                                                rgb[usize::from(pixel[1])],
+                                                rgb[usize::from(pixel[2])],
+                                                a[usize::from(pixel[3])],
+                                            ];
+                                        }
+                                        *pixel = last_out;
+                                    }
+                                    if let Some(pixel) = rem.first_mut() {
+                                        let current = u32::from_ne_bytes(*pixel);
+                                        if current != last_in {
+                                            last_in = current;
+                                            last_out = [
+                                                rgb[usize::from(pixel[0])],
+                                                rgb[usize::from(pixel[1])],
+                                                rgb[usize::from(pixel[2])],
+                                                a[usize::from(pixel[3])],
+                                            ];
+                                        }
+                                        *pixel = last_out;
+                                    }
+                                }
+                            } else {
+                                for pixel_y in y_range {
+                                    let row_pixels = &mut canvas.pixels[pixel_y as usize * stride
+                                        ..(pixel_y as usize + 1) * stride];
+                                    let span =
+                                        &mut row_pixels.as_chunks_mut::<4>().0[first_x..=last_x];
+                                    for chunk in span.chunks_mut(step) {
+                                        let pixel = &mut chunk[0];
+                                        let current = u32::from_ne_bytes(*pixel);
+                                        if current != last_in {
+                                            last_in = current;
+                                            last_out = [
+                                                rgb[usize::from(pixel[0])],
+                                                rgb[usize::from(pixel[1])],
+                                                rgb[usize::from(pixel[2])],
+                                                a[usize::from(pixel[3])],
+                                            ];
+                                        }
+                                        *pixel = last_out;
+                                    }
+                                }
+                            }
+                        }
+                        BlendLut::Rgba(tables) => {
+                            let [r, g, b, a] = tables.as_ref();
+                            let mut last_out = [
+                                r[usize::from(seed[0])],
+                                g[usize::from(seed[1])],
+                                b[usize::from(seed[2])],
+                                a[usize::from(seed[3])],
+                            ];
+                            if step == 3 {
+                                for pixel_y in y_range {
+                                    let row_pixels = &mut canvas.pixels[pixel_y as usize * stride
+                                        ..(pixel_y as usize + 1) * stride];
+                                    let span =
+                                        &mut row_pixels.as_chunks_mut::<4>().0[first_x..=last_x];
+                                    let (chunks, rem) = span.as_chunks_mut::<3>();
+                                    let (blocks, tail) = chunks.as_chunks_mut::<4>();
+                                    for block in blocks {
+                                        let p0 = u32::from_ne_bytes(block[0][0]);
+                                        let p1 = u32::from_ne_bytes(block[1][0]);
+                                        let p2 = u32::from_ne_bytes(block[2][0]);
+                                        let p3 = u32::from_ne_bytes(block[3][0]);
+                                        if ((p0 ^ last_in)
+                                            | (p1 ^ last_in)
+                                            | (p2 ^ last_in)
+                                            | (p3 ^ last_in))
+                                            == 0
+                                        {
+                                            block[0][0] = last_out;
+                                            block[1][0] = last_out;
+                                            block[2][0] = last_out;
+                                            block[3][0] = last_out;
+                                        } else {
+                                            for chunk in block {
+                                                let pixel = &mut chunk[0];
+                                                let current = u32::from_ne_bytes(*pixel);
+                                                if current != last_in {
+                                                    last_in = current;
+                                                    last_out = [
+                                                        r[usize::from(pixel[0])],
+                                                        g[usize::from(pixel[1])],
+                                                        b[usize::from(pixel[2])],
+                                                        a[usize::from(pixel[3])],
+                                                    ];
+                                                }
+                                                *pixel = last_out;
+                                            }
+                                        }
+                                    }
+                                    for chunk in tail {
+                                        let pixel = &mut chunk[0];
+                                        let current = u32::from_ne_bytes(*pixel);
+                                        if current != last_in {
+                                            last_in = current;
+                                            last_out = [
+                                                r[usize::from(pixel[0])],
+                                                g[usize::from(pixel[1])],
+                                                b[usize::from(pixel[2])],
+                                                a[usize::from(pixel[3])],
+                                            ];
+                                        }
+                                        *pixel = last_out;
+                                    }
+                                    if let Some(pixel) = rem.first_mut() {
+                                        let current = u32::from_ne_bytes(*pixel);
+                                        if current != last_in {
+                                            last_in = current;
+                                            last_out = [
+                                                r[usize::from(pixel[0])],
+                                                g[usize::from(pixel[1])],
+                                                b[usize::from(pixel[2])],
+                                                a[usize::from(pixel[3])],
+                                            ];
+                                        }
+                                        *pixel = last_out;
+                                    }
+                                }
+                            } else {
+                                for pixel_y in y_range {
+                                    let row_pixels = &mut canvas.pixels[pixel_y as usize * stride
+                                        ..(pixel_y as usize + 1) * stride];
+                                    let span =
+                                        &mut row_pixels.as_chunks_mut::<4>().0[first_x..=last_x];
+                                    for chunk in span.chunks_mut(step) {
+                                        let pixel = &mut chunk[0];
+                                        let current = u32::from_ne_bytes(*pixel);
+                                        if current != last_in {
+                                            last_in = current;
+                                            last_out = [
+                                                r[usize::from(pixel[0])],
+                                                g[usize::from(pixel[1])],
+                                                b[usize::from(pixel[2])],
+                                                a[usize::from(pixel[3])],
+                                            ];
+                                        }
+                                        *pixel = last_out;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                let alpha = u16::from(color.alpha);
+                let inverse = 255 - alpha;
+                let (sr, sg, sb, sa) = (
+                    u16::from(color.red) * alpha,
+                    u16::from(color.green) * alpha,
+                    u16::from(color.blue) * alpha,
+                    alpha * 255,
+                );
+                for pixel_y in y_range {
+                    let row_pixels = &mut canvas.pixels
+                        [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                    let pixels = row_pixels.as_chunks_mut::<4>().0;
+                    for pixel in pixels[first_x..=last_x].iter_mut().step_by(step) {
+                        let r = sr + u16::from(pixel[0]) * inverse;
+                        let g = sg + u16::from(pixel[1]) * inverse;
+                        let b = sb + u16::from(pixel[2]) * inverse;
+                        let a = sa + u16::from(pixel[3]) * inverse;
+                        pixel[0] = ((r + 1 + (r >> 8)) >> 8) as u8;
+                        pixel[1] = ((g + 1 + (g >> 8)) >> 8) as u8;
+                        pixel[2] = ((b + 1 + (b >> 8)) >> 8) as u8;
+                        pixel[3] = ((a + 1 + (a >> 8)) >> 8) as u8;
+                    }
+                }
+                return;
+            }
+            let active = self.slice_range(x_range, span_bounds);
+            if active.is_empty() {
+                return;
+            }
+            if color.alpha == 255 {
+                let rgba = [color.red, color.green, color.blue, 255];
+                for pixel_y in y_range {
+                    let row_pixels = &mut canvas.pixels
+                        [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                    let pixels = row_pixels.as_chunks_mut::<4>().0;
+                    for &(pixel_x, _) in active {
+                        pixels[pixel_x as usize] = rgba;
+                    }
+                }
+            } else if let Some(lut) = self.blend_lut.as_ref() {
+                let first_x = active[0].0 as usize;
+                let seed = &canvas.pixels[y_range.start as usize * stride + first_x * 4
+                    ..y_range.start as usize * stride + first_x * 4 + 4];
+                let seed = [seed[0], seed[1], seed[2], seed[3]];
+                let mut last_in = u32::from_ne_bytes(seed);
+                match lut {
+                    BlendLut::Gray(tables) => {
+                        let [rgb, a] = tables.as_ref();
+                        let mut last_out = [
+                            rgb[usize::from(seed[0])],
+                            rgb[usize::from(seed[1])],
+                            rgb[usize::from(seed[2])],
+                            a[usize::from(seed[3])],
+                        ];
+                        for pixel_y in y_range {
+                            let row_pixels = &mut canvas.pixels
+                                [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                            let pixels = row_pixels.as_chunks_mut::<4>().0;
+                            for &(pixel_x, _) in active {
+                                let pixel = &mut pixels[pixel_x as usize];
+                                let current = u32::from_ne_bytes(*pixel);
+                                if current != last_in {
+                                    last_in = current;
+                                    last_out = [
+                                        rgb[usize::from(pixel[0])],
+                                        rgb[usize::from(pixel[1])],
+                                        rgb[usize::from(pixel[2])],
+                                        a[usize::from(pixel[3])],
+                                    ];
+                                }
+                                *pixel = last_out;
+                            }
+                        }
+                    }
+                    BlendLut::Rgba(tables) => {
+                        let [r, g, b, a] = tables.as_ref();
+                        let mut last_out = [
+                            r[usize::from(seed[0])],
+                            g[usize::from(seed[1])],
+                            b[usize::from(seed[2])],
+                            a[usize::from(seed[3])],
+                        ];
+                        for pixel_y in y_range {
+                            let row_pixels = &mut canvas.pixels
+                                [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                            let pixels = row_pixels.as_chunks_mut::<4>().0;
+                            for &(pixel_x, _) in active {
+                                let pixel = &mut pixels[pixel_x as usize];
+                                let current = u32::from_ne_bytes(*pixel);
+                                if current != last_in {
+                                    last_in = current;
+                                    last_out = [
+                                        r[usize::from(pixel[0])],
+                                        g[usize::from(pixel[1])],
+                                        b[usize::from(pixel[2])],
+                                        a[usize::from(pixel[3])],
+                                    ];
+                                }
+                                *pixel = last_out;
+                            }
+                        }
+                    }
+                }
+            } else {
+                let alpha = u16::from(color.alpha);
+                let inverse = 255 - alpha;
+                let (sr, sg, sb, sa) = (
+                    u16::from(color.red) * alpha,
+                    u16::from(color.green) * alpha,
+                    u16::from(color.blue) * alpha,
+                    alpha * 255,
+                );
+                for pixel_y in y_range {
+                    let row_pixels = &mut canvas.pixels
+                        [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                    let pixels = row_pixels.as_chunks_mut::<4>().0;
+                    for &(pixel_x, _) in active {
+                        let pixel = &mut pixels[pixel_x as usize];
+                        let r = sr + u16::from(pixel[0]) * inverse;
+                        let g = sg + u16::from(pixel[1]) * inverse;
+                        let b = sb + u16::from(pixel[2]) * inverse;
+                        let a = sa + u16::from(pixel[3]) * inverse;
+                        pixel[0] = ((r + 1 + (r >> 8)) >> 8) as u8;
+                        pixel[1] = ((g + 1 + (g >> 8)) >> 8) as u8;
+                        pixel[2] = ((b + 1 + (b >> 8)) >> 8) as u8;
+                        pixel[3] = ((a + 1 + (a >> 8)) >> 8) as u8;
+                    }
+                }
+            }
+            return;
+        }
+        let active = self.slice_range(x_range, span_bounds);
+        if active.is_empty() {
+            return;
+        }
+        for pixel_y in y_range {
+            let row_pixels =
+                &mut canvas.pixels[pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+            let pixels = row_pixels.as_chunks_mut::<4>().0;
+            for &(pixel_x, color) in active {
+                blend_rgba(&mut pixels[pixel_x as usize], color);
+            }
+        }
+    }
+}
+
 fn fill_solid_span(row: &mut [u8], color: Color) {
     if color.alpha == 255 {
         row.as_chunks_mut::<4>()
@@ -2667,9 +3301,8 @@ impl DeviceBounds {
     }
 }
 
-// a subtree's bounds, and how far glyphs, outlines and focus rings can reach past them, which
-// is none under a transform
-type Extent = (Rect, Option<f32>);
+// a subtree's painted bounds and whether every transformed descendant stays finite
+type Extent = (Rect, bool);
 type Extents = crate::hashing::HashMap<(usize, [u32; 2]), Extent>;
 
 thread_local! {
@@ -2729,59 +3362,105 @@ fn subtree_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent
     extent
 }
 
-fn measure_subtree_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent {
-    let outline = layout_box
-        .outline
-        .as_ref()
-        .map_or(0.0, |outline| outline.width + outline.offset.max(0.0));
-    // glyphs overhang the runs measured below by less than their font size; a box with none
-    // paints nothing past its bounds but its outline
-    let glyphs = if layout_box.text.is_empty()
-        && layout_box.control.is_none()
-        && layout_box.control_value.is_none()
-    {
-        0.0
-    } else {
-        layout_box.font_size
+fn text_run_ink(run: &TextRun, offset: (f32, f32)) -> Rect {
+    let builtin_height = text_advance(run.font_size) / 6.0 * 7.0;
+    let base = Rect {
+        x: run.x + offset.0,
+        y: run.y + offset.1,
+        width: run.width,
+        height: (run.font_size * 1.5).max(builtin_height),
     };
-    let mut reach = Some(outline.max(glyphs));
+    let stroke = run.decoration.stroke.width.max(0.0);
+    // glyphs, accents and italic slants can slightly overhang their advance box
+    let h_pad = (run.font_size * 0.5).max(2.0) + stroke;
+    let v_top = (run.font_size * 0.4).max(2.0) + stroke;
+    let deco = if run.decoration.has_lines() {
+        run.decoration
+            .thickness
+            .unwrap_or((run.font_size / 14.0).max(1.0))
+            * 4.0
+    } else {
+        0.0
+    };
+    let v_bot = stroke + deco;
+    let mut bounds = Rect {
+        x: base.x - h_pad,
+        y: base.y - v_top,
+        width: base.width + h_pad * 2.0,
+        height: base.height + v_top + v_bot,
+    };
+    if let Some(shadow) = run.decoration.shadow
+        && shadow.color.alpha > 0
+    {
+        if shadow.blur > 0.0 {
+            let reach = shadow.blur * 2.0;
+            let shadow_base = Rect {
+                x: run.x + offset.0 + shadow.x,
+                y: run.y + offset.1 + shadow.y,
+                width: run.width,
+                height: run.font_size * 1.5,
+            };
+            bounds = union_rect(bounds, outset_rect(shadow_base, reach));
+        } else {
+            bounds = union_rect(bounds, translate_rect(bounds, (shadow.x, shadow.y)));
+        }
+    }
+    bounds
+}
+
+fn measure_subtree_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent {
     let offset = visual_offset_for(layout_box, ancestor_offset);
-    let mut bounds = visual_rect_for(layout_box, ancestor_offset);
+    let box_rect = visual_rect_for(layout_box, ancestor_offset);
+    let mut bounds = box_rect;
+    if let Some(outline) = layout_box.outline.as_ref() {
+        let reach = outline.width + outline.offset.max(0.0) + 1.0;
+        bounds = union_rect(bounds, outset_rect(box_rect, reach));
+    }
+    if layout_box.control.is_some() {
+        bounds = union_rect(bounds, outset_rect(box_rect, 2.0));
+    }
+    if layout_box.control_value.is_some() {
+        bounds = union_rect(bounds, outset_rect(box_rect, layout_box.font_size * 0.5));
+    }
     for shadow in layout_box.shadows.iter().filter(|shadow| !shadow.inset) {
-        let reach = shadow.blur + shadow.spread.max(0.0);
+        let reach = shadow.blur + shadow.spread.max(0.0) + 1.0;
         bounds = union_rect(
             bounds,
             Rect {
-                x: bounds.x + shadow.offset_x - reach,
-                y: bounds.y + shadow.offset_y - reach,
-                width: bounds.width + reach * 2.0,
-                height: bounds.height + reach * 2.0,
+                x: box_rect.x + shadow.offset_x - reach,
+                y: box_rect.y + shadow.offset_y - reach,
+                width: box_rect.width + reach * 2.0,
+                height: box_rect.height + reach * 2.0,
             },
         );
     }
+    let content_clip = (layout_box.overflow.clips() || layout_box.is_document())
+        .then(|| translate_rect(overflow_clip_rect(layout_box), offset));
     for run in &layout_box.text {
-        let glyphs = Rect {
-            x: run.x + offset.0,
-            y: run.y + offset.1,
-            width: run.width,
-            height: run.font_size * 1.5,
-        };
-        bounds = union_rect(bounds, glyphs);
-        // a blurred text shadow spreads twice its blur, as paint_text_shadow draws it
-        if let Some(shadow) = run.decoration.shadow {
-            let reach = shadow.blur.max(0.0) * 2.0;
-            let cast = translate_rect(glyphs, (shadow.x, shadow.y));
-            bounds = union_rect(bounds, outset_rect(cast, reach));
+        let glyphs = text_run_ink(run, offset);
+        if let Some(clip) = content_clip {
+            if let Some(visible) = intersect_clip(Some(clip), glyphs) {
+                bounds = union_rect(bounds, visible);
+            }
+        } else {
+            bounds = union_rect(bounds, glyphs);
         }
     }
+    let mut finite = true;
     for child in &layout_box.children {
-        let (child_bounds, child_reach) = placed_extent(child, offset);
-        bounds = union_rect(bounds, child_bounds);
-        reach = reach.zip(child_reach).map(|(most, next)| most.max(next));
+        let (child_bounds, child_finite) = placed_extent(child, offset);
+        finite &= child_finite;
+        if let Some(clip) = content_clip {
+            if let Some(visible) = intersect_clip(Some(clip), child_bounds) {
+                bounds = union_rect(bounds, visible);
+            }
+        } else {
+            bounds = union_rect(bounds, child_bounds);
+        }
     }
     (
         outset_rect(bounds, crate::filter::reach(&layout_box.filters.own)),
-        reach,
+        finite,
     )
 }
 
@@ -2789,25 +3468,24 @@ fn measure_subtree_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -
 // where its corners land, as paint maps it about the border box corner, and one that turns
 // away from the viewer is out of reach
 fn placed_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent {
-    let (bounds, reach) = subtree_extent(layout_box, ancestor_offset);
+    let (bounds, finite) = subtree_extent(layout_box, ancestor_offset);
     let Some(transform) = layout_box.transform.as_deref() else {
-        return (bounds, reach);
+        return (bounds, finite);
     };
-    let Some(reach) = reach else {
-        return (bounds, None);
-    };
+    if !finite {
+        return (bounds, false);
+    }
     let corner = visual_rect_for(layout_box, ancestor_offset);
     let full = transform.about(corner.x, corner.y);
-    let outer = outset_rect(bounds, reach);
     let corners = [
-        (outer.x, outer.y),
-        (outer.x + outer.width, outer.y),
-        (outer.x, outer.y + outer.height),
-        (outer.x + outer.width, outer.y + outer.height),
+        (bounds.x, bounds.y),
+        (bounds.x + bounds.width, bounds.y),
+        (bounds.x, bounds.y + bounds.height),
+        (bounds.x + bounds.width, bounds.y + bounds.height),
     ]
     .map(|(x, y)| full.map_point(x, y));
     let Some(corners) = corners.into_iter().collect::<Option<Vec<_>>>() else {
-        return (bounds, None);
+        return (bounds, false);
     };
     let (left, top, right, bottom) = corners.iter().fold(
         (
@@ -2827,7 +3505,7 @@ fn placed_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent 
             width: right - left,
             height: bottom - top,
         },
-        Some(0.0),
+        true,
     )
 }
 
@@ -3131,6 +3809,13 @@ impl Paint {
             }
         }
     }
+
+    fn covers_all_rows(&self) -> bool {
+        match self {
+            Self::Solid(_) => true,
+            Self::Ramp(ramp) => ramp.repeat.1,
+        }
+    }
 }
 
 // a gradient laid out over its tile, in layout pixels from the tile's corner; stops are
@@ -3377,17 +4062,26 @@ impl Ramp {
 }
 
 #[inline]
+fn round_channel(value: f32) -> u8 {
+    let clamped = value.clamp(0.0, 255.0);
+    let floor = clamped as u8;
+    floor + u8::from(clamped - f32::from(floor) >= 0.5)
+}
+
 fn premul_to_color(color: [f32; 4]) -> Color {
     let alpha = color[3];
     if alpha <= 0.0 {
         return Color::transparent();
     }
-    let channel = |value: f32| (value / alpha).round().clamp(0.0, 255.0) as u8;
+    let channel = |value: f32| {
+        let raw = if alpha == 1.0 { value } else { value / alpha };
+        round_channel(raw)
+    };
     Color {
         red: channel(color[0]),
         green: channel(color[1]),
         blue: channel(color[2]),
-        alpha: (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+        alpha: round_channel(alpha * 255.0),
     }
 }
 
@@ -4396,7 +5090,10 @@ impl Region {
     // a repaint reaches a few device pixels past its rectangle, so near neighbours join
     const NEAR: f32 = 8.0;
 
-    fn add(&mut self, mut rect: Rect) {
+    fn add_coalesced(&mut self, mut rect: Rect) {
+        if rect.width < 0.0 || rect.height < 0.0 {
+            return;
+        }
         let near = |a: &Rect, b: &Rect| {
             a.x <= b.x + b.width + Self::NEAR
                 && b.x <= a.x + a.width + Self::NEAR
@@ -4407,7 +5104,10 @@ impl Region {
             rect = union_rect(rect, self.rects.swap_remove(index));
         }
         self.rects.push(rect);
-        while self.rects.len() > Self::LIMIT {
+    }
+
+    fn compact_to(&mut self, limit: usize) {
+        while self.rects.len() > limit {
             let area = |rect: Rect| rect.width * rect.height;
             let mut best = (0, 1, f32::INFINITY);
             for first in 0..self.rects.len() {
@@ -4421,9 +5121,231 @@ impl Region {
             }
             let joined = union_rect(self.rects[best.0], self.rects.swap_remove(best.1));
             self.rects.swap_remove(best.0);
-            self.add(joined);
+            self.add_coalesced(joined);
         }
     }
+
+    // collects rects before final compaction so vertical columns merge before cross-column pairs
+    fn add_deferred(&mut self, rect: Rect) {
+        self.add_coalesced(rect);
+        if self.rects.len() > Self::LIMIT * 2 {
+            self.compact_to(Self::LIMIT * 2);
+        }
+    }
+
+    fn compact(&mut self) {
+        self.compact_to(Self::LIMIT);
+    }
+
+    #[cfg(test)]
+    fn add(&mut self, rect: Rect) {
+        self.add_coalesced(rect);
+        self.compact();
+    }
+}
+
+fn add_clipped(area: &mut Region, clip: Rect, rect: Rect) {
+    if let Some(visible) = intersect_clip(Some(clip), rect) {
+        area.add_deferred(visible);
+    }
+}
+
+fn add_rect_diff(area: &mut Region, clip: Rect, old: Rect, new: Rect, pad: f32) {
+    let mut emit_outside = |source: Rect, cover: Rect| {
+        if source.width <= 0.0 || source.height <= 0.0 {
+            return;
+        }
+        let Some(hit) = intersect_clip(Some(source), cover) else {
+            add_clipped(area, clip, outset_rect(source, pad));
+            return;
+        };
+        let strips = [
+            Rect {
+                x: source.x,
+                y: source.y,
+                width: source.width,
+                height: hit.y - source.y,
+            },
+            Rect {
+                x: source.x,
+                y: hit.bottom(),
+                width: source.width,
+                height: source.bottom() - hit.bottom(),
+            },
+            Rect {
+                x: source.x,
+                y: hit.y,
+                width: hit.x - source.x,
+                height: hit.height,
+            },
+            Rect {
+                x: hit.right(),
+                y: hit.y,
+                width: source.right() - hit.right(),
+                height: hit.height,
+            },
+        ];
+        for strip in strips {
+            if strip.width > 0.0 && strip.height > 0.0 {
+                add_clipped(area, clip, outset_rect(strip, pad));
+            }
+        }
+    };
+    emit_outside(old, new);
+    emit_outside(new, old);
+}
+
+fn add_scrollbar_damage(area: &mut Region, clip: Rect, layout_box: &LayoutBox, offset: (f32, f32)) {
+    let metrics = scrollbar_metrics(layout_box);
+    if let Some(vertical) = metrics.vertical_track {
+        add_clipped(
+            area,
+            clip,
+            outset_rect(translate_rect(vertical, offset), 1.0),
+        );
+    }
+    if let Some(horizontal) = metrics.horizontal_track {
+        add_clipped(
+            area,
+            clip,
+            outset_rect(translate_rect(horizontal, offset), 1.0),
+        );
+    }
+    if let (Some(vertical), Some(horizontal)) = (metrics.vertical_track, metrics.horizontal_track) {
+        let corner = Rect {
+            x: vertical.x,
+            y: horizontal.y,
+            width: vertical.width,
+            height: horizontal.height,
+        };
+        add_clipped(area, clip, outset_rect(translate_rect(corner, offset), 1.0));
+    }
+}
+
+fn is_plain_square_solid_border(border: &BoxBorder) -> bool {
+    let widths = [
+        border.widths.top,
+        border.widths.right,
+        border.widths.bottom,
+        border.widths.left,
+    ];
+    let mut drawn = (0..4).filter(|&side| widths[side] > 0.0);
+    let Some(first) = drawn.next() else {
+        return true;
+    };
+    let color = border.colors[first];
+    border.styles[first] == BorderStyle::Solid
+        && drawn
+            .all(|side| border.styles[side] == BorderStyle::Solid && border.colors[side] == color)
+}
+
+fn border_edge_rects(rect: Rect, widths: ResolvedEdges) -> [Rect; 4] {
+    let inner_h = (rect.height - widths.top - widths.bottom).max(0.0);
+    [
+        Rect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: widths.top,
+        },
+        Rect {
+            x: rect.x,
+            y: rect.y + rect.height - widths.bottom,
+            width: rect.width,
+            height: widths.bottom,
+        },
+        Rect {
+            x: rect.x,
+            y: rect.y + widths.top,
+            width: widths.left,
+            height: inner_h,
+        },
+        Rect {
+            x: rect.x + rect.width - widths.right,
+            y: rect.y + widths.top,
+            width: widths.right,
+            height: inner_h,
+        },
+    ]
+}
+
+fn can_split_rect_or_text(layout_box: &LayoutBox, depth: usize) -> bool {
+    (depth > 2 || !matches!(layout_box.tag.as_str(), "html" | "body"))
+        && layout_box.transform.is_none()
+        && layout_box.filters.own.is_empty()
+        && layout_box.filters.backdrop.is_empty()
+        && layout_box.masks.is_empty()
+        && layout_box.clip_path.is_none()
+        && layout_box.shadows.is_empty()
+        && layout_box.outline.is_none()
+        && layout_box.backgrounds.is_empty()
+        && layout_box.svg.is_none()
+        && layout_box.control.is_none()
+        && layout_box.control_value.is_none()
+        && !layout_box.background_clip_text
+        && layout_box.opacity == 1.0
+        && layout_box.radii == SQUARE_CORNERS
+        && !layout_box.overflow.clips()
+        && !layout_box.is_document()
+        && !matches!(layout_box.tag.as_str(), "img" | "canvas" | "video")
+        && is_plain_square_solid_border(&layout_box.border)
+}
+
+// true when every cell in a table row shares the same opaque (or empty) background and opaque
+// horizontal borders across the exact same contiguous span in both frames, so moving column
+// seams changes zero surface pixels
+fn uniform_contiguous_cells(old: &[Rc<LayoutBox>], new: &[Rc<LayoutBox>]) -> bool {
+    if old.is_empty() || old.len() != new.len() {
+        return false;
+    }
+    let first = &old[0];
+    let bg = first.background;
+    if bg.alpha != 0 && bg.alpha != 255 {
+        return false;
+    }
+    let border = &first.border;
+    if border.widths.left != 0.0 || border.widths.right != 0.0 {
+        return false;
+    }
+    let opaque_solid = |side: usize, width: f32| {
+        width == 0.0
+            || (border.styles[side] == BorderStyle::Solid && border.colors[side].alpha == 255)
+    };
+    if !opaque_solid(0, border.widths.top) || !opaque_solid(2, border.widths.bottom) {
+        return false;
+    }
+    let row_y = first.rect.y;
+    let row_h = first.rect.height;
+    let pos = first.position;
+    let vis = first.visual_offset;
+    let z = first.z_index;
+    let check_slice = |cells: &[Rc<LayoutBox>]| {
+        let mut expected_x = cells[0].rect.x;
+        for cell in cells {
+            if !matches!(cell.tag.as_str(), "td" | "th")
+                || !cell.visible
+                || cell.background != bg
+                || cell.border != *border
+                || cell.position != pos
+                || cell.visual_offset != vis
+                || cell.z_index != z
+                || cell.creates_stacking_context
+                || cell.scroll_offset != (0.0, 0.0)
+                || !can_split_rect_or_text(cell, 3)
+                || (cell.rect.y - row_y).abs() > 1e-3
+                || (cell.rect.height - row_h).abs() > 1e-3
+                || (cell.rect.x - expected_x).abs() > 1e-3
+            {
+                return false;
+            }
+            expected_x = cell.rect.right();
+        }
+        true
+    };
+    check_slice(old)
+        && check_slice(new)
+        && (old[0].rect.x - new[0].rect.x).abs() <= 1e-3
+        && (old.last().unwrap().rect.right() - new.last().unwrap().rect.right()).abs() <= 1e-3
 }
 
 // compares the layout and layers a frame was painted from with the next frame's; a new frame
@@ -4439,8 +5361,22 @@ pub(crate) fn damage(
     if old.viewport != new.viewport || old.prose_selections != new.prose_selections {
         return Damage::Everything;
     }
+    let viewport_clip = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: new.viewport.width,
+        height: new.viewport.height,
+    };
     let mut area = Region::default();
-    if !changed_area(&old.root, &new.root, ((0.0, 0.0), (0.0, 0.0)), 0, &mut area) {
+    if !changed_area(
+        &old.root,
+        &new.root,
+        ((0.0, 0.0), (0.0, 0.0)),
+        0,
+        viewport_clip,
+        false,
+        &mut area,
+    ) {
         return Damage::Everything;
     }
     // a layer draws over its node's box wherever it sits in the list, and a box that came,
@@ -4467,9 +5403,12 @@ pub(crate) fn damage(
             .filter(|before| !new_layers.iter().any(|after| same(before, after)))
             .map(|before| before.node),
     );
-    if !redrawn.is_empty() && !node_area(&new.root, (0.0, 0.0), &redrawn, &mut area) {
+    if !redrawn.is_empty()
+        && !node_area_clipped(&new.root, (0.0, 0.0), &redrawn, viewport_clip, &mut area)
+    {
         return Damage::Everything;
     }
+    area.compact();
     match area.rects {
         rects if rects.is_empty() => Damage::Nothing,
         // a backdrop filter reads what lies around it, so a change anywhere may reach it
@@ -4485,58 +5424,204 @@ fn changed_area(
     new: &LayoutBox,
     offsets: ((f32, f32), (f32, f32)),
     depth: usize,
+    clip: Rect,
+    skip_own_surface: bool,
     area: &mut Region,
 ) -> bool {
     if std::ptr::eq(old, new) && offsets.0 == offsets.1 {
         return true;
     }
-    if old.same_own(new) && old.children.len() == new.children.len() {
-        if old.transform.is_some() || !old.filters.own.is_empty() {
-            if old.children == new.children {
-                return true;
+    let same_len = old.children.len() == new.children.len();
+    let diff = if same_len {
+        old.paint_diff(new)
+    } else {
+        PaintDiff::Visual
+    };
+    match diff {
+        PaintDiff::Same => {
+            if old.transform.is_some() || !old.filters.own.is_empty() {
+                if old.children == new.children && offsets.0 == offsets.1 {
+                    return true;
+                }
+            } else {
+                let inner = (
+                    visual_offset_for(old, offsets.0),
+                    visual_offset_for(new, offsets.1),
+                );
+                let child_clip =
+                    if (old.overflow.clips() || old.is_document()) && inner.0 == inner.1 {
+                        let Some(next) = intersect_clip(
+                            Some(clip),
+                            translate_rect(overflow_clip_rect(new), inner.1),
+                        ) else {
+                            return true;
+                        };
+                        next
+                    } else {
+                        clip
+                    };
+                let skip_cells = old.tag == "tr"
+                    && inner.0 == inner.1
+                    && uniform_contiguous_cells(&old.children, &new.children);
+                return old.children.iter().zip(&new.children).all(|(old, new)| {
+                    changed_area(old, new, inner, depth + 1, child_clip, skip_cells, area)
+                });
             }
-        } else {
+        }
+        PaintDiff::ScrollContentOnly
+            if old.transform.is_none()
+                && old.filters.own.is_empty()
+                && offsets.0 == offsets.1
+                && overflow_clip_rect(old) == overflow_clip_rect(new)
+                && (user_scroll_range(old) != (0.0, 0.0))
+                    == (user_scroll_range(new) != (0.0, 0.0)) =>
+        {
             let inner = (
                 visual_offset_for(old, offsets.0),
                 visual_offset_for(new, offsets.1),
             );
+            add_scrollbar_damage(area, clip, old, inner.0);
+            add_scrollbar_damage(area, clip, new, inner.1);
+            let child_clip = if old.overflow.clips() || old.is_document() {
+                let Some(next) =
+                    intersect_clip(Some(clip), translate_rect(overflow_clip_rect(new), inner.1))
+                else {
+                    return true;
+                };
+                next
+            } else {
+                clip
+            };
+            return old.children.iter().zip(&new.children).all(|(old, new)| {
+                changed_area(old, new, inner, depth + 1, child_clip, false, area)
+            });
+        }
+        PaintDiff::RectOrTextOnly if can_split_rect_or_text(old, depth) => {
+            let inner = (
+                visual_offset_for(old, offsets.0),
+                visual_offset_for(new, offsets.1),
+            );
+            let old_rect = visual_rect_for(old, offsets.0);
+            let new_rect = visual_rect_for(new, offsets.1);
+            if old.visible && old_rect != new_rect && !skip_own_surface {
+                if old.background.alpha > 0 {
+                    add_rect_diff(area, clip, old_rect, new_rect, 1.0);
+                }
+                if !old.border.is_none() {
+                    let old_edges = border_edge_rects(old_rect, old.border.widths);
+                    let new_edges = border_edge_rects(new_rect, new.border.widths);
+                    for (old_edge, new_edge) in old_edges.into_iter().zip(new_edges) {
+                        if old_edge != new_edge {
+                            add_rect_diff(area, clip, old_edge, new_edge, 1.0);
+                        }
+                    }
+                }
+            }
+            if old.visible && (old.text != new.text || inner.0 != inner.1) {
+                if old.text.len() == new.text.len() && inner.0 == inner.1 {
+                    for (o, n) in old.text.iter().zip(&new.text) {
+                        if o != n {
+                            add_clipped(area, clip, text_run_ink(o, inner.0));
+                            add_clipped(area, clip, text_run_ink(n, inner.1));
+                        }
+                    }
+                } else {
+                    for o in &old.text {
+                        add_clipped(area, clip, text_run_ink(o, inner.0));
+                    }
+                    for n in &new.text {
+                        add_clipped(area, clip, text_run_ink(n, inner.1));
+                    }
+                }
+            }
             return old
                 .children
                 .iter()
                 .zip(&new.children)
-                .all(|(old, new)| changed_area(old, new, inner, depth + 1, area));
+                .all(|(old, new)| changed_area(old, new, inner, depth + 1, clip, false, area));
         }
-    } else if depth <= 2 && matches!(new.tag.as_str(), "html" | "body") {
+        _ => {}
+    }
+    if depth <= 2 && matches!(new.tag.as_str(), "html" | "body") {
         return false;
     }
-    let (Some(old), Some(new)) = (ink(old, offsets.0), ink(new, offsets.1)) else {
+    let (Some(old_ink), Some(new_ink)) = (ink(old, offsets.0), ink(new, offsets.1)) else {
         return false;
     };
-    area.add(union_rect(old, new));
+    add_clipped(area, clip, old_ink);
+    add_clipped(area, clip, new_ink);
     true
 }
 
+#[cfg(test)]
 fn node_area(
     layout_box: &LayoutBox,
     ancestor_offset: (f32, f32),
     nodes: &[crate::dom::NodeId],
     area: &mut Region,
 ) -> bool {
+    let huge = Rect {
+        x: -1.0e9,
+        y: -1.0e9,
+        width: 2.0e9,
+        height: 2.0e9,
+    };
+    let ok = node_area_clipped(layout_box, ancestor_offset, nodes, huge, area);
+    area.compact();
+    ok
+}
+
+fn node_area_clipped(
+    layout_box: &LayoutBox,
+    ancestor_offset: (f32, f32),
+    nodes: &[crate::dom::NodeId],
+    clip: Rect,
+    area: &mut Region,
+) -> bool {
     if nodes.contains(&layout_box.node) {
-        let Some(ink) = ink(layout_box, ancestor_offset) else {
+        let Some(box_ink) = ink(layout_box, ancestor_offset) else {
             return false;
         };
-        area.add(ink);
+        if let Some(visible) = intersect_clip(Some(clip), box_ink) {
+            area.add_deferred(visible);
+        } else if (box_ink.width == 0.0 || box_ink.height == 0.0)
+            && box_ink.width >= 0.0
+            && box_ink.height >= 0.0
+        {
+            let left = box_ink.x.max(clip.x);
+            let top = box_ink.y.max(clip.y);
+            let right = box_ink.right().min(clip.right());
+            let bottom = box_ink.bottom().min(clip.bottom());
+            if right >= left && bottom >= top {
+                area.add_deferred(Rect {
+                    x: left,
+                    y: top,
+                    width: right - left,
+                    height: bottom - top,
+                });
+            }
+        }
     }
     if layout_box.transform.is_some() {
         // a transformed layer's ink is out of reach, so a redrawn image under it repaints all
         return !has_node(layout_box, nodes);
     }
     let offset = visual_offset_for(layout_box, ancestor_offset);
+    let child_clip = if layout_box.overflow.clips() || layout_box.is_document() {
+        let Some(next) = intersect_clip(
+            Some(clip),
+            translate_rect(overflow_clip_rect(layout_box), offset),
+        ) else {
+            return true;
+        };
+        next
+    } else {
+        clip
+    };
     layout_box
         .children
         .iter()
-        .all(|child| node_area(child, offset, nodes, area))
+        .all(|child| node_area_clipped(child, offset, nodes, child_clip, area))
 }
 
 fn has_node(layout_box: &LayoutBox, nodes: &[crate::dom::NodeId]) -> bool {
@@ -4548,10 +5633,10 @@ fn has_node(layout_box: &LayoutBox, nodes: &[crate::dom::NodeId]) -> bool {
 }
 
 // everything a box and its subtree can paint where it lands, none when a transform turns it
-// away; glyphs, outlines and focus rings can reach past the boxes and runs subtree_bounds measures
+// away
 fn ink(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Option<Rect> {
-    let (bounds, reach) = placed_extent(layout_box, ancestor_offset);
-    Some(outset_rect(bounds, reach?))
+    let (bounds, finite) = placed_extent(layout_box, ancestor_offset);
+    finite.then_some(bounds)
 }
 
 // paints area again over the frame before, which already shows the rest; a clip rounds its
@@ -4581,28 +5666,48 @@ fn prepare_repaint_region(
     Some((kept, painted, reach))
 }
 
-fn save_region_pixels(canvas: &Canvas, reach: DeviceBounds) -> Vec<u8> {
+// saves only the margin border outside kept, leaving the interior untouched
+fn save_region_margin(canvas: &Canvas, kept: DeviceBounds, reach: DeviceBounds) -> Vec<u8> {
     let stride = canvas.bytes_per_row();
     let row_bytes = (reach.right - reach.left) as usize * 4;
-    let mut saved = Vec::with_capacity(row_bytes * (reach.bottom - reach.top) as usize);
-    for row in reach.top as usize..reach.bottom as usize {
-        let start = row * stride + reach.left as usize * 4;
+    let left_bytes = (kept.left - reach.left) as usize * 4;
+    let right_bytes = (reach.right - kept.right) as usize * 4;
+    let top_rows = (kept.top - reach.top) as usize;
+    let mid_rows = (kept.bottom - kept.top) as usize;
+    let bot_rows = (reach.bottom - kept.bottom) as usize;
+    let mut saved = Vec::with_capacity(
+        (top_rows + bot_rows) * row_bytes + mid_rows * (left_bytes + right_bytes),
+    );
+    let left_off = reach.left as usize * 4;
+    let right_off = kept.right as usize * 4;
+    for row in reach.top as usize..kept.top as usize {
+        let start = row * stride + left_off;
+        saved.extend_from_slice(&canvas.pixels[start..start + row_bytes]);
+    }
+    for row in kept.top as usize..kept.bottom as usize {
+        let row_start = row * stride;
+        saved.extend_from_slice(
+            &canvas.pixels[row_start + left_off..row_start + left_off + left_bytes],
+        );
+        saved.extend_from_slice(
+            &canvas.pixels[row_start + right_off..row_start + right_off + right_bytes],
+        );
+    }
+    for row in kept.bottom as usize..reach.bottom as usize {
+        let start = row * stride + left_off;
         saved.extend_from_slice(&canvas.pixels[start..start + row_bytes]);
     }
     saved
 }
 
-fn clear_repaint_area(canvas: &mut Canvas, kept: DeviceBounds, painted: Rect) {
+fn clear_clip_area(canvas: &mut Canvas, clip: Rect) {
     let base = canvas.background;
     if base.alpha > 0 {
-        canvas.fill_rect(painted.x, painted.y, painted.width, painted.height, base);
-    } else {
+        canvas.fill_rect(clip.x, clip.y, clip.width, clip.height, base);
+    } else if let Some(bounds) = DeviceBounds::of(canvas, clip, None) {
         let stride = canvas.bytes_per_row();
-        let columns = kept.left.saturating_sub(REPAINT_MARGIN) as usize * 4
-            ..(kept.right + REPAINT_MARGIN).min(canvas.width) as usize * 4;
-        for row in kept.top.saturating_sub(REPAINT_MARGIN)
-            ..(kept.bottom + REPAINT_MARGIN).min(canvas.height)
-        {
+        let columns = bounds.left as usize * 4..bounds.right as usize * 4;
+        for row in bounds.top..bounds.bottom {
             let start = row as usize * stride;
             canvas.pixels[start + columns.start..start + columns.end].fill(0);
         }
@@ -4617,16 +5722,29 @@ fn restore_region_margin(
 ) {
     let stride = canvas.bytes_per_row();
     let row_bytes = (reach.right - reach.left) as usize * 4;
-    let inner = (kept.left - reach.left) as usize * 4..(kept.right - reach.left) as usize * 4;
-    for (row, before) in (reach.top as usize..reach.bottom as usize).zip(saved.chunks(row_bytes)) {
-        let start = row * stride + reach.left as usize * 4;
-        let after = &mut canvas.pixels[start..start + row_bytes];
-        if (kept.top as usize..kept.bottom as usize).contains(&row) {
-            after[..inner.start].copy_from_slice(&before[..inner.start]);
-            after[inner.end..].copy_from_slice(&before[inner.end..]);
-        } else {
-            after.copy_from_slice(before);
-        }
+    let left_bytes = (kept.left - reach.left) as usize * 4;
+    let right_bytes = (reach.right - kept.right) as usize * 4;
+    let left_off = reach.left as usize * 4;
+    let right_off = kept.right as usize * 4;
+    let mut cursor = 0;
+    for row in reach.top as usize..kept.top as usize {
+        let start = row * stride + left_off;
+        canvas.pixels[start..start + row_bytes].copy_from_slice(&saved[cursor..cursor + row_bytes]);
+        cursor += row_bytes;
+    }
+    for row in kept.top as usize..kept.bottom as usize {
+        let row_start = row * stride;
+        canvas.pixels[row_start + left_off..row_start + left_off + left_bytes]
+            .copy_from_slice(&saved[cursor..cursor + left_bytes]);
+        cursor += left_bytes;
+        canvas.pixels[row_start + right_off..row_start + right_off + right_bytes]
+            .copy_from_slice(&saved[cursor..cursor + right_bytes]);
+        cursor += right_bytes;
+    }
+    for row in kept.bottom as usize..reach.bottom as usize {
+        let start = row * stride + left_off;
+        canvas.pixels[start..start + row_bytes].copy_from_slice(&saved[cursor..cursor + row_bytes]);
+        cursor += row_bytes;
     }
 }
 
@@ -4656,15 +5774,14 @@ fn repaint_with_layers(
         return;
     };
     let scale = canvas.scale;
-    let saved = save_region_pixels(canvas, reach);
+    let saved = save_region_margin(canvas, kept, reach);
     let kept_box = [kept.left, kept.top, kept.right, kept.bottom];
     let before = canvas.planes.clone();
     if let Some(planes) = &mut canvas.planes {
         planes.retain(|plane| !overlaps(plane.bounds, kept_box));
     }
     let base = canvas.background;
-    clear_repaint_area(canvas, kept, painted);
-    paint_document(canvas, document, layers, Some(painted));
+    paint_document_inner(canvas, document, layers, Some(painted), true);
     restore_region_margin(canvas, kept, reach, &saved);
     if let Some(before) = before {
         match settled_planes(&before, canvas.planes.take().unwrap_or_default(), kept_box) {
@@ -4693,8 +5810,9 @@ pub(crate) fn repaint_behind(
 ) {
     let mut region = Region::default();
     for &area in behind.iter().chain(areas) {
-        region.add(area);
+        region.add_deferred(area);
     }
+    region.compact();
     let shown = canvas.revision.id;
     repaint_areas(canvas, document, canvases, &region.rects);
     if let Some((base, _)) = &mut canvas.revision.changed
@@ -4743,15 +5861,14 @@ pub(crate) fn repaint_areas(
             let _profile = crate::profile::scope("paint: repaint");
             let saved: Vec<Vec<u8>> = regions
                 .iter()
-                .map(|&(_, _, reach)| save_region_pixels(canvas, reach))
+                .map(|&(kept, _, reach)| save_region_margin(canvas, kept, reach))
                 .collect();
             let mut painted_rects = ClipList::default();
             for &(kept, painted, _) in &regions {
-                clear_repaint_area(canvas, kept, painted);
                 painted_rects.push(painted);
                 boxes.push([kept.left, kept.top, kept.right, kept.bottom]);
             }
-            paint_document_multi(canvas, document, &layers, painted_rects.as_slice());
+            paint_document_multi(canvas, document, &layers, painted_rects.as_slice(), true);
             for (&(kept, _, reach), before) in regions.iter().zip(&saved) {
                 restore_region_margin(canvas, kept, reach, before);
             }
@@ -5211,13 +6328,24 @@ fn settled_planes(before: &[Plane], found: Vec<Plane>, kept: [u32; 4]) -> Option
 }
 
 // inline list of active damage clip rectangles for single-pass multi-rect repaints
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct ClipList {
-    rects: [Rect; Region::LIMIT],
+    rects: [Rect; Self::MAX],
     count: usize,
 }
 
+impl Default for ClipList {
+    fn default() -> Self {
+        Self {
+            rects: [Rect::default(); Self::MAX],
+            count: 0,
+        }
+    }
+}
+
 impl ClipList {
+    const MAX: usize = Region::LIMIT * 2;
+
     fn push(&mut self, rect: Rect) {
         if self.count < self.rects.len() {
             self.rects[self.count] = rect;
@@ -5532,6 +6660,238 @@ fn find_occluder(
     best.map(|(occluder, _)| occluder)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn find_occluders_multi_walk(
+    canvas: &Canvas,
+    layout_box: &LayoutBox,
+    active: &[(usize, Rect)],
+    clip_bounds: &[Option<DeviceBounds>],
+    ancestor_offset: (f32, f32),
+    is_context: bool,
+    stack: &mut Vec<*const LayoutBox>,
+    masks: &mut Vec<Shape>,
+    best: &mut [Option<(Occluder, u64)>],
+) {
+    if active.is_empty()
+        || layout_box.opacity < 1.0
+        || layout_box.transform.is_some()
+        || !layout_box.filters.own.is_empty()
+        || !layout_box.filters.backdrop.is_empty()
+        || !layout_box.masks.is_empty()
+        || layout_box.clip_path.is_some()
+    {
+        return;
+    }
+    let Some(box_ink) = ink(layout_box, ancestor_offset) else {
+        return;
+    };
+    let mut here = [(0usize, Rect::default()); ClipList::MAX];
+    let mut here_len = 0;
+    for &(idx, clip) in active {
+        let Some(hit) = intersect_clip(Some(clip), box_ink) else {
+            continue;
+        };
+        if let Some((_, best_area)) = best[idx] {
+            let hit_w = (hit.width * canvas.scale).ceil().max(0.0) as u64 + 1;
+            let hit_h = (hit.height * canvas.scale).ceil().max(0.0) as u64 + 1;
+            if hit_w.saturating_mul(hit_h) < best_area {
+                continue;
+            }
+        }
+        if here_len < here.len() {
+            here[here_len] = (idx, clip);
+            here_len += 1;
+        }
+    }
+    if here_len == 0 {
+        return;
+    }
+    let here = &here[..here_len];
+    let ptr = layout_box as *const LayoutBox;
+    stack.push(ptr);
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    let rect = visual_rect_for(layout_box, ancestor_offset);
+    if layout_box.visible
+        && !layout_box.background_clip_text
+        && !layout_box.is_document()
+        && !matches!(layout_box.tag.as_str(), "html" | "body")
+    {
+        let outer = Shape::from_rect(canvas.snap_rect(rect), layout_box.radii);
+        let surface = outer.inset(layout_box.border.widths);
+        if box_has_opaque_background(layout_box, surface) {
+            let outer_device = canvas.device_shape(outer);
+            for &(idx, _) in here {
+                let Some(bounds) = clip_bounds[idx] else {
+                    continue;
+                };
+                if let Some(occ) = safe_opaque_rect(outer_device, bounds, masks) {
+                    let area = u64::from(occ.right - occ.left) * u64::from(occ.bottom - occ.top);
+                    if best[idx]
+                        .as_ref()
+                        .is_none_or(|(_, best_area)| area >= *best_area)
+                    {
+                        best[idx] = Some((
+                            Occluder {
+                                target: ptr,
+                                path: stack.clone(),
+                                rect: occ,
+                            },
+                            area,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let masks_before = masks.len();
+    let mut content_buf = [(0usize, Rect::default()); ClipList::MAX];
+    let content_here = if layout_box.overflow.clips() || layout_box.is_document() {
+        let overflow_rect = translate_rect(overflow_clip_rect(layout_box), offset);
+        if layout_box.overflow.clips() {
+            masks.push(canvas.device_shape(Shape::square(overflow_rect)));
+        }
+        let mut len = 0;
+        for &(idx, clip) in here {
+            if let Some(next) = intersect_clip(Some(clip), overflow_rect) {
+                content_buf[len] = (idx, next);
+                len += 1;
+            }
+        }
+        &content_buf[..len]
+    } else {
+        here
+    };
+    if let Some(mask) = overflow_mask(canvas, layout_box, rect) {
+        masks.push(canvas.device_shape(mask));
+    }
+    let visit_non_context_children =
+        |stack: &mut Vec<*const LayoutBox>,
+         masks: &mut Vec<Shape>,
+         best: &mut [Option<(Occluder, u64)>]| {
+            if content_here.is_empty() {
+                return;
+            }
+            for_each_paint_order(&layout_box.children, |index| {
+                let child = &layout_box.children[index];
+                if child.creates_stacking_context || child.inline || child.paints_positioned() {
+                    return;
+                }
+                find_occluders_multi_walk(
+                    canvas,
+                    child,
+                    content_here,
+                    clip_bounds,
+                    offset,
+                    false,
+                    stack,
+                    masks,
+                    best,
+                );
+            });
+        };
+    if is_context {
+        let mut contexts = stacking_context_entries(layout_box, None, ancestor_offset);
+        contexts.sort_by_key(|entry| (entry.z_index, entry.order));
+        let visit_entry = |entry: &StackingContextEntry<'_>,
+                           stack: &mut Vec<*const LayoutBox>,
+                           masks: &mut Vec<Shape>,
+                           best: &mut [Option<(Occluder, u64)>]| {
+            let entry_masks_before = masks.len();
+            let mut entry_buf = [(0usize, Rect::default()); ClipList::MAX];
+            let mut entry_len = here.len();
+            entry_buf[..entry_len].copy_from_slice(here);
+            for &(clipper, clipper_offset) in &entry.clippers {
+                if clipper.opacity < 1.0
+                    || clipper.transform.is_some()
+                    || !clipper.filters.own.is_empty()
+                    || !clipper.filters.backdrop.is_empty()
+                    || !clipper.masks.is_empty()
+                    || clipper.clip_path.is_some()
+                {
+                    masks.truncate(entry_masks_before);
+                    return;
+                }
+                let clipper_visual = visual_offset_for(clipper, clipper_offset);
+                let clipper_rect = visual_rect_for(clipper, clipper_offset);
+                let clipper_clip = translate_rect(overflow_clip_rect(clipper), clipper_visual);
+                let mut next_len = 0;
+                for i in 0..entry_len {
+                    let (idx, clip) = entry_buf[i];
+                    if let Some(next) = intersect_clip(Some(clip), clipper_clip) {
+                        entry_buf[next_len] = (idx, next);
+                        next_len += 1;
+                    }
+                }
+                entry_len = next_len;
+                if entry_len == 0 {
+                    masks.truncate(entry_masks_before);
+                    return;
+                }
+                masks.push(canvas.device_shape(Shape::square(clipper_clip)));
+                if let Some(mask) = overflow_mask(canvas, clipper, clipper_rect) {
+                    masks.push(canvas.device_shape(mask));
+                }
+            }
+            find_occluders_multi_walk(
+                canvas,
+                entry.layout,
+                &entry_buf[..entry_len],
+                clip_bounds,
+                entry.ancestor_offset,
+                entry.layout.creates_stacking_context,
+                stack,
+                masks,
+                best,
+            );
+            masks.truncate(entry_masks_before);
+        };
+        for entry in contexts.iter().filter(|entry| entry.z_index < 0) {
+            visit_entry(entry, stack, masks, best);
+        }
+        visit_non_context_children(stack, masks, best);
+        for entry in contexts.iter().filter(|entry| entry.z_index >= 0) {
+            visit_entry(entry, stack, masks, best);
+        }
+    } else {
+        visit_non_context_children(stack, masks, best);
+    }
+    masks.truncate(masks_before);
+    stack.pop();
+}
+
+fn find_occluders_multi(
+    canvas: &Canvas,
+    root: &LayoutBox,
+    clips: &[Rect],
+    clip_bounds: &[Option<DeviceBounds>],
+) -> Vec<Option<Occluder>> {
+    let mut active = [(0usize, Rect::default()); ClipList::MAX];
+    let mut len = 0;
+    for (idx, (&clip, bounds)) in clips.iter().zip(clip_bounds).enumerate() {
+        if bounds.is_some() && len < active.len() {
+            active[len] = (idx, clip);
+            len += 1;
+        }
+    }
+    let mut stack = Vec::with_capacity(16);
+    let mut masks = Vec::with_capacity(8);
+    let mut best: Vec<Option<(Occluder, u64)>> = (0..clips.len()).map(|_| None).collect();
+    find_occluders_multi_walk(
+        canvas,
+        root,
+        &active[..len],
+        clip_bounds,
+        (0.0, 0.0),
+        true,
+        &mut stack,
+        &mut masks,
+        &mut best,
+    );
+    best.into_iter()
+        .map(|entry| entry.map(|(occ, _)| occ))
+        .collect()
+}
+
 fn covers_bounds(outer: DeviceBounds, inner: DeviceBounds) -> bool {
     outer.left <= inner.left
         && outer.top <= inner.top
@@ -5620,11 +6980,44 @@ fn paint_document_from_occluder(
     debug_assert!(skip.is_none());
 }
 
+fn paint_document_from_occluder_multi(
+    canvas: &mut Canvas,
+    document: &LayoutDocument,
+    images: &[ImageLayer],
+    clips: &[Rect],
+    occluder: &Occluder,
+) {
+    let mut skip = Some(OcclusionSkip {
+        target: occluder.target,
+        path: &occluder.path,
+    });
+    paint_context_multi(
+        canvas,
+        &document.root,
+        images,
+        &document.prose_selections,
+        clips,
+        (0.0, 0.0),
+        &mut skip,
+    );
+    debug_assert!(skip.is_none());
+}
+
 fn paint_document(
     canvas: &mut Canvas,
     document: &LayoutDocument,
     images: &[ImageLayer],
     clip: Option<Rect>,
+) {
+    paint_document_inner(canvas, document, images, clip, false);
+}
+
+fn paint_document_inner(
+    canvas: &mut Canvas,
+    document: &LayoutDocument,
+    images: &[ImageLayer],
+    clip: Option<Rect>,
+    clear_base: bool,
 ) {
     let _profile = crate::profile::scope("paint: document");
     let _extents = memoize_extents();
@@ -5654,11 +7047,17 @@ fn paint_document(
                     .into_iter()
                     .flatten()
                 {
+                    if clear_base {
+                        clear_clip_area(canvas, strip);
+                    }
                     paint_document_unoccluded(canvas, document, images, Some(strip));
                 }
                 return;
             }
         }
+    }
+    if clear_base && let Some(clip) = clip {
+        clear_clip_area(canvas, clip);
     }
     paint_document_unoccluded(canvas, document, images, clip);
 }
@@ -5668,19 +7067,36 @@ fn paint_document_multi(
     document: &LayoutDocument,
     images: &[ImageLayer],
     clips: &[Rect],
+    clear_base: bool,
 ) {
     let _profile = crate::profile::scope("paint: document");
     let _extents = memoize_extents();
     if can_use_occlusion(canvas, document) {
         let mut normal_clips = ClipList::default();
-        let mut occluded: Vec<(Rect, Occluder)> = Vec::new();
+        let mut occluded: Vec<(ClipList, Occluder)> = Vec::new();
         let exact_scale = canvas.scale == 1.0 || canvas.scale == 2.0 || canvas.scale == 4.0;
-        for &clip in clips {
-            if let Some(clip_bounds) = DeviceBounds::of(canvas, clip, None)
-                && let Some(occluder) = find_occluder(canvas, &document.root, clip, clip_bounds)
-            {
+        let push_occluded =
+            |occluded: &mut Vec<(ClipList, Occluder)>, clip: Rect, occluder: Occluder| {
+                if let Some((list, _)) = occluded
+                    .iter_mut()
+                    .find(|(_, existing)| existing.target == occluder.target)
+                {
+                    list.push(clip);
+                } else {
+                    let mut list = ClipList::default();
+                    list.push(clip);
+                    occluded.push((list, occluder));
+                }
+            };
+        let bounds_list: Vec<Option<DeviceBounds>> = clips
+            .iter()
+            .map(|&clip| DeviceBounds::of(canvas, clip, None))
+            .collect();
+        let found = find_occluders_multi(canvas, &document.root, clips, &bounds_list);
+        for ((&clip, clip_bounds), occluder) in clips.iter().zip(&bounds_list).zip(found) {
+            if let (Some(clip_bounds), Some(occluder)) = (*clip_bounds, occluder) {
                 if covers_bounds(occluder.rect, clip_bounds) {
-                    occluded.push((clip, occluder));
+                    push_occluded(&mut occluded, clip, occluder);
                     continue;
                 }
                 let clip_area = u64::from(clip_bounds.right - clip_bounds.left)
@@ -5690,9 +7106,9 @@ fn paint_document_multi(
                 if exact_scale && occ_area >= 16_384 && occ_area * 2 >= clip_area {
                     let strips = split_outer_strips(clip_bounds, occluder.rect, canvas.scale);
                     let strip_count = strips.iter().filter(|strip| strip.is_some()).count();
-                    if normal_clips.count + strip_count <= Region::LIMIT {
+                    if normal_clips.count + strip_count <= ClipList::MAX {
                         let core = device_rect_to_layout(occluder.rect, canvas.scale);
-                        occluded.push((core, occluder));
+                        push_occluded(&mut occluded, core, occluder);
                         for strip in strips.into_iter().flatten() {
                             normal_clips.push(strip);
                         }
@@ -5704,6 +7120,11 @@ fn paint_document_multi(
         }
         if !occluded.is_empty() {
             if !normal_clips.as_slice().is_empty() {
+                if clear_base {
+                    for &clip in normal_clips.as_slice() {
+                        clear_clip_area(canvas, clip);
+                    }
+                }
                 if let Some(root) = canvas_background(&document.root) {
                     let viewport = Shape::square(Rect {
                         x: 0.0,
@@ -5711,17 +7132,15 @@ fn paint_document_multi(
                         width: document.viewport.width,
                         height: document.viewport.height,
                     });
-                    for &clip in normal_clips.as_slice() {
-                        paint_backgrounds(
-                            canvas,
-                            root,
-                            &[],
-                            viewport,
-                            viewport,
-                            root.opacity,
-                            Some(clip),
-                        );
-                    }
+                    paint_backgrounds_multi(
+                        canvas,
+                        root,
+                        &[],
+                        viewport,
+                        viewport,
+                        root.opacity,
+                        normal_clips.as_slice(),
+                    );
                 }
                 paint_context_multi(
                     canvas,
@@ -5730,12 +7149,25 @@ fn paint_document_multi(
                     &document.prose_selections,
                     normal_clips.as_slice(),
                     (0.0, 0.0),
+                    &mut None,
                 );
             }
-            for (clip, occluder) in &occluded {
-                paint_document_from_occluder(canvas, document, images, *clip, occluder);
+            for (group_clips, occluder) in &occluded {
+                match group_clips.as_slice() {
+                    [only] => {
+                        paint_document_from_occluder(canvas, document, images, *only, occluder)
+                    }
+                    many => {
+                        paint_document_from_occluder_multi(canvas, document, images, many, occluder)
+                    }
+                }
             }
             return;
+        }
+    }
+    if clear_base {
+        for &clip in clips {
+            clear_clip_area(canvas, clip);
         }
     }
     if let Some(root) = canvas_background(&document.root) {
@@ -5745,17 +7177,7 @@ fn paint_document_multi(
             width: document.viewport.width,
             height: document.viewport.height,
         });
-        for &clip in clips {
-            paint_backgrounds(
-                canvas,
-                root,
-                &[],
-                viewport,
-                viewport,
-                root.opacity,
-                Some(clip),
-            );
-        }
+        paint_backgrounds_multi(canvas, root, &[], viewport, viewport, root.opacity, clips);
     }
     paint_context_multi(
         canvas,
@@ -5764,6 +7186,7 @@ fn paint_document_multi(
         &document.prose_selections,
         clips,
         (0.0, 0.0),
+        &mut None,
     );
 }
 
@@ -5774,7 +7197,16 @@ fn paint_context_multi(
     prose_selections: &[ProseSpan],
     clips: &[Rect],
     ancestor_offset: (f32, f32),
+    skip: &mut Option<OcclusionSkip<'_>>,
 ) {
+    if let Some(guard) = *skip {
+        let ptr = layout_box as *const LayoutBox;
+        if ptr == guard.target {
+            *skip = None;
+        } else if !guard.path.contains(&ptr) {
+            return;
+        }
+    }
     let opacity = layout_box.opacity;
     if opacity <= 0.0 {
         return;
@@ -5790,18 +7222,19 @@ fn paint_context_multi(
                 prose_selections,
                 Some(*only),
                 ancestor_offset,
-                &mut None,
+                skip,
             );
             return;
         }
         _ => {}
     }
-    if layout_box.transform.is_some()
-        || !layout_box.filters.own.is_empty()
-        || !layout_box.filters.backdrop.is_empty()
-        || layout_box.clip_path.is_some()
-        || !layout_box.masks.is_empty()
-        || (opacity < 1.0 && !fades_without_layer(layout_box))
+    if skip.is_none()
+        && (layout_box.transform.is_some()
+            || !layout_box.filters.own.is_empty()
+            || !layout_box.filters.backdrop.is_empty()
+            || layout_box.clip_path.is_some()
+            || !layout_box.masks.is_empty()
+            || (opacity < 1.0 && !fades_without_layer(layout_box)))
     {
         for &clip in active.as_slice() {
             paint_context(
@@ -5818,12 +7251,12 @@ fn paint_context_multi(
     }
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let rect = visual_rect_for(layout_box, ancestor_offset);
-    for &clip in active.as_slice() {
-        paint_box_surface(
+    if skip.is_none() {
+        paint_box_surface_multi(
             canvas,
             layout_box,
             images,
-            Some(clip),
+            active.as_slice(),
             offset,
             rect,
             opacity,
@@ -5847,13 +7280,22 @@ fn paint_context_multi(
     let mut contexts = stacking_context_entries(layout_box, None, ancestor_offset);
     contexts.sort_by_key(|entry| (entry.z_index, entry.order));
     for entry in contexts.iter().filter(|entry| entry.z_index < 0) {
-        paint_context_entry_multi(canvas, entry, images, prose_selections, active.as_slice());
+        paint_context_entry_multi(
+            canvas,
+            entry,
+            images,
+            prose_selections,
+            active.as_slice(),
+            skip,
+        );
     }
     if !content_clips.as_slice().is_empty() {
-        let box_selections = prose_selections_for_box(layout_box, prose_selections);
-        for &clip in content_clips.as_slice() {
-            paint_inline_fragments(canvas, layout_box, images, Some(clip), offset);
-            paint_box_text(canvas, layout_box, Some(clip), offset, &box_selections);
+        if skip.is_none() {
+            let box_selections = prose_selections_for_box(layout_box, prose_selections);
+            for &clip in content_clips.as_slice() {
+                paint_inline_fragments(canvas, layout_box, images, Some(clip), offset);
+                paint_box_text(canvas, layout_box, Some(clip), offset, &box_selections);
+            }
         }
         paint_non_context_children_multi(
             canvas,
@@ -5862,18 +7304,28 @@ fn paint_context_multi(
             prose_selections,
             content_clips.as_slice(),
             offset,
+            skip,
         );
     }
     for entry in contexts.iter().filter(|entry| entry.z_index >= 0) {
-        paint_context_entry_multi(canvas, entry, images, prose_selections, active.as_slice());
+        paint_context_entry_multi(
+            canvas,
+            entry,
+            images,
+            prose_selections,
+            active.as_slice(),
+            skip,
+        );
     }
     canvas.opaque = opaque;
     if mask.is_some() {
         canvas.pop_mask();
     }
-    for &clip in active.as_slice() {
-        paint_scrollbars(canvas, layout_box, images, (offset, opacity), Some(clip));
-        paint_outline(canvas, layout_box, rect, opacity, Some(clip));
+    if skip.is_none() {
+        for &clip in active.as_slice() {
+            paint_scrollbars(canvas, layout_box, images, (offset, opacity), Some(clip));
+            paint_outline(canvas, layout_box, rect, opacity, Some(clip));
+        }
     }
 }
 
@@ -5883,7 +7335,14 @@ fn paint_context_entry_multi(
     images: &[ImageLayer],
     prose_selections: &[ProseSpan],
     clips: &[Rect],
+    skip: &mut Option<OcclusionSkip<'_>>,
 ) {
+    if let Some(guard) = *skip {
+        let ptr = entry.layout as *const LayoutBox;
+        if ptr != guard.target && !guard.path.contains(&ptr) {
+            return;
+        }
+    }
     let clipped = match entry.clip {
         Some(bounds) => intersect_clips(clips, bounds),
         None => {
@@ -5924,7 +7383,7 @@ fn paint_context_entry_multi(
                 prose_selections,
                 clip,
                 entry.ancestor_offset,
-                &mut None,
+                skip,
             );
         } else {
             paint_non_context_subtree(
@@ -5934,7 +7393,7 @@ fn paint_context_entry_multi(
                 prose_selections,
                 clip,
                 entry.ancestor_offset,
-                &mut None,
+                skip,
             );
         }
     } else if entry.layout.creates_stacking_context {
@@ -5945,6 +7404,7 @@ fn paint_context_entry_multi(
             prose_selections,
             active,
             entry.ancestor_offset,
+            skip,
         );
     } else {
         paint_non_context_subtree_multi(
@@ -5954,6 +7414,7 @@ fn paint_context_entry_multi(
             prose_selections,
             active,
             entry.ancestor_offset,
+            skip,
         );
     }
     canvas.opaque = opaque;
@@ -5969,6 +7430,7 @@ fn paint_non_context_children_multi(
     prose_selections: &[ProseSpan],
     clips: &[Rect],
     ancestor_offset: (f32, f32),
+    skip: &mut Option<OcclusionSkip<'_>>,
 ) {
     for_each_paint_order(&layout_box.children, |index| {
         let child = &layout_box.children[index];
@@ -5982,6 +7444,7 @@ fn paint_non_context_children_multi(
             prose_selections,
             clips,
             ancestor_offset,
+            skip,
         );
     });
 }
@@ -5993,7 +7456,16 @@ fn paint_non_context_subtree_multi(
     prose_selections: &[ProseSpan],
     clips: &[Rect],
     ancestor_offset: (f32, f32),
+    skip: &mut Option<OcclusionSkip<'_>>,
 ) {
+    if let Some(guard) = *skip {
+        let ptr = layout_box as *const LayoutBox;
+        if ptr == guard.target {
+            *skip = None;
+        } else if !guard.path.contains(&ptr) {
+            return;
+        }
+    }
     let active = narrow_clips(layout_box, ancestor_offset, clips);
     match active.as_slice() {
         [] => return,
@@ -6005,7 +7477,7 @@ fn paint_non_context_subtree_multi(
                 prose_selections,
                 Some(*only),
                 ancestor_offset,
-                &mut None,
+                skip,
             );
             return;
         }
@@ -6013,12 +7485,12 @@ fn paint_non_context_subtree_multi(
     }
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let rect = visual_rect_for(layout_box, ancestor_offset);
-    for &clip in active.as_slice() {
-        paint_box_surface(
+    if skip.is_none() {
+        paint_box_surface_multi(
             canvas,
             layout_box,
             images,
-            Some(clip),
+            active.as_slice(),
             offset,
             rect,
             layout_box.opacity,
@@ -6039,10 +7511,12 @@ fn paint_non_context_subtree_multi(
     let opaque = canvas.opaque;
     canvas.opaque &= !scrolls_in_own_layer(canvas, layout_box);
     if !content_clips.as_slice().is_empty() {
-        let box_selections = prose_selections_for_box(layout_box, prose_selections);
-        for &clip in content_clips.as_slice() {
-            paint_inline_fragments(canvas, layout_box, images, Some(clip), offset);
-            paint_box_text(canvas, layout_box, Some(clip), offset, &box_selections);
+        if skip.is_none() {
+            let box_selections = prose_selections_for_box(layout_box, prose_selections);
+            for &clip in content_clips.as_slice() {
+                paint_inline_fragments(canvas, layout_box, images, Some(clip), offset);
+                paint_box_text(canvas, layout_box, Some(clip), offset, &box_selections);
+            }
         }
         paint_non_context_children_multi(
             canvas,
@@ -6051,21 +7525,24 @@ fn paint_non_context_subtree_multi(
             prose_selections,
             content_clips.as_slice(),
             offset,
+            skip,
         );
     }
     canvas.opaque = opaque;
     if mask.is_some() {
         canvas.pop_mask();
     }
-    for &clip in active.as_slice() {
-        paint_scrollbars(
-            canvas,
-            layout_box,
-            images,
-            (offset, layout_box.opacity),
-            Some(clip),
-        );
-        paint_outline(canvas, layout_box, rect, layout_box.opacity, Some(clip));
+    if skip.is_none() {
+        for &clip in active.as_slice() {
+            paint_scrollbars(
+                canvas,
+                layout_box,
+                images,
+                (offset, layout_box.opacity),
+                Some(clip),
+            );
+            paint_outline(canvas, layout_box, rect, layout_box.opacity, Some(clip));
+        }
     }
 }
 
@@ -6981,6 +8458,151 @@ fn paint_svg(
 
 // the color lies under every image layer, the last layer lowest and the first on top; images
 // take their place from the padding box and paint across the border box
+fn is_likely_opaque_gradient_box(layout_box: &LayoutBox) -> bool {
+    layout_box.background.alpha == 255
+        || layout_box.backgrounds.iter().any(|layer| {
+            layer.size == crate::css::BackgroundSize::Auto
+                && layer.repeat.x
+                && layer.repeat.y
+                && matches!(
+                    &layer.image,
+                    LayerImage::Gradient(gradient)
+                        if !gradient.stops.is_empty()
+                            && gradient.stops.iter().all(|stop| stop.color.alpha == 255)
+                )
+        })
+}
+
+fn paint_box_surface_multi(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    images: &[ImageLayer],
+    clips: &[Rect],
+    offset: (f32, f32),
+    rect: Rect,
+    opacity: f32,
+) {
+    if !layout_box.visible || clips.is_empty() {
+        return;
+    }
+    if clips.len() == 1 || layout_box.background_clip_text {
+        for &clip in clips {
+            paint_box_surface(
+                canvas,
+                layout_box,
+                images,
+                Some(clip),
+                offset,
+                rect,
+                opacity,
+            );
+        }
+        return;
+    }
+    let outer = Shape::from_rect(canvas.snap_rect(rect), layout_box.radii);
+    let surface = outer.inset(layout_box.border.widths);
+    for shadow in layout_box
+        .shadows
+        .iter()
+        .rev()
+        .filter(|shadow| !shadow.inset)
+    {
+        for &clip in clips {
+            paint_shadow(canvas, shadow, outer, surface, opacity, Some(clip));
+        }
+    }
+    paint_backgrounds_multi(canvas, layout_box, images, outer, surface, opacity, clips);
+    if !layout_box.border.is_none() {
+        for &clip in clips {
+            paint_border(
+                canvas,
+                outer,
+                surface,
+                &layout_box.border,
+                opacity,
+                Some(clip),
+            );
+        }
+    }
+    if let Some(control) = layout_box.control {
+        let inner = Rect {
+            x: surface.x,
+            y: surface.y,
+            width: surface.width,
+            height: surface.height,
+        };
+        for &clip in clips {
+            paint_control(canvas, control, inner, opacity, Some(clip));
+        }
+    }
+    for shadow in layout_box
+        .shadows
+        .iter()
+        .rev()
+        .filter(|shadow| shadow.inset)
+    {
+        for &clip in clips {
+            paint_shadow(canvas, shadow, outer, surface, opacity, Some(clip));
+        }
+    }
+    let content_clips = if layout_box.overflow.clips() || layout_box.is_document() {
+        intersect_clips(
+            clips,
+            translate_rect(overflow_clip_rect(layout_box), offset),
+        )
+    } else {
+        let mut out = ClipList::default();
+        for &clip in clips {
+            out.push(clip);
+        }
+        out
+    };
+    if matches!(layout_box.tag.as_str(), "img" | "canvas" | "video")
+        && let Some(layer) = images
+            .iter()
+            .find(|layer| layer.background.is_none() && layer.node == layout_box.node)
+    {
+        let padding_box = Shape::from_rect(rect, layout_box.radii).inset(layout_box.border.widths);
+        let content = Rect {
+            x: padding_box.x,
+            y: padding_box.y,
+            width: padding_box.width,
+            height: padding_box.height,
+        };
+        let mut fitted = fitted_placement(
+            content,
+            &layer.image,
+            layout_box.object_fit,
+            layout_box.object_position.as_deref().copied(),
+            layout_box.font_size,
+        );
+        if layout_box.tag == "video" {
+            fitted = whole_sized(fitted, canvas.scale);
+        }
+        let placement = canvas.snap_rect(fitted);
+        for &clip in content_clips.as_slice() {
+            paint_image(
+                canvas,
+                ImageDraw {
+                    image: &layer.image,
+                    placement,
+                    area: surface,
+                    clip: Some(clip),
+                    opacity,
+                    repeat: (false, false),
+                    video: (layout_box.tag == "video").then_some(layout_box.node),
+                },
+            );
+        }
+    }
+    if let Some(scene) = &layout_box.svg {
+        let snapped = canvas.snap_rect(rect);
+        for &clip in content_clips.as_slice() {
+            paint_svg(canvas, scene, snapped, surface, Some(clip), opacity);
+        }
+    }
+}
+
 fn paint_backgrounds(
     canvas: &mut Canvas,
     layout_box: &LayoutBox,
@@ -6990,22 +8612,10 @@ fn paint_backgrounds(
     opacity: f32,
     clip: Option<Rect>,
 ) {
-    let backdrop_clip = clip.or_else(|| {
-        let likely_opaque = layout_box.background.alpha == 255
-            || layout_box.backgrounds.iter().any(|layer| {
-                layer.size == crate::css::BackgroundSize::Auto
-                    && layer.repeat.x
-                    && layer.repeat.y
-                    && matches!(
-                        &layer.image,
-                        LayerImage::Gradient(gradient)
-                            if gradient.stops.iter().all(|stop| stop.color.alpha == 255)
-                    )
-            });
-        likely_opaque.then(|| canvas.extent())
-    });
+    let backdrop_clip =
+        is_likely_opaque_gradient_box(layout_box).then(|| clip.unwrap_or_else(|| canvas.extent()));
     if let Some(clip) = backdrop_clip
-        && paint_cached_backdrop(canvas, layout_box, (outer, surface), opacity, clip)
+        && paint_cached_backdrop_multi(canvas, layout_box, (outer, surface), opacity, &[clip])
     {
         return;
     }
@@ -7023,6 +8633,38 @@ fn paint_backgrounds(
         opacity,
         clip,
     );
+}
+
+fn paint_backgrounds_multi(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    images: &[ImageLayer],
+    outer: Shape,
+    surface: Shape,
+    opacity: f32,
+    clips: &[Rect],
+) {
+    if is_likely_opaque_gradient_box(layout_box)
+        && paint_cached_backdrop_multi(canvas, layout_box, (outer, surface), opacity, clips)
+    {
+        return;
+    }
+    if layout_box.background.alpha > 0 {
+        let color = layout_box.background.scale_alpha(opacity);
+        canvas.fill_shape_multi(outer, &Paint::Solid(color), clips);
+    }
+    if !layout_box.backgrounds.is_empty() {
+        paint_layers_multi(
+            canvas,
+            &layout_box.backgrounds,
+            layout_box,
+            images,
+            surface,
+            outer,
+            opacity,
+            clips,
+        );
+    }
 }
 
 // a large box's opaque background of gradients, painted once whole and copied from where a
@@ -7057,12 +8699,12 @@ pub(crate) fn forget_backdrop() {
 // copies the box's background over the clip from a backdrop painted whole, when the box is
 // square on whole device pixels and its stack is opaque, so the copy is what painting each
 // layer over the clip gives
-fn paint_cached_backdrop(
+fn paint_cached_backdrop_multi(
     canvas: &mut Canvas,
     layout_box: &LayoutBox,
     (outer, surface): (Shape, Shape),
     opacity: f32,
-    clip: Rect,
+    clips: &[Rect],
 ) -> bool {
     const LEAST_PIXELS: f32 = 250_000.0;
     let device = canvas.device_shape(outer);
@@ -7105,13 +8747,8 @@ fn paint_cached_backdrop(
         surface.radii[3].1,
     ]
     .map(f32::to_bits);
-    let key = BackdropKey {
-        background: layout_box.background,
-        backgrounds: layout_box.backgrounds.clone(),
-        shapes,
-        scale: canvas.scale.to_bits(),
-        font_size: layout_box.font_size.to_bits(),
-    };
+    let scale_bits = canvas.scale.to_bits();
+    let font_size_bits = layout_box.font_size.to_bits();
     let bounds = [
         device.x.round() as u32,
         device.y.round() as u32,
@@ -7120,10 +8757,15 @@ fn paint_cached_backdrop(
     ];
     BACKDROP.with(|backdrop| {
         let mut backdrop = backdrop.borrow_mut();
-        if backdrop
-            .as_ref()
-            .is_none_or(|kept| kept.key != key || kept.bounds != bounds)
-        {
+        let matches = backdrop.as_ref().is_some_and(|kept| {
+            kept.bounds == bounds
+                && kept.key.background == layout_box.background
+                && kept.key.shapes == shapes
+                && kept.key.scale == scale_bits
+                && kept.key.font_size == font_size_bits
+                && kept.key.backgrounds == layout_box.backgrounds
+        });
+        if !matches {
             let area = Rect {
                 x: outer.x,
                 y: outer.y,
@@ -7163,11 +8805,21 @@ fn paint_cached_backdrop(
                     })
                     .collect()
             });
-            *backdrop = Some(Backdrop {
-                key,
-                bounds,
-                pixels,
-            });
+            if pixels.is_some() || backdrop.as_ref().is_none_or(|kept| kept.pixels.is_none()) {
+                *backdrop = Some(Backdrop {
+                    key: BackdropKey {
+                        background: layout_box.background,
+                        backgrounds: layout_box.backgrounds.clone(),
+                        shapes,
+                        scale: scale_bits,
+                        font_size: font_size_bits,
+                    },
+                    bounds,
+                    pixels,
+                });
+            } else {
+                return false;
+            }
         }
         let Some(kept) = backdrop.as_ref() else {
             return false;
@@ -7175,30 +8827,84 @@ fn paint_cached_backdrop(
         let Some(pixels) = &kept.pixels else {
             return false;
         };
-        // the pixels fill_shape would paint: the box's rows and columns the clip reaches
-        let clip = canvas.device_shape(Shape::square(clip));
-        let [left, top, right, bottom] = narrow(
-            [
-                bounds[0].min(canvas.width),
-                bounds[1].min(canvas.height),
-                bounds[2].min(canvas.width),
-                bounds[3].min(canvas.height),
-            ],
-            Some(clip),
-        );
+        let clamped = [
+            bounds[0].min(canvas.width),
+            bounds[1].min(canvas.height),
+            bounds[2].min(canvas.width),
+            bounds[3].min(canvas.height),
+        ];
         let width = (bounds[2] - bounds[0]) as usize;
         let stride = canvas.bytes_per_row();
-        if left < right {
-            let length = (right - left) as usize * 4;
-            for pixel_y in top..bottom {
-                let from =
-                    (pixel_y - bounds[1]) as usize * width * 4 + (left - bounds[0]) as usize * 4;
-                let to = pixel_y as usize * stride + left as usize * 4;
-                canvas.pixels[to..to + length].copy_from_slice(&pixels[from..from + length]);
+        for &clip in clips {
+            // the pixels fill_shape would paint: the box's rows and columns the clip reaches
+            let clip = canvas.device_shape(Shape::square(clip));
+            let [left, top, right, bottom] = narrow(clamped, Some(clip));
+            if left < right {
+                let length = (right - left) as usize * 4;
+                for pixel_y in top..bottom {
+                    let from = (pixel_y - bounds[1]) as usize * width * 4
+                        + (left - bounds[0]) as usize * 4;
+                    let to = pixel_y as usize * stride + left as usize * 4;
+                    canvas.pixels[to..to + length].copy_from_slice(&pixels[from..from + length]);
+                }
             }
         }
         true
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_layers_multi(
+    canvas: &mut Canvas,
+    layers: &[BackgroundLayer],
+    layout_box: &LayoutBox,
+    images: &[ImageLayer],
+    origin: Shape,
+    painted: Shape,
+    opacity: f32,
+    clips: &[Rect],
+) {
+    let area = Rect {
+        x: origin.x,
+        y: origin.y,
+        width: origin.width,
+        height: origin.height,
+    };
+    let font_size = layout_box.font_size;
+    for layer in layers.iter().rev() {
+        let repeat = (layer.repeat.x, layer.repeat.y);
+        match &layer.image {
+            LayerImage::Gradient(gradient) => {
+                let tile = background_placement(area, None, layer, font_size);
+                if let Some(ramp) = Ramp::new(canvas, gradient, tile, repeat, font_size, opacity) {
+                    canvas.fill_shape_multi(painted, &Paint::Ramp(ramp), clips);
+                }
+            }
+            LayerImage::Url(source) => {
+                let Some(found) = images.iter().find(|image| {
+                    image.background == Some(*source) && image.node == layout_box.node
+                }) else {
+                    continue;
+                };
+                let natural = (found.image.width as f32, found.image.height as f32);
+                let placement = background_placement(area, Some(natural), layer, font_size);
+                for &clip in clips {
+                    paint_image(
+                        canvas,
+                        ImageDraw {
+                            image: &found.image,
+                            placement,
+                            area: origin,
+                            clip: Some(clip),
+                            opacity,
+                            repeat,
+                            video: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
 }
 
 // layers take their place from `origin` and paint across `painted`, the last lowest
@@ -11176,6 +12882,140 @@ mod tests {
                 fast.rgba_pixels(),
                 ref_canvas.rgba_pixels(),
                 "clip={clip:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn round_channel_matches_f32_round_clamped() {
+        for value in [
+            f32::NAN,
+            f32::NEG_INFINITY,
+            -10.0,
+            -0.5,
+            -0.0,
+            0.0,
+            0.49999997,
+            0.5,
+            1.4999999,
+            1.5,
+            127.5,
+            254.49998,
+            254.5,
+            254.99998,
+            255.0,
+            255.5,
+            1000.0,
+            f32::INFINITY,
+        ] {
+            let expected = value.round().clamp(0.0, 255.0) as u8;
+            assert_eq!(round_channel(value), expected, "value={value}");
+        }
+    }
+
+    #[test]
+    fn offscreen_overflow_damage_clips_to_nothing_and_scroll_content_only_damages_scrollbar() {
+        let html_a = concat!(
+            "<style>body { margin: 0 } #sc { width: 120px; height: 60px; overflow: auto; }",
+            ".item { height: 24px; } #pad { height: 140px; }</style>",
+            "<div id='sc'><div class='item'>top</div><div id='pad'></div><div id='off'>old</div></div>",
+        );
+        let html_b = html_a.replace(">old<", ">new<");
+        let html_c = html_a.replace("height: 140px", "height: 220px");
+        let viewport = Size {
+            width: 200.0,
+            height: 120.0,
+        };
+        let layout_of = |markup: &str| {
+            let doc = crate::dom::Document::parse_markup(markup).unwrap();
+            let sheet = crate::css::Stylesheet::parse(&doc.style_text()).unwrap();
+            crate::layout::layout(&doc, &sheet, viewport)
+        };
+        let a = layout_of(html_a);
+        let b = layout_of(&html_b);
+        let c = layout_of(&html_c);
+        assert!(matches!(damage((&a, &[]), (&b, &[]), &[]), Damage::Nothing));
+        match damage((&a, &[]), (&c, &[]), &[]) {
+            Damage::Areas(rects) => {
+                assert!(!rects.is_empty());
+                assert!(
+                    rects.iter().all(|r| r.x >= 90.0),
+                    "expected scrollbar-only damage, got {rects:?}"
+                );
+            }
+            other => panic!("expected scrollbar-only areas, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_clip_grain_panel_and_shifted_table_match_whole_frame_bit_exact() {
+        let make = |rate: &str, tile: &str| {
+            format!(
+                concat!(
+                    "<style>",
+                    "body {{ margin: 0; background: #0b0b0b; color: #ececec; font-size: 12px; }}",
+                    ".app {{ position: relative; width: 420px; height: 280px; padding: 12px;",
+                    "  background: linear-gradient(180deg, #141414, #0c0c0c); }}",
+                    ".app::before {{ content: ''; position: absolute; inset: 0; z-index: 0;",
+                    "  background: repeating-linear-gradient(90deg, #ffffff05 0 1px, transparent 1px 3px);",
+                    "  opacity: 0.5; }}",
+                    ".tile {{ position: relative; z-index: 1; display: inline-block; width: 90px; height: 34px;",
+                    "  margin-bottom: 12px; padding: 6px; border-radius: 6px; background: #181818; }}",
+                    ".panel {{ position: relative; z-index: 1; width: 390px; height: 190px; border-radius: 7px;",
+                    "  background: linear-gradient(180deg, #191919, #101010);",
+                    "  box-shadow: inset 0 1px 0 #ffffff0f, inset 0 -1px 0 #00000080; overflow: hidden; }}",
+                    ".panel::before {{ content: ''; position: absolute; inset: 0; border-radius: inherit;",
+                    "  background: repeating-linear-gradient(90deg, #ffffff05 0 1px, transparent 1px 3px);",
+                    "  opacity: 0.5; }}",
+                    "table {{ width: 100%; border-collapse: collapse; }}",
+                    "tr {{ background: #141414; border-bottom: 1px solid #2a2a2a; }}",
+                    "td {{ padding: 6px 8px; white-space: nowrap; }}",
+                    ".over {{ position: absolute; top: 8px; right: 8px; width: 36px; height: 24px;",
+                    "  background: rgba(255, 80, 40, 0.4); z-index: 2; }}",
+                    "</style>",
+                    "<div class='app'><div class='tile'>{tile}</div>",
+                    "<div class='panel'><table>",
+                    "<tr><td>alpha</td><td>{rate}</td><td>12</td><td>ok</td></tr>",
+                    "<tr><td>beta</td><td>4.2 KiB/s</td><td>34</td><td>ok</td></tr>",
+                    "<tr><td>gamma</td><td>9.8 KiB/s</td><td>56</td><td>ok</td></tr>",
+                    "</table></div><div class='over'></div></div>"
+                ),
+                tile = tile,
+                rate = rate
+            )
+        };
+        let viewport = Size {
+            width: 420.0,
+            height: 280.0,
+        };
+        let layout_of = |markup: &str| {
+            let doc = crate::dom::Document::parse_markup(markup).unwrap();
+            let sheet = crate::css::Stylesheet::parse(&doc.style_text()).unwrap();
+            crate::layout::layout(&doc, &sheet, viewport)
+        };
+        let first = layout_of(&make("204.1 KiB/s", "10"));
+        let second = layout_of(&make("891 B/s", "11"));
+        let rects = match damage((&first, &[]), (&second, &[]), &[]) {
+            Damage::Areas(rects) => rects,
+            other => panic!("expected partial damage areas, got {other:?}"),
+        };
+        assert!(
+            rects.len() >= 2,
+            "tile and table should stay separate: {rects:?}"
+        );
+        let damaged_px: f32 = rects.iter().map(|r| r.width * r.height).sum();
+        assert!(
+            damaged_px < 390.0 * 190.0,
+            "damage should stay strictly smaller than the whole panel: {damaged_px} in {rects:?}"
+        );
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let mut incremental = paint_frame(&first, &[], scale, false, BASE);
+            repaint_areas(&mut incremental, &second, &[], &rects);
+            let whole = paint_frame(&second, &[], scale, false, BASE);
+            assert_eq!(
+                incremental.rgba_pixels(),
+                whole.rgba_pixels(),
+                "scale={scale} rects={rects:?}"
             );
         }
     }

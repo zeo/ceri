@@ -854,6 +854,7 @@ struct FlexLayoutInput<'a> {
 struct GridItem<'a> {
     source: FlexSource<'a>,
     style: Style,
+    style_momentary: bool,
     margin: ResolvedEdges,
     padding: ResolvedEdges,
     border: ResolvedEdges,
@@ -903,6 +904,8 @@ struct ElementLayoutInput<'node, 'style> {
     list_ordinal: i32,
     parent: ParentStyle,
     context: LayoutContext<'style>,
+    // style already computed for node with the same parent, paired with whether it read motion
+    pre_style: Option<(Style, bool)>,
 }
 
 pub fn layout(document: &Document, stylesheet: &Stylesheet, viewport: Size) -> LayoutDocument {
@@ -1128,7 +1131,9 @@ fn layout_document_children(
     let root_floats = Rc::new(FloatArea::default());
     for node in document.element_children(document.root()) {
         let node = Subject::new(document, node);
+        let before_style = crate::css::moment_reports();
         let style = stylesheet.style_for(node.style_context(&root_parent, style_state));
+        let style_momentary = crate::css::moment_reports() != before_style;
         if style.position.is_out_of_flow() {
             positioned.push(node);
             continue;
@@ -1198,6 +1203,7 @@ fn layout_document_children(
                 stylesheet,
                 style_state,
             },
+            pre_style: Some((style, style_momentary)),
         }) {
             cursor_y = child_box.rect.bottom() + child_box.margin.bottom;
             children.push(child_box);
@@ -2192,7 +2198,9 @@ fn append_positioned_nodes(
         style_state,
     } = context;
     for node in nodes {
+        let before_style = crate::css::moment_reports();
         let style = stylesheet.style_for(node.style_context(&parent, style_state));
+        let style_momentary = crate::css::moment_reports() != before_style;
         let mode = if style.position == Position::Fixed {
             LayoutMode::Fixed
         } else {
@@ -2224,6 +2232,7 @@ fn append_positioned_nodes(
                 stylesheet,
                 style_state,
             },
+            pre_style: Some((style, style_momentary)),
         }) {
             children.push(layout);
         }
@@ -2960,6 +2969,9 @@ fn intersect_rect(parent: Option<Rect>, rect: Rect) -> Option<Rect> {
     })
 }
 
+// sentinel bit pattern for dimensions a cached box layout does not read
+const ANY_DIM: u32 = u32::MAX;
+
 // everything an element's layout is decided by besides the document, stylesheet and state,
 // compared bit for bit
 #[derive(Clone, PartialEq)]
@@ -2975,6 +2987,25 @@ struct BoxInputs {
     environment: crate::css::LayoutEnvironment,
     // laid out inside a block formatting context's float area, which it found empty
     among_floats: bool,
+}
+
+impl BoxInputs {
+    fn matches_query(&self, query: &Self) -> bool {
+        (self.heights.0 == query.heights.0 || self.heights.0 == Some(ANY_DIM))
+            && self.heights.1 == query.heights.1
+            && self.heights.2 == query.heights.2
+            && (self.numbers[2] == query.numbers[2] || self.numbers[2] == ANY_DIM)
+            && self.numbers[..2] == query.numbers[..2]
+            && self.numbers[3..] == query.numbers[3..]
+            && self.list_ordinal == query.list_ordinal
+            && self.color == query.color
+            && self.weight == query.weight
+            && self.text == query.text
+            && self.mode == query.mode
+            && self.zero_font == query.zero_font
+            && self.environment == query.environment
+            && self.among_floats == query.among_floats
+    }
 }
 
 // an answer worked out for a node under some inputs: a box or an intrinsic width
@@ -3426,19 +3457,7 @@ fn layout_element_rc(input: ElementLayoutInput<'_, '_>) -> Option<Rc<LayoutBox>>
     }
     let block = input.context.containing_block;
     let bits = f32::to_bits;
-    // a box reads the height it is laid out within only for a percentage height of its own,
-    // as its children get its own height to resolve theirs against, so without one the flex
-    // and grid passes that differ in nothing else share one answer
-    let style = input.context.stylesheet.style_for(
-        input
-            .node
-            .style_context(&input.parent, input.context.style_state),
-    );
-    let reads_height = [style.height, style.min_height, style.max_height]
-        .into_iter()
-        .any(Length::has_percent);
-    let containing_height = input.containing_height.filter(|_| reads_height);
-    let inputs = BoxInputs {
+    let mut inputs = BoxInputs {
         numbers: [
             input.containing_x,
             input.containing_y,
@@ -3454,7 +3473,7 @@ fn layout_element_rc(input: ElementLayoutInput<'_, '_>) -> Option<Rc<LayoutBox>>
         ]
         .map(bits),
         heights: (
-            containing_height.map(bits),
+            input.containing_height.map(bits),
             input.size_override.0.map(bits),
             input.size_override.1.map(bits),
         ),
@@ -3478,13 +3497,28 @@ fn layout_element_rc(input: ElementLayoutInput<'_, '_>) -> Option<Rc<LayoutBox>>
         return layout_element_fresh(input).map(Rc::new);
     };
     let (document, node) = (input.node.document, input.node.node);
+    // probe the cache before computing style so hits skip style_for entirely
     let known = KEPT.with(|kept| {
-        kept_answer(
-            &mut kept.borrow_mut().boxes,
-            (&key, &inputs),
-            (pass, works),
-            |since| document.unwritten_since(node, since),
-        )
+        let mut kept_map = kept.borrow_mut();
+        let entry = kept_map
+            .boxes
+            .get_mut(&key)?
+            .iter_mut()
+            .find(|entry| entry.inputs.matches_query(&inputs))?;
+        let earlier = entry.pass != pass;
+        if earlier && !document.unwritten_since(node, entry.stamp) {
+            crate::profile::count("kept: answer written since");
+            return None;
+        }
+        if earlier {
+            crate::profile::count("kept: answer taken");
+        }
+        entry.pass = pass;
+        entry.used = works;
+        if entry.refers {
+            crate::svg::note_reference_read();
+        }
+        Some((entry.answer.clone(), earlier))
     });
     if let Some((layout, earlier)) = known {
         if cfg!(feature = "recheck") {
@@ -3503,8 +3537,46 @@ fn layout_element_rc(input: ElementLayoutInput<'_, '_>) -> Option<Rc<LayoutBox>>
         return layout;
     }
     let (reported, looked_up) = (crate::css::moment_reports(), crate::svg::reference_reads());
-    let layout = layout_element_fresh(input).map(Rc::new);
-    let momentary = crate::css::moment_reports() != reported;
+    let (style, style_momentary) = input.pre_style.unwrap_or_else(|| {
+        (
+            input.context.stylesheet.style_for(
+                input
+                    .node
+                    .style_context(&input.parent, input.context.style_state),
+            ),
+            false,
+        )
+    });
+    let reads_height = [style.height, style.min_height, style.max_height]
+        .into_iter()
+        .any(Length::has_percent);
+    if !reads_height {
+        inputs.heights.0 = Some(ANY_DIM);
+    }
+    let reads_width = [
+        style.margin.top,
+        style.margin.right,
+        style.margin.bottom,
+        style.margin.left,
+        style.padding.top,
+        style.padding.right,
+        style.padding.bottom,
+        style.padding.left,
+        style.min_width,
+        style.max_width,
+    ]
+    .into_iter()
+    .any(Length::has_percent)
+        || (input.context.mode == LayoutMode::Flow
+            && (style.margin.left == Length::Auto || style.margin.right == Length::Auto))
+        || style.display == Display::Table
+        || (input.size_override.0.is_none()
+            && (style.width == Length::Auto || style.width.has_percent()));
+    if !reads_width {
+        inputs.numbers[2] = ANY_DIM;
+    }
+    let layout = layout_element_fresh_with_style(input, style).map(Rc::new);
+    let momentary = style_momentary || crate::css::moment_reports() != reported;
     let refers = crate::svg::reference_reads() != looked_up;
     if placed() > 0 {
         return layout;
@@ -3530,7 +3602,25 @@ fn layout_element_rc(input: ElementLayoutInput<'_, '_>) -> Option<Rc<LayoutBox>>
 }
 
 fn layout_element_fresh(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
+    let style = input.context.stylesheet.style_for(
+        input
+            .node
+            .style_context(&input.parent, input.context.style_state),
+    );
+    layout_element_fresh_with_style(input, style)
+}
+
+fn layout_element_fresh_with_style(
+    input: ElementLayoutInput<'_, '_>,
+    style: Style,
+) -> Option<LayoutBox> {
     let _profile = crate::profile::scope("layout: element");
+    if style.display == Display::None {
+        return None;
+    }
+    if style.overflow_axes()[1] != Overflow::Auto {
+        return layout_element_with_gutter(input, style, 0.0);
+    }
     // a vertical scrollbar sits between the border and the padding, so the content box gives
     // up its width and the content lays out again. a box lays out first with the scrollbar it
     // had last time, as chromium keeps a scroller's bars from one layout to the next, so a
@@ -3538,14 +3628,17 @@ fn layout_element_fresh(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> 
     let node = (input.node.document.identity(), input.node.node);
     let last = GUTTERS.with(|gutters| gutters.borrow().get(&node).copied());
     if let Some(last) = last {
-        let layout = layout_element_with_gutter(input.clone(), last)?;
+        let layout = layout_element_with_gutter(input.clone(), style, last)?;
         if wanted_gutter(&layout) == Some(last) {
             return Some(layout);
         }
     }
-    let layout = layout_element_with_gutter(input.clone(), 0.0)?;
+    let layout = layout_element_with_gutter(input.clone(), style, 0.0)?;
     let (gutter, layout) = match wanted_gutter(&layout) {
-        Some(gutter) => (Some(gutter), layout_element_with_gutter(input, gutter)?),
+        Some(gutter) => (
+            Some(gutter),
+            layout_element_with_gutter(input, style, gutter)?,
+        ),
         None => (None, layout),
     };
     GUTTERS.with(|gutters| {
@@ -3583,7 +3676,11 @@ fn wanted_gutter(layout: &LayoutBox) -> Option<f32> {
     (user_scroll_axes(layout)[1] && gutter > 0.0 && layout.rect.width > gutter).then_some(gutter)
 }
 
-fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) -> Option<LayoutBox> {
+fn layout_element_with_gutter(
+    input: ElementLayoutInput<'_, '_>,
+    style: Style,
+    gutter: f32,
+) -> Option<LayoutBox> {
     let ElementLayoutInput {
         node,
         containing_x,
@@ -3602,8 +3699,8 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
                 stylesheet,
                 style_state,
             },
+        pre_style: _,
     } = input;
-    let style = stylesheet.style_for(node.style_context(&parent, style_state));
     if style.display == Display::None {
         return None;
     }
@@ -4141,8 +4238,10 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
             Child::Text(..) => {}
             Child::Element(_) if !own_children => {}
             Child::Element(child) => {
+                let before_style = crate::css::moment_reports();
                 let child_style =
                     stylesheet.style_for(child.style_context(&child_parent, style_state));
+                let child_momentary = crate::css::moment_reports() != before_style;
                 if child_style.display == Display::None {
                     continue;
                 }
@@ -4243,6 +4342,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
                             stylesheet,
                             style_state,
                         },
+                        pre_style: Some((child_style, child_momentary)),
                     }) {
                         line.y = child_box.rect.bottom();
                         pending_margin = Some(child_box.margin.bottom);
@@ -4534,6 +4634,7 @@ enum FlexSource<'a> {
 struct FlexItem<'a> {
     source: FlexSource<'a>,
     style: Style,
+    style_momentary: bool,
     font_size: f32,
     margin: ResolvedEdges,
     padding: ResolvedEdges,
@@ -5242,8 +5343,10 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         match child {
             Child::Text(text_node, value) => run.push((text_node, value)),
             Child::Element(child) => {
+                let before_style = crate::css::moment_reports();
                 let child_style =
                     stylesheet.style_for(child.style_context(&child_parent, style_state));
+                let child_momentary = crate::css::moment_reports() != before_style;
                 if child_style.display == Display::None {
                     continue;
                 }
@@ -5255,7 +5358,10 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                     positioned.push(child);
                     continue;
                 }
-                sources.push((FlexSource::Element(child), Some(child_style)));
+                sources.push((
+                    FlexSource::Element(child),
+                    Some((child_style, child_momentary)),
+                ));
             }
         }
     }
@@ -5282,7 +5388,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     anonymous_style.align_self = None;
     let mut items = Vec::with_capacity(sources.len());
     for (source, child_style) in sources {
-        let child_style = child_style.unwrap_or(anonymous_style);
+        let (child_style, style_momentary) = child_style.unwrap_or((anonymous_style, false));
         let child_font_size = child_style
             .font_size
             .resolve(font_size, font_size)
@@ -5311,6 +5417,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         items.push(FlexItem {
             source,
             style: child_style,
+            style_momentary,
             font_size: child_font_size,
             margin: child_margin,
             padding: child_padding,
@@ -5367,6 +5474,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                         stylesheet,
                         style_state,
                     },
+                    pre_style: Some((item.style, item.style_momentary)),
                 }),
             }
         };
@@ -5454,17 +5562,27 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         } else {
             item.style.max_height
         };
+        item.max_main = resolve_main(max_property).map_or(f32::INFINITY, to_content);
         // an auto minimum keeps an item from shrinking below its longest word
+        let specified = resolve_main(main_property).map(to_content);
         item.min_main = match resolve_main(min_property) {
             Some(size) => to_content(size),
             None if row && item.style.overflow == Overflow::Visible => {
-                let min_width = get_min(item);
-                let specified = resolve_main(main_property).map(to_content);
-                specified.map_or(min_width, |specified| specified.min(min_width))
+                // a non-flexing item with a definite main size inside max stays frozen at base
+                if resolve_main(item.style.flex_basis).is_none()
+                    && specified.is_some()
+                    && item.base <= item.max_main
+                    && item.style.flex_shrink == 0.0
+                    && item.style.flex_grow == 0.0
+                {
+                    0.0
+                } else {
+                    let min_width = get_min(item);
+                    specified.map_or(min_width, |specified| specified.min(min_width))
+                }
             }
             None => 0.0,
         };
-        item.max_main = resolve_main(max_property).map_or(f32::INFINITY, to_content);
         item.hypothetical = item.base.min(item.max_main).max(item.min_main);
         item.target = item.hypothetical;
     }
@@ -5942,8 +6060,10 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         match child {
             Child::Text(text_node, value) => run.push((text_node, value)),
             Child::Element(child) => {
+                let before_style = crate::css::moment_reports();
                 let child_style =
                     stylesheet.style_for(child.style_context(&child_parent, style_state));
+                let child_momentary = crate::css::moment_reports() != before_style;
                 if child_style.display == Display::None {
                     continue;
                 }
@@ -5955,7 +6075,10 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     positioned.push(child);
                     continue;
                 }
-                sources.push((FlexSource::Element(child), Some(child_style)));
+                sources.push((
+                    FlexSource::Element(child),
+                    Some((child_style, child_momentary)),
+                ));
             }
         }
     }
@@ -5977,7 +6100,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let mut items = sources
         .into_iter()
         .map(|(source, child_style)| {
-            let child_style = child_style.unwrap_or(anonymous_style);
+            let (child_style, style_momentary) = child_style.unwrap_or((anonymous_style, false));
             let child_font_size = child_style
                 .font_size
                 .resolve(font_size, font_size)
@@ -5987,6 +6110,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             GridItem {
                 source,
                 style: child_style,
+                style_momentary,
                 margin: resolve_margins(child_style.margin, content_width, child_font_size),
                 padding: resolve_edges(child_style.padding, content_width, child_font_size),
                 border,
@@ -6247,6 +6371,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     stylesheet,
                     style_state,
                 },
+                pre_style: Some((item.style, item.style_momentary)),
             }),
         }
     };
@@ -7325,6 +7450,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 stylesheet,
                 style_state,
             },
+            pre_style: None,
         })
     };
     if !style.caption_bottom {
@@ -7392,6 +7518,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 stylesheet,
                 style_state,
             },
+            pre_style: None,
         })
     };
     let mut row_heights = rows
@@ -9044,6 +9171,33 @@ fn size_grid_tracks(
         Sizing::Fixed(size) => Some(size),
         _ => None,
     };
+    // a lone auto track in a definite stretched axis always stretches to fill the remaining
+    // space past its base size, so max-content never affects its final size
+    let lone_stretched_auto = if stretch && available.is_some() {
+        let mut auto_count = 0usize;
+        let mut eligible = true;
+        for track in 0..tracks.len() {
+            if collapsed[track] {
+                continue;
+            }
+            if mins[track] == Sizing::Auto && maxs[track] == Sizing::Auto {
+                auto_count += 1;
+                if auto_count > 1 {
+                    eligible = false;
+                    break;
+                }
+            } else if !matches!(
+                (mins[track], maxs[track]),
+                (Sizing::Fixed(a), Sizing::Fixed(b)) if (a - b).abs() <= 0.001
+            ) {
+                eligible = false;
+                break;
+            }
+        }
+        eligible && auto_count == 1
+    } else {
+        false
+    };
     let mut flex_items = Vec::new();
     let mut order = (0..items.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| items[*index].1);
@@ -9084,7 +9238,7 @@ fn size_grid_tracks(
             (
                 needs_min && !min_uses_max && min_all_auto,
                 (needs_min && !min_uses_max && !min_all_auto) || max_all_min,
-                min_uses_max || (has_max_target && !max_all_min),
+                !lone_stretched_auto && (min_uses_max || (has_max_target && !max_all_min)),
             )
         };
         if !need_floor && !need_min && !need_max {
@@ -10290,6 +10444,13 @@ impl TextPlacer {
     }
 }
 
+fn has_out_of_flow_descendant(layout_box: &LayoutBox) -> bool {
+    layout_box
+        .children
+        .iter()
+        .any(|child| child.position.is_out_of_flow() || has_out_of_flow_descendant(child))
+}
+
 // lays out an inline-block or replaced element as a block, then places it on the line
 fn append_atomic(
     input: InlineElementInput<'_>,
@@ -10327,10 +10488,10 @@ fn append_atomic(
         } else {
             context.content_width
         };
-    let Some(laid_out) = layout_element(ElementLayoutInput {
+    let atomic_input = ElementLayoutInput {
         node,
-        containing_x: context.content_x + line.left + line.used,
-        containing_y: line.y,
+        containing_x: 0.0,
+        containing_y: 0.0,
         containing_width,
         containing_height: None,
         size_override: (None, None),
@@ -10344,9 +10505,22 @@ fn append_atomic(
             stylesheet,
             style_state,
         },
-    }) else {
+        pre_style: None,
+    };
+    let Some(mut laid_out) = layout_element(atomic_input.clone()) else {
         return;
     };
+    // fall back to flow origin when an out-of-flow descendant depends on it
+    if has_out_of_flow_descendant(&laid_out) {
+        let Some(exact) = layout_element(ElementLayoutInput {
+            containing_x: context.content_x + line.left + line.used,
+            containing_y: line.y,
+            ..atomic_input
+        }) else {
+            return;
+        };
+        laid_out = exact;
+    }
     let outer_width = laid_out.rect.width + laid_out.margin.left + laid_out.margin.right;
     let outer_height = laid_out.rect.height + laid_out.margin.top + laid_out.margin.bottom;
     if !line.has_content() {
@@ -10959,6 +11133,7 @@ fn place_float(input: InlineElementInput<'_>, style: &Style, line: &mut InlineLi
             stylesheet,
             style_state,
         },
+        pre_style: None,
     }) else {
         return;
     };
@@ -11509,10 +11684,18 @@ fn control_text_lines(
     lines
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaintDiff {
+    Same,
+    ScrollContentOnly,
+    RectOrTextOnly,
+    Visual,
+}
+
 impl LayoutBox {
-    // every field but the children, which damage tracking walks one by one; the pattern names
-    // them all so a new field cannot be left out
-    pub(crate) fn same_own(&self, other: &Self) -> bool {
+    // classifies own-box visual changes while exhaustively naming every field so new fields
+    // cannot be missed by damage tracking
+    pub(crate) fn paint_diff(&self, other: &Self) -> PaintDiff {
         let Self {
             children: _,
             node,
@@ -11543,14 +11726,14 @@ impl LayoutBox {
             visual_offset,
             z_index,
             creates_stacking_context,
-            sticky_inset,
+            sticky_inset: _,
             font_size,
             overflow,
             overflow_axes,
             visible,
-            pointer_events,
-            selectable,
-            cursor,
+            pointer_events: _,
+            selectable: _,
+            cursor: _,
             floated,
             inline,
             control,
@@ -11561,17 +11744,16 @@ impl LayoutBox {
             svg,
             scrollbar,
             stable_gutter,
-            row_baseline,
-            margin,
+            row_baseline: _,
+            margin: _,
             child_shift: _,
             has_child_shift: _,
             has_sticky: _,
             has_stacking_descendant: _,
             has_backdrop_filter: _,
         } = self;
-        *node == other.node
+        let style_same = *node == other.node
             && *tag == other.tag
-            && *rect == other.rect
             && *background == other.background
             && *backgrounds == other.backgrounds
             && *masks == other.masks
@@ -11588,7 +11770,6 @@ impl LayoutBox {
             && *filters == other.filters
             && *border == other.border
             && *outline == other.outline
-            && *text == other.text
             && *control_value == other.control_value
             && *control_selection == other.control_selection
             && *control_focused == other.control_focused
@@ -11597,26 +11778,30 @@ impl LayoutBox {
             && *visual_offset == other.visual_offset
             && *z_index == other.z_index
             && *creates_stacking_context == other.creates_stacking_context
-            && *sticky_inset == other.sticky_inset
             && *font_size == other.font_size
             && *overflow == other.overflow
             && *overflow_axes == other.overflow_axes
             && *visible == other.visible
-            && *pointer_events == other.pointer_events
-            && *selectable == other.selectable
-            && *cursor == other.cursor
             && *floated == other.floated
             && *inline == other.inline
             && *control == other.control
             && *selection == other.selection
             && *selection_color == other.selection_color
-            && *scroll_content == other.scroll_content
             && *scroll_offset == other.scroll_offset
             && *svg == other.svg
             && *scrollbar == other.scrollbar
-            && *stable_gutter == other.stable_gutter
-            && *row_baseline == other.row_baseline
-            && *margin == other.margin
+            && *stable_gutter == other.stable_gutter;
+        if !style_same {
+            return PaintDiff::Visual;
+        }
+        let scroll_same = *scroll_content == other.scroll_content
+            || (!self.is_document() && *overflow != Overflow::Auto);
+        match (*rect == other.rect, *text == other.text, scroll_same) {
+            (true, true, true) => PaintDiff::Same,
+            (true, true, false) => PaintDiff::ScrollContentOnly,
+            (_, _, true) => PaintDiff::RectOrTextOnly,
+            (_, _, false) => PaintDiff::Visual,
+        }
     }
 
     pub(crate) fn is_document(&self) -> bool {
@@ -14854,5 +15039,54 @@ mod tests {
         .expect("opacity motion should patch without full relayout");
         let fresh = layout_afresh(&document, &stylesheet, viewport, &mid_state);
         assert_eq!(patched, fresh);
+    }
+
+    #[test]
+    fn lone_stretched_auto_grid_and_atomic_column_shift_match_fresh_layout() {
+        let markup = concat!(
+            "<style>",
+            "body { margin: 0; }",
+            ".shell { display: grid; grid-template-rows: 30px auto 20px; width: 320px; height: 220px; }",
+            "table { width: 100%; border-collapse: collapse; }",
+            "td { padding: 4px; white-space: nowrap; }",
+            ".act { display: inline-flex; position: relative; padding: 2px 6px; }",
+            ".tip { position: absolute; left: 2px; top: 2px; width: 4px; height: 4px; }",
+            "</style>",
+            "<div class='shell'><div>hdr</div><div><table>",
+            "<tr><td>row1</td><td id='rate'>204.1 KiB/s</td><td><span class='act'>go</span></td></tr>",
+            "<tr><td>row2</td><td>4.2 KiB/s</td><td><span class='act'>go<i class='tip'></i></span></td></tr>",
+            "</table></div><div>ftr</div></div>",
+        );
+        let mut document = Document::parse_markup(markup).expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let viewport = Size {
+            width: 320.0,
+            height: 220.0,
+        };
+        let state = StyleState::default();
+        let first = layout_with_state(&document, &stylesheet, viewport, &state);
+        let first_fresh = layout_afresh(&document, &stylesheet, viewport, &state);
+        assert_eq!(first, first_fresh);
+
+        let rate = document.find_element_by_id("rate").expect("rate cell");
+        let text_node = document.children(rate)[0];
+        assert!(document.replace_data(text_node, 0, "204.1 KiB/s".len(), "891 B/s"));
+        let second = layout_with_state(&document, &stylesheet, viewport, &state);
+        let second_fresh = layout_afresh(&document, &stylesheet, viewport, &state);
+        assert_eq!(second, second_fresh);
+
+        // non-scroll containers ignore scroll_content differences in paint_diff
+        let mut tweaked = second.root.clone();
+        tweaked.scroll_content.height += 12.0;
+        assert_eq!(
+            second.root.paint_diff(&tweaked),
+            PaintDiff::ScrollContentOnly
+        );
+        let mut visible_a = second.root.children[0].as_ref().clone();
+        let mut visible_b = visible_a.clone();
+        visible_a.overflow = Overflow::Visible;
+        visible_b.overflow = Overflow::Visible;
+        visible_b.scroll_content.height += 12.0;
+        assert_eq!(visible_a.paint_diff(&visible_b), PaintDiff::Same);
     }
 }
