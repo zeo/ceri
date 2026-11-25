@@ -1744,7 +1744,7 @@ impl ScriptRuntime {
         property: &str,
     ) -> Result<Value, ScriptError> {
         if let Some(&name) = METHODS.iter().find(|&&name| name == property) {
-            return Ok(Value::Builtin(Builtin::CanvasMethod(Box::new((
+            return Ok(Value::builtin(Builtin::CanvasMethod(Box::new((
                 context.clone(),
                 name,
             )))));
@@ -1990,11 +1990,21 @@ impl ScriptRuntime {
             self.get_property(value, "addColorStop"),
             self.get_property(value, "setTransform"),
         ) {
-            (Ok(Value::Builtin(Builtin::CanvasGradientAddColorStop(gradient))), _) => {
-                Paint::Gradient(gradient, value.clone())
+            (Ok(Value::Builtin(b)), _)
+                if matches!(b.as_ref(), Builtin::CanvasGradientAddColorStop(_)) =>
+            {
+                let Builtin::CanvasGradientAddColorStop(gradient) = b.as_ref() else {
+                    unreachable!()
+                };
+                Paint::Gradient(gradient.clone(), value.clone())
             }
-            (_, Ok(Value::Builtin(Builtin::CanvasPatternSetTransform(pattern)))) => {
-                Paint::Pattern(pattern, value.clone())
+            (_, Ok(Value::Builtin(b)))
+                if matches!(b.as_ref(), Builtin::CanvasPatternSetTransform(_)) =>
+            {
+                let Builtin::CanvasPatternSetTransform(pattern) = b.as_ref() else {
+                    unreachable!()
+                };
+                Paint::Pattern(pattern.clone(), value.clone())
             }
             _ => return false,
         };
@@ -2631,7 +2641,7 @@ impl ScriptRuntime {
             ("height".to_string(), Value::Number(f64::from(height))),
             (
                 "close".to_string(),
-                Value::Builtin(Builtin::ImageBitmapClose(held)),
+                Value::builtin(Builtin::ImageBitmapClose(held)),
             ),
         ]);
         self.host_object(bitmap, "ImageBitmap")
@@ -2686,8 +2696,8 @@ impl ScriptRuntime {
         let source = behind.as_ref().unwrap_or(source);
         // an ImageBitmap is known by the close that carries its pixels
         if !matches!(source, Value::Element(_))
-            && let Ok(Value::Builtin(Builtin::ImageBitmapClose(held))) =
-                self.get_property(source, "close")
+            && let Ok(Value::Builtin(b)) = self.get_property(source, "close")
+            && let Builtin::ImageBitmapClose(held) = b.as_ref()
         {
             let Some(bitmap) = held.borrow().clone() else {
                 return Err(self.throw_value(dom_exception(
@@ -2999,7 +3009,7 @@ impl ScriptRuntime {
 fn pattern_object(pattern: PatternHandle) -> Value {
     plain_object([(
         "setTransform".to_string(),
-        Value::Builtin(Builtin::CanvasPatternSetTransform(pattern)),
+        Value::builtin(Builtin::CanvasPatternSetTransform(pattern)),
     )])
 }
 
@@ -3007,7 +3017,7 @@ fn pattern_object(pattern: PatternHandle) -> Value {
 fn gradient_object(gradient: GradientHandle) -> Value {
     plain_object([(
         "addColorStop".to_string(),
-        Value::Builtin(Builtin::CanvasGradientAddColorStop(gradient)),
+        Value::builtin(Builtin::CanvasGradientAddColorStop(gradient)),
     )])
 }
 

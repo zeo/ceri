@@ -1026,7 +1026,7 @@ impl ScriptRuntime {
     }
 
     fn numeric_comparator(&self) -> Value {
-        Value::Builtin(Builtin::native(Native::NumericCompare))
+        Value::builtin(Builtin::native(Native::NumericCompare))
     }
 
     fn kind_of_constructor(&mut self, constructor: &Value) -> Result<ElementKind, ScriptError> {

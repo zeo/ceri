@@ -29,10 +29,11 @@ const MINIMUM_THRESHOLD: usize = 262_144;
 #[derive(Debug)]
 pub(super) struct BorrowError;
 
-struct Entry<T> {
-    meta: Cell<u32>,
-    borrow: Cell<i32>,
-    value: UnsafeCell<Option<T>>,
+#[repr(C)]
+pub(super) struct Entry<T> {
+    pub(super) meta: Cell<u32>,
+    pub(super) borrow: Cell<i32>,
+    pub(super) value: UnsafeCell<Option<T>>,
 }
 
 pub(super) struct GcRef<'a, T> {
@@ -96,7 +97,9 @@ impl<T> Drop for GcRefMut<'_, T> {
     }
 }
 
+#[repr(C)]
 struct Slab<T> {
+    chunks_ptr: Cell<*const *mut Entry<T>>,
     chunks: UnsafeCell<Vec<*mut Entry<T>>>,
     chunk_gen: UnsafeCell<Vec<u32>>,
     free_list: UnsafeCell<Vec<u32>>,
@@ -108,6 +111,7 @@ struct Slab<T> {
 impl<T> Default for Slab<T> {
     fn default() -> Self {
         Self {
+            chunks_ptr: Cell::new(std::ptr::null()),
             chunks: UnsafeCell::new(Vec::new()),
             chunk_gen: UnsafeCell::new(Vec::new()),
             free_list: UnsafeCell::new(Vec::new()),
@@ -158,20 +162,21 @@ impl<T> Slab<T> {
 
     #[inline]
     fn free_slot(&self, index: u32, expected_gen: u32) -> bool {
-        let Some(entry) = self.entry_if_alive(index, expected_gen) else {
-            return false;
-        };
+        self.take_free_slot(index, expected_gen).is_some()
+    }
+
+    #[inline]
+    fn take_free_slot(&self, index: u32, expected_gen: u32) -> Option<T> {
+        let entry = self.entry_if_alive(index, expected_gen)?;
         let entry = unsafe { &*entry };
         if entry.borrow.get() != 0 {
-            return false;
+            return None;
         }
         let meta = entry.meta.get();
         if (meta & META_PINNED) != 0 {
-            return false;
+            return None;
         }
-        unsafe {
-            *entry.value.get() = None;
-        }
+        let taken = unsafe { (*entry.value.get()).take() };
         let mut next_gen = ((meta & META_GEN_MASK) + 1) & META_GEN_MASK;
         if next_gen == 0 {
             next_gen = 1;
@@ -181,7 +186,7 @@ impl<T> Slab<T> {
         unsafe {
             (&mut *self.free_list.get()).push(index);
         }
-        true
+        taken
     }
 
     #[cold]
@@ -214,6 +219,7 @@ impl<T> Slab<T> {
         }
         let ptr = Box::into_raw(entries.into_boxed_slice()) as *mut Entry<T>;
         chunks[slot] = ptr;
+        self.chunks_ptr.set(chunks.as_ptr());
         let base_index = (slot << CHUNK_SHIFT) as u32;
         free_list.reserve(CHUNK_SIZE - 1);
         for offset in (1..CHUNK_SIZE as u32).rev() {
@@ -430,13 +436,26 @@ impl<T> Slab<T> {
     }
 }
 
+#[repr(C)]
 pub(super) struct Heap {
-    id: u16,
+    pub(super) id: u16,
     objects: Slab<JsObject>,
     arrays: Slab<ArrayData>,
     scopes: Slab<Scope>,
     allocs_since_gc: Cell<usize>,
     gc_threshold: Cell<usize>,
+    // recycled small scope slot vectors avoiding malloc/free on short-lived scopes
+    slot_pool: UnsafeCell<Vec<Vec<Value>>>,
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+impl Heap {
+    pub(super) const OFF_ID: usize = std::mem::offset_of!(Self, id);
+    pub(super) const OFF_OBJECTS_CHUNKS: usize =
+        std::mem::offset_of!(Self, objects) + std::mem::offset_of!(Slab<JsObject>, chunks_ptr);
 }
 
 impl Heap {
@@ -448,7 +467,94 @@ impl Heap {
             scopes: Slab::default(),
             allocs_since_gc: Cell::new(0),
             gc_threshold: Cell::new(MINIMUM_THRESHOLD),
+            slot_pool: UnsafeCell::new(Vec::new()),
         })
+    }
+
+    #[inline]
+    pub(super) fn alloc_scope_slots(&self, len: usize, uninit: bool) -> Vec<Value> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let pool = unsafe { &mut *self.slot_pool.get() };
+        let mut buf = match pool.pop() {
+            Some(mut reused) => {
+                if reused.capacity() < len {
+                    reused.reserve(len);
+                }
+                reused
+            }
+            None => Vec::with_capacity(len),
+        };
+        unsafe {
+            let ptr = buf.as_mut_ptr();
+            if uninit {
+                for i in 0..len {
+                    std::ptr::write(ptr.add(i), Value::Uninitialized);
+                }
+            } else {
+                for i in 0..len {
+                    std::ptr::write(ptr.add(i), Value::Undefined);
+                }
+            }
+            buf.set_len(len);
+        }
+        buf
+    }
+
+    #[inline]
+    pub(super) fn clone_scope_slots(&self, src: &[Value]) -> Vec<Value> {
+        let len = src.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        let pool = unsafe { &mut *self.slot_pool.get() };
+        let mut buf = match pool.pop() {
+            Some(mut reused) => {
+                if reused.capacity() < len {
+                    reused.reserve(len);
+                }
+                reused
+            }
+            None => Vec::with_capacity(len),
+        };
+        unsafe {
+            let dst = buf.as_mut_ptr();
+            let sp = src.as_ptr();
+            for i in 0..len {
+                let val = &*sp.add(i);
+                if val.is_copy() {
+                    std::ptr::copy_nonoverlapping(val as *const Value, dst.add(i), 1);
+                } else {
+                    std::ptr::write(dst.add(i), val.clone());
+                }
+            }
+            buf.set_len(len);
+        }
+        buf
+    }
+
+    #[inline]
+    pub(super) fn recycle_scope_slots(&self, mut slots: Vec<Value>) {
+        let len = slots.len();
+        let ptr = slots.as_mut_ptr();
+        // safety: shrink len to 0 before dropping so unwind cannot double-drop
+        unsafe {
+            slots.set_len(0);
+            for i in 0..len {
+                let slot = ptr.add(i);
+                if !(*slot).is_copy() {
+                    drop_value_slow(std::ptr::read(slot));
+                }
+            }
+        }
+        let cap = slots.capacity();
+        if cap > 0 && cap <= 16 {
+            let pool = unsafe { &mut *self.slot_pool.get() };
+            if pool.len() < 256 {
+                pool.push(slots);
+            }
+        }
     }
 
     #[inline]
@@ -592,7 +698,10 @@ impl Heap {
     pub(super) fn free_scope_fast(&self, scope: ScopeRef) {
         let (heap_id, epoch, index) = unpack_handle(scope.0);
         if heap_id == self.id {
-            if self.scopes.free_slot(index, epoch) {
+            if let Some(mut freed) = self.scopes.take_free_slot(index, epoch) {
+                let slots = std::mem::take(&mut freed.slots);
+                self.recycle_scope_slots(slots);
+                drop(freed);
                 let count = self.allocs_since_gc.get();
                 if count > 0 {
                     self.allocs_since_gc.set(count - 1);
@@ -1182,7 +1291,27 @@ impl Tracer {
         }
     }
 
+    #[inline(always)]
     pub(super) fn trace_value(&mut self, value: &Value) {
+        match value {
+            Value::Object(handle) => self.mark_object(handle.clone()),
+            Value::Array(handle) => self.mark_array(handle.clone()),
+            Value::Element(handle) => self.trace_element(handle),
+            Value::Undefined
+            | Value::Uninitialized
+            | Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::ArrayIter(_)
+            | Value::String(_)
+            | Value::Symbol(_) => {}
+            other => self.trace_value_slow(other),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn trace_value_slow(&mut self, value: &Value) {
         match value {
             Value::Undefined
             | Value::Uninitialized
@@ -1860,7 +1989,47 @@ mod tests {
         assert_eq!(std::mem::size_of::<Entry<ArrayData>>(), 40);
         assert_eq!(std::mem::size_of::<vm::Closure>(), 24);
         assert_eq!(std::mem::size_of::<Value>(), 16);
+        assert_eq!(std::mem::size_of::<Slot>(), 16);
         assert_eq!(std::mem::size_of::<compiler::Op>(), 16);
+        // verify Value repr(C, u8) and Slot niche layout assumptions used by JIT
+        assert_eq!(Value::Undefined.tag(), VALUE_TAG_UNDEFINED);
+        assert_eq!(Value::Uninitialized.tag(), VALUE_TAG_UNINITIALIZED);
+        assert_eq!(Value::Null.tag(), VALUE_TAG_NULL);
+        assert_eq!(Value::Bool(true).tag(), VALUE_TAG_BOOL);
+        assert_eq!(Value::Number(1.5).tag(), VALUE_TAG_NUMBER);
+        assert_eq!(Value::ArrayIter(0).tag(), VALUE_TAG_ARRAY_ITER);
+        assert_eq!(Value::String(JsStr::new("")).tag(), VALUE_TAG_STRING);
+        assert_eq!(
+            Value::builtin(Builtin::SetTimeout).tag(),
+            VALUE_TAG_COUNT - 1
+        );
+        let data_slot = Slot::Data(Value::Number(42.5));
+        let acc_slot = Slot::accessor(None, None);
+        let data_tag = unsafe { *(&data_slot as *const Slot as *const u8) };
+        let data_num = unsafe { *((&data_slot as *const Slot as *const u8).add(8) as *const f64) };
+        let acc_tag = unsafe { *(&acc_slot as *const Slot as *const u8) };
+        assert_eq!(data_tag, VALUE_TAG_NUMBER);
+        assert_eq!(data_num, 42.5);
+        assert!(acc_tag >= VALUE_TAG_COUNT);
+        // verify Entry<JsObject> niche-packs Option<JsObject> at offset 8
+        let entry = Entry {
+            meta: Cell::new(1),
+            borrow: Cell::new(0),
+            value: UnsafeCell::new(Some(JsObject::new())),
+        };
+        let entry_base = &entry as *const Entry<JsObject> as usize;
+        let obj_addr =
+            unsafe { (*entry.value.get()).as_ref().unwrap() as *const JsObject as usize };
+        assert_eq!(
+            obj_addr - entry_base,
+            std::mem::offset_of!(Entry<JsObject>, value)
+        );
+        // verify Option<ObjectHandle> niche-packs None as 0u64 and MonoIc fits two 16-byte entries
+        assert_eq!(std::mem::size_of::<Option<ObjectHandle>>(), 8);
+        let none_bits: u64 = unsafe { std::mem::transmute(Option::<ObjectHandle>::None) };
+        assert_eq!(none_bits, 0);
+        assert_eq!(std::mem::size_of::<super::object::MonoEntry>(), 16);
+        assert_eq!(std::mem::size_of::<super::object::MonoIc>(), 32);
     }
 
     #[test]

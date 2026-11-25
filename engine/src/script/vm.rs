@@ -46,6 +46,27 @@ impl std::ops::DerefMut for Grown {
     }
 }
 
+impl Drop for Scope {
+    #[inline]
+    fn drop(&mut self) {
+        let len = self.slots.len();
+        if len == 0 {
+            return;
+        }
+        let ptr = self.slots.as_mut_ptr();
+        // safety: clear len first so unwind cannot double-drop; skip drop_glue for Copy values
+        unsafe {
+            self.slots.set_len(0);
+            for i in 0..len {
+                let slot = ptr.add(i);
+                if !(*slot).is_copy() {
+                    drop_value_slow(std::ptr::read(slot));
+                }
+            }
+        }
+    }
+}
+
 impl Scope {
     #[allow(clippy::new_ret_no_self)]
     pub(super) fn new(layout: Rc<Layout>, parent: Option<ScopeRef>) -> ScopeRef {
@@ -311,8 +332,6 @@ const FLAG_OWNS_SCOPE: u8 = 1 << 1;
 const FLAG_CONSTRUCT: u8 = 1 << 2;
 const FLAG_EVAL: u8 = 1 << 3;
 const FLAG_CALLEE_ON_STACK: u8 = 1 << 4;
-// set whenever the frame's own scope could be referenced outside this frame
-const FLAG_SCOPE_ESCAPED: u8 = 1 << 5;
 
 // rare per-frame state kept out of line so ordinary calls push zero heap allocations
 struct FrameExtra {
@@ -380,11 +399,20 @@ pub(super) struct Frame {
     pub(super) this: Value,
     function: Value,
     scopes: u16,
+    // number of nested scopes from depth 0 that may have escaped to a closure or eval
+    escaped_scopes: u16,
     flags: u8,
     extra: Option<Box<FrameExtra>>,
 }
 
 impl Frame {
+    #[inline(always)]
+    fn mark_scopes_escaped(&mut self) {
+        let needed = self.scopes.saturating_add(1);
+        if self.escaped_scopes < needed {
+            self.escaped_scopes = needed;
+        }
+    }
     #[inline(always)]
     fn uses_regs(&self) -> bool {
         self.flags & FLAG_USES_REGS != 0
@@ -461,6 +489,30 @@ impl Frame {
         self.extra
             .as_ref()
             .map_or(Value::Undefined, |extra| extra.new_target.clone())
+    }
+
+    // avoids out-of-line drop_glue::<Value> calls for this/function on every return;
+    // returns Some(code) only when this frame held the final reference to Code
+    #[inline(always)]
+    fn fast_drop_keep_unique_code(mut self) -> Option<Rc<Code>> {
+        let this = std::mem::replace(&mut self.this, Value::Undefined);
+        let function = std::mem::replace(&mut self.function, Value::Undefined);
+        this.fast_drop();
+        function.fast_drop();
+        let md = std::mem::ManuallyDrop::new(self);
+        // safety: this/function are Undefined (Copy); drop remaining fields in place
+        unsafe {
+            std::ptr::drop_in_place(&md.closure as *const _ as *mut Option<Rc<Closure>>);
+            std::ptr::drop_in_place(&md.scope as *const _ as *mut Option<ScopeRef>);
+            std::ptr::drop_in_place(&md.extra as *const _ as *mut Option<Box<FrameExtra>>);
+            let code = std::ptr::read(&md.code);
+            if Rc::strong_count(&code) == 1 {
+                Some(code)
+            } else {
+                drop(code);
+                None
+            }
+        }
     }
 }
 
@@ -572,7 +624,7 @@ fn fast_compare(op: super::ast::BinaryOperator, left: &Value, right: &Value) -> 
     }
 }
 
-enum FastNativeCall {
+pub(super) enum FastNativeCall {
     NotHandled,
     Done,
     FramePushed,
@@ -898,6 +950,7 @@ impl ScriptRuntime {
                 this,
                 function: Value::Undefined,
                 scopes: 0,
+                escaped_scopes: 0,
                 flags: FLAG_USES_REGS | FLAG_CALLEE_ON_STACK,
                 extra: None,
             });
@@ -927,6 +980,7 @@ impl ScriptRuntime {
                 this,
                 function: Value::Undefined,
                 scopes: 0,
+                escaped_scopes: 0,
                 flags: FLAG_OWNS_SCOPE | FLAG_CALLEE_ON_STACK,
                 extra: None,
             });
@@ -1455,8 +1509,10 @@ impl ScriptRuntime {
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
         match callee {
-            Value::Builtin(Builtin::Native(native)) => self.call_native(&native, this, arguments),
-            Value::Builtin(builtin) => self.call_builtin(builtin, arguments),
+            Value::Builtin(builtin) => match builtin.as_ref() {
+                Builtin::Native(native) => self.call_native(native, this, arguments),
+                _ => self.call_builtin(builtin, arguments),
+            },
             other if is_callable(&other) => self.call_host_constructor(other, arguments),
             other => Err(self.type_error(format!("{} is not a function", other.string_value()))),
         }
@@ -1783,14 +1839,45 @@ impl ScriptRuntime {
         }
     }
 
-    fn restore_scopes(frame: &mut Frame, target: u16) {
+    fn restore_scopes_fast(heap: &super::heap::Heap, frame: &mut Frame, target: u16) {
         while frame.scopes > target {
-            let parent = frame
-                .scope
-                .as_ref()
-                .and_then(|scope| scope.borrow().parent.clone());
+            let depth = frame.scopes;
+            let popped = frame.scope.take();
+            let parent = popped.as_ref().and_then(|scope| {
+                unsafe { heap.scope_at_ref(scope, 0) }
+                    .map(|s| s.parent.clone())
+                    .unwrap_or_else(|| scope.borrow().parent.clone())
+            });
+            if depth >= frame.escaped_scopes
+                && let Some(scope) = popped
+            {
+                heap.free_scope_fast(scope);
+            }
             frame.scope = parent;
             frame.scopes -= 1;
+            if frame.escaped_scopes > frame.scopes + 1 {
+                frame.escaped_scopes = frame.scopes + 1;
+            }
+        }
+    }
+
+    fn restore_scopes(frame: &mut Frame, target: u16) {
+        while frame.scopes > target {
+            let depth = frame.scopes;
+            let popped = frame.scope.take();
+            let parent = popped
+                .as_ref()
+                .and_then(|scope| scope.borrow().parent.clone());
+            if depth >= frame.escaped_scopes
+                && let Some(scope) = popped
+            {
+                super::heap::free_scope(scope);
+            }
+            frame.scope = parent;
+            frame.scopes -= 1;
+            if frame.escaped_scopes > frame.scopes + 1 {
+                frame.escaped_scopes = frame.scopes + 1;
+            }
         }
     }
 
@@ -2008,7 +2095,7 @@ impl ScriptRuntime {
     // caller's this, new.target, function and home object
     fn direct_eval(&mut self, source: &str) -> Result<Option<RunResult>, ScriptError> {
         let frame = self.frames.last_mut().expect("a frame is running");
-        frame.flags |= FLAG_SCOPE_ESCAPED;
+        frame.mark_scopes_escaped();
         let caller_url = frame.code.url.get().cloned();
         let (this, new_target) = if frame.code.kind == FunctionKind::Arrow {
             (
@@ -2183,15 +2270,26 @@ impl ScriptRuntime {
                 let grow = reg_count.saturating_sub(keep);
                 reserve_headroom(&mut self.vm_stack, grow + code.max_pushes as usize);
                 if keep < reg_count {
-                    self.vm_stack
-                        .resize(arg_start + reg_count, Value::Undefined);
+                    // safety: headroom for grow slots was just reserved above
+                    unsafe {
+                        let ptr = self.vm_stack.as_mut_ptr().add(arg_start + keep);
+                        for i in 0..grow {
+                            ptr.add(i).write(Value::Undefined);
+                        }
+                        self.vm_stack.set_len(arg_start + reg_count);
+                    }
                 }
             } else {
                 // duplicate parameter names in sloppy mode: last occurrence wins
                 let mut args = self.vm_stack.split_off(arg_start);
                 reserve_headroom(&mut self.vm_stack, reg_count + code.max_pushes as usize);
-                self.vm_stack
-                    .resize(arg_start + reg_count, Value::Undefined);
+                unsafe {
+                    let ptr = self.vm_stack.as_mut_ptr().add(arg_start);
+                    for i in 0..reg_count {
+                        ptr.add(i).write(Value::Undefined);
+                    }
+                    self.vm_stack.set_len(arg_start + reg_count);
+                }
                 for (position, slot) in code.param_slots.iter().enumerate() {
                     if let Some(slot) = slot {
                         self.vm_stack[arg_start + *slot as usize] = match args.get_mut(position) {
@@ -2218,18 +2316,19 @@ impl ScriptRuntime {
                 this,
                 function: Value::Undefined,
                 scopes: 0,
+                escaped_scopes: 0,
                 flags: FLAG_USES_REGS | FLAG_CALLEE_ON_STACK,
                 extra: None,
             });
             return true;
         }
-        let mut slots = vec![Value::Undefined; code.layout.names.len()];
+        let mut slots = heap.alloc_scope_slots(code.layout.names.len(), false);
         if code.simple_params {
             // every parameter is written, the ones past the arguments as undefined, so the
             // last of two parameters with one name decides its value
             for (position, slot) in code.param_slots.iter().enumerate() {
                 if let Some(slot) = slot {
-                    slots[*slot as usize] = if position < count {
+                    let arg = if position < count {
                         std::mem::replace(
                             unsafe { self.vm_stack.get_unchecked_mut(arg_start + position) },
                             Value::Undefined,
@@ -2237,6 +2336,9 @@ impl ScriptRuntime {
                     } else {
                         Value::Undefined
                     };
+                    let old =
+                        std::mem::replace(unsafe { slots.get_unchecked_mut(*slot as usize) }, arg);
+                    old.fast_drop();
                 }
             }
             truncate_stack(&mut self.vm_stack, arg_start);
@@ -2274,6 +2376,7 @@ impl ScriptRuntime {
             this,
             function: Value::Undefined,
             scopes: 0,
+            escaped_scopes: 0,
             flags: FLAG_OWNS_SCOPE | FLAG_CALLEE_ON_STACK,
             extra: None,
         });
@@ -2302,17 +2405,23 @@ impl ScriptRuntime {
             ArrayPop,
             ArrayIsArray,
             FunctionCall,
+            Bound,
             Collection(super::collections::CollectionMethod),
             ObjectGetOwnPropertyDescriptor,
             Dom(super::interfaces::DomMember),
         }
         let hot = match unsafe { self.vm_stack.get_unchecked(callee_at) } {
-            Value::Builtin(Builtin::ArrayIsArray) => HotNative::ArrayIsArray,
+            Value::Builtin(b) if matches!(b.as_ref(), Builtin::ArrayIsArray) => {
+                HotNative::ArrayIsArray
+            }
             Value::Object(object) => {
                 let Some(borrowed) = (unsafe { heap.object_ref(object) }) else {
                     return Ok(FastNativeCall::NotHandled);
                 };
                 match &borrowed.class {
+                    ObjectClass::Bound(bound) if bound.arguments.len() + count <= 16 => {
+                        HotNative::Bound
+                    }
                     ObjectClass::Native(native) => match native.as_ref() {
                         Native::String(m) if count <= 4 => HotNative::String(*m),
                         Native::Array(super::arrays::ArrayMethod::Push) if method => {
@@ -2368,7 +2477,8 @@ impl ScriptRuntime {
                     self.vm_stack.set_len(return_base);
                     this
                 };
-                let result = self.call_string_method_slice(string_method, this, &args[..count]);
+                let result = self.call_string_method_slice(string_method, &this, &args[..count]);
+                this.fast_drop();
                 for slot in &mut args[..count] {
                     std::mem::replace(slot, Value::Undefined).fast_drop();
                 }
@@ -2376,6 +2486,57 @@ impl ScriptRuntime {
                 std::mem::forget(args);
                 self.vm_stack.push(result?);
                 Ok(FastNativeCall::Done)
+            }
+            HotNative::Bound => {
+                let Value::Object(bound_handle) =
+                    (unsafe { self.vm_stack.get_unchecked(callee_at).clone() })
+                else {
+                    return Ok(FastNativeCall::NotHandled);
+                };
+                let (target, bound_this, bound_len, mut bound_args) = {
+                    let Some(borrowed) = (unsafe { heap.object_ref(&bound_handle) }) else {
+                        return Ok(FastNativeCall::NotHandled);
+                    };
+                    let ObjectClass::Bound(bound) = &borrowed.class else {
+                        return Ok(FastNativeCall::NotHandled);
+                    };
+                    let mut buf: [Value; 16] = [const { Value::Undefined }; 16];
+                    let blen = bound.arguments.len();
+                    for (dst, src) in buf.iter_mut().take(blen).zip(bound.arguments.iter()) {
+                        *dst = src.clone();
+                    }
+                    (bound.target.clone(), bound.this.clone(), blen, buf)
+                };
+                let new_count = bound_len + count;
+                // rewrite [..., (orig_this?), bound_fn, a0..aN] -> [..., bound_this, target, b0..bM, a0..aN]
+                let extra_slots = bound_len + usize::from(!method);
+                reserve_headroom(&mut self.vm_stack, extra_slots);
+                unsafe {
+                    let ptr = self.vm_stack.as_mut_ptr();
+                    if method {
+                        std::ptr::read(ptr.add(return_base)).fast_drop();
+                    }
+                    let new_arg_start = return_base + 2;
+                    if count > 0 {
+                        std::ptr::copy(
+                            ptr.add(arg_start),
+                            ptr.add(new_arg_start + bound_len),
+                            count,
+                        );
+                    }
+                    ptr.add(return_base).write(bound_this);
+                    ptr.add(return_base + 1).write(target);
+                    for (i, slot) in bound_args.iter_mut().take(bound_len).enumerate() {
+                        ptr.add(new_arg_start + i)
+                            .write(std::mem::replace(slot, Value::Undefined));
+                    }
+                    std::mem::forget(bound_args);
+                    self.vm_stack.set_len(new_arg_start + new_count);
+                }
+                if self.call_plain(heap, new_count, true) {
+                    return Ok(FastNativeCall::FramePushed);
+                }
+                Ok(FastNativeCall::FallbackMethod(new_count))
             }
             HotNative::ArrayIsArray => {
                 let is_arr = if count == 0 {
@@ -2819,6 +2980,11 @@ impl ScriptRuntime {
         let mut block_start: usize = pc;
         let mut safepoint_at: u64 = self.safepoint_target(sampling);
         reserve_headroom(&mut self.vm_stack, unsafe { (&*code).max_pushes as usize });
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        let mut try_jit = true;
         macro_rules! reload_frame {
             () => {
                 top = self.frames.len() - 1;
@@ -2829,9 +2995,70 @@ impl ScriptRuntime {
                 reg_base = frame.reg_base;
                 block_start = pc;
                 reserve_headroom(&mut self.vm_stack, unsafe { (&*code).max_pushes as usize });
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                {
+                    try_jit = true;
+                }
             };
         }
         loop {
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            if try_jit {
+                try_jit = false;
+                loop {
+                    let code_ref = unsafe { &*code };
+                    let jit_opt = if let Some(cached) = code_ref.jit_code.get() {
+                        cached.as_ref()
+                    } else {
+                        let hits = code_ref.jit_hits.get().wrapping_add(1);
+                        code_ref.jit_hits.set(hits);
+                        if hits >= super::jit::JIT_THRESHOLD {
+                            let compiled = super::jit::compile(code_ref);
+                            let _ = code_ref.jit_code.set(compiled);
+                            code_ref.jit_code.get().and_then(Option::as_ref)
+                        } else {
+                            None
+                        }
+                    };
+                    let Some(jit) = jit_opt else {
+                        break;
+                    };
+                    // keep Rc<Code> (and its executable JitCode buffer) alive even if Op::Return
+                    // pops the last frame referencing this Code before the JIT epilogue runs
+                    let _keep_code = unsafe { self.frames.get_unchecked(top) }.code.clone();
+                    match super::jit::run_jit_frame(
+                        self,
+                        jit,
+                        heap_ptr,
+                        top,
+                        pc,
+                        frame_floor,
+                        sampling,
+                        &mut safepoint_at,
+                    ) {
+                        super::jit::JitOutcome::FrameChanged => {
+                            top = self.frames.len() - 1;
+                            let frame = unsafe { self.frames.get_unchecked(top) };
+                            code = Rc::as_ptr(&frame.code);
+                            ops_ptr = unsafe { (&*code).ops.as_ptr() };
+                            pc = frame.pc;
+                            reg_base = frame.reg_base;
+                            block_start = pc;
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
+                        }
+                        super::jit::JitOutcome::Done(result) => return Ok(result),
+                        super::jit::JitOutcome::Error(error) => return Err(error),
+                    }
+                }
+            }
             // safety: self.frames[top] owns Rc<Code> until frames changes, at which point we reload
             let op_pc = pc;
             debug_assert!(op_pc < unsafe { (&*code).ops.len() });
@@ -3218,14 +3445,14 @@ impl ScriptRuntime {
                     let layout = unsafe { (&*code).blocks.get_unchecked(block as usize).clone() };
                     let frame = unsafe { self.frames.get_unchecked_mut(top) };
                     let parent = frame.scope.clone();
-                    let slots = vec![Value::Uninitialized; layout.names.len()];
-                    let scope = unsafe { &*heap_ptr }.alloc_scope_fast(Scope {
+                    let heap = unsafe { &*heap_ptr };
+                    let slots = heap.alloc_scope_slots(layout.names.len(), true);
+                    let scope = heap.alloc_scope_fast(Scope {
                         slots,
                         parent,
                         layout,
                         extra: Grown::default(),
                     });
-                    frame.flags |= FLAG_SCOPE_ESCAPED;
                     frame.scope = Some(scope);
                     frame.scopes += 1;
                 }
@@ -3233,51 +3460,67 @@ impl ScriptRuntime {
                     let layout = unsafe { (&*code).blocks.get_unchecked(block as usize).clone() };
                     let frame = unsafe { self.frames.get_unchecked_mut(top) };
                     let parent = frame.scope.clone();
-                    let slots = vec![Value::Undefined; layout.names.len()];
-                    let scope = unsafe { &*heap_ptr }.alloc_scope_fast(Scope {
+                    let heap = unsafe { &*heap_ptr };
+                    let slots = heap.alloc_scope_slots(layout.names.len(), false);
+                    let scope = heap.alloc_scope_fast(Scope {
                         slots,
                         parent,
                         layout,
                         extra: Grown::default(),
                     });
-                    frame.flags |= FLAG_SCOPE_ESCAPED;
                     frame.scope = Some(scope);
                     frame.scopes += 1;
                 }
                 Op::PopScope => {
                     let frame = unsafe { self.frames.get_unchecked_mut(top) };
                     if frame.scopes > 0 {
-                        let parent = frame.scope.as_ref().and_then(|scope| {
+                        let depth = frame.scopes;
+                        let popped = frame.scope.take();
+                        let parent = popped.as_ref().and_then(|scope| {
                             unsafe { (&*heap_ptr).scope_at_ref(scope, 0) }
                                 .map(|s| s.parent.clone())
                                 .unwrap_or_else(|| scope.borrow().parent.clone())
                         });
+                        if depth >= frame.escaped_scopes
+                            && let Some(scope) = popped
+                        {
+                            unsafe { &*heap_ptr }.free_scope_fast(scope);
+                        }
                         frame.scope = parent;
                         frame.scopes -= 1;
+                        if frame.escaped_scopes > frame.scopes + 1 {
+                            frame.escaped_scopes = frame.scopes + 1;
+                        }
                     }
                 }
                 Op::CloneScope => {
                     let frame = unsafe { self.frames.get_unchecked_mut(top) };
-                    frame.flags |= FLAG_SCOPE_ESCAPED;
-                    let current = frame.scope.as_ref().expect("a scope to copy");
-                    let cloned =
-                        if let Some(scope) = unsafe { (&*heap_ptr).scope_at_ref(current, 0) } {
-                            Scope {
-                                slots: scope.slots.clone(),
-                                parent: scope.parent.clone(),
-                                layout: scope.layout.clone(),
-                                extra: scope.extra.clone(),
-                            }
-                        } else {
-                            let scope = current.borrow();
-                            Scope {
-                                slots: scope.slots.clone(),
-                                parent: scope.parent.clone(),
-                                layout: scope.layout.clone(),
-                                extra: scope.extra.clone(),
-                            }
-                        };
-                    frame.scope = Some(unsafe { &*heap_ptr }.alloc_scope_fast(cloned));
+                    let depth = frame.scopes;
+                    let current = frame.scope.take().expect("a scope to copy");
+                    let heap = unsafe { &*heap_ptr };
+                    let cloned = if let Some(scope) = unsafe { heap.scope_at_ref(&current, 0) } {
+                        Scope {
+                            slots: heap.clone_scope_slots(&scope.slots),
+                            parent: scope.parent.clone(),
+                            layout: scope.layout.clone(),
+                            extra: scope.extra.clone(),
+                        }
+                    } else {
+                        let scope = current.borrow();
+                        Scope {
+                            slots: heap.clone_scope_slots(&scope.slots),
+                            parent: scope.parent.clone(),
+                            layout: scope.layout.clone(),
+                            extra: scope.extra.clone(),
+                        }
+                    };
+                    if depth > 0 && depth >= frame.escaped_scopes {
+                        heap.free_scope_fast(current);
+                    }
+                    if frame.escaped_scopes > depth {
+                        frame.escaped_scopes = depth;
+                    }
+                    frame.scope = Some(heap.alloc_scope_fast(cloned));
                 }
                 Op::This => {
                     let frame = unsafe { self.frames.get_unchecked(top) };
@@ -3414,6 +3657,13 @@ impl ScriptRuntime {
                         reserve_headroom(&mut self.vm_stack, unsafe {
                             (&*code).max_pushes as usize
                         });
+                        #[cfg(all(
+                            target_arch = "x86_64",
+                            any(target_os = "windows", target_os = "linux")
+                        ))]
+                        {
+                            try_jit = true;
+                        }
                     }
                     pc = target;
                     block_start = pc;
@@ -3693,7 +3943,7 @@ impl ScriptRuntime {
                     let scope = if child.captures_nothing {
                         None
                     } else {
-                        frame.flags |= FLAG_SCOPE_ESCAPED;
+                        frame.mark_scopes_escaped();
                         frame.scope.clone()
                     };
                     let home = if child.kind == FunctionKind::Arrow {
@@ -4730,12 +4980,16 @@ impl ScriptRuntime {
                         if self.vm_iters.len() > finished.iter_base as usize {
                             self.vm_iters.truncate(finished.iter_base as usize);
                         }
-                        if (finished.flags & (FLAG_OWNS_SCOPE | FLAG_SCOPE_ESCAPED))
-                            == FLAG_OWNS_SCOPE
+                        if finished.scopes > 0 {
+                            Self::restore_scopes_fast(unsafe { &*heap_ptr }, &mut finished, 0);
+                        }
+                        if (finished.flags & FLAG_OWNS_SCOPE) != 0
+                            && finished.escaped_scopes == 0
                             && let Some(scope) = finished.scope.take()
                         {
                             unsafe { &*heap_ptr }.free_scope_fast(scope);
                         }
+                        let _ = finished.fast_drop_keep_unique_code();
                         if self.frames.len() == frame_floor {
                             return Ok(RunResult::Return(value));
                         }
@@ -4756,6 +5010,1699 @@ impl ScriptRuntime {
                     reload_frame!();
                 }
             }
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn jit_hit_safepoint(
+        &mut self,
+        sampling: bool,
+        pc: usize,
+    ) -> Result<u64, ScriptError> {
+        self.hit_safepoint(sampling, pc)
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn jit_call_plain(
+        &mut self,
+        heap: &super::heap::Heap,
+        count: usize,
+        method: bool,
+    ) -> bool {
+        self.call_plain(heap, count, method)
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn jit_call_fast_native(
+        &mut self,
+        heap: &super::heap::Heap,
+        count: usize,
+        method: bool,
+    ) -> Result<FastNativeCall, ScriptError> {
+        self.call_fast_native(heap, count, method)
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn jit_call_in_loop_stack(
+        &mut self,
+        count: usize,
+        method: bool,
+    ) -> Result<(), ScriptError> {
+        let arguments = self.pop_arguments(count);
+        let callee = pop_fast(&mut self.vm_stack);
+        let this = if method {
+            pop_fast(&mut self.vm_stack)
+        } else {
+            Value::Undefined
+        };
+        let _ = self.call_in_loop(callee, this, arguments)?;
+        Ok(())
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn jit_return(
+        &mut self,
+        heap: &super::heap::Heap,
+        top: usize,
+        frame_floor: usize,
+    ) -> Result<(Option<RunResult>, Option<Rc<Code>>), ScriptError> {
+        let value = pop_fast(&mut self.vm_stack);
+        let frame = unsafe { self.frames.get_unchecked(top) };
+        if self.vm_handlers.len() == frame.handler_base as usize && !frame.construct() {
+            let mut finished = self.frames.pop().expect("a frame is running");
+            truncate_stack(&mut self.vm_stack, finished.return_base);
+            if self.vm_chains.len() > finished.chain_base as usize {
+                self.vm_chains.truncate(finished.chain_base as usize);
+            }
+            if self.vm_pending.len() > finished.pending_base as usize {
+                self.vm_pending.truncate(finished.pending_base as usize);
+            }
+            if self.vm_iters.len() > finished.iter_base as usize {
+                self.vm_iters.truncate(finished.iter_base as usize);
+            }
+            if finished.scopes > 0 {
+                Self::restore_scopes_fast(heap, &mut finished, 0);
+            }
+            if (finished.flags & FLAG_OWNS_SCOPE) != 0
+                && finished.escaped_scopes == 0
+                && let Some(scope) = finished.scope.take()
+            {
+                heap.free_scope_fast(scope);
+            }
+            let keep_code = finished.fast_drop_keep_unique_code();
+            if self.frames.len() == frame_floor {
+                return Ok((Some(RunResult::Return(value)), keep_code));
+            }
+            self.vm_stack.push(value);
+            return Ok((None, keep_code));
+        }
+        let code_keep = unsafe { self.frames.get_unchecked(top) }.code.clone();
+        Ok((self.do_return(frame_floor, value)?, Some(code_keep)))
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline(always)]
+    pub(super) fn jit_ic_get_value_only(
+        &self,
+        heap: &super::heap::Heap,
+        receiver: &Value,
+        cache: &super::object::PropIc,
+    ) -> Option<Value> {
+        match self.ic_get_value(heap, receiver, cache) {
+            Some(super::object::IcGetHit::Value(v)) => Some(v),
+            Some(super::object::IcGetHit::Missing) => Some(Value::Undefined),
+            _ => None,
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline(always)]
+    pub(super) fn jit_try_fast_get_index(
+        heap: &super::heap::Heap,
+        object: &Value,
+        key: &Value,
+    ) -> Option<Value> {
+        Self::try_fast_get_index(heap, object, key)
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline(always)]
+    pub(super) fn jit_try_fast_set_index(
+        heap: &super::heap::Heap,
+        object: &Value,
+        key: &Value,
+        value: Value,
+    ) -> Result<(), Value> {
+        Self::try_fast_set_index(heap, object, key, value)
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_new_object(&self, heap: &super::heap::Heap) -> Value {
+        let object = heap.alloc_object_fast(JsObject::with_prototype(
+            Some(self.intrinsics.object_prototype.clone()),
+            ObjectClass::Ordinary,
+        ));
+        Value::Object(object)
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) unsafe fn jit_make_object(
+        &self,
+        heap: &super::heap::Heap,
+        code: &Code,
+        template: u32,
+        src: *const Value,
+    ) -> Value {
+        let (keys, cell) = unsafe { code.object_shapes.get_unchecked(template as usize) };
+        let shape = cell
+            .get_or_init(|| {
+                let names: Vec<&str> = keys.iter().map(|name| &**name).collect();
+                super::object::Shape::from_keys(&names)
+            })
+            .clone();
+        let count = shape.len();
+        let mut slots = Vec::with_capacity(count);
+        for i in 0..count {
+            slots.push(Slot::Data(unsafe { std::ptr::read(src.add(i)) }));
+        }
+        let object = heap.alloc_object_fast(JsObject::from_shape(
+            shape,
+            slots,
+            Some(self.intrinsics.object_prototype.clone()),
+        ));
+        Value::Object(object)
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_make_closure(&mut self, top: usize, index: u32) -> Value {
+        let frame = unsafe { self.frames.get_unchecked_mut(top) };
+        let child = unsafe { frame.code.children.get_unchecked(index as usize).clone() };
+        let scope = if child.captures_nothing {
+            None
+        } else {
+            frame.mark_scopes_escaped();
+            frame.scope.clone()
+        };
+        let home = if child.kind == FunctionKind::Arrow {
+            frame.closure.as_ref().and_then(|closure| closure.home())
+        } else {
+            None
+        };
+        let closure = Rc::new(Closure::new(child, scope));
+        if let Some(home) = home {
+            closure.set_home_object(home);
+        }
+        self.function_object(closure)
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_get_global_fast(&self, key: &str) -> Option<Value> {
+        let global = self.global.borrow();
+        if global.accessors.is_empty() || !global.accessors.contains_key(key) {
+            match global.values.get(key) {
+                Some(Value::Uninitialized) | None => None,
+                Some(value) => Some(value.resolve()),
+            }
+        } else {
+            None
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_typeof(&self, value: &Value) -> Value {
+        Value::String(type_name(self.type_of(value)))
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_push_handler(&mut self, top: usize, sp_len: usize, catch: u32, finally: u32) {
+        let frame = unsafe { self.frames.get_unchecked(top) };
+        let stack_offset = sp_len - frame.stack_base;
+        let chains = self.vm_chains.len() - frame.chain_base as usize;
+        let iters = self.vm_iters.len() - frame.iter_base as usize;
+        self.vm_handlers.push(Handler {
+            catch,
+            finally,
+            stack: stack_offset,
+            scopes: frame.scopes,
+            chains,
+            iters,
+        });
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_pop_handler(&mut self, top: usize) {
+        let base = unsafe { self.frames.get_unchecked(top) }.handler_base as usize;
+        if self.vm_handlers.len() > base {
+            self.vm_handlers.pop();
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_completion_normal(&mut self) {
+        self.vm_pending.push(Pending::Normal);
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_chain_start(&mut self, top: usize, sp_len: usize) {
+        let offset = sp_len - unsafe { self.frames.get_unchecked(top) }.stack_base;
+        self.vm_chains.push(offset);
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_chain_end(&mut self, top: usize) {
+        let base = unsafe { self.frames.get_unchecked(top) }.chain_base as usize;
+        if self.vm_chains.len() > base {
+            self.vm_chains.pop();
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_args_iter(&mut self, slot: &mut Value) {
+        let Value::Array(array) = slot.clone() else {
+            unreachable!("arguments arrive as an array");
+        };
+        let iter_slot = self.vm_iters.len() as u32;
+        self.vm_iters.push((array, 0));
+        *slot = Value::ArrayIter(iter_slot);
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_get_iter_fast(&mut self, heap: &super::heap::Heap, slot: &mut Value) -> bool {
+        let Value::Array(array) = slot else {
+            return false;
+        };
+        let plain = unsafe { heap.array_ref(array) }.is_some_and(|a| a.extra.is_none());
+        let proto_ok = plain
+            && unsafe { heap.object_ref(&self.intrinsics.array_prototype) }
+                .is_some_and(|p| p.array_iterator_intact(&self.intrinsics.array_values));
+        if !proto_ok {
+            return false;
+        }
+        let array = array.clone();
+        let iter_slot = self.vm_iters.len() as u32;
+        self.vm_iters.push((array, 0));
+        *slot = Value::ArrayIter(iter_slot);
+        true
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_iter_value_fast(
+        &mut self,
+        heap: &super::heap::Heap,
+        slot: &Value,
+    ) -> Option<Value> {
+        let Value::ArrayIter(iter_slot) = slot else {
+            return None;
+        };
+        let (array, index) = unsafe { self.vm_iters.get_unchecked_mut(*iter_slot as usize) };
+        if *index == u32::MAX {
+            return Some(Value::Undefined);
+        }
+        let data = unsafe { heap.array_ref(array)? };
+        let idx = *index as usize;
+        if let Some(val) = data.values.get(idx) {
+            *index = (idx + 1) as u32;
+            Some(val.clone().filled())
+        } else {
+            *index = u32::MAX;
+            Some(Value::Undefined)
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_iter_step_fast(
+        &mut self,
+        heap: &super::heap::Heap,
+        slot: &Value,
+    ) -> Option<Option<Value>> {
+        let Value::ArrayIter(iter_slot) = slot else {
+            return None;
+        };
+        let (array, index) = unsafe { self.vm_iters.get_unchecked_mut(*iter_slot as usize) };
+        if *index == u32::MAX {
+            return Some(None);
+        }
+        let data = unsafe { heap.array_ref(array)? };
+        let idx = *index as usize;
+        if let Some(val) = data.values.get(idx) {
+            *index = (idx + 1) as u32;
+            Some(Some(val.clone().filled()))
+        } else {
+            *index = u32::MAX;
+            Some(None)
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_iter_close_array(&mut self, iter_slot: u32) {
+        let slot = iter_slot as usize;
+        if slot < self.vm_iters.len() {
+            self.vm_iters.truncate(slot);
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_iter_rest_fast(
+        &mut self,
+        heap: &super::heap::Heap,
+        slot: &Value,
+    ) -> Option<Value> {
+        let Value::ArrayIter(iter_slot) = slot else {
+            return None;
+        };
+        let (array, index) = unsafe { self.vm_iters.get_unchecked_mut(*iter_slot as usize) };
+        let rest = if *index == u32::MAX {
+            Vec::new()
+        } else {
+            let data = unsafe { heap.array_ref(array)? };
+            let idx = *index as usize;
+            *index = u32::MAX;
+            if idx < data.values.len() {
+                data.values[idx..]
+                    .iter()
+                    .map(|v| v.clone().filled())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        Some(Value::Array(heap.alloc_array_fast(ArrayData::from(rest))))
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_end_finally_normal(&mut self, top: usize) -> bool {
+        let pending_base = unsafe { self.frames.get_unchecked(top) }.pending_base as usize;
+        let len = self.vm_pending.len();
+        if len <= pending_base {
+            return true;
+        }
+        if matches!(
+            unsafe { self.vm_pending.get_unchecked(len - 1) },
+            Pending::Normal
+        ) {
+            self.vm_pending.pop();
+            return true;
+        }
+        false
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_push_scope(
+        &mut self,
+        heap: &super::heap::Heap,
+        top: usize,
+        block: u32,
+        is_var: bool,
+    ) -> (*mut Value, usize) {
+        let frame = unsafe { self.frames.get_unchecked_mut(top) };
+        let layout = unsafe { frame.code.blocks.get_unchecked(block as usize).clone() };
+        let parent = frame.scope.clone();
+        let grows = layout.grows;
+        let slots = heap.alloc_scope_slots(layout.names.len(), !is_var);
+        let scope = heap.alloc_scope_fast(Scope {
+            slots,
+            parent,
+            layout,
+            extra: Grown::default(),
+        });
+        let cached = if grows {
+            (std::ptr::null_mut(), 0)
+        } else if let Some(s) = unsafe { heap.scope_at_mut(&scope, 0) } {
+            (s.slots.as_mut_ptr(), s.slots.len())
+        } else {
+            (std::ptr::null_mut(), 0)
+        };
+        frame.scope = Some(scope);
+        frame.scopes += 1;
+        cached
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_pop_scope(&mut self, heap: &super::heap::Heap, top: usize) {
+        let frame = unsafe { self.frames.get_unchecked_mut(top) };
+        if frame.scopes > 0 {
+            let depth = frame.scopes;
+            let popped = frame.scope.take();
+            let parent = popped.as_ref().and_then(|scope| {
+                unsafe { heap.scope_at_ref(scope, 0) }
+                    .map(|s| s.parent.clone())
+                    .unwrap_or_else(|| scope.borrow().parent.clone())
+            });
+            if depth >= frame.escaped_scopes
+                && let Some(scope) = popped
+            {
+                heap.free_scope_fast(scope);
+            }
+            frame.scope = parent;
+            frame.scopes -= 1;
+            if frame.escaped_scopes > frame.scopes + 1 {
+                frame.escaped_scopes = frame.scopes + 1;
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(super) fn jit_clone_scope(
+        &mut self,
+        heap: &super::heap::Heap,
+        top: usize,
+    ) -> (*mut Value, usize) {
+        let frame = unsafe { self.frames.get_unchecked_mut(top) };
+        let depth = frame.scopes;
+        let current = frame.scope.take().expect("a scope to copy");
+        let cloned = if let Some(scope) = unsafe { heap.scope_at_ref(&current, 0) } {
+            Scope {
+                slots: heap.clone_scope_slots(&scope.slots),
+                parent: scope.parent.clone(),
+                layout: scope.layout.clone(),
+                extra: scope.extra.clone(),
+            }
+        } else {
+            let scope = current.borrow();
+            Scope {
+                slots: heap.clone_scope_slots(&scope.slots),
+                parent: scope.parent.clone(),
+                layout: scope.layout.clone(),
+                extra: scope.extra.clone(),
+            }
+        };
+        let grows = cloned.layout.grows;
+        if depth > 0 && depth >= frame.escaped_scopes {
+            heap.free_scope_fast(current);
+        }
+        if frame.escaped_scopes > depth {
+            frame.escaped_scopes = depth;
+        }
+        let next = heap.alloc_scope_fast(cloned);
+        let cached = if grows {
+            (std::ptr::null_mut(), 0)
+        } else if let Some(s) = unsafe { heap.scope_at_mut(&next, 0) } {
+            (s.slots.as_mut_ptr(), s.slots.len())
+        } else {
+            (std::ptr::null_mut(), 0)
+        };
+        frame.scope = Some(next);
+        cached
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn jit_get_prop_ic_or_slow(
+        &mut self,
+        heap: &super::heap::Heap,
+        top: usize,
+        op_pc: usize,
+        next_pc: usize,
+        name: u32,
+        ic: u32,
+        cache: &super::object::PropIc,
+        mode: u32,
+        safepoint_at: &mut u64,
+        sampling: bool,
+    ) -> Result<(), ScriptError> {
+        use super::object::IcGetHit;
+        let op = unsafe { *self.frames.get_unchecked(top).code.ops.get_unchecked(op_pc) };
+        let is_method = matches!(mode, 2 | 4);
+        let recv_opt = match op {
+            Op::GetProp { .. } => None,
+            Op::GetRegProp { reg, .. } | Op::GetRegMethod { reg, .. } => {
+                let reg_base = unsafe { self.frames.get_unchecked(top) }.reg_base;
+                let value = unsafe { self.vm_stack.get_unchecked(reg_base + reg as usize) };
+                if matches!(value, Value::Uninitialized) {
+                    unsafe { self.frames.get_unchecked_mut(top) }.pc = next_pc;
+                    let key = self.frames[top].code.layout.names[reg as usize].clone();
+                    return Err(
+                        self.reference_error(format!("cannot access {key} before initialization"))
+                    );
+                }
+                Some(value.clone())
+            }
+            Op::GetLocalProp { depth, index, .. } | Op::GetLocalMethod { depth, index, .. } => {
+                let fast = unsafe {
+                    self.frames
+                        .get_unchecked(top)
+                        .scope
+                        .as_ref()
+                        .and_then(|start| heap.scope_at_ref(start, depth))
+                        .and_then(|scope| match scope.slots.get(index as usize) {
+                            Some(Value::Binding(cell) | Value::ConstBinding(cell)) => {
+                                let inner = cell.borrow();
+                                (!matches!(*inner, Value::Uninitialized)).then(|| inner.clone())
+                            }
+                            Some(Value::Uninitialized) | None => None,
+                            Some(v) => Some(v.clone()),
+                        })
+                };
+                match fast {
+                    Some(v) => Some(v),
+                    None => {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = next_pc;
+                        let key = self.local_layout_name(top, depth, index);
+                        Some(self.read_local_named(top, depth, index, &key)?)
+                    }
+                }
+            }
+            _ => unreachable!(),
+        };
+        let hit = match &recv_opt {
+            Some(recv) => self.ic_get_value(heap, recv, cache),
+            None => self
+                .vm_stack
+                .last()
+                .and_then(|recv| self.ic_get_value(heap, recv, cache)),
+        };
+        match hit {
+            Some(IcGetHit::Value(value)) => {
+                if let Some(recv) = recv_opt {
+                    if is_method {
+                        self.vm_stack.push(recv);
+                    } else {
+                        recv.fast_drop();
+                    }
+                    self.vm_stack.push(value);
+                } else {
+                    let len = self.vm_stack.len();
+                    let old = std::mem::replace(
+                        unsafe { self.vm_stack.get_unchecked_mut(len - 1) },
+                        value,
+                    );
+                    old.fast_drop();
+                }
+                Ok(())
+            }
+            Some(IcGetHit::Missing) => {
+                if let Some(recv) = recv_opt {
+                    if is_method {
+                        self.vm_stack.push(recv);
+                    } else {
+                        recv.fast_drop();
+                    }
+                    self.vm_stack.push(Value::Undefined);
+                } else {
+                    let len = self.vm_stack.len();
+                    let old = std::mem::replace(
+                        unsafe { self.vm_stack.get_unchecked_mut(len - 1) },
+                        Value::Undefined,
+                    );
+                    old.fast_drop();
+                }
+                Ok(())
+            }
+            Some(IcGetHit::Getter(getter)) => {
+                if let Some(recv) = recv_opt {
+                    if is_method {
+                        let recv2 = recv.clone();
+                        self.vm_stack.push(recv);
+                        self.vm_stack.push(recv2);
+                    } else {
+                        self.vm_stack.push(recv);
+                    }
+                }
+                self.vm_stack.push(getter);
+                self.steps += 1;
+                if self.steps >= *safepoint_at {
+                    *safepoint_at = self.hit_safepoint(sampling, op_pc)?;
+                }
+                unsafe { self.frames.get_unchecked_mut(top) }.pc = next_pc;
+                if !self.call_plain(heap, 0, true)
+                    && !matches!(self.call_fast_native(heap, 0, true)?, FastNativeCall::Done)
+                {
+                    let callee = pop_fast(&mut self.vm_stack);
+                    let this = pop_fast(&mut self.vm_stack);
+                    self.call_in_loop(callee, this, Vec::new())?;
+                }
+                Ok(())
+            }
+            None => {
+                if let Some(recv) = recv_opt {
+                    if is_method {
+                        let recv2 = recv.clone();
+                        self.vm_stack.push(recv);
+                        self.vm_stack.push(recv2);
+                    } else {
+                        self.vm_stack.push(recv);
+                    }
+                }
+                unsafe { self.frames.get_unchecked_mut(top) }.pc = next_pc;
+                let _ = self.get_prop_slow(name, ic)?;
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn jit_set_prop_ic_or_slow(
+        &mut self,
+        heap: &super::heap::Heap,
+        name: u32,
+        ic: u32,
+        cache: &super::object::PropIc,
+        pop: bool,
+    ) -> Result<(), ScriptError> {
+        if pop {
+            let value = pop_fast(&mut self.vm_stack);
+            let object = pop_fast(&mut self.vm_stack);
+            let missed = match &object {
+                Value::Object(handle) => match unsafe { heap.object_mut(handle) } {
+                    Some(target) => target.ic_set_fast(handle, heap, cache, value),
+                    None => Err(value),
+                },
+                _ => Err(value),
+            };
+            if let Err(value) = missed {
+                self.set_prop_slow_with(object, value, name, ic, false)?;
+            } else {
+                object.fast_drop();
+            }
+        } else {
+            let len = self.vm_stack.len();
+            let hit = len >= 2
+                && match unsafe { self.vm_stack.get_unchecked(len - 2) } {
+                    Value::Object(handle) => {
+                        let value = unsafe { self.vm_stack.get_unchecked(len - 1).clone() };
+                        unsafe { heap.object_mut(handle) }.is_some_and(|target| {
+                            target.ic_set_fast(handle, heap, cache, value).is_ok()
+                        })
+                    }
+                    _ => false,
+                };
+            if hit {
+                let value = pop_fast(&mut self.vm_stack);
+                let old =
+                    std::mem::replace(unsafe { self.vm_stack.get_unchecked_mut(len - 2) }, value);
+                old.fast_drop();
+            } else {
+                self.set_prop_slow(name, ic)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn jit_exec_op(
+        &mut self,
+        heap: &super::heap::Heap,
+        op: Op,
+        op_pc: usize,
+        next_pc: usize,
+        frame_floor: usize,
+        safepoint_at: &mut u64,
+        sampling: bool,
+    ) -> Result<Option<RunResult>, ScriptError> {
+        let top = self.frames.len() - 1;
+        let reg_base = unsafe { self.frames.get_unchecked(top) }.reg_base;
+        let code_ptr: *const Code = Rc::as_ptr(&unsafe { self.frames.get_unchecked(top) }.code);
+        match op {
+            Op::UpdateReg {
+                reg,
+                name,
+                increment,
+                prefix,
+            } => {
+                self.update_reg_slow(top, reg, name, increment, prefix)?;
+                Ok(None)
+            }
+            Op::UpdateRegPop { reg, increment } => {
+                let name = unsafe { (&*code_ptr).layout.names[reg as usize].clone() };
+                self.update_reg_slow_named(top, reg, &name, increment, false)?;
+                pop_fast(&mut self.vm_stack).fast_drop();
+                Ok(None)
+            }
+            Op::UninitRegs { index, count } => {
+                let start = reg_base + index as usize;
+                let end = start + count as usize;
+                for slot in &mut self.vm_stack[start..end] {
+                    let old = std::mem::replace(slot, Value::Uninitialized);
+                    old.fast_drop();
+                }
+                Ok(None)
+            }
+            Op::GetLocal { depth, index, name } => {
+                let fast = unsafe {
+                    self.frames
+                        .get_unchecked(top)
+                        .scope
+                        .as_ref()
+                        .and_then(|start| heap.scope_at_ref(start, depth))
+                        .and_then(|scope| match scope.slots.get(index as usize) {
+                            Some(Value::Binding(cell) | Value::ConstBinding(cell)) => {
+                                let inner = cell.borrow();
+                                (!matches!(*inner, Value::Uninitialized)).then(|| inner.clone())
+                            }
+                            Some(Value::Uninitialized) | None => None,
+                            Some(v) => Some(v.clone()),
+                        })
+                };
+                let value = match fast {
+                    Some(v) => v,
+                    None => self.read_local(top, depth, index, name)?,
+                };
+                self.vm_stack.push(value);
+                Ok(None)
+            }
+            Op::SetLocal { depth, index, name } => {
+                let value = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
+                let written = unsafe {
+                    self.frames
+                        .get_unchecked(top)
+                        .scope
+                        .as_ref()
+                        .and_then(|start| heap.scope_at_mut(start, depth))
+                        .and_then(|scope| match scope.slots.get_mut(index as usize) {
+                            Some(
+                                Value::Binding(_) | Value::ConstBinding(_) | Value::Uninitialized,
+                            )
+                            | None => None,
+                            Some(slot) => Some(slot),
+                        })
+                };
+                if let Some(slot) = written {
+                    let old = std::mem::replace(slot, value);
+                    old.fast_drop();
+                } else {
+                    self.write_local(top, depth, index, name, value)?;
+                }
+                Ok(None)
+            }
+            Op::SetLocalPop { depth, index } => {
+                let value = pop_fast(&mut self.vm_stack);
+                let written = unsafe {
+                    self.frames
+                        .get_unchecked(top)
+                        .scope
+                        .as_ref()
+                        .and_then(|start| heap.scope_at_mut(start, depth))
+                        .and_then(|scope| match scope.slots.get_mut(index as usize) {
+                            Some(
+                                Value::Binding(_) | Value::ConstBinding(_) | Value::Uninitialized,
+                            )
+                            | None => None,
+                            Some(slot) => Some(slot),
+                        })
+                };
+                if let Some(slot) = written {
+                    let old = std::mem::replace(slot, value);
+                    old.fast_drop();
+                } else {
+                    let name = self.local_layout_name(top, depth, index);
+                    self.write_local_named(top, depth, index, &name, value)?;
+                }
+                Ok(None)
+            }
+            Op::InitLocal { depth, index } => {
+                let value = pop_fast(&mut self.vm_stack);
+                if let Some(scope) = unsafe {
+                    self.frames
+                        .get_unchecked(top)
+                        .scope
+                        .as_ref()
+                        .and_then(|start| heap.scope_at_mut(start, depth))
+                } {
+                    match &scope.slots[index as usize] {
+                        Value::Binding(cell) | Value::ConstBinding(cell) => {
+                            let old = std::mem::replace(&mut *cell.borrow_mut(), value);
+                            old.fast_drop();
+                        }
+                        _ => {
+                            let old = std::mem::replace(&mut scope.slots[index as usize], value);
+                            old.fast_drop();
+                        }
+                    }
+                } else {
+                    let scope_ref = Self::scope_at(&self.frames[top], depth);
+                    let mut scope = scope_ref.borrow_mut();
+                    match &scope.slots[index as usize] {
+                        Value::Binding(cell) | Value::ConstBinding(cell) => {
+                            let old = std::mem::replace(&mut *cell.borrow_mut(), value);
+                            old.fast_drop();
+                        }
+                        _ => {
+                            let old = std::mem::replace(&mut scope.slots[index as usize], value);
+                            old.fast_drop();
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Op::UpdateLocal {
+                depth,
+                index,
+                name,
+                increment,
+                prefix,
+            } => {
+                let fast = unsafe {
+                    self.frames
+                        .get_unchecked(top)
+                        .scope
+                        .as_ref()
+                        .and_then(|start| heap.scope_at_mut(start, depth))
+                        .and_then(|scope| {
+                            let Value::Number(slot) = scope.slots.get_mut(index as usize)? else {
+                                return None;
+                            };
+                            let old = *slot;
+                            let new = if increment { old + 1.0 } else { old - 1.0 };
+                            *slot = new;
+                            Some(Value::Number(if prefix { new } else { old }))
+                        })
+                };
+                match fast {
+                    Some(v) => self.vm_stack.push(v),
+                    None => self.update_local_slow(top, depth, index, name, increment, prefix)?,
+                }
+                Ok(None)
+            }
+            Op::UpdateLocalPop {
+                depth,
+                index,
+                increment,
+            } => {
+                let fast = unsafe {
+                    self.frames
+                        .get_unchecked(top)
+                        .scope
+                        .as_ref()
+                        .and_then(|start| heap.scope_at_mut(start, depth))
+                        .is_some_and(|scope| {
+                            if let Some(Value::Number(slot)) = scope.slots.get_mut(index as usize) {
+                                *slot = if increment { *slot + 1.0 } else { *slot - 1.0 };
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                };
+                if !fast {
+                    let name = self.local_layout_name(top, depth, index);
+                    self.update_local_slow_named(top, depth, index, &name, increment, false)?;
+                    pop_fast(&mut self.vm_stack).fast_drop();
+                }
+                Ok(None)
+            }
+            Op::GetLocalProp { name, ic, .. } => {
+                let cache = unsafe { (&*code_ptr).ics.get_unchecked(ic as usize) };
+                self.jit_get_prop_ic_or_slow(
+                    heap,
+                    top,
+                    op_pc,
+                    next_pc,
+                    name,
+                    ic,
+                    cache,
+                    3,
+                    safepoint_at,
+                    sampling,
+                )?;
+                Ok(None)
+            }
+            Op::GetLocalMethod { name, ic, .. } => {
+                let cache = unsafe { (&*code_ptr).ics.get_unchecked(ic as usize) };
+                self.jit_get_prop_ic_or_slow(
+                    heap,
+                    top,
+                    op_pc,
+                    next_pc,
+                    name,
+                    ic,
+                    cache,
+                    4,
+                    safepoint_at,
+                    sampling,
+                )?;
+                Ok(None)
+            }
+            Op::GetGlobal(name) => {
+                let key: &str = unsafe { (&*code_ptr).names.get_unchecked(name as usize) };
+                let fast = {
+                    let global = self.global.borrow();
+                    if global.accessors.is_empty() || !global.accessors.contains_key(key) {
+                        match global.values.get(key) {
+                            Some(Value::Uninitialized) | None => None,
+                            Some(v) => Some(v.resolve()),
+                        }
+                    } else {
+                        None
+                    }
+                };
+                let value = match fast {
+                    Some(v) => v,
+                    None => {
+                        let key = unsafe { (&*code_ptr).names[name as usize].clone() };
+                        self.get_global(&key)?
+                    }
+                };
+                self.vm_stack.push(value);
+                Ok(None)
+            }
+            Op::This => {
+                let frame = unsafe { self.frames.get_unchecked(top) };
+                if matches!(frame.this, Value::Uninitialized) {
+                    return Err(
+                        self.reference_error("must call super constructor before accessing this")
+                    );
+                }
+                let this = frame.this.clone();
+                self.vm_stack.push(this);
+                Ok(None)
+            }
+            Op::TypeOf => {
+                let value = pop_fast(&mut self.vm_stack);
+                let kind = self.type_of(&value);
+                value.fast_drop();
+                self.vm_stack.push(Value::String(type_name(kind)));
+                Ok(None)
+            }
+            Op::ToPropertyKey | Op::ToIndexKey => {
+                let value = pop_fast(&mut self.vm_stack);
+                let key = self.coerce_key(value)?;
+                self.vm_stack.push(Value::String(key.into()));
+                Ok(None)
+            }
+            Op::Negate => {
+                let value = pop_fast(&mut self.vm_stack);
+                let result = self.negate_numeric(value)?;
+                self.vm_stack.push(result);
+                Ok(None)
+            }
+            Op::Plus => {
+                let value = pop_fast(&mut self.vm_stack);
+                let number = self.coerce_number(value)?;
+                self.vm_stack.push(Value::Number(number));
+                Ok(None)
+            }
+            Op::Increment | Op::Decrement => {
+                let value = pop_fast(&mut self.vm_stack);
+                let delta = if matches!(op, Op::Increment) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let delta_i = if matches!(op, Op::Increment) { 1 } else { -1 };
+                let result = match self.coerce_numeric(value)? {
+                    Value::BigInt(v) => {
+                        Value::BigInt(Rc::new(v.add(&super::bigint::BigInt::from_i64(delta_i))))
+                    }
+                    numeric => Value::Number(self.coerce_number(numeric)? + delta),
+                };
+                self.vm_stack.push(result);
+                Ok(None)
+            }
+            Op::Binary(operator) => {
+                let right = pop_fast(&mut self.vm_stack);
+                let left = pop_fast(&mut self.vm_stack);
+                let result = self.binary(operator, left, right)?;
+                self.vm_stack.push(result);
+                Ok(None)
+            }
+            Op::BinaryRegs {
+                left,
+                right,
+                op: operator,
+            } => {
+                let left_ref = unsafe { self.vm_stack.get_unchecked(reg_base + left as usize) };
+                if matches!(left_ref, Value::Uninitialized) {
+                    let name = unsafe { (&*code_ptr).layout.names[left as usize].clone() };
+                    return Err(
+                        self.reference_error(format!("cannot access {name} before initialization"))
+                    );
+                }
+                let right_ref = unsafe { self.vm_stack.get_unchecked(reg_base + right as usize) };
+                if matches!(right_ref, Value::Uninitialized) {
+                    let name = unsafe { (&*code_ptr).layout.names[right as usize].clone() };
+                    return Err(
+                        self.reference_error(format!("cannot access {name} before initialization"))
+                    );
+                }
+                let l = left_ref.clone();
+                let r = right_ref.clone();
+                let result = self.binary(operator, l, r)?;
+                self.vm_stack.push(result);
+                Ok(None)
+            }
+            Op::JumpIfNotCompare {
+                op: operator,
+                target,
+            } => {
+                let right = pop_fast(&mut self.vm_stack);
+                let left = pop_fast(&mut self.vm_stack);
+                let result = self.binary(operator, left, right)?;
+                let passed = result.truthy();
+                result.fast_drop();
+                if !passed {
+                    let target = target as usize;
+                    if target <= op_pc {
+                        self.steps += 1;
+                        if self.steps >= *safepoint_at {
+                            *safepoint_at = self.hit_safepoint(sampling, target)?;
+                        }
+                    }
+                    unsafe { self.frames.get_unchecked_mut(top) }.pc = target;
+                }
+                Ok(None)
+            }
+            Op::JumpIfNotCompareRegs {
+                left,
+                right,
+                op: operator,
+                target,
+            } => {
+                let left_ref = unsafe { self.vm_stack.get_unchecked(reg_base + left as usize) };
+                if matches!(left_ref, Value::Uninitialized) {
+                    let name = unsafe { (&*code_ptr).layout.names[left as usize].clone() };
+                    return Err(
+                        self.reference_error(format!("cannot access {name} before initialization"))
+                    );
+                }
+                let right_ref = unsafe { self.vm_stack.get_unchecked(reg_base + right as usize) };
+                if matches!(right_ref, Value::Uninitialized) {
+                    let name = unsafe { (&*code_ptr).layout.names[right as usize].clone() };
+                    return Err(
+                        self.reference_error(format!("cannot access {name} before initialization"))
+                    );
+                }
+                let l = left_ref.clone();
+                let r = right_ref.clone();
+                let result = self.binary(operator, l, r)?;
+                let passed = result.truthy();
+                result.fast_drop();
+                if !passed {
+                    let target = target as usize;
+                    if target <= op_pc {
+                        self.steps += 1;
+                        if self.steps >= *safepoint_at {
+                            *safepoint_at = self.hit_safepoint(sampling, target)?;
+                        }
+                    }
+                    unsafe { self.frames.get_unchecked_mut(top) }.pc = target;
+                }
+                Ok(None)
+            }
+            Op::NewObject => {
+                let object = heap.alloc_object_fast(JsObject::with_prototype(
+                    Some(self.intrinsics.object_prototype.clone()),
+                    ObjectClass::Ordinary,
+                ));
+                self.vm_stack.push(Value::Object(object));
+                Ok(None)
+            }
+            Op::MakeObject(template) => {
+                let (keys, cell) =
+                    unsafe { (&*code_ptr).object_shapes.get_unchecked(template as usize) };
+                let shape = cell
+                    .get_or_init(|| {
+                        let names: Vec<&str> = keys.iter().map(|name| &**name).collect();
+                        super::object::Shape::from_keys(&names)
+                    })
+                    .clone();
+                let count = shape.len();
+                let start = self.vm_stack.len() - count;
+                let mut slots = Vec::with_capacity(count);
+                unsafe {
+                    let src = self.vm_stack.as_ptr().add(start);
+                    for i in 0..count {
+                        slots.push(Slot::Data(std::ptr::read(src.add(i))));
+                    }
+                    self.vm_stack.set_len(start);
+                }
+                let object = heap.alloc_object_fast(JsObject::from_shape(
+                    shape,
+                    slots,
+                    Some(self.intrinsics.object_prototype.clone()),
+                ));
+                self.vm_stack.push(Value::Object(object));
+                Ok(None)
+            }
+            Op::NewArray => {
+                let array = heap.alloc_array_fast(ArrayData::default());
+                self.vm_stack.push(Value::Array(array));
+                Ok(None)
+            }
+            Op::MakeArray(count) => {
+                let count = count as usize;
+                let values = if count == 0 {
+                    Vec::new()
+                } else {
+                    let start = self.vm_stack.len() - count;
+                    self.vm_stack.split_off(start)
+                };
+                let array = heap.alloc_array_fast(ArrayData::from(values));
+                self.vm_stack.push(Value::Array(array));
+                Ok(None)
+            }
+            Op::ArrayPush => {
+                let value = pop_fast(&mut self.vm_stack);
+                if let Some(Value::Array(array)) = self.vm_stack.last() {
+                    if let Some(data) = unsafe { heap.array_mut(array) } {
+                        data.values.push(value);
+                    } else {
+                        array.borrow_mut().push(value);
+                    }
+                } else {
+                    value.fast_drop();
+                }
+                Ok(None)
+            }
+            Op::DefineField(name) => {
+                let value = pop_fast(&mut self.vm_stack);
+                if let Some(Value::Object(object)) = self.vm_stack.last() {
+                    let key: &str = unsafe { (&*code_ptr).names.get_unchecked(name as usize) };
+                    if let Some(target) = unsafe { heap.object_mut(object) } {
+                        target.define_key(key, Property::data(value));
+                    } else {
+                        object.borrow_mut().define_key(key, Property::data(value));
+                    }
+                } else {
+                    value.fast_drop();
+                }
+                Ok(None)
+            }
+            Op::Closure(index) => {
+                let child = unsafe { (&*code_ptr).children.get_unchecked(index as usize).clone() };
+                let frame = unsafe { self.frames.get_unchecked_mut(top) };
+                let scope = if child.captures_nothing {
+                    None
+                } else {
+                    frame.mark_scopes_escaped();
+                    frame.scope.clone()
+                };
+                let home = if child.kind == FunctionKind::Arrow {
+                    frame.closure.as_ref().and_then(|closure| closure.home())
+                } else {
+                    None
+                };
+                let closure = Rc::new(Closure::new(child, scope));
+                if let Some(home) = home {
+                    closure.set_home_object(home);
+                }
+                let function = self.function_object(closure);
+                self.vm_stack.push(function);
+                Ok(None)
+            }
+            Op::GetIndex => {
+                let len = self.vm_stack.len();
+                if len >= 2
+                    && let Some(value) = Self::try_fast_get_index(
+                        heap,
+                        unsafe { self.vm_stack.get_unchecked(len - 2) },
+                        unsafe { self.vm_stack.get_unchecked(len - 1) },
+                    )
+                {
+                    let key = pop_fast(&mut self.vm_stack);
+                    key.fast_drop();
+                    let old = std::mem::replace(
+                        unsafe { self.vm_stack.get_unchecked_mut(len - 2) },
+                        value,
+                    );
+                    old.fast_drop();
+                } else {
+                    let key = pop_fast(&mut self.vm_stack);
+                    let object = pop_fast(&mut self.vm_stack);
+                    match self.get_index_tail(&object, key)? {
+                        super::operations::GetOutcome::Value(v) => self.vm_stack.push(v),
+                        super::operations::GetOutcome::Call {
+                            callee,
+                            this,
+                            arguments,
+                        } => {
+                            let _ = self.call_in_loop(callee, this, arguments)?;
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Op::GetRegIndex { array, index } => {
+                let arr_ref = unsafe { self.vm_stack.get_unchecked(reg_base + array as usize) };
+                if matches!(arr_ref, Value::Uninitialized) {
+                    let name = unsafe { (&*code_ptr).layout.names[array as usize].clone() };
+                    return Err(
+                        self.reference_error(format!("cannot access {name} before initialization"))
+                    );
+                }
+                let idx_ref = unsafe { self.vm_stack.get_unchecked(reg_base + index as usize) };
+                if matches!(idx_ref, Value::Uninitialized) {
+                    let name = unsafe { (&*code_ptr).layout.names[index as usize].clone() };
+                    return Err(
+                        self.reference_error(format!("cannot access {name} before initialization"))
+                    );
+                }
+                if let Some(value) = Self::try_fast_get_index(heap, arr_ref, idx_ref) {
+                    self.vm_stack.push(value);
+                } else {
+                    let object = arr_ref.clone();
+                    let key = idx_ref.clone();
+                    match self.get_index_tail(&object, key)? {
+                        super::operations::GetOutcome::Value(v) => self.vm_stack.push(v),
+                        super::operations::GetOutcome::Call {
+                            callee,
+                            this,
+                            arguments,
+                        } => {
+                            let _ = self.call_in_loop(callee, this, arguments)?;
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Op::SetIndex => {
+                let len = self.vm_stack.len();
+                let hit = len >= 3 && {
+                    let value = unsafe { self.vm_stack.get_unchecked(len - 1).clone() };
+                    Self::try_fast_set_index(
+                        heap,
+                        unsafe { self.vm_stack.get_unchecked(len - 3) },
+                        unsafe { self.vm_stack.get_unchecked(len - 2) },
+                        value,
+                    )
+                    .is_ok()
+                };
+                if hit {
+                    let value = pop_fast(&mut self.vm_stack);
+                    let key = pop_fast(&mut self.vm_stack);
+                    key.fast_drop();
+                    let old = std::mem::replace(
+                        unsafe { self.vm_stack.get_unchecked_mut(len - 3) },
+                        value,
+                    );
+                    old.fast_drop();
+                } else {
+                    let value = pop_fast(&mut self.vm_stack);
+                    let key = pop_fast(&mut self.vm_stack);
+                    let object = pop_fast(&mut self.vm_stack);
+                    let strict = unsafe { (&*code_ptr).strict };
+                    self.set_index(&object, key, value.clone(), strict)?;
+                    object.fast_drop();
+                    self.vm_stack.push(value);
+                }
+                Ok(None)
+            }
+            Op::SetIndexPop => {
+                let value = pop_fast(&mut self.vm_stack);
+                let key = pop_fast(&mut self.vm_stack);
+                let object = pop_fast(&mut self.vm_stack);
+                match Self::try_fast_set_index(heap, &object, &key, value) {
+                    Ok(()) => {
+                        key.fast_drop();
+                        object.fast_drop();
+                    }
+                    Err(value) => {
+                        let strict = unsafe { (&*code_ptr).strict };
+                        self.set_index(&object, key, value, strict)?;
+                        object.fast_drop();
+                    }
+                }
+                Ok(None)
+            }
+            Op::PushScope(block) => {
+                let layout = unsafe { (&*code_ptr).blocks.get_unchecked(block as usize).clone() };
+                let frame = unsafe { self.frames.get_unchecked_mut(top) };
+                let parent = frame.scope.clone();
+                let slots = heap.alloc_scope_slots(layout.names.len(), true);
+                let scope = heap.alloc_scope_fast(Scope {
+                    slots,
+                    parent,
+                    layout,
+                    extra: Grown::default(),
+                });
+                frame.scope = Some(scope);
+                frame.scopes += 1;
+                Ok(None)
+            }
+            Op::PushVarScope(block) => {
+                let layout = unsafe { (&*code_ptr).blocks.get_unchecked(block as usize).clone() };
+                let frame = unsafe { self.frames.get_unchecked_mut(top) };
+                let parent = frame.scope.clone();
+                let slots = heap.alloc_scope_slots(layout.names.len(), false);
+                let scope = heap.alloc_scope_fast(Scope {
+                    slots,
+                    parent,
+                    layout,
+                    extra: Grown::default(),
+                });
+                frame.scope = Some(scope);
+                frame.scopes += 1;
+                Ok(None)
+            }
+            Op::PopScope => {
+                self.jit_pop_scope(heap, top);
+                Ok(None)
+            }
+            Op::CloneScope => {
+                let _ = self.jit_clone_scope(heap, top);
+                Ok(None)
+            }
+            Op::ArgumentsIterator => {
+                let len = self.vm_stack.len();
+                let slot = unsafe { self.vm_stack.get_unchecked_mut(len - 1) };
+                let Value::Array(array) = slot.clone() else {
+                    unreachable!("arguments arrive as an array");
+                };
+                let iter_slot = self.vm_iters.len() as u32;
+                self.vm_iters.push((array, 0));
+                *slot = Value::ArrayIter(iter_slot);
+                Ok(None)
+            }
+            Op::GetIterator(callsite) => {
+                let fast = if let Some(Value::Array(array)) = self.vm_stack.last() {
+                    let plain_array =
+                        unsafe { heap.array_ref(array) }.is_some_and(|a| a.extra.is_none());
+                    let proto_ok = plain_array
+                        && unsafe { heap.object_ref(&self.intrinsics.array_prototype) }
+                            .is_some_and(|p| {
+                                p.array_iterator_intact(&self.intrinsics.array_values)
+                            });
+                    proto_ok.then(|| array.clone())
+                } else {
+                    None
+                };
+                if let Some(array) = fast {
+                    let len = self.vm_stack.len();
+                    let iter_slot = self.vm_iters.len() as u32;
+                    self.vm_iters.push((array, 0));
+                    unsafe {
+                        *self.vm_stack.get_unchecked_mut(len - 1) = Value::ArrayIter(iter_slot);
+                    }
+                } else {
+                    let value = pop_fast(&mut self.vm_stack);
+                    self.iterable_callsite = callsite.map(|index| {
+                        Callsite::Source(unsafe {
+                            (&*code_ptr).names.get_unchecked(index as usize).clone()
+                        })
+                    });
+                    let iterator = self.get_iterator(value);
+                    self.iterable_callsite = None;
+                    self.vm_stack.push(iterator?);
+                }
+                Ok(None)
+            }
+            Op::IterValue => {
+                let len = self.vm_stack.len();
+                let fast = if len > 0
+                    && let Value::ArrayIter(iter_slot) =
+                        unsafe { self.vm_stack.get_unchecked(len - 1) }
+                {
+                    let (array, index) =
+                        unsafe { self.vm_iters.get_unchecked_mut(*iter_slot as usize) };
+                    if *index == u32::MAX {
+                        Some(Value::Undefined)
+                    } else if let Some(data) = unsafe { heap.array_ref(array) } {
+                        let idx = *index as usize;
+                        if let Some(val) = data.values.get(idx) {
+                            *index = (idx + 1) as u32;
+                            Some(val.clone().filled())
+                        } else {
+                            *index = u32::MAX;
+                            Some(Value::Undefined)
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let value = match fast {
+                    Some(v) => v,
+                    None => {
+                        let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
+                        self.iterator_step(&iterator)?.unwrap_or(Value::Undefined)
+                    }
+                };
+                self.vm_stack.push(value);
+                Ok(None)
+            }
+            Op::IterStep(target) => {
+                let len = self.vm_stack.len();
+                let fast = if len > 0
+                    && let Value::ArrayIter(iter_slot) =
+                        unsafe { self.vm_stack.get_unchecked(len - 1) }
+                {
+                    let (array, index) =
+                        unsafe { self.vm_iters.get_unchecked_mut(*iter_slot as usize) };
+                    if *index == u32::MAX {
+                        Some(None)
+                    } else if let Some(data) = unsafe { heap.array_ref(array) } {
+                        let idx = *index as usize;
+                        if let Some(val) = data.values.get(idx) {
+                            *index = (idx + 1) as u32;
+                            Some(Some(val.clone().filled()))
+                        } else {
+                            *index = u32::MAX;
+                            Some(None)
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                match fast {
+                    Some(Some(v)) => self.vm_stack.push(v),
+                    Some(None) => {
+                        let target = target as usize;
+                        if target <= op_pc {
+                            self.steps += 1;
+                            if self.steps >= *safepoint_at {
+                                *safepoint_at = self.hit_safepoint(sampling, target)?;
+                            }
+                        }
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = target;
+                    }
+                    None => {
+                        let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
+                        match self.iterator_step(&iterator)? {
+                            Some(v) => self.vm_stack.push(v),
+                            None => {
+                                unsafe { self.frames.get_unchecked_mut(top) }.pc = target as usize
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Op::IterRest => {
+                let len = self.vm_stack.len();
+                let fast = if len > 0
+                    && let Value::ArrayIter(iter_slot) =
+                        unsafe { self.vm_stack.get_unchecked(len - 1) }
+                {
+                    let (array, index) =
+                        unsafe { self.vm_iters.get_unchecked_mut(*iter_slot as usize) };
+                    if *index == u32::MAX {
+                        Some(Vec::new())
+                    } else if let Some(data) = unsafe { heap.array_ref(array) } {
+                        let idx = *index as usize;
+                        *index = u32::MAX;
+                        if idx < data.values.len() {
+                            Some(
+                                data.values[idx..]
+                                    .iter()
+                                    .map(|v| v.clone().filled())
+                                    .collect(),
+                            )
+                        } else {
+                            Some(Vec::new())
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(rest) = fast {
+                    let array = heap.alloc_array_fast(ArrayData::from(rest));
+                    self.vm_stack.push(Value::Array(array));
+                } else {
+                    let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
+                    let mut rest = Vec::new();
+                    while let Some(v) = self.iterator_step(&iterator)? {
+                        rest.push(v);
+                    }
+                    self.vm_stack.push(Self::new_array(rest));
+                }
+                Ok(None)
+            }
+            Op::IterClose => {
+                let value = pop_fast(&mut self.vm_stack);
+                if let Value::ArrayIter(iter_slot) = value {
+                    let slot = iter_slot as usize;
+                    if slot < self.vm_iters.len() {
+                        self.vm_iters.truncate(slot);
+                    }
+                } else {
+                    self.iterator_close(&value)?;
+                    value.fast_drop();
+                }
+                Ok(None)
+            }
+            Op::Uninitialize { index, count } => {
+                if let Some(scope_ref) = unsafe { self.frames.get_unchecked(top) }.scope.as_ref() {
+                    if let Some(scope) = unsafe { heap.scope_at_mut(scope_ref, 0) } {
+                        let end = (index as usize + count as usize).min(scope.slots.len());
+                        for slot in &mut scope.slots[index as usize..end] {
+                            let old = std::mem::replace(slot, Value::Uninitialized);
+                            old.fast_drop();
+                        }
+                    } else {
+                        let mut scope = scope_ref.borrow_mut();
+                        let end = (index as usize + count as usize).min(scope.slots.len());
+                        for slot in &mut scope.slots[index as usize..end] {
+                            let old = std::mem::replace(slot, Value::Uninitialized);
+                            old.fast_drop();
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Op::JumpIfNullishChain(target) => {
+                if matches!(
+                    self.vm_stack.last(),
+                    Some(Value::Undefined | Value::Null) | None
+                ) {
+                    let frame = unsafe { self.frames.get_unchecked(top) };
+                    let stack_base = frame.stack_base;
+                    let chain_base = frame.chain_base as usize;
+                    let mark = if self.vm_chains.len() > chain_base {
+                        stack_base + self.vm_chains.pop().expect("checked above")
+                    } else {
+                        self.vm_stack.len()
+                    };
+                    truncate_stack(&mut self.vm_stack, mark);
+                    self.vm_stack.push(Value::Undefined);
+                    unsafe { self.frames.get_unchecked_mut(top) }.pc = target as usize;
+                }
+                Ok(None)
+            }
+            Op::EndFinally => {
+                let pending_base = unsafe { self.frames.get_unchecked(top) }.pending_base as usize;
+                let pending = if self.vm_pending.len() > pending_base {
+                    self.vm_pending.pop().expect("checked above")
+                } else {
+                    Pending::Normal
+                };
+                match pending {
+                    Pending::Normal => Ok(None),
+                    Pending::Throw(value) => Err(self.throw_value(value)),
+                    Pending::Return(value) => self.do_return(frame_floor, value),
+                    Pending::Jump {
+                        target,
+                        handlers,
+                        scopes,
+                    } => {
+                        self.do_exit(target, handlers, scopes);
+                        Ok(None)
+                    }
+                }
+            }
+            Op::Exit {
+                target,
+                handlers,
+                scopes,
+            } => {
+                self.do_exit(target, handlers, scopes);
+                let target_pc = unsafe { self.frames.get_unchecked(top) }.pc;
+                if target_pc <= op_pc {
+                    self.steps += 1;
+                    if self.steps >= *safepoint_at {
+                        *safepoint_at = self.hit_safepoint(sampling, target_pc)?;
+                    }
+                }
+                Ok(None)
+            }
+            other => self.step_op(other, frame_floor),
         }
     }
 
@@ -5286,7 +7233,6 @@ impl ScriptRuntime {
                     *slot = Value::Uninitialized;
                 }
                 let frame = &mut self.frames[top];
-                frame.flags |= FLAG_SCOPE_ESCAPED;
                 frame.scope = Some(scope);
                 frame.scopes += 1;
             }
@@ -5296,7 +7242,6 @@ impl ScriptRuntime {
                 // a function's variable environment, whose bindings start undefined
                 let scope = self.new_scope(layout, parent);
                 let frame = &mut self.frames[top];
-                frame.flags |= FLAG_SCOPE_ESCAPED;
                 frame.scope = Some(scope);
                 frame.scopes += 1;
             }
@@ -5314,14 +7259,27 @@ impl ScriptRuntime {
             }
             Op::Debugger => {}
             Op::CloneScope => {
-                self.frames[top].flags |= FLAG_SCOPE_ESCAPED;
-                let scope = self.frames[top].scope.clone().expect("a scope to copy");
-                let scope = scope.borrow();
-                let copy = Scope::new(scope.layout.clone(), scope.parent.clone());
-                copy.borrow_mut().slots = scope.slots.clone();
-                copy.borrow_mut().extra = scope.extra.clone();
-                drop(scope);
-                self.frames[top].scope = Some(copy);
+                let frame = &mut self.frames[top];
+                let depth = frame.scopes;
+                let current = frame.scope.take().expect("a scope to copy");
+                let (layout, parent, slots, extra) = {
+                    let scope = current.borrow();
+                    (
+                        scope.layout.clone(),
+                        scope.parent.clone(),
+                        scope.slots.clone(),
+                        scope.extra.clone(),
+                    )
+                };
+                if depth > 0 && depth >= frame.escaped_scopes {
+                    super::heap::free_scope(current);
+                }
+                if frame.escaped_scopes > depth {
+                    frame.escaped_scopes = depth;
+                }
+                let copy = Scope::new_with_slots(layout, parent, slots);
+                copy.borrow_mut().extra = extra;
+                frame.scope = Some(copy);
             }
             Op::This => {
                 if matches!(self.frames[top].this, Value::Uninitialized) {
@@ -5717,7 +7675,7 @@ impl ScriptRuntime {
                 let scope = if code.captures_nothing {
                     None
                 } else {
-                    self.frames[top].flags |= FLAG_SCOPE_ESCAPED;
+                    self.frames[top].mark_scopes_escaped();
                     self.frames[top].scope.clone()
                 };
                 let home = self.frames[top]
@@ -5739,7 +7697,7 @@ impl ScriptRuntime {
             } => {
                 let template = self.frames[top].code.classes[template as usize].clone();
                 let superclass = if has_super { Some(self.pop()) } else { None };
-                self.frames[top].flags |= FLAG_SCOPE_ESCAPED;
+                self.frames[top].mark_scopes_escaped();
                 let scope = self.frames[top].scope.clone();
                 let (constructor, prototype) = self.create_class(&template, superclass, scope)?;
                 self.vm_stack.push(constructor);
@@ -6943,11 +8901,11 @@ impl ScriptRuntime {
         state: Rc<RefCell<AsyncFunctionData>>,
     ) -> Result<(), ScriptError> {
         let promise = self.promise_resolve(value)?;
-        let fulfilled = Value::Builtin(Builtin::native(Native::AsyncResume(
+        let fulfilled = Value::builtin(Builtin::native(Native::AsyncResume(
             AsyncResumeHandle(state.clone()),
             false,
         )));
-        let rejected = Value::Builtin(Builtin::native(Native::AsyncResume(
+        let rejected = Value::builtin(Builtin::native(Native::AsyncResume(
             AsyncResumeHandle(state),
             true,
         )));
@@ -7173,6 +9131,7 @@ impl Frame {
             this,
             function,
             scopes: 0,
+            escaped_scopes: 0,
             flags: 0,
             extra,
         }

@@ -73,6 +73,15 @@ impl JsStr {
         left.0 == right.0
     }
 
+    #[inline(always)]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn as_raw_ptr(&self) -> *mut u8 {
+        self.0.as_ptr().cast()
+    }
+
     #[cold]
     #[inline(never)]
     fn dealloc_slow(&mut self) {

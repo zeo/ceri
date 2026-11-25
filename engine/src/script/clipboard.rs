@@ -266,7 +266,15 @@ impl ScriptRuntime {
             _ => None,
         };
         let entries = match first.map(|item| self.get_property(&item, "getType")) {
-            Some(Ok(Value::Builtin(Builtin::ClipboardItemGetType(entries)))) => entries,
+            Some(Ok(Value::Builtin(b))) => match b.as_ref() {
+                Builtin::ClipboardItemGetType(entries) => entries.clone(),
+                _ => {
+                    return Ok(Value::Promise(self.rejected_promise_value(dom_exception(
+                        "DataError",
+                        "Failed to execute 'write' on 'Clipboard': No ClipboardItem was given",
+                    ))));
+                }
+            },
             _ => {
                 return Ok(Value::Promise(self.rejected_promise_value(dom_exception(
                     "DataError",
@@ -294,11 +302,11 @@ impl ScriptRuntime {
             let promise = self.promise_resolve(piece)?;
             self.promise_then(
                 promise,
-                Some(&Value::Builtin(Builtin::ClipboardWriteStep(Box::new((
+                Some(&Value::builtin(Builtin::ClipboardWriteStep(Box::new((
                     write.clone(),
                     index,
                 ))))),
-                Some(&Value::Builtin(Builtin::ClipboardWriteFailed(
+                Some(&Value::builtin(Builtin::ClipboardWriteFailed(
                     write.clone(),
                 ))),
             )?;
@@ -350,7 +358,7 @@ fn clipboard_item(entries: ItemHandle) -> Value {
         ),
         (
             "getType".to_string(),
-            Value::Builtin(Builtin::ClipboardItemGetType(entries)),
+            Value::builtin(Builtin::ClipboardItemGetType(entries)),
         ),
     ])
 }
@@ -365,11 +373,11 @@ pub(super) fn transfer_items(handle: &TransferHandle) -> (Vec<Value>, Vec<Value>
             ("type".to_string(), text(mime)),
             (
                 "getAsString".to_string(),
-                Value::Builtin(Builtin::ClipboardItemString(Box::new(string.map(Rc::from)))),
+                Value::builtin(Builtin::ClipboardItemString(Box::new(string.map(Rc::from)))),
             ),
             (
                 "getAsFile".to_string(),
-                Value::Builtin(Builtin::ClipboardItemFile(file.cloned())),
+                Value::builtin(Builtin::ClipboardItemFile(file.cloned())),
             ),
         ])
     };
@@ -395,7 +403,7 @@ pub(super) fn transfer_items(handle: &TransferHandle) -> (Vec<Value>, Vec<Value>
 impl ScriptRuntime {
     pub(super) fn transfer_object(&self, handle: &TransferHandle) -> Value {
         let text = |value: &str| Value::String(value.to_string().into());
-        let method = |builtin: Builtin| Value::Builtin(builtin);
+        let method = |builtin: Builtin| Value::builtin(builtin);
         let files = handle.borrow().files.clone();
         let transfer = plain_object([
             (
@@ -426,7 +434,7 @@ impl ScriptRuntime {
                 object.define(
                     name.to_string(),
                     object::Property {
-                        slot: object::Slot::accessor(Some(Value::Builtin(getter)), None),
+                        slot: object::Slot::accessor(Some(Value::builtin(getter)), None),
                         enumerable: true,
                         writable: false,
                         configurable: true,

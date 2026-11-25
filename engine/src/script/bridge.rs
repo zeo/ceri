@@ -110,9 +110,9 @@ impl ScriptRuntime {
             return object.clone();
         }
         let object = plain_object([
-            ("invoke".to_string(), Value::Builtin(Builtin::CeriInvoke)),
-            ("listen".to_string(), Value::Builtin(Builtin::CeriListen)),
-            ("emit".to_string(), Value::Builtin(Builtin::CeriEmit)),
+            ("invoke".to_string(), Value::builtin(Builtin::CeriInvoke)),
+            ("listen".to_string(), Value::builtin(Builtin::CeriListen)),
+            ("emit".to_string(), Value::builtin(Builtin::CeriEmit)),
             (
                 "windowLabel".to_string(),
                 Value::String(state.bridge.window.clone().into()),
@@ -277,7 +277,7 @@ impl ScriptRuntime {
         state.next_id += 1;
         let id = state.next_id;
         state.listeners.push((id, name, callback));
-        Ok(Value::Promise(self.fulfilled_promise(Value::Builtin(
+        Ok(Value::Promise(self.fulfilled_promise(Value::builtin(
             Builtin::CeriUnlisten(id),
         ))))
     }

@@ -600,7 +600,7 @@ impl ScriptRuntime {
     fn set_this_time(&mut self, this: &Value, time: f64) -> f64 {
         let time = time_clip(time);
         if let Value::Object(object) = this {
-            object.borrow_mut().class = ObjectClass::Date(time);
+            object.borrow_mut().set_class(ObjectClass::Date(time));
         }
         time
     }

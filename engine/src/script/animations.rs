@@ -448,7 +448,7 @@ impl ScriptRuntime {
         self.tasks.push(ScheduledTask {
             id,
             due,
-            callback: Value::Builtin(Builtin::native(Native::AnimFinish(handle, generation))),
+            callback: Value::builtin(Builtin::native(Native::AnimFinish(handle, generation))),
             arguments: Vec::new(),
             kind: TaskKind::Timeout,
         });
@@ -602,11 +602,11 @@ impl ScriptRuntime {
                     ("target".to_string(), target),
                     (
                         "getTiming".to_string(),
-                        Value::Builtin(Builtin::ReturnValue(Rc::new(timing_object))),
+                        Value::builtin(Builtin::ReturnValue(Rc::new(timing_object))),
                     ),
                     (
                         "getComputedTiming".to_string(),
-                        Value::Builtin(Builtin::ReturnValue(Rc::new(computed))),
+                        Value::builtin(Builtin::ReturnValue(Rc::new(computed))),
                     ),
                 ])
             }

@@ -2555,7 +2555,7 @@ impl ScriptRuntime {
         };
         match stepped {
             Some(Value::Promise(promise)) => {
-                let wrap = Value::Builtin(Builtin::native(Native::IterResultWrap(false)));
+                let wrap = Value::builtin(Builtin::native(Native::IterResultWrap(false)));
                 self.promise_then(promise, Some(&wrap), None)
             }
             Some(value) => Ok(self.iterator_result(value, false)),

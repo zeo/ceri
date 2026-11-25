@@ -340,7 +340,7 @@ impl ScriptRuntime {
         self.tasks.push(ScheduledTask {
             id: task,
             due: self.clock.saturating_add(retry),
-            callback: Value::Builtin(Builtin::native(Native::SourceReconnect(id))),
+            callback: Value::builtin(Builtin::native(Native::SourceReconnect(id))),
             arguments: Vec::new(),
             kind: TaskKind::Timeout,
         });

@@ -45,6 +45,11 @@ mod displaynames;
 mod disposables;
 mod durationformat;
 mod heap;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+mod jit;
 mod jsstr;
 pub(crate) use jsstr::JsStr;
 mod lexer;
@@ -324,26 +329,27 @@ impl fmt::Display for ScriptError {
 
 impl std::error::Error for ScriptError {}
 
+#[repr(C, u8)]
 enum Value {
     // trivial non-drop variants grouped first so is_copy compiles to one range test
-    Undefined,
+    Undefined = 0,
     // a lexical binding read before its declaration ran, or an array index nothing was put
     // at, which reads as undefined and is no property of the array
-    Uninitialized,
-    Null,
-    Bool(bool),
-    Number(f64),
-    Object(ObjectHandle),
-    Array(ArrayHandle),
+    Uninitialized = 1,
+    Null = 2,
+    Bool(bool) = 3,
+    Number(f64) = 4,
+    Object(ObjectHandle) = 5,
+    Array(ArrayHandle) = 6,
     // index into ScriptRuntime::vm_iters for inline array iteration
-    ArrayIter(u32),
-    String(JsStr),
-    Element(ElementHandle),
-    Symbol(JsStr),
-    BigInt(Rc<bigint::BigInt>),
+    ArrayIter(u32) = 7,
+    String(JsStr) = 8,
+    Element(ElementHandle) = 9,
+    Symbol(JsStr) = 10,
+    BigInt(Rc<bigint::BigInt>) = 11,
     // a cell shared with the binding it reads, writable or constant
-    Binding(Rc<RefCell<Value>>),
-    ConstBinding(Rc<RefCell<Value>>),
+    Binding(Rc<RefCell<Value>>) = 12,
+    ConstBinding(Rc<RefCell<Value>>) = 13,
     NodeList(NodeListHandle),
     Iterator(IteratorHandle),
     Validity(ValidityHandle),
@@ -397,8 +403,22 @@ enum Value {
     IndexedDbObjectStore(IndexedDbObjectStoreHandle),
     IndexedDbNameList(IndexedDbNameListHandle),
     VmIterator(Rc<RefCell<VmIterator>>),
-    Builtin(Builtin),
+    Builtin(Rc<Builtin>),
 }
+
+const VALUE_TAG_UNDEFINED: u8 = 0;
+const VALUE_TAG_UNINITIALIZED: u8 = 1;
+const VALUE_TAG_NULL: u8 = 2;
+const VALUE_TAG_BOOL: u8 = 3;
+const VALUE_TAG_NUMBER: u8 = 4;
+const VALUE_TAG_OBJECT: u8 = 5;
+const VALUE_TAG_ARRAY: u8 = 6;
+const VALUE_TAG_ARRAY_ITER: u8 = 7;
+const VALUE_TAG_STRING: u8 = 8;
+const VALUE_TAG_ELEMENT: u8 = 9;
+const VALUE_TAG_BINDING: u8 = 12;
+const VALUE_TAG_CONST_BINDING: u8 = 13;
+const VALUE_TAG_COUNT: u8 = 67;
 
 #[derive(Clone, Debug, PartialEq)]
 enum CloneValue {
@@ -1907,21 +1927,21 @@ impl ScriptRuntime {
                 .insert("history".to_string(), Value::History(history.clone()));
             values.values.insert(
                 "structuredClone".to_string(),
-                Value::Builtin(Builtin::StructuredClone),
+                Value::builtin(Builtin::StructuredClone),
             );
             values
                 .values
-                .insert("atob".to_string(), Value::Builtin(Builtin::Atob));
+                .insert("atob".to_string(), Value::builtin(Builtin::Atob));
             values
                 .values
-                .insert("btoa".to_string(), Value::Builtin(Builtin::Btoa));
+                .insert("btoa".to_string(), Value::builtin(Builtin::Btoa));
             values.values.insert(
                 "createImageBitmap".to_string(),
-                Value::Builtin(Builtin::CreateImageBitmap),
+                Value::builtin(Builtin::CreateImageBitmap),
             );
             values.values.insert(
                 "postMessage".to_string(),
-                Value::Builtin(Builtin::WindowPostMessage),
+                Value::builtin(Builtin::WindowPostMessage),
             );
             values
                 .values
@@ -1969,34 +1989,34 @@ impl ScriptRuntime {
             );
             values
                 .values
-                .insert("fetch".to_string(), Value::Builtin(Builtin::Fetch));
+                .insert("fetch".to_string(), Value::builtin(Builtin::Fetch));
             values.values.insert(
                 "setTimeout".to_string(),
-                Value::Builtin(Builtin::SetTimeout),
+                Value::builtin(Builtin::SetTimeout),
             );
             values.values.insert(
                 "clearTimeout".to_string(),
-                Value::Builtin(Builtin::ClearTimeout),
+                Value::builtin(Builtin::ClearTimeout),
             );
             values.values.insert(
                 "requestAnimationFrame".to_string(),
-                Value::Builtin(Builtin::RequestAnimationFrame),
+                Value::builtin(Builtin::RequestAnimationFrame),
             );
             values.values.insert(
                 "cancelAnimationFrame".to_string(),
-                Value::Builtin(Builtin::CancelAnimationFrame),
+                Value::builtin(Builtin::CancelAnimationFrame),
             );
             values.values.insert(
                 "scrollTo".to_string(),
-                Value::Builtin(Builtin::WindowScrollTo),
+                Value::builtin(Builtin::WindowScrollTo),
             );
             values.values.insert(
                 "scroll".to_string(),
-                Value::Builtin(Builtin::WindowScrollTo),
+                Value::builtin(Builtin::WindowScrollTo),
             );
             values.values.insert(
                 "scrollBy".to_string(),
-                Value::Builtin(Builtin::WindowScrollBy),
+                Value::builtin(Builtin::WindowScrollBy),
             );
         }
         let mut runtime = Self {
@@ -2352,7 +2372,9 @@ impl ScriptRuntime {
                 let mut busy = document.range_nodes().into_iter().collect::<HashSet<_>>();
                 // keep detached nodes alive while a scheduled task still targets them
                 for task in &self.tasks {
-                    if let Value::Builtin(Builtin::Native(native)) = &task.callback {
+                    if let Value::Builtin(b) = &task.callback
+                        && let Builtin::Native(native) = b.as_ref()
+                    {
                         match &**native {
                             Native::ImageDeliver(node, _)
                             | Native::MediaLoad(node, _)
@@ -4572,18 +4594,18 @@ impl ScriptRuntime {
     fn member(&self, object: Value, property: &str) -> Result<Value, ScriptError> {
         match object.resolve() {
             Value::Document => match property {
-                "getElementById" => Ok(Value::Builtin(Builtin::DocumentGetElementById)),
-                "querySelector" => Ok(Value::Builtin(Builtin::DocumentQuerySelector)),
-                "querySelectorAll" => Ok(Value::Builtin(Builtin::DocumentQuerySelectorAll)),
-                "createElement" => Ok(Value::Builtin(Builtin::DocumentCreateElement)),
-                "createTextNode" => Ok(Value::Builtin(Builtin::DocumentCreateTextNode)),
-                "importNode" => Ok(Value::Builtin(Builtin::DocumentImportNode)),
-                "adoptNode" => Ok(Value::Builtin(Builtin::DocumentAdoptNode)),
-                "createRange" => Ok(Value::Builtin(Builtin::DocumentCreateRange)),
-                "createTreeWalker" => Ok(Value::Builtin(Builtin::DocumentCreateTreeWalker)),
-                "getAnimations" => Ok(Value::Builtin(Builtin::DocumentGetAnimations)),
-                "createNodeIterator" => Ok(Value::Builtin(Builtin::DocumentCreateNodeIterator)),
-                "getSelection" => Ok(Value::Builtin(Builtin::DocumentGetSelection)),
+                "getElementById" => Ok(Value::builtin(Builtin::DocumentGetElementById)),
+                "querySelector" => Ok(Value::builtin(Builtin::DocumentQuerySelector)),
+                "querySelectorAll" => Ok(Value::builtin(Builtin::DocumentQuerySelectorAll)),
+                "createElement" => Ok(Value::builtin(Builtin::DocumentCreateElement)),
+                "createTextNode" => Ok(Value::builtin(Builtin::DocumentCreateTextNode)),
+                "importNode" => Ok(Value::builtin(Builtin::DocumentImportNode)),
+                "adoptNode" => Ok(Value::builtin(Builtin::DocumentAdoptNode)),
+                "createRange" => Ok(Value::builtin(Builtin::DocumentCreateRange)),
+                "createTreeWalker" => Ok(Value::builtin(Builtin::DocumentCreateTreeWalker)),
+                "getAnimations" => Ok(Value::builtin(Builtin::DocumentGetAnimations)),
+                "createNodeIterator" => Ok(Value::builtin(Builtin::DocumentCreateNodeIterator)),
+                "getSelection" => Ok(Value::builtin(Builtin::DocumentGetSelection)),
                 "documentElement" => Ok(self
                     .document
                     .borrow()
@@ -4658,17 +4680,17 @@ impl ScriptRuntime {
                     .borrow()
                     .get("indexedDB")
                     .ok_or_else(|| runtime_error("window indexedDB is unavailable")),
-                "getSelection" => Ok(Value::Builtin(Builtin::WindowGetSelection)),
+                "getSelection" => Ok(Value::builtin(Builtin::WindowGetSelection)),
                 "WebAssembly" => Ok(Value::WebAssemblyNamespace),
-                "scroll" | "scrollTo" => Ok(Value::Builtin(Builtin::WindowScrollTo)),
-                "scrollBy" => Ok(Value::Builtin(Builtin::WindowScrollBy)),
-                "alert" if self.worker_sender.is_none() => Ok(Value::Builtin(Builtin::WindowAlert)),
-                "open" if self.worker_sender.is_none() => Ok(Value::Builtin(Builtin::WindowOpen)),
+                "scroll" | "scrollTo" => Ok(Value::builtin(Builtin::WindowScrollTo)),
+                "scrollBy" => Ok(Value::builtin(Builtin::WindowScrollBy)),
+                "alert" if self.worker_sender.is_none() => Ok(Value::builtin(Builtin::WindowAlert)),
+                "open" if self.worker_sender.is_none() => Ok(Value::builtin(Builtin::WindowOpen)),
                 "confirm" if self.worker_sender.is_none() => {
-                    Ok(Value::Builtin(Builtin::WindowConfirm))
+                    Ok(Value::builtin(Builtin::WindowConfirm))
                 }
                 "prompt" if self.worker_sender.is_none() => {
-                    Ok(Value::Builtin(Builtin::WindowPrompt))
+                    Ok(Value::builtin(Builtin::WindowPrompt))
                 }
                 // a top-level window is its own self, top and parent, with no frames in it
                 "self" | "window" | "frames" => Ok(Value::Window),
@@ -4684,30 +4706,30 @@ impl ScriptRuntime {
                 "outerWidth" => Ok(Value::Number(self.viewport.width as f64)),
                 "outerHeight" => Ok(Value::Number(self.viewport.height as f64)),
                 "screenX" | "screenY" | "screenLeft" | "screenTop" => Ok(Value::Number(0.0)),
-                "structuredClone" => Ok(Value::Builtin(Builtin::StructuredClone)),
+                "structuredClone" => Ok(Value::builtin(Builtin::StructuredClone)),
                 "postMessage" if self.worker_sender.is_none() => {
-                    Ok(Value::Builtin(Builtin::WindowPostMessage))
+                    Ok(Value::builtin(Builtin::WindowPostMessage))
                 }
-                "atob" => Ok(Value::Builtin(Builtin::Atob)),
-                "btoa" => Ok(Value::Builtin(Builtin::Btoa)),
-                "createImageBitmap" => Ok(Value::Builtin(Builtin::CreateImageBitmap)),
+                "atob" => Ok(Value::builtin(Builtin::Atob)),
+                "btoa" => Ok(Value::builtin(Builtin::Btoa)),
+                "createImageBitmap" => Ok(Value::builtin(Builtin::CreateImageBitmap)),
                 "AbortController" => Ok(Value::AbortControllerConstructor),
                 "Worker" => Ok(Value::WorkerConstructor),
-                "fetch" => Ok(Value::Builtin(Builtin::Fetch)),
-                "setTimeout" => Ok(Value::Builtin(Builtin::SetTimeout)),
-                "clearTimeout" | "clearInterval" => Ok(Value::Builtin(Builtin::ClearTimeout)),
-                "setInterval" => Ok(Value::Builtin(Builtin::SetInterval)),
-                "queueMicrotask" => Ok(Value::Builtin(Builtin::QueueMicrotask)),
-                "requestAnimationFrame" => Ok(Value::Builtin(Builtin::RequestAnimationFrame)),
-                "cancelAnimationFrame" => Ok(Value::Builtin(Builtin::CancelAnimationFrame)),
+                "fetch" => Ok(Value::builtin(Builtin::Fetch)),
+                "setTimeout" => Ok(Value::builtin(Builtin::SetTimeout)),
+                "clearTimeout" | "clearInterval" => Ok(Value::builtin(Builtin::ClearTimeout)),
+                "setInterval" => Ok(Value::builtin(Builtin::SetInterval)),
+                "queueMicrotask" => Ok(Value::builtin(Builtin::QueueMicrotask)),
+                "requestAnimationFrame" => Ok(Value::builtin(Builtin::RequestAnimationFrame)),
+                "cancelAnimationFrame" => Ok(Value::builtin(Builtin::CancelAnimationFrame)),
                 "importScripts"
                     if self.worker_sender.is_some()
                         && matches!(self.worker_script_type, Some(WorkerScriptType::Classic)) =>
                 {
-                    Ok(Value::Builtin(Builtin::WorkerGlobalImportScripts))
+                    Ok(Value::builtin(Builtin::WorkerGlobalImportScripts))
                 }
                 "postMessage" if self.worker_sender.is_some() => {
-                    Ok(Value::Builtin(Builtin::WorkerGlobalPostMessage(
+                    Ok(Value::builtin(Builtin::WorkerGlobalPostMessage(
                         self.worker_sender
                             .clone()
                             .expect("worker sender checked above"),
@@ -4720,7 +4742,7 @@ impl ScriptRuntime {
                 "ceriQuery" => Ok(self
                     .host_runtime_info
                     .as_ref()
-                    .map(|_| Value::Builtin(Builtin::CeriQuery))
+                    .map(|_| Value::builtin(Builtin::CeriQuery))
                     .unwrap_or(Value::Undefined)),
                 _ => Err(runtime_error(format!("window has no property {property}"))),
             },
@@ -4782,22 +4804,22 @@ impl ScriptRuntime {
                 _ => Ok(Value::Undefined),
             },
             Value::Clipboard => match property {
-                "readText" => Ok(Value::Builtin(Builtin::ClipboardReadText)),
-                "writeText" => Ok(Value::Builtin(Builtin::ClipboardWriteText)),
-                "read" => Ok(Value::Builtin(Builtin::ClipboardRead)),
-                "write" => Ok(Value::Builtin(Builtin::ClipboardWrite)),
+                "readText" => Ok(Value::builtin(Builtin::ClipboardReadText)),
+                "writeText" => Ok(Value::builtin(Builtin::ClipboardWriteText)),
+                "read" => Ok(Value::builtin(Builtin::ClipboardRead)),
+                "write" => Ok(Value::builtin(Builtin::ClipboardWrite)),
                 _ => Err(runtime_error(format!(
                     "clipboard has no property {property}"
                 ))),
             },
             Value::Crypto => match property {
                 "subtle" => Ok(Value::SubtleCrypto),
-                "getRandomValues" => Ok(Value::Builtin(Builtin::CryptoGetRandomValues)),
-                "randomUUID" => Ok(Value::Builtin(Builtin::CryptoRandomUuid)),
+                "getRandomValues" => Ok(Value::builtin(Builtin::CryptoGetRandomValues)),
+                "randomUUID" => Ok(Value::builtin(Builtin::CryptoRandomUuid)),
                 _ => Err(runtime_error(format!("crypto has no property {property}"))),
             },
             Value::SubtleCrypto => match property {
-                "digest" => Ok(Value::Builtin(Builtin::SubtleDigest)),
+                "digest" => Ok(Value::builtin(Builtin::SubtleDigest)),
                 _ => Err(runtime_error(format!(
                     "SubtleCrypto has no property {property}"
                 ))),
@@ -4805,7 +4827,7 @@ impl ScriptRuntime {
             Value::Element(handle) => {
                 let node = handle.id;
                 let bound =
-                    |builtin: fn(ElementHandle) -> Builtin| Value::Builtin(builtin(handle.clone()));
+                    |builtin: fn(ElementHandle) -> Builtin| Value::builtin(builtin(handle.clone()));
                 let related = |related: Option<NodeId>| {
                     related.map_or(Value::Null, |related| self.node_value(related))
                 };
@@ -4999,9 +5021,9 @@ impl ScriptRuntime {
                 }
             }
             Value::Style(handle) => Ok(match property {
-                "getPropertyValue" => Value::Builtin(Builtin::StyleGetPropertyValue(handle)),
-                "setProperty" => Value::Builtin(Builtin::StyleSetProperty(handle)),
-                "removeProperty" => Value::Builtin(Builtin::StyleRemoveProperty(handle)),
+                "getPropertyValue" => Value::builtin(Builtin::StyleGetPropertyValue(handle)),
+                "setProperty" => Value::builtin(Builtin::StyleSetProperty(handle)),
+                "removeProperty" => Value::builtin(Builtin::StyleRemoveProperty(handle)),
                 "cssText" => Value::String(
                     self.element_attribute(&handle, "style")
                         .unwrap_or_default()
@@ -5022,28 +5044,28 @@ impl ScriptRuntime {
                 _ => Value::Undefined,
             }),
             Value::ClassList(handle) => match property {
-                "add" => Ok(Value::Builtin(Builtin::ElementClassListAdd(handle))),
-                "remove" => Ok(Value::Builtin(Builtin::ElementClassListRemove(handle))),
-                "contains" => Ok(Value::Builtin(Builtin::ElementClassListContains(handle))),
-                "toggle" => Ok(Value::Builtin(Builtin::ElementClassListToggle(handle))),
-                "item" => Ok(Value::Builtin(Builtin::ElementClassListItem(handle))),
-                "replace" => Ok(Value::Builtin(Builtin::ElementClassListReplace(handle))),
-                "supports" => Ok(Value::Builtin(Builtin::ElementClassListSupports)),
-                "toString" => Ok(Value::Builtin(Builtin::ElementClassListToString(handle))),
+                "add" => Ok(Value::builtin(Builtin::ElementClassListAdd(handle))),
+                "remove" => Ok(Value::builtin(Builtin::ElementClassListRemove(handle))),
+                "contains" => Ok(Value::builtin(Builtin::ElementClassListContains(handle))),
+                "toggle" => Ok(Value::builtin(Builtin::ElementClassListToggle(handle))),
+                "item" => Ok(Value::builtin(Builtin::ElementClassListItem(handle))),
+                "replace" => Ok(Value::builtin(Builtin::ElementClassListReplace(handle))),
+                "supports" => Ok(Value::builtin(Builtin::ElementClassListSupports)),
+                "toString" => Ok(Value::builtin(Builtin::ElementClassListToString(handle))),
                 "length" => Ok(Value::Number(self.class_tokens(&handle).len() as f64)),
                 "value" => Ok(Value::String(
                     self.element_attribute(&handle, "class")
                         .unwrap_or_default()
                         .into(),
                 )),
-                "forEach" => Ok(Value::Builtin(Builtin::ElementClassListForEach(handle))),
-                "keys" => Ok(Value::Builtin(Builtin::ElementClassListWalk(Box::new((
+                "forEach" => Ok(Value::builtin(Builtin::ElementClassListForEach(handle))),
+                "keys" => Ok(Value::builtin(Builtin::ElementClassListWalk(Box::new((
                     handle, "keys",
                 ))))),
-                "entries" => Ok(Value::Builtin(Builtin::ElementClassListWalk(Box::new((
+                "entries" => Ok(Value::builtin(Builtin::ElementClassListWalk(Box::new((
                     handle, "entries",
                 ))))),
-                "values" | "@@iterator" => Ok(Value::Builtin(Builtin::ElementClassListWalk(
+                "values" | "@@iterator" => Ok(Value::builtin(Builtin::ElementClassListWalk(
                     Box::new((handle, "values")),
                 ))),
                 _ => Ok(property
@@ -5083,9 +5105,9 @@ impl ScriptRuntime {
                         })
                         .into(),
                     )),
-                    "assign" => Ok(Value::Builtin(Builtin::LocationAssign)),
-                    "replace" => Ok(Value::Builtin(Builtin::LocationReplace)),
-                    "reload" => Ok(Value::Builtin(Builtin::LocationReload)),
+                    "assign" => Ok(Value::builtin(Builtin::LocationAssign)),
+                    "replace" => Ok(Value::builtin(Builtin::LocationReplace)),
+                    "reload" => Ok(Value::builtin(Builtin::LocationReload)),
                     _ => Err(runtime_error(format!(
                         "location has no property {property}"
                     ))),
@@ -5095,43 +5117,43 @@ impl ScriptRuntime {
                 "state" => Ok(history.borrow().state.clone()),
                 "length" => Ok(Value::Number(history.borrow().length as f64)),
                 "scrollRestoration" => Ok(Value::String("auto".into())),
-                "pushState" => Ok(Value::Builtin(Builtin::HistoryPushState)),
-                "replaceState" => Ok(Value::Builtin(Builtin::HistoryReplaceState)),
-                "back" => Ok(Value::Builtin(Builtin::HistoryBack)),
-                "forward" => Ok(Value::Builtin(Builtin::HistoryForward)),
-                "go" => Ok(Value::Builtin(Builtin::HistoryGo)),
+                "pushState" => Ok(Value::builtin(Builtin::HistoryPushState)),
+                "replaceState" => Ok(Value::builtin(Builtin::HistoryReplaceState)),
+                "back" => Ok(Value::builtin(Builtin::HistoryBack)),
+                "forward" => Ok(Value::builtin(Builtin::HistoryForward)),
+                "go" => Ok(Value::builtin(Builtin::HistoryGo)),
                 _ => Err(runtime_error(format!("history has no property {property}"))),
             },
             Value::Storage(storage) => match property {
                 "length" => Ok(Value::Number(storage.borrow().values.len() as f64)),
-                "key" => Ok(Value::Builtin(Builtin::StorageKey(storage))),
-                "getItem" => Ok(Value::Builtin(Builtin::StorageGetItem(storage))),
-                "setItem" => Ok(Value::Builtin(Builtin::StorageSetItem(storage))),
-                "removeItem" => Ok(Value::Builtin(Builtin::StorageRemoveItem(storage))),
-                "clear" => Ok(Value::Builtin(Builtin::StorageClear(storage))),
+                "key" => Ok(Value::builtin(Builtin::StorageKey(storage))),
+                "getItem" => Ok(Value::builtin(Builtin::StorageGetItem(storage))),
+                "setItem" => Ok(Value::builtin(Builtin::StorageSetItem(storage))),
+                "removeItem" => Ok(Value::builtin(Builtin::StorageRemoveItem(storage))),
+                "clear" => Ok(Value::builtin(Builtin::StorageClear(storage))),
                 _ => Err(runtime_error(format!("storage has no property {property}"))),
             },
             Value::CacheStorage(storage) => match property {
-                "open" => Ok(Value::Builtin(Builtin::CacheStorageOpen(storage))),
-                "has" => Ok(Value::Builtin(Builtin::CacheStorageHas(storage))),
-                "delete" => Ok(Value::Builtin(Builtin::CacheStorageDelete(storage))),
-                "keys" => Ok(Value::Builtin(Builtin::CacheStorageKeys(storage))),
-                "match" => Ok(Value::Builtin(Builtin::CacheStorageMatch(storage))),
+                "open" => Ok(Value::builtin(Builtin::CacheStorageOpen(storage))),
+                "has" => Ok(Value::builtin(Builtin::CacheStorageHas(storage))),
+                "delete" => Ok(Value::builtin(Builtin::CacheStorageDelete(storage))),
+                "keys" => Ok(Value::builtin(Builtin::CacheStorageKeys(storage))),
+                "match" => Ok(Value::builtin(Builtin::CacheStorageMatch(storage))),
                 _ => Err(runtime_error(format!(
                     "CacheStorage has no property {property}"
                 ))),
             },
             Value::Cache(cache) => match property {
-                "put" => Ok(Value::Builtin(Builtin::CachePut(cache))),
-                "match" => Ok(Value::Builtin(Builtin::CacheMatch(cache))),
-                "delete" => Ok(Value::Builtin(Builtin::CacheDelete(cache))),
-                "keys" => Ok(Value::Builtin(Builtin::CacheKeys(cache))),
+                "put" => Ok(Value::builtin(Builtin::CachePut(cache))),
+                "match" => Ok(Value::builtin(Builtin::CacheMatch(cache))),
+                "delete" => Ok(Value::builtin(Builtin::CacheDelete(cache))),
+                "keys" => Ok(Value::builtin(Builtin::CacheKeys(cache))),
                 _ => Err(runtime_error(format!("Cache has no property {property}"))),
             },
             Value::IndexedDbFactory(storage) => match property {
-                "open" => Ok(Value::Builtin(Builtin::IndexedDbOpen(storage))),
-                "deleteDatabase" => Ok(Value::Builtin(Builtin::IndexedDbDeleteDatabase(storage))),
-                "databases" => Ok(Value::Builtin(Builtin::IndexedDbFactoryDatabases(storage))),
+                "open" => Ok(Value::builtin(Builtin::IndexedDbOpen(storage))),
+                "deleteDatabase" => Ok(Value::builtin(Builtin::IndexedDbDeleteDatabase(storage))),
+                "databases" => Ok(Value::builtin(Builtin::IndexedDbFactoryDatabases(storage))),
                 _ => Err(runtime_error(format!(
                     "indexedDB has no property {property}"
                 ))),
@@ -5171,16 +5193,16 @@ impl ScriptRuntime {
                 "objectStoreNames" => Ok(Value::IndexedDbNameList(Rc::new(
                     database.borrow().store_order.clone(),
                 ))),
-                "createObjectStore" => Ok(Value::Builtin(
+                "createObjectStore" => Ok(Value::builtin(
                     Builtin::IndexedDbDatabaseCreateObjectStore(database),
                 )),
-                "deleteObjectStore" => Ok(Value::Builtin(
+                "deleteObjectStore" => Ok(Value::builtin(
                     Builtin::IndexedDbDatabaseDeleteObjectStore(database),
                 )),
-                "transaction" => Ok(Value::Builtin(Builtin::IndexedDbDatabaseTransaction(
+                "transaction" => Ok(Value::builtin(Builtin::IndexedDbDatabaseTransaction(
                     database,
                 ))),
-                "close" => Ok(Value::Builtin(Builtin::IndexedDbDatabaseClose(database))),
+                "close" => Ok(Value::builtin(Builtin::IndexedDbDatabaseClose(database))),
                 "onversionchange" => Ok(database
                     .borrow()
                     .on_version_change
@@ -5192,10 +5214,10 @@ impl ScriptRuntime {
             },
             Value::IndexedDbTransaction(transaction) => match property {
                 "mode" => Ok(Value::String(transaction.borrow().mode.clone().into())),
-                "objectStore" => Ok(Value::Builtin(Builtin::IndexedDbTransactionObjectStore(
+                "objectStore" => Ok(Value::builtin(Builtin::IndexedDbTransactionObjectStore(
                     transaction,
                 ))),
-                "abort" => Ok(Value::Builtin(Builtin::IndexedDbTransactionAbort(
+                "abort" => Ok(Value::builtin(Builtin::IndexedDbTransactionAbort(
                     transaction,
                 ))),
                 "oncomplete" => Ok(transaction
@@ -5238,14 +5260,14 @@ impl ScriptRuntime {
                     .clone()
                     .map(Value::IndexedDbTransaction)
                     .unwrap_or(Value::Null)),
-                "put" => Ok(Value::Builtin(Builtin::IndexedDbObjectStorePut(store))),
-                "add" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreAdd(store))),
-                "get" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreGet(store))),
-                "delete" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreDelete(store))),
-                "clear" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreClear(store))),
-                "count" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreCount(store))),
-                "getAll" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreGetAll(store))),
-                "getAllKeys" => Ok(Value::Builtin(Builtin::IndexedDbObjectStoreGetAllKeys(
+                "put" => Ok(Value::builtin(Builtin::IndexedDbObjectStorePut(store))),
+                "add" => Ok(Value::builtin(Builtin::IndexedDbObjectStoreAdd(store))),
+                "get" => Ok(Value::builtin(Builtin::IndexedDbObjectStoreGet(store))),
+                "delete" => Ok(Value::builtin(Builtin::IndexedDbObjectStoreDelete(store))),
+                "clear" => Ok(Value::builtin(Builtin::IndexedDbObjectStoreClear(store))),
+                "count" => Ok(Value::builtin(Builtin::IndexedDbObjectStoreCount(store))),
+                "getAll" => Ok(Value::builtin(Builtin::IndexedDbObjectStoreGetAll(store))),
+                "getAllKeys" => Ok(Value::builtin(Builtin::IndexedDbObjectStoreGetAllKeys(
                     store,
                 ))),
                 _ => Err(runtime_error(format!(
@@ -5254,30 +5276,30 @@ impl ScriptRuntime {
             },
             Value::IndexedDbNameList(names) => match property {
                 "length" => Ok(Value::Number(names.len() as f64)),
-                "contains" => Ok(Value::Builtin(Builtin::IndexedDbNameListContains(names))),
-                "item" => Ok(Value::Builtin(Builtin::IndexedDbNameListItem(names))),
+                "contains" => Ok(Value::builtin(Builtin::IndexedDbNameListContains(names))),
+                "item" => Ok(Value::builtin(Builtin::IndexedDbNameListItem(names))),
                 _ => Err(runtime_error(format!(
                     "DOMStringList has no property {property}"
                 ))),
             },
             Value::FormData(form_data) => match property {
-                "append" => Ok(Value::Builtin(Builtin::FormDataAppend(form_data))),
-                "delete" => Ok(Value::Builtin(Builtin::FormDataDelete(form_data))),
-                "get" => Ok(Value::Builtin(Builtin::FormDataGet(form_data))),
-                "getAll" => Ok(Value::Builtin(Builtin::FormDataGetAll(form_data))),
-                "has" => Ok(Value::Builtin(Builtin::FormDataHas(form_data))),
-                "set" => Ok(Value::Builtin(Builtin::FormDataSet(form_data))),
-                "keys" => Ok(Value::Builtin(Builtin::FormDataKeys(form_data))),
-                "values" => Ok(Value::Builtin(Builtin::FormDataValues(form_data))),
-                "entries" | "@@iterator" => Ok(Value::Builtin(Builtin::FormDataEntries(form_data))),
-                "forEach" => Ok(Value::Builtin(Builtin::FormDataForEach(form_data))),
+                "append" => Ok(Value::builtin(Builtin::FormDataAppend(form_data))),
+                "delete" => Ok(Value::builtin(Builtin::FormDataDelete(form_data))),
+                "get" => Ok(Value::builtin(Builtin::FormDataGet(form_data))),
+                "getAll" => Ok(Value::builtin(Builtin::FormDataGetAll(form_data))),
+                "has" => Ok(Value::builtin(Builtin::FormDataHas(form_data))),
+                "set" => Ok(Value::builtin(Builtin::FormDataSet(form_data))),
+                "keys" => Ok(Value::builtin(Builtin::FormDataKeys(form_data))),
+                "values" => Ok(Value::builtin(Builtin::FormDataValues(form_data))),
+                "entries" | "@@iterator" => Ok(Value::builtin(Builtin::FormDataEntries(form_data))),
+                "forEach" => Ok(Value::builtin(Builtin::FormDataForEach(form_data))),
                 _ => Err(runtime_error(format!(
                     "FormData has no property {property}"
                 ))),
             },
             Value::FileList(files) => match property {
                 "length" => Ok(Value::Number(files.len() as f64)),
-                "item" => Ok(Value::Builtin(Builtin::FileListItem(files))),
+                "item" => Ok(Value::builtin(Builtin::FileListItem(files))),
                 _ => Err(runtime_error(format!(
                     "FileList has no property {property}"
                 ))),
@@ -5286,13 +5308,13 @@ impl ScriptRuntime {
                 let handle = worker.clone();
                 let worker = worker.borrow();
                 match property {
-                    "postMessage" => Ok(Value::Builtin(Builtin::WorkerPostMessage(handle.clone()))),
-                    "terminate" => Ok(Value::Builtin(Builtin::WorkerTerminate(handle))),
+                    "postMessage" => Ok(Value::builtin(Builtin::WorkerPostMessage(handle.clone()))),
+                    "terminate" => Ok(Value::builtin(Builtin::WorkerTerminate(handle))),
                     "addEventListener" => {
-                        Ok(Value::Builtin(Builtin::WorkerAddEventListener(handle)))
+                        Ok(Value::builtin(Builtin::WorkerAddEventListener(handle)))
                     }
                     "removeEventListener" => {
-                        Ok(Value::Builtin(Builtin::WorkerRemoveEventListener(handle)))
+                        Ok(Value::builtin(Builtin::WorkerRemoveEventListener(handle)))
                     }
                     "onmessage" => Ok(worker.onmessage.clone().unwrap_or(Value::Null)),
                     "onerror" => Ok(worker.onerror.clone().unwrap_or(Value::Null)),
@@ -5304,11 +5326,11 @@ impl ScriptRuntime {
             Value::Blob(blob) => match property {
                 "size" => Ok(Value::Number(blob.bytes.len() as f64)),
                 "type" => Ok(Value::String(blob.mime_type.clone().into())),
-                "slice" => Ok(Value::Builtin(Builtin::BlobSlice(blob))),
-                "text" => Ok(Value::Builtin(Builtin::BlobText(blob))),
-                "arrayBuffer" => Ok(Value::Builtin(Builtin::BlobBytes(blob))),
-                "bytes" => Ok(Value::Builtin(Builtin::BlobUint8(blob))),
-                "stream" => Ok(Value::Builtin(Builtin::BlobStream(blob))),
+                "slice" => Ok(Value::builtin(Builtin::BlobSlice(blob))),
+                "text" => Ok(Value::builtin(Builtin::BlobText(blob))),
+                "arrayBuffer" => Ok(Value::builtin(Builtin::BlobBytes(blob))),
+                "bytes" => Ok(Value::builtin(Builtin::BlobUint8(blob))),
+                "stream" => Ok(Value::builtin(Builtin::BlobStream(blob))),
                 _ => Err(runtime_error(format!("Blob has no property {property}"))),
             },
             Value::BlobConstructor => {
@@ -5319,11 +5341,11 @@ impl ScriptRuntime {
                 "type" => Ok(Value::String(file.mime_type.clone().into())),
                 "name" => Ok(Value::String(file.name.clone().into())),
                 "lastModified" => Ok(Value::Number(file.last_modified as f64)),
-                "slice" => Ok(Value::Builtin(Builtin::FileSlice(file))),
-                "text" => Ok(Value::Builtin(Builtin::FileText(file))),
-                "arrayBuffer" => Ok(Value::Builtin(Builtin::FileBytes(file))),
-                "bytes" => Ok(Value::Builtin(Builtin::FileUint8(file))),
-                "stream" => Ok(Value::Builtin(Builtin::FileStream(file))),
+                "slice" => Ok(Value::builtin(Builtin::FileSlice(file))),
+                "text" => Ok(Value::builtin(Builtin::FileText(file))),
+                "arrayBuffer" => Ok(Value::builtin(Builtin::FileBytes(file))),
+                "bytes" => Ok(Value::builtin(Builtin::FileUint8(file))),
+                "stream" => Ok(Value::builtin(Builtin::FileStream(file))),
                 _ => Err(runtime_error(format!("File has no property {property}"))),
             },
             Value::FileConstructor => {
@@ -5332,7 +5354,7 @@ impl ScriptRuntime {
             Value::CanvasContext(context) => self.canvas_context_property(&context, property),
             Value::AbortController(controller) => match property {
                 "signal" => Ok(Value::AbortSignal(controller.borrow().signal.clone())),
-                "abort" => Ok(Value::Builtin(Builtin::AbortControllerAbort(controller))),
+                "abort" => Ok(Value::builtin(Builtin::AbortControllerAbort(controller))),
                 _ => Err(runtime_error(format!(
                     "AbortController has no property {property}"
                 ))),
@@ -5341,10 +5363,10 @@ impl ScriptRuntime {
                 "aborted" => Ok(Value::Bool(signal.borrow().aborted)),
                 "reason" => Ok(signal.borrow().reason.clone().unwrap_or(Value::Undefined)),
                 "addEventListener" => {
-                    Ok(Value::Builtin(Builtin::AbortSignalAddEventListener(signal)))
+                    Ok(Value::builtin(Builtin::AbortSignalAddEventListener(signal)))
                 }
-                "throwIfAborted" => Ok(Value::Builtin(Builtin::AbortSignalThrowIfAborted(signal))),
-                "removeEventListener" => Ok(Value::Builtin(
+                "throwIfAborted" => Ok(Value::builtin(Builtin::AbortSignalThrowIfAborted(signal))),
+                "removeEventListener" => Ok(Value::builtin(
                     Builtin::AbortSignalRemoveEventListener(signal),
                 )),
                 "onabort" => Ok(signal.borrow().onabort.clone().unwrap_or(Value::Null)),
@@ -5361,21 +5383,21 @@ impl ScriptRuntime {
                 "headers" => Ok(Value::Headers(response.headers.clone())),
                 "bodyUsed" => Ok(Value::Bool(response_body_used(&response.body))),
                 "body" => Ok(self.body_stream(&response.stream)),
-                "clone" => Ok(Value::Builtin(Builtin::ResponseClone(response))),
-                "text" => Ok(Value::Builtin(Builtin::ResponseText(response))),
-                "json" => Ok(Value::Builtin(Builtin::ResponseJson(response))),
-                "arrayBuffer" => Ok(Value::Builtin(Builtin::ResponseBytes(response))),
-                "bytes" => Ok(Value::Builtin(Builtin::ResponseUint8(response))),
-                "blob" => Ok(Value::Builtin(Builtin::ResponseBlob(response))),
-                "formData" => Ok(Value::Builtin(Builtin::ResponseFormData(response))),
+                "clone" => Ok(Value::builtin(Builtin::ResponseClone(response))),
+                "text" => Ok(Value::builtin(Builtin::ResponseText(response))),
+                "json" => Ok(Value::builtin(Builtin::ResponseJson(response))),
+                "arrayBuffer" => Ok(Value::builtin(Builtin::ResponseBytes(response))),
+                "bytes" => Ok(Value::builtin(Builtin::ResponseUint8(response))),
+                "blob" => Ok(Value::builtin(Builtin::ResponseBlob(response))),
+                "formData" => Ok(Value::builtin(Builtin::ResponseFormData(response))),
                 _ => Err(runtime_error(format!(
                     "response has no property {property}"
                 ))),
             },
             Value::ResponseConstructor => match property {
-                "error" => Ok(Value::Builtin(Builtin::ResponseErrorConstructor)),
-                "json" => Ok(Value::Builtin(Builtin::ResponseJsonConstructor)),
-                "redirect" => Ok(Value::Builtin(Builtin::ResponseRedirectConstructor)),
+                "error" => Ok(Value::builtin(Builtin::ResponseErrorConstructor)),
+                "json" => Ok(Value::builtin(Builtin::ResponseJsonConstructor)),
+                "redirect" => Ok(Value::builtin(Builtin::ResponseRedirectConstructor)),
                 _ => Err(runtime_error(format!(
                     "Response has no property {property}"
                 ))),
@@ -5397,24 +5419,24 @@ impl ScriptRuntime {
                     .clone()
                     .map(Value::AbortSignal)
                     .unwrap_or(Value::Null)),
-                "clone" => Ok(Value::Builtin(Builtin::RequestClone(request))),
-                "text" => Ok(Value::Builtin(Builtin::RequestText(request))),
-                "arrayBuffer" => Ok(Value::Builtin(Builtin::RequestBytes(request))),
-                "bytes" => Ok(Value::Builtin(Builtin::RequestUint8(request))),
-                "blob" => Ok(Value::Builtin(Builtin::RequestBlob(request))),
-                "formData" => Ok(Value::Builtin(Builtin::RequestFormData(request))),
+                "clone" => Ok(Value::builtin(Builtin::RequestClone(request))),
+                "text" => Ok(Value::builtin(Builtin::RequestText(request))),
+                "arrayBuffer" => Ok(Value::builtin(Builtin::RequestBytes(request))),
+                "bytes" => Ok(Value::builtin(Builtin::RequestUint8(request))),
+                "blob" => Ok(Value::builtin(Builtin::RequestBlob(request))),
+                "formData" => Ok(Value::builtin(Builtin::RequestFormData(request))),
                 _ => Err(runtime_error(format!("request has no property {property}"))),
             },
             Value::Headers(headers) => match property {
-                "append" => Ok(Value::Builtin(Builtin::HeadersAppend(headers))),
-                "delete" => Ok(Value::Builtin(Builtin::HeadersDelete(headers))),
-                "get" => Ok(Value::Builtin(Builtin::HeadersGet(headers))),
-                "has" => Ok(Value::Builtin(Builtin::HeadersHas(headers))),
-                "keys" => Ok(Value::Builtin(Builtin::HeadersKeys(headers))),
-                "values" => Ok(Value::Builtin(Builtin::HeadersValues(headers))),
-                "entries" => Ok(Value::Builtin(Builtin::HeadersEntries(headers))),
-                "forEach" => Ok(Value::Builtin(Builtin::HeadersForEach(headers))),
-                "set" => Ok(Value::Builtin(Builtin::HeadersSet(headers))),
+                "append" => Ok(Value::builtin(Builtin::HeadersAppend(headers))),
+                "delete" => Ok(Value::builtin(Builtin::HeadersDelete(headers))),
+                "get" => Ok(Value::builtin(Builtin::HeadersGet(headers))),
+                "has" => Ok(Value::builtin(Builtin::HeadersHas(headers))),
+                "keys" => Ok(Value::builtin(Builtin::HeadersKeys(headers))),
+                "values" => Ok(Value::builtin(Builtin::HeadersValues(headers))),
+                "entries" => Ok(Value::builtin(Builtin::HeadersEntries(headers))),
+                "forEach" => Ok(Value::builtin(Builtin::HeadersForEach(headers))),
+                "set" => Ok(Value::builtin(Builtin::HeadersSet(headers))),
                 _ => Err(runtime_error(format!("headers has no property {property}"))),
             },
             Value::Iterator(iterator) => match property {
@@ -5424,8 +5446,8 @@ impl ScriptRuntime {
                         iterator.values.len().saturating_sub(iterator.index) as f64,
                     ))
                 }
-                "next" => Ok(Value::Builtin(Builtin::IteratorNext(iterator))),
-                "join" => Ok(Value::Builtin(Builtin::IteratorJoin(iterator))),
+                "next" => Ok(Value::builtin(Builtin::IteratorNext(iterator))),
+                "join" => Ok(Value::builtin(Builtin::IteratorJoin(iterator))),
                 _ => Err(runtime_error(format!(
                     "iterator has no property {property}"
                 ))),
@@ -5467,11 +5489,11 @@ impl ScriptRuntime {
             },
             Value::NodeList(nodes) => match property {
                 "length" => Ok(Value::Number(nodes.len() as f64)),
-                "item" => Ok(Value::Builtin(Builtin::NodeListItem(nodes))),
-                "forEach" => Ok(Value::Builtin(Builtin::NodeListForEach(nodes))),
-                "keys" => Ok(Value::Builtin(Builtin::NodeListKeys(nodes))),
-                "values" | "@@iterator" => Ok(Value::Builtin(Builtin::NodeListValues(nodes))),
-                "entries" => Ok(Value::Builtin(Builtin::NodeListEntries(nodes))),
+                "item" => Ok(Value::builtin(Builtin::NodeListItem(nodes))),
+                "forEach" => Ok(Value::builtin(Builtin::NodeListForEach(nodes))),
+                "keys" => Ok(Value::builtin(Builtin::NodeListKeys(nodes))),
+                "values" | "@@iterator" => Ok(Value::builtin(Builtin::NodeListValues(nodes))),
+                "entries" => Ok(Value::builtin(Builtin::NodeListEntries(nodes))),
                 _ => {
                     let index = property.parse::<usize>().map_err(|_| {
                         runtime_error(format!("NodeList has no property {property}"))
@@ -5488,7 +5510,7 @@ impl ScriptRuntime {
                 .map(|text| Value::String(text.into()))
                 .unwrap_or(Value::Undefined)),
             Value::WebAssemblyNamespace => match property {
-                "instantiate" => Ok(Value::Builtin(Builtin::WebAssemblyInstantiate)),
+                "instantiate" => Ok(Value::builtin(Builtin::WebAssemblyInstantiate)),
                 _ => Err(runtime_error(format!(
                     "WebAssembly has no property {property}"
                 ))),
@@ -5559,7 +5581,7 @@ impl ScriptRuntime {
                 Ok(strings::unit_at(&string, index as usize).unwrap_or(Value::Undefined))
             }
             Value::FormData(form_data) if index.property_key() == "@@iterator" => {
-                Ok(Value::Builtin(Builtin::FormDataEntries(form_data)))
+                Ok(Value::builtin(Builtin::FormDataEntries(form_data)))
             }
             Value::Bytes(bytes) => {
                 let index = index.number()?;
@@ -5934,7 +5956,7 @@ impl ScriptRuntime {
                 .insert("self".to_string(), Value::Window);
             runtime.global.borrow_mut().values.insert(
                 "postMessage".to_string(),
-                Value::Builtin(Builtin::WorkerGlobalPostMessage(event_sender.clone())),
+                Value::builtin(Builtin::WorkerGlobalPostMessage(event_sender.clone())),
             );
             runtime
                 .global
@@ -5944,7 +5966,7 @@ impl ScriptRuntime {
             if matches!(worker_type, WorkerScriptType::Classic) {
                 runtime.global.borrow_mut().values.insert(
                     "importScripts".to_string(),
-                    Value::Builtin(Builtin::WorkerGlobalImportScripts),
+                    Value::builtin(Builtin::WorkerGlobalImportScripts),
                 );
             }
             let startup = match worker_type {
@@ -8227,10 +8249,10 @@ impl ScriptRuntime {
 
     fn call_builtin(
         &mut self,
-        builtin: Builtin,
+        builtin: Rc<Builtin>,
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
-        match builtin {
+        match Rc::unwrap_or_clone(builtin) {
             Builtin::Native(native) => self.call_native(&native, Value::Undefined, arguments),
             Builtin::DocumentGetElementById => {
                 let id = arguments
@@ -8286,8 +8308,8 @@ impl ScriptRuntime {
                 Ok(self.node_value(node))
             }
             // one document holds every node, so importing is a clone and adopting a removal
-            Builtin::DocumentImportNode | Builtin::DocumentAdoptNode => {
-                let import = matches!(builtin, Builtin::DocumentImportNode);
+            kind @ (Builtin::DocumentImportNode | Builtin::DocumentAdoptNode) => {
+                let import = matches!(kind, Builtin::DocumentImportNode);
                 let method = if import { "importNode" } else { "adoptNode" };
                 let node = match arguments.first().map(Value::resolve) {
                     Some(Value::Element(handle)) => handle.id,
@@ -8395,7 +8417,7 @@ impl ScriptRuntime {
                 for (name, function_index) in module.exported_functions() {
                     exports.insert(
                         name.to_string(),
-                        Value::Builtin(Builtin::WebAssemblyFunction(Rc::new(WasmFunctionData {
+                        Value::builtin(Builtin::WebAssemblyFunction(Rc::new(WasmFunctionData {
                             module: module.clone(),
                             function_index,
                         }))),
@@ -8593,13 +8615,13 @@ impl ScriptRuntime {
                 }
                 Ok(Value::Null)
             }
-            Builtin::WindowAlert | Builtin::WindowConfirm | Builtin::WindowPrompt => {
+            kind @ (Builtin::WindowAlert | Builtin::WindowConfirm | Builtin::WindowPrompt) => {
                 let message = match arguments.first() {
                     Some(message) => self.coerce_string(message.clone())?,
                     None => String::new(),
                 };
                 let Some(dialogs) = self.script_dialogs.clone() else {
-                    return Ok(match builtin {
+                    return Ok(match kind {
                         Builtin::WindowConfirm => Value::Bool(false),
                         Builtin::WindowPrompt => Value::Null,
                         _ => Value::Undefined,
@@ -8609,7 +8631,7 @@ impl ScriptRuntime {
                     let document = self.document.borrow();
                     document.title_of(document.root()).unwrap_or_default()
                 };
-                Ok(match builtin {
+                Ok(match kind {
                     Builtin::WindowConfirm => Value::Bool(dialogs.confirm(&title, &message)),
                     Builtin::WindowPrompt => {
                         let default = match arguments.get(1) {
@@ -9806,7 +9828,7 @@ impl ScriptRuntime {
                 let signal = new_abort_signal();
                 self.schedule_task(
                     vec![
-                        Value::Builtin(Builtin::AbortSignalAbortWith(signal.clone())),
+                        Value::builtin(Builtin::AbortSignalAbortWith(signal.clone())),
                         Value::Number(delay),
                         dom_exception("TimeoutError", "signal timed out"),
                     ],
@@ -9830,7 +9852,7 @@ impl ScriptRuntime {
                     }
                     let follow =
                         Builtin::AbortSignalFollow(Box::new((source.clone(), signal.clone())));
-                    source.borrow_mut().listeners.push(Value::Builtin(follow));
+                    source.borrow_mut().listeners.push(Value::builtin(follow));
                 }
                 Ok(Value::AbortSignal(signal))
             }
@@ -11052,7 +11074,7 @@ impl ScriptRuntime {
 
     // a host step that runs as its own task once the current one finishes
     fn schedule_native_task(&mut self, native: Native) {
-        self.schedule_callback(Value::Builtin(Builtin::native(native)), Vec::new());
+        self.schedule_callback(Value::builtin(Builtin::native(native)), Vec::new());
     }
 
     fn schedule_callback(&mut self, callback: Value, arguments: Vec<Value>) {
@@ -11385,7 +11407,7 @@ impl ScriptRuntime {
             new_version,
             needs_upgrade,
         }));
-        self.queue_internal_microtask(Value::Builtin(Builtin::IndexedDbRequestDispatch(
+        self.queue_internal_microtask(Value::builtin(Builtin::IndexedDbRequestDispatch(
             request.clone(),
         )));
         Value::IndexedDbRequest(request)
@@ -11430,7 +11452,7 @@ impl ScriptRuntime {
             request.borrow_mut().transaction = None;
             callback_result?;
             if let Some(transaction) = transaction.clone() {
-                self.queue_internal_microtask(Value::Builtin(
+                self.queue_internal_microtask(Value::builtin(
                     Builtin::IndexedDbTransactionComplete(transaction),
                 ));
             }
@@ -11457,7 +11479,7 @@ impl ScriptRuntime {
                 let mut transaction_state = transaction.borrow_mut();
                 transaction_state.pending = transaction_state.pending.saturating_sub(1);
             }
-            self.queue_internal_microtask(Value::Builtin(Builtin::IndexedDbTransactionComplete(
+            self.queue_internal_microtask(Value::builtin(Builtin::IndexedDbTransactionComplete(
                 transaction,
             )));
         }
@@ -11620,7 +11642,7 @@ impl ScriptRuntime {
             on_error: None,
             on_abort: None,
         }));
-        self.queue_internal_microtask(Value::Builtin(Builtin::IndexedDbTransactionComplete(
+        self.queue_internal_microtask(Value::builtin(Builtin::IndexedDbTransactionComplete(
             transaction.clone(),
         )));
         Ok(Value::IndexedDbTransaction(transaction))
@@ -11672,7 +11694,7 @@ impl ScriptRuntime {
         }
         transaction_state.aborted = true;
         drop(transaction_state);
-        self.queue_internal_microtask(Value::Builtin(Builtin::IndexedDbTransactionComplete(
+        self.queue_internal_microtask(Value::builtin(Builtin::IndexedDbTransactionComplete(
             transaction,
         )));
         Ok(Value::Undefined)
@@ -12008,19 +12030,20 @@ impl Clone for Value {
 }
 
 impl Value {
+    #[inline]
+    fn builtin(builtin: Builtin) -> Self {
+        Self::Builtin(Rc::new(builtin))
+    }
+
+    #[inline(always)]
+    fn tag(&self) -> u8 {
+        // safety: Value is repr(C, u8), so byte 0 is always the initialized discriminant
+        unsafe { *(self as *const Self as *const u8) }
+    }
+
     #[inline(always)]
     fn is_copy(&self) -> bool {
-        matches!(
-            self,
-            Self::Undefined
-                | Self::Uninitialized
-                | Self::Null
-                | Self::Bool(_)
-                | Self::Number(_)
-                | Self::Object(_)
-                | Self::Array(_)
-                | Self::ArrayIter(_)
-        )
+        self.tag() <= VALUE_TAG_ARRAY_ITER
     }
 
     #[cold]

@@ -463,7 +463,7 @@ impl ScriptRuntime {
     pub(super) fn call_string_method_slice(
         &mut self,
         method: StringMethod,
-        this: Value,
+        this: &Value,
         arguments: &[Value],
     ) -> Result<Value, ScriptError> {
         use StringMethod as M;
@@ -476,7 +476,7 @@ impl ScriptRuntime {
             if matches!(method, M::Split)
                 && let Some(data) = self.intrinsic_regexp_split(pattern)
             {
-                let subject = self.this_js_str(&this, method)?;
+                let subject = self.this_js_str(this, method)?;
                 let limit = match arguments.get(1) {
                     None | Some(Value::Undefined) => u32::MAX as usize,
                     Some(limit) => self.coerce_uint32(limit.clone())? as usize,
@@ -502,14 +502,14 @@ impl ScriptRuntime {
                         )));
                     }
                 }
-                let subject = self.this_js_str(&this, method)?;
+                let subject = self.this_js_str(this, method)?;
                 let mut forwarded = Vec::with_capacity(arguments.len());
                 forwarded.push(Value::String(subject));
                 forwarded.extend(arguments.iter().skip(1).cloned());
                 return self.call_function(protocol, pattern, forwarded);
             }
         }
-        let text = self.this_js_str(&this, method)?;
+        let text = self.this_js_str(this, method)?;
         Ok(match method {
             M::At | M::CharAt | M::CharCodeAt | M::CodePointAt => {
                 let ascii = text.is_ascii();

@@ -253,6 +253,7 @@ type AttrTransitions = Vec<(Rc<str>, u8, Weak<Shape>)>;
 // the keys and attributes of an object in insertion order. objects that gained the same keys
 // with the same attributes in the same order share one, so each keeps only compact 16-byte slots
 pub(super) struct Shape {
+    pub(super) id: u32,
     keys: Vec<Rc<str>>,
     attrs: Vec<u8>,
     // built once a shape grows past a handful of keys
@@ -275,6 +276,20 @@ pub(super) struct Shape {
     has_integer_key: bool,
 }
 
+fn next_shape_id() -> u32 {
+    thread_local! {
+        static NEXT_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+    }
+    NEXT_ID.with(|cell| {
+        let id = cell.get();
+        if id == 0 {
+            return 0;
+        }
+        cell.set(id.wrapping_add(1));
+        id
+    })
+}
+
 impl std::fmt::Debug for Shape {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("Shape")
@@ -289,6 +304,7 @@ impl Shape {
     fn root() -> Rc<Self> {
         thread_local! {
             static ROOT: Rc<Shape> = Rc::new(Shape {
+                id: next_shape_id(),
                 keys: Vec::new(),
                 attrs: Vec::new(),
                 index: None,
@@ -318,6 +334,7 @@ impl Shape {
 
     fn own_copy(&self) -> Self {
         Self {
+            id: 0,
             keys: self.keys.clone(),
             attrs: self.attrs.clone(),
             index: self.index.clone(),
@@ -385,6 +402,7 @@ impl Shape {
             }
             let key: Rc<str> = Rc::from(key);
             let mut next = Shape {
+                id: next_shape_id(),
                 keys: self.keys.clone(),
                 attrs: self.attrs.clone(),
                 index: self.index.clone(),
@@ -421,6 +439,7 @@ impl Shape {
         }
         let key: Rc<str> = Rc::from(key);
         let mut next = Shape {
+            id: next_shape_id(),
             keys: self.keys.clone(),
             attrs: self.attrs.clone(),
             index: self.index.clone(),
@@ -459,6 +478,7 @@ const PIC_SIZE: usize = 8;
 struct ShapePin {
     _weak: Weak<Shape>,
     ptr: *const Shape,
+    id: u32,
 }
 
 impl ShapePin {
@@ -467,6 +487,7 @@ impl ShapePin {
         Self {
             ptr: Rc::as_ptr(shape),
             _weak: Rc::downgrade(shape),
+            id: shape.id,
         }
     }
 
@@ -481,11 +502,107 @@ impl ShapePin {
     }
 }
 
+pub(super) const MONO_EMPTY: u8 = 0;
+pub(super) const MONO_OWN_DATA: u8 = 1;
+pub(super) const MONO_PROTO_DATA: u8 = 2;
+pub(super) const MONO_MISSING: u8 = 3;
+
+// compact inline fast-path entry mirrored from entries[0..2] for direct JIT checks
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct MonoEntry {
+    pub(super) shape_id: u32,
+    pub(super) proto_shape_id: u32,
+    pub(super) index: u16,
+    pub(super) kind: u8,
+    pub(super) writable: u8,
+    pub(super) _pad: u32,
+}
+
+impl MonoEntry {
+    const EMPTY: Self = Self {
+        shape_id: 0,
+        proto_shape_id: 0,
+        index: 0,
+        kind: MONO_EMPTY,
+        writable: 0,
+        _pad: 0,
+    };
+
+    #[inline]
+    fn from_ic_entry(entry: &IcEntry) -> Self {
+        match entry {
+            IcEntry::OwnData {
+                shape,
+                index,
+                writable,
+            } if shape.id != 0 => Self {
+                shape_id: shape.id,
+                proto_shape_id: 0,
+                index: *index,
+                kind: MONO_OWN_DATA,
+                writable: u8::from(*writable),
+                _pad: 0,
+            },
+            IcEntry::ProtoData {
+                receiver: Some(recv),
+                holder_shape,
+                index,
+                ..
+            } if recv.id != 0 && holder_shape.id != 0 => Self {
+                shape_id: recv.id,
+                proto_shape_id: holder_shape.id,
+                index: *index,
+                kind: MONO_PROTO_DATA,
+                writable: 0,
+                _pad: 0,
+            },
+            IcEntry::Missing { receiver, proto } if receiver.id != 0 => match proto {
+                None => Self {
+                    shape_id: receiver.id,
+                    proto_shape_id: 0,
+                    index: 0,
+                    kind: MONO_MISSING,
+                    writable: 0,
+                    _pad: 0,
+                },
+                Some(guard) if guard.shape.id != 0 => Self {
+                    shape_id: receiver.id,
+                    proto_shape_id: guard.shape.id,
+                    index: 0,
+                    kind: MONO_MISSING,
+                    writable: 0,
+                    _pad: 0,
+                },
+                _ => Self::EMPTY,
+            },
+            _ => Self::EMPTY,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct MonoIc {
+    pub(super) e0: MonoEntry,
+    pub(super) e1: MonoEntry,
+}
+
+impl MonoIc {
+    const EMPTY: Self = Self {
+        e0: MonoEntry::EMPTY,
+        e1: MonoEntry::EMPTY,
+    };
+}
+
 // per-site 8-entry polymorphic inline cache for GetProp and SetProp; holds shapes weakly so
 // their addresses stay unique while referenced
+#[repr(transparent)]
 pub(super) struct PropIc(UnsafeCell<PropIcInner>);
 
+#[repr(C)]
 struct PropIcInner {
+    mono: MonoIc,
     entries: [IcEntry; PIC_SIZE],
     next: u8,
 }
@@ -493,6 +610,7 @@ struct PropIcInner {
 impl Default for PropIc {
     fn default() -> Self {
         Self(UnsafeCell::new(PropIcInner {
+            mono: MonoIc::EMPTY,
             entries: [const { IcEntry::Empty }; PIC_SIZE],
             next: 0,
         }))
@@ -573,24 +691,39 @@ enum IcEntry {
 }
 
 impl PropIc {
+    #[inline]
+    fn sync_mono(inner: &mut PropIcInner) {
+        inner.mono.e0 = MonoEntry::from_ic_entry(&inner.entries[0]);
+        inner.mono.e1 = MonoEntry::from_ic_entry(&inner.entries[1]);
+    }
+
     fn replace_or_insert(&self, matches_existing: impl Fn(&IcEntry) -> bool, entry: IcEntry) {
         // safety: single-threaded VM, never re-entered during mutation
         let inner = unsafe { &mut *self.0.get() };
-        for slot in &mut inner.entries {
+        for (i, slot) in inner.entries.iter_mut().enumerate() {
             if matches_existing(slot) {
                 *slot = entry;
+                if i <= 1 {
+                    Self::sync_mono(inner);
+                }
                 return;
             }
         }
-        for slot in &mut inner.entries {
+        for (i, slot) in inner.entries.iter_mut().enumerate() {
             if matches!(slot, IcEntry::Empty) {
                 *slot = entry;
+                if i <= 1 {
+                    Self::sync_mono(inner);
+                }
                 return;
             }
         }
         let slot = inner.next as usize % PIC_SIZE;
         inner.next = inner.next.wrapping_add(1);
         inner.entries[slot] = entry;
+        if slot <= 1 {
+            Self::sync_mono(inner);
+        }
     }
 
     #[inline]
@@ -633,14 +766,15 @@ impl std::fmt::Debug for PropIc {
 }
 
 // sentinel capacity indicating ptr/len came from Rc<[Slot]>::into_raw rather than an owned Vec
-const SHARED_CAP: u32 = u32::MAX;
+pub(super) const SHARED_CAP: u32 = u32::MAX;
 
 // compact 16-byte slot storage: either an owned Vec<Slot> buffer or a shared Rc<[Slot]>
 // until mutated, keeping JsObject entries compact with branchless reads
-struct Properties {
-    ptr: std::ptr::NonNull<Slot>,
-    len: u32,
-    cap: u32,
+#[repr(C)]
+pub(super) struct Properties {
+    pub(super) ptr: std::ptr::NonNull<Slot>,
+    pub(super) len: u32,
+    pub(super) cap: u32,
 }
 
 impl Default for Properties {
@@ -661,10 +795,21 @@ impl Drop for Properties {
             // safety: SHARED_CAP entries were created from Rc::<[Slot]>::into_raw
             drop(unsafe { Rc::from_raw(raw) });
         } else if self.cap != 0 {
-            // safety: owned entries were created from Vec::<Slot> with matching len and cap
-            drop(unsafe {
-                Vec::from_raw_parts(self.ptr.as_ptr(), self.len as usize, self.cap as usize)
-            });
+            let ptr = self.ptr.as_ptr();
+            let len = self.len as usize;
+            let cap = self.cap as usize;
+            self.len = 0;
+            self.cap = 0;
+            // safety: owned entries came from Vec::<Slot>; drop only non-copy slots then free buffer
+            unsafe {
+                for i in 0..len {
+                    let slot = ptr.add(i);
+                    if !matches!(&*slot, Slot::Data(v) if v.is_copy()) {
+                        std::ptr::drop_in_place(slot);
+                    }
+                }
+                drop(Vec::from_raw_parts(ptr, 0, cap));
+            }
         }
     }
 }
@@ -820,12 +965,30 @@ impl std::fmt::Debug for ObjectTemplate {
     }
 }
 
+pub(super) const JIT_FLAG_ORDINARY: u8 = 1;
+pub(super) const JIT_FLAG_PROXY: u8 = 2;
+pub(super) const JIT_FLAG_NO_PROTO_IC: u8 = 4;
+
+#[inline(always)]
+fn class_jit_flags(class: &ObjectClass) -> u8 {
+    match class {
+        ObjectClass::Ordinary => JIT_FLAG_ORDINARY,
+        ObjectClass::Proxy(_) => JIT_FLAG_PROXY | JIT_FLAG_NO_PROTO_IC,
+        ObjectClass::String(_) => JIT_FLAG_NO_PROTO_IC,
+        _ => 0,
+    }
+}
+
+#[repr(C)]
 #[derive(Clone)]
 pub(super) struct JsObject {
     shape: Rc<Shape>,
     // the values of the shape's keys, in the same order
-    properties: Properties,
-    prototype: Option<ObjectHandle>,
+    pub(super) properties: Properties,
+    pub(super) prototype: Option<ObjectHandle>,
+    // cached shape id and class flags sit in existing padding for inline JIT checks
+    pub(super) shape_id: u32,
+    pub(super) jit_flags: u8,
     // objects built by host code without a realm at hand inherit from Object.prototype
     orphan: bool,
     pub(super) extensible: bool,
@@ -862,11 +1025,28 @@ pub(super) fn array_index(key: &str) -> Option<u32> {
 }
 
 impl JsObject {
+    #[inline(always)]
+    fn set_shape(&mut self, shape: Rc<Shape>) {
+        self.shape_id = shape.id;
+        self.shape = shape;
+    }
+
+    #[inline(always)]
+    pub(super) fn set_class(&mut self, class: ObjectClass) {
+        self.jit_flags =
+            class_jit_flags(&class) | if self.orphan { JIT_FLAG_NO_PROTO_IC } else { 0 };
+        self.class = class;
+    }
+
     pub(super) fn new() -> Self {
+        let shape = Shape::root();
+        let shape_id = shape.id;
         Self {
-            shape: Shape::root(),
+            shape,
             properties: Properties::default(),
             prototype: None,
+            shape_id,
+            jit_flags: JIT_FLAG_ORDINARY | JIT_FLAG_NO_PROTO_IC,
             orphan: true,
             extensible: true,
             class: ObjectClass::Ordinary,
@@ -874,8 +1054,10 @@ impl JsObject {
     }
 
     pub(super) fn with_prototype(prototype: Option<ObjectHandle>, class: ObjectClass) -> Self {
+        let jit_flags = class_jit_flags(&class);
         Self {
             prototype,
+            jit_flags,
             orphan: false,
             class,
             ..Self::new()
@@ -889,10 +1071,13 @@ impl JsObject {
         prototype: Option<ObjectHandle>,
     ) -> Self {
         debug_assert_eq!(shape.keys.len(), slots.len());
+        let shape_id = shape.id;
         Self {
             shape,
             properties: Properties::from_vec(slots),
             prototype,
+            shape_id,
+            jit_flags: JIT_FLAG_ORDINARY,
             orphan: false,
             extensible: true,
             class: ObjectClass::Ordinary,
@@ -920,15 +1105,21 @@ impl JsObject {
                         .collect(),
                 ),
                 prototype: template.prototype.clone(),
+                shape_id: template.shape.id,
+                jit_flags: template.jit_flags,
                 orphan: template.orphan,
                 extensible: template.extensible,
                 class: template.class.clone(),
             };
         }
+        let shape = Shape::root();
+        let shape_id = shape.id;
         let mut object = Self {
-            shape: Shape::root(),
+            shape,
             properties: Properties::from_vec(Vec::with_capacity(properties.len())),
             prototype: template.prototype.clone(),
+            shape_id,
+            jit_flags: template.jit_flags,
             orphan: template.orphan,
             extensible: template.extensible,
             class: template.class.clone(),
@@ -1047,7 +1238,8 @@ impl JsObject {
         if self.shape.own || self.properties.len() >= SHARED_KEYS {
             self.own_shape().push_own(Rc::from(key), ATTR_DATA);
         } else {
-            self.shape = self.shape.with_key_attrs(key, ATTR_DATA);
+            let next = self.shape.with_key_attrs(key, ATTR_DATA);
+            self.set_shape(next);
             let length = self.properties.len();
             if length == self.properties.capacity() {
                 let doubled = (length * 2).max(4);
@@ -1218,7 +1410,7 @@ impl JsObject {
                         && let Some(next_shape) = to.upgrade()
                     {
                         let length = self.properties.len();
-                        self.shape = next_shape;
+                        self.set_shape(next_shape);
                         if length == self.properties.capacity() {
                             let doubled = (length * 2).max(4);
                             let wanted = self.shape.longest.get().clamp(length + 1, doubled);
@@ -1723,10 +1915,13 @@ impl JsObject {
         prototype: Option<ObjectHandle>,
         class: ObjectClass,
     ) -> Self {
+        let jit_flags = class_jit_flags(&class);
         Self {
             shape: template.shape.clone(),
             properties: Properties::from_shared(template.properties.clone()),
             prototype,
+            shape_id: template.shape.id,
+            jit_flags,
             orphan: false,
             extensible: true,
             class,
@@ -1770,7 +1965,9 @@ impl JsObject {
 
     // a host-built object of a class, whose prototype comes from the realm that reads it
     pub(super) fn with_class(class: ObjectClass) -> Self {
+        let jit_flags = class_jit_flags(&class);
         Self {
+            jit_flags,
             class,
             ..Self::new()
         }
@@ -1784,6 +1981,7 @@ impl JsObject {
     pub(super) fn set_prototype(&mut self, prototype: Option<ObjectHandle>) {
         self.prototype = prototype;
         self.orphan = false;
+        self.jit_flags = class_jit_flags(&self.class);
     }
 
     fn position(&self, key: &str) -> Option<usize> {
@@ -1797,6 +1995,7 @@ impl JsObject {
         // the shape it noted
         if !self.shape.own || Rc::strong_count(&self.shape) > 1 || Rc::weak_count(&self.shape) > 0 {
             self.shape = Rc::new(self.shape.own_copy());
+            self.shape_id = 0;
         }
         Rc::get_mut(&mut self.shape).expect("an own shape has no other holder")
     }
@@ -1838,7 +2037,8 @@ impl JsObject {
         if self.shape.own || self.properties.len() >= SHARED_KEYS {
             self.own_shape().push_own(Rc::from(key), attrs);
         } else {
-            self.shape = self.shape.with_key_attrs(key, attrs);
+            let next = self.shape.with_key_attrs(key, attrs);
+            self.set_shape(next);
             let length = self.properties.len();
             if length == self.properties.capacity() {
                 // never more than doubling would take, so a shape shared by unlike objects only

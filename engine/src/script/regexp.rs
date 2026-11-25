@@ -131,10 +131,10 @@ impl ScriptRuntime {
         let mut object =
             TEMPLATE.with(|template| JsObject::with_shape_of(template, vec![last_index()]));
         object.set_prototype(Some(prototype));
-        object.class = ObjectClass::RegExp(Rc::new(RegExpData {
+        object.set_class(ObjectClass::RegExp(Rc::new(RegExpData {
             source: pattern.to_string(),
             regex,
-        }));
+        })));
         Ok(Value::Object(new_object(object)))
     }
 
@@ -556,6 +556,39 @@ impl ScriptRuntime {
                         return Ok(Self::new_array(parts));
                     }
                     previous = position + 1;
+                }
+            }
+            if previous == 0 {
+                parts.push(Value::String(text.clone()));
+            } else {
+                parts.push(Value::String(JsStr::new(&text[previous..])));
+            }
+            return Ok(Self::new_array(parts));
+        }
+        // fast ASCII byte scan for greedy `+` char/class split patterns (such as /\s+/)
+        if let Some(ascii) = data.regex.ascii_repeat_units()
+            && text.is_ascii()
+        {
+            if text.is_empty() {
+                parts.push(Value::String(text.clone()));
+                return Ok(Self::new_array(parts));
+            }
+            let bytes = text.as_bytes();
+            let mut previous = 0;
+            let mut position = 0;
+            while position < bytes.len() {
+                if (ascii >> bytes[position]) & 1 == 1 {
+                    parts.push(Value::String(JsStr::new(&text[previous..position])));
+                    if parts.len() == limit {
+                        return Ok(Self::new_array(parts));
+                    }
+                    position += 1;
+                    while position < bytes.len() && (ascii >> bytes[position]) & 1 == 1 {
+                        position += 1;
+                    }
+                    previous = position;
+                } else {
+                    position += 1;
                 }
             }
             if previous == 0 {

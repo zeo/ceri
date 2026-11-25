@@ -156,6 +156,8 @@ pub(super) struct Regex {
     pub(super) flags: Flags,
     // which ascii units a one-character pattern matches, worked out on the first split by it
     ascii_units: std::cell::OnceCell<Option<u128>>,
+    // which ascii units a greedy one-or-more (+) char/class pattern matches
+    ascii_repeat_units: std::cell::OnceCell<Option<u128>>,
 }
 
 // the start and end of each group, group 0 first
@@ -1189,6 +1191,7 @@ impl Regex {
             marks,
             flags,
             ascii_units: std::cell::OnceCell::new(),
+            ascii_repeat_units: std::cell::OnceCell::new(),
         })
     }
 
@@ -1200,6 +1203,49 @@ impl Regex {
             Some((0..128u16).fold(0u128, |bits, unit| {
                 bits | (u128::from(self.unit_match(unit) == Some(true)) << unit)
             }))
+        })
+    }
+
+    // the ascii units a greedy `+` repeat of one character or one class matches (such as /\s+/)
+    pub(super) fn ascii_repeat_units(&self) -> Option<u128> {
+        *self.ascii_repeat_units.get_or_init(|| {
+            if self.flags.full_unicode() || self.groups != 1 {
+                return None;
+            }
+            match self.program.as_slice() {
+                [
+                    Inst::Save(0),
+                    Inst::Char(c1),
+                    Inst::Split(3, 5),
+                    Inst::Char(c2),
+                    Inst::Jump(2),
+                    Inst::Save(1),
+                    Inst::Match,
+                ] if c1 == c2 => {
+                    let expected = *c1;
+                    Some((0..128u32).fold(0u128, |bits, unit| {
+                        let ok =
+                            unit == expected || self.canonical(unit) == self.canonical(expected);
+                        bits | (u128::from(ok) << unit)
+                    }))
+                }
+                [
+                    Inst::Save(0),
+                    Inst::Class(i1),
+                    Inst::Split(3, 5),
+                    Inst::Class(i2),
+                    Inst::Jump(2),
+                    Inst::Save(1),
+                    Inst::Match,
+                ] if i1 == i2 => {
+                    let class = &self.classes[*i1];
+                    Some((0..128u32).fold(0u128, |bits, unit| {
+                        let ok = self.class_matches(class, unit);
+                        bits | (u128::from(ok) << unit)
+                    }))
+                }
+                _ => None,
+            }
         })
     }
 

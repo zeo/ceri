@@ -424,10 +424,22 @@ pub(super) struct Code {
     pub(super) linear_params: bool,
     // true when this function and its inner closures never read any enclosing function scope
     pub(super) captures_nothing: bool,
+    // max lexical scope depth read by ops in this code (0 when no scope-chain ops exist)
+    pub(super) max_scope_depth: u8,
     // true for top-level script and module bodies
     pub(super) is_script: bool,
     // the module URL this code was compiled in, shared by every closure of this code
     pub(super) url: std::cell::OnceCell<Rc<super::AppUrl>>,
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) jit_hits: Cell<u32>,
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) jit_code: std::cell::OnceCell<Option<super::jit::JitCode>>,
 }
 
 impl Code {
@@ -1805,6 +1817,36 @@ impl Compiler {
             .map(|_| super::object::PropIc::default())
             .collect();
         let max_pushes = compute_max_pushes(&ops);
+        let mut max_scope_depth = 0u8;
+        let mut has_pop_scope = false;
+        for &op in &ops {
+            match op {
+                Op::GetLocal { depth, .. }
+                | Op::SetLocal { depth, .. }
+                | Op::SetLocalPop { depth, .. }
+                | Op::InitLocal { depth, .. }
+                | Op::UpdateLocal { depth, .. }
+                | Op::UpdateLocalPop { depth, .. }
+                | Op::GetLocalProp { depth, .. }
+                | Op::GetLocalMethod { depth, .. } => {
+                    max_scope_depth = max_scope_depth.max(depth.saturating_add(1).min(6) as u8);
+                }
+                Op::InitThisSlot(_)
+                | Op::Uninitialize { .. }
+                | Op::PushScope(_)
+                | Op::PushVarScope(_)
+                | Op::CloneScope => {
+                    max_scope_depth = max_scope_depth.max(1);
+                }
+                Op::PopScope => {
+                    has_pop_scope = true;
+                }
+                _ => {}
+            }
+        }
+        if has_pop_scope && max_scope_depth > 0 {
+            max_scope_depth = 6;
+        }
         Code {
             ops,
             entry,
@@ -1813,8 +1855,19 @@ impl Compiler {
             registers,
             linear_params,
             captures_nothing,
+            max_scope_depth,
             is_script: state.is_global,
             url: std::cell::OnceCell::new(),
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            jit_hits: Cell::new(0),
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            jit_code: std::cell::OnceCell::new(),
             names: state.names,
             children: state.children,
             classes: state.classes,

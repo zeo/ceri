@@ -1044,7 +1044,7 @@ pub(super) fn create(
     ] {
         abort_signal
             .borrow_mut()
-            .define(name.to_string(), Property::hidden(Value::Builtin(builtin)));
+            .define(name.to_string(), Property::hidden(Value::builtin(builtin)));
     }
     globals.push(("AbortSignal", Value::Object(abort_signal)));
     DomInterfaces { prototypes }

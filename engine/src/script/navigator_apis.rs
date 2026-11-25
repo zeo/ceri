@@ -668,7 +668,7 @@ impl ScriptRuntime {
                 self.tasks.push(ScheduledTask {
                     id,
                     due: self.clock.saturating_add(delay),
-                    callback: Value::Builtin(Builtin::native(native(NavFunction::RunTask(
+                    callback: Value::builtin(Builtin::native(native(NavFunction::RunTask(
                         task.clone(),
                     )))),
                     arguments: Vec::new(),

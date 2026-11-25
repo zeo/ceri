@@ -884,7 +884,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         "isFinite",
         Value::Object(build.function(Native::GlobalIsFinite, "isFinite", 1)),
     ));
-    build.value(&number, "isFinite", Value::Builtin(Builtin::NumberIsFinite));
+    build.value(&number, "isFinite", Value::builtin(Builtin::NumberIsFinite));
     build.method(&number, "isInteger", Native::NumberIsInteger, 1);
     build.method(&number, "isSafeInteger", Native::NumberIsSafeInteger, 1);
     build.method(&number, "isNaN", Native::NumberIsNaN, 1);
@@ -939,7 +939,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         build.method(&array_prototype, key, Native::Array(*method), *length);
     }
     let array = build.constructor(Native::ArrayConstructor, "Array", 1, &array_prototype);
-    build.value(&array, "isArray", Value::Builtin(Builtin::ArrayIsArray));
+    build.value(&array, "isArray", Value::builtin(Builtin::ArrayIsArray));
     build.method(&array, "from", Native::ArrayFrom, 1);
     build.method(&array, "of", Native::ArrayOf, 0);
     build.getter(&array, "@@species", Native::IteratorSelf, None);
@@ -2554,7 +2554,7 @@ impl ScriptRuntime {
         match native {
             Native::Dom(member) => return self.call_dom(*member, this, arguments),
             Native::String(method) => {
-                return self.call_string_method_slice(*method, this, &arguments);
+                return self.call_string_method_slice(*method, &this, &arguments);
             }
             Native::Array(method) => {
                 return self
@@ -3320,7 +3320,7 @@ impl ScriptRuntime {
             Native::Array(method) => self
                 .call_array_method(*method, this, arguments)
                 .map(Value::filled),
-            Native::String(method) => self.call_string_method_slice(*method, this, &arguments),
+            Native::String(method) => self.call_string_method_slice(*method, &this, &arguments),
             Native::Math(function) => self.call_math(*function, arguments),
             Native::NumberFormat(super::numbers::NumberFormat::Locale) => {
                 let number = self.this_number(&this, "toLocaleString")?;
