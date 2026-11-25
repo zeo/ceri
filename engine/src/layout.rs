@@ -189,6 +189,8 @@ pub struct LayoutBox {
     pub(crate) child_shift: (f32, f32),
     pub(crate) has_child_shift: bool,
     pub(crate) has_sticky: bool,
+    pub(crate) has_stacking_descendant: bool,
+    pub(crate) has_backdrop_filter: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -686,18 +688,7 @@ impl<'a> Subject<'a> {
         if self.generated.is_some() {
             return [None, None];
         }
-        [PseudoElement::Before, PseudoElement::After].map(|pseudo| {
-            stylesheet.generated_content(StyleContext {
-                document: self.document,
-                node: self.node,
-                pseudo: Some(pseudo),
-                parent_font_size: 16.0,
-                parent_color: Color::BLACK,
-                parent_weight: FontWeight::NORMAL,
-                parent_text: SharedText::default(),
-                state,
-            })
-        })
+        stylesheet.generated_content_pair(self.document, self.node, state)
     }
 
     // text and element children in order, with generated boxes first and last
@@ -1063,6 +1054,8 @@ pub fn layout_with_state(
         child_shift: (0.0, 0.0),
         has_child_shift: false,
         has_sticky: false,
+        has_stacking_descendant: false,
+        has_backdrop_filter: false,
     };
     // the root element's scrollbar styles draw the viewport's bars
     if let Some(html) = document.document_element() {
@@ -1087,6 +1080,8 @@ pub fn layout_with_state(
     }
     root.children = layout_document_children(document, stylesheet, viewport, style_state);
     root.has_sticky = root.children.iter().any(|child| child.has_sticky);
+    root.has_stacking_descendant = box_has_stacking(&root.children);
+    root.has_backdrop_filter = root.children.iter().any(|child| child.has_backdrop_filter);
     flush_child_shifts(&mut root, (0.0, 0.0));
     finalize_scroll(&mut root, ResolvedEdges::default(), style_state);
     // a classic vertical scrollbar takes its width from the initial and fixed containing
@@ -1099,6 +1094,8 @@ pub fn layout_with_state(
         CONTAINERS.with(|containers| containers.borrow_mut().clear());
         root.children = layout_document_children(document, stylesheet, scrollport, style_state);
         root.has_sticky = root.children.iter().any(|child| child.has_sticky);
+        root.has_stacking_descendant = box_has_stacking(&root.children);
+        root.has_backdrop_filter = root.children.iter().any(|child| child.has_backdrop_filter);
         flush_child_shifts(&mut root, (0.0, 0.0));
         finalize_scroll(&mut root, ResolvedEdges::default(), style_state);
     }
@@ -2169,6 +2166,15 @@ fn append_positioned_to(
         if child.has_sticky {
             layout.has_sticky = true;
         }
+        if child.creates_stacking_context
+            || child.paints_positioned()
+            || child.has_stacking_descendant
+        {
+            layout.has_stacking_descendant = true;
+        }
+        if child.has_backdrop_filter {
+            layout.has_backdrop_filter = true;
+        }
     }
 }
 
@@ -2632,9 +2638,12 @@ fn collect_stacking_contexts<'a>(
     clippers: &mut Vec<(&'a LayoutBox, (f32, f32))>,
     entries: &mut Vec<StackingContextEntry<'a>>,
 ) {
+    if !layout.has_stacking_descendant {
+        return;
+    }
     let visual_offset = visual_offset_for(layout, ancestor_offset);
     let child_clip = stacking_child_clip(layout, clip, visual_offset);
-    for index in paint_order(&layout.children) {
+    for_each_paint_order(&layout.children, |index| {
         let child = &layout.children[index];
         let child_order = *order;
         *order += 1;
@@ -2651,7 +2660,7 @@ fn collect_stacking_contexts<'a>(
                 order: child_order,
             });
         }
-        if !child.creates_stacking_context {
+        if !child.creates_stacking_context && child.has_stacking_descendant {
             let clips = child.overflow.clips();
             if clips {
                 clippers.push((child, visual_offset));
@@ -2661,7 +2670,7 @@ fn collect_stacking_contexts<'a>(
                 clippers.pop();
             }
         }
-    }
+    });
 }
 
 fn stacking_child_clip(
@@ -2691,10 +2700,34 @@ impl LayoutBox {
     }
 }
 
+#[inline]
+fn box_has_stacking(children: &[Rc<LayoutBox>]) -> bool {
+    children.iter().any(|child| {
+        child.creates_stacking_context || child.paints_positioned() || child.has_stacking_descendant
+    })
+}
+
 pub(crate) fn paint_order(children: &[Rc<LayoutBox>]) -> Vec<usize> {
     let mut order = (0..children.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| (children[*index].z_index, children[*index].floated, *index));
     order
+}
+
+#[inline]
+pub(crate) fn for_each_paint_order(children: &[Rc<LayoutBox>], mut visit: impl FnMut(usize)) {
+    if children.len() <= 1
+        || children
+            .windows(2)
+            .all(|pair| (pair[0].z_index, pair[0].floated) <= (pair[1].z_index, pair[1].floated))
+    {
+        for index in 0..children.len() {
+            visit(index);
+        }
+        return;
+    }
+    for index in paint_order(children) {
+        visit(index);
+    }
 }
 
 // maps a point into a transformed box's untransformed space; None when the point misses
@@ -3004,6 +3037,38 @@ struct TableRowInputs {
     environment: crate::css::LayoutEnvironment,
 }
 
+impl TableRowInputs {
+    fn matches_meta(
+        &self,
+        font_size_bits: u32,
+        parent: &ParentStyle,
+        zero_font: (crate::font::FontStack, crate::font::FontStyle),
+        environment: crate::css::LayoutEnvironment,
+    ) -> bool {
+        self.numbers[5] == font_size_bits
+            && self.color == parent.color
+            && self.weight == parent.weight
+            && self.text == parent.text
+            && self.zero_font == zero_font
+            && self.environment == environment
+    }
+}
+
+// phase 1 cell scan metadata cached alongside a table row box for fixed-layout tables
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TableRowMeta {
+    columns: usize,
+    all_border_max: [f32; 4],
+    cell_border_tb: [f32; 2],
+    has_rowspan: bool,
+}
+
+#[derive(Clone)]
+struct KeptTableRow {
+    layout: Rc<LayoutBox>,
+    meta: TableRowMeta,
+}
+
 #[derive(Default)]
 struct KeptAnswers {
     // none where no answer outlives its pass; the font set is held so its address stays its
@@ -3020,7 +3085,7 @@ struct KeptAnswers {
     boxes: KeptMap<(NodeId, Option<PseudoElement>), BoxInputs, Option<Rc<LayoutBox>>>,
     // each width with whether it read the width it was measured within, through a percentage
     widths: KeptMap<IntrinsicKey, IntrinsicInputs, (f32, bool)>,
-    table_rows: KeptMap<NodeId, TableRowInputs, Rc<LayoutBox>>,
+    table_rows: KeptMap<NodeId, TableRowInputs, KeptTableRow>,
 }
 
 thread_local! {
@@ -3187,6 +3252,9 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
 // by reference, as through svg's <use>, can be written anywhere
 fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet: &Stylesheet) {
     use crate::css::SelectorReach;
+    if kept.boxes.is_empty() && kept.widths.is_empty() && kept.table_rows.is_empty() {
+        return;
+    }
     let written = document.written_since(kept.since);
     if written.is_empty() {
         return;
@@ -3218,10 +3286,12 @@ fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet:
             kept.table_rows.clear();
             return;
         };
-        let stale: std::collections::HashSet<NodeId> = roots
-            .iter()
-            .flat_map(|&root| document.subtree(root))
-            .collect();
+        let mut stale = crate::hashing::HashSet::default();
+        for &root in &roots {
+            if !stale.contains(&root) {
+                stale.extend(document.subtree(root));
+            }
+        }
         forget(&mut kept.boxes, |(node, _), _| stale.contains(node));
         forget(&mut kept.widths, |(node, ..), _| stale.contains(node));
         forget(&mut kept.table_rows, |node, _| stale.contains(node));
@@ -3237,13 +3307,28 @@ fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet:
                 kept.table_rows.clear();
                 return;
             };
-            let mut stale = crate::hashing::HashSet::default();
+            // deduplicate sibling walks per parent so bulk child writes stay linear
+            let mut parents: HashMap<NodeId, Option<NodeId>> = HashMap::default();
             for (node, _) in changes.filter(|(_, changed)| stylesheet.reaches_siblings(changed)) {
                 let Some(parent) = document.parent(node) else {
                     continue;
                 };
+                parents
+                    .entry(parent)
+                    .and_modify(|only| {
+                        if *only != Some(node) {
+                            *only = None;
+                        }
+                    })
+                    .or_insert(Some(node));
+            }
+            if parents.is_empty() {
+                return;
+            }
+            let mut stale = crate::hashing::HashSet::default();
+            for (parent, only) in parents {
                 for &sibling in document.children(parent) {
-                    if sibling != node {
+                    if Some(sibling) != only && !stale.contains(&sibling) {
                         stale.extend(document.subtree(sibling));
                     }
                 }
@@ -4278,6 +4363,10 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
     let has_child_shift = children.iter().any(|child| child.has_child_shift);
     let has_sticky =
         style.position == Position::Sticky || children.iter().any(|child| child.has_sticky);
+    let has_stacking_descendant = box_has_stacking(&children);
+    let filters = crate::filter::Filters::of(&style, font_size);
+    let has_backdrop_filter =
+        !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
     let mut layout = LayoutBox {
         node: node.node,
         tag: name.to_string(),
@@ -4295,7 +4384,7 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: style.opacity * parent.opacity,
         shadows: resolve_shadows(style.shadows, content_width, font_size),
-        filters: crate::filter::Filters::of(&style, font_size),
+        filters,
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text,
@@ -4345,6 +4434,8 @@ fn layout_element_with_gutter(input: ElementLayoutInput<'_, '_>, gutter: f32) ->
         child_shift: (0.0, 0.0),
         has_child_shift,
         has_sticky,
+        has_stacking_descendant,
+        has_backdrop_filter,
     };
     // a checked box fills with the accent color, and a checked radio rings with it, unless
     // the page painted the box itself
@@ -4525,6 +4616,8 @@ fn anonymous_box(
         child_shift: (0.0, 0.0),
         has_child_shift: false,
         has_sticky: false,
+        has_stacking_descendant: false,
+        has_backdrop_filter: false,
     }
 }
 
@@ -4536,17 +4629,20 @@ pub(crate) fn part_box(
     rect: Rect,
     (font_size, cursor): (f32, Cursor),
 ) -> LayoutBox {
+    let filters = crate::filter::Filters::of(style, font_size);
+    let has_backdrop_filter = !filters.backdrop.is_empty();
     LayoutBox {
         tag: pseudo.tag().to_string(),
         background: style.background,
         backgrounds: style.layers(),
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         shadows: resolve_shadows(style.shadows, rect.width, font_size),
-        filters: crate::filter::Filters::of(style, font_size),
+        filters,
         border: BoxBorder::of(style),
         // a filtered part paints through a layer of its own
         creates_stacking_context: style.filter.is_some(),
         visible: style.visibility == Visibility::Visible,
+        has_backdrop_filter,
         ..anonymous_box(node, rect, Vec::new(), (font_size, cursor), style.opacity)
     }
 }
@@ -4641,6 +4737,8 @@ fn slider_parts(
         (font_size, cursor),
     );
     track.children.push(Rc::new(thumb));
+    track.has_stacking_descendant = box_has_stacking(&track.children);
+    track.has_backdrop_filter |= track.children.iter().any(|child| child.has_backdrop_filter);
     (track, start, (travel, thumb_width))
 }
 
@@ -5610,6 +5708,10 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let has_child_shift = children.iter().any(|child| child.has_child_shift);
     let has_sticky =
         style.position == Position::Sticky || children.iter().any(|child| child.has_sticky);
+    let has_stacking_descendant = box_has_stacking(&children);
+    let filters = crate::filter::Filters::of(&style, font_size);
+    let has_backdrop_filter =
+        !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
     let mut layout = LayoutBox {
         node: node.node,
         tag: node.name().to_string(),
@@ -5627,7 +5729,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadows: resolve_shadows(style.shadows, content_width, font_size),
-        filters: crate::filter::Filters::of(&style, font_size),
+        filters,
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text: Vec::new(),
@@ -5669,6 +5771,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         child_shift: (0.0, 0.0),
         has_child_shift,
         has_sticky,
+        has_stacking_descendant,
+        has_backdrop_filter,
     };
     if row {
         layout.row_baseline = layout
@@ -6016,8 +6120,46 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         style.justify_content,
     );
 
+    // leading fixed-length rows settle at known offsets before content-sized tracks run, so
+    // items placed there lay out at their final coordinates without a deferred shift
+    let mut fixed_row_y = vec![None; row_tracks.len()];
+    if matches!(
+        style.align_content,
+        AlignContent::Stretch | AlignContent::FlexStart
+    ) {
+        let mut cursor = 0.0_f32;
+        let mut first_open = true;
+        for (index, track) in row_tracks.iter().enumerate() {
+            if row_collapsed.get(index).copied().unwrap_or(false) {
+                fixed_row_y[index] = Some(cursor);
+                continue;
+            }
+            if !first_open {
+                cursor += row_gap;
+            }
+            fixed_row_y[index] = Some(cursor);
+            first_open = false;
+            let definite = |breadth: Breadth| match breadth {
+                Breadth::Length(length) if !length.has_percent() => {
+                    length.resolve(0.0, font_size).map(|size| size.max(0.0))
+                }
+                Breadth::Length(length) => content_height
+                    .and_then(|basis| length.resolve(basis, font_size).map(|size| size.max(0.0))),
+                _ => None,
+            };
+            let (Some(min), Some(max)) = (definite(track.min), definite(track.max)) else {
+                break;
+            };
+            if (max - min).abs() > 0.001 {
+                break;
+            }
+            cursor += min;
+        }
+    }
+
     // lays an item out in its column span, at a content-box width and height when decided
     let lay_out = |item: &GridItem<'_>,
+                   origin: (f32, f32),
                    cell_width: f32,
                    cell_height: Option<f32>,
                    height: Option<f32>|
@@ -6038,8 +6180,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             }
             FlexSource::Element(child) => layout_element_rc(ElementLayoutInput {
                 node: *child,
-                containing_x: 0.0,
-                containing_y: 0.0,
+                containing_x: origin.0,
+                containing_y: origin.1,
                 containing_width: cell_width,
                 containing_height: cell_height,
                 size_override: (item.width, height),
@@ -6090,7 +6232,16 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             }
         };
         item.width = width;
-        item.layout = lay_out(item, cell_width, None, None);
+        let origin = (
+            content_x + column_offsets[item.area[0].0],
+            content_y
+                + fixed_row_y
+                    .get(item.area[1].0)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(0.0),
+        );
+        item.layout = lay_out(item, origin, cell_width, None, None);
     }
 
     let row_items = items
@@ -6180,12 +6331,14 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         let cell_width = span_size(&column_offsets, &column_sizes, item.area[0]);
         let cell_height = span_size(&row_offsets, &row_sizes, item.area[1]);
         let item_align = align(item);
+        let origin = (content_x + cell_x, content_y + cell_y);
         if item_align == AlignItems::Stretch && item.style.height == Length::Auto {
             let inner =
                 item.padding.top + item.padding.bottom + item.border.top + item.border.bottom;
             let target = (cell_height - item.margin.top - item.margin.bottom - inner).max(0.0);
             if (child.rect.height - inner - target).abs() > 0.01 {
-                child = lay_out(item, cell_width, Some(cell_height), Some(target)).unwrap_or(child);
+                child = lay_out(item, origin, cell_width, Some(cell_height), Some(target))
+                    .unwrap_or(child);
             }
         } else if [
             item.style.height,
@@ -6196,7 +6349,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         .any(|length| length.has_percent())
         {
             // rows were sized with percentage heights as auto; now they resolve against the area
-            child = lay_out(item, cell_width, Some(cell_height), None).unwrap_or(child);
+            child = lay_out(item, origin, cell_width, Some(cell_height), None).unwrap_or(child);
         }
         let free_x = cell_width - child.rect.width - item.margin.left - item.margin.right;
         let free_y = cell_height - child.rect.height - item.margin.top - item.margin.bottom;
@@ -6220,6 +6373,10 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let has_child_shift = children.iter().any(|child| child.has_child_shift);
     let has_sticky =
         style.position == Position::Sticky || children.iter().any(|child| child.has_sticky);
+    let has_stacking_descendant = box_has_stacking(&children);
+    let filters = crate::filter::Filters::of(&style, font_size);
+    let has_backdrop_filter =
+        !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
     let mut layout = LayoutBox {
         node: node.node,
         tag: node.name().to_string(),
@@ -6237,7 +6394,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadows: resolve_shadows(style.shadows, content_width, font_size),
-        filters: crate::filter::Filters::of(&style, font_size),
+        filters,
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text: Vec::new(),
@@ -6279,6 +6436,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         child_shift: (0.0, 0.0),
         has_child_shift,
         has_sticky,
+        has_stacking_descendant,
+        has_backdrop_filter,
     };
     if mode != LayoutMode::Flow {
         position_layout_box(
@@ -6321,6 +6480,7 @@ struct TableRow<'a> {
     node: Option<(Subject<'a>, Style)>,
     group: usize,
     cells: Vec<(Subject<'a>, Style)>,
+    momentary: bool,
 }
 
 struct TableCellSlot<'a> {
@@ -6414,7 +6574,9 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         let Child::Element(child) = child else {
             continue;
         };
+        let before_child = crate::css::moment_reports();
         let child_style = style_of(child, &child_parent);
+        let child_momentary = crate::css::moment_reports() != before_child;
         if child_style.display == Display::None {
             continue;
         }
@@ -6439,7 +6601,10 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     let Child::Element(grandchild) = grandchild else {
                         continue;
                     };
+                    let before_grandchild = crate::css::moment_reports();
                     let grandchild_style = style_of(grandchild, &group_parent);
+                    let row_momentary =
+                        child_momentary || crate::css::moment_reports() != before_grandchild;
                     if grandchild_style.display == Display::None {
                         continue;
                     }
@@ -6449,6 +6614,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                             node: Some((grandchild, grandchild_style)),
                             group,
                             cells: Vec::new(),
+                            momentary: row_momentary,
                         });
                     } else {
                         let row = *loose.get_or_insert_with(|| {
@@ -6456,6 +6622,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                                 node: None,
                                 group,
                                 cells: Vec::new(),
+                                momentary: false,
                             });
                             rows.len() - 1
                         });
@@ -6469,6 +6636,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     node: Some((child, child_style)),
                     group,
                     cells: Vec::new(),
+                    momentary: child_momentary,
                 });
             }
             _ => {
@@ -6482,27 +6650,12 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                         node: None,
                         group,
                         cells: Vec::new(),
+                        momentary: false,
                     });
                 }
                 if let Some(row) = rows.last_mut() {
                     row.cells.push((child, child_style));
                 }
-            }
-        }
-    }
-    // the cells of each real row
-    for row in &mut rows {
-        let Some((row_node, row_style)) = row.node else {
-            continue;
-        };
-        let row_parent = parent_of(&row_style, &child_parent);
-        for cell in row_node.children(&NO_GENERATED_CONTENT) {
-            let Child::Element(cell) = cell else {
-                continue;
-            };
-            let cell_style = style_of(cell, &row_parent);
-            if cell_style.display != Display::None && !cell_style.position.is_out_of_flow() {
-                row.cells.push((cell, cell_style));
             }
         }
     }
@@ -6516,18 +6669,117 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             .unwrap_or(0)
     });
 
-    // cells take the first free slots of their row, below any cell spanning down into it
-    let mut occupied: Vec<Vec<bool>> = vec![Vec::new(); rows.len()];
-    let mut row_has_rowspan = vec![false; rows.len()];
+    let kept_pass = content_height
+        .is_none()
+        .then(|| {
+            KEPT.with(|kept| {
+                let kept = kept.borrow();
+                kept.pass.map(|(pass, stamp)| (pass, stamp, kept.works))
+            })
+        })
+        .flatten();
+    let zero_font = crate::css::zero_font();
+    let environment = crate::css::layout_environment();
+    let font_size_bits = font_size.to_bits();
+    // fixed-layout tables only inspect row 0 for column widths, so unwritten rows after row 0
+    // reuse their cached column count and border widths without styling their cells
+    let fixed_meta_eligible =
+        style.table_fixed && style.width != Length::Auto && kept_pass.is_some();
+
+    let row_count = rows.len();
+    let mut occupied: Vec<Vec<bool>> = vec![Vec::new(); row_count];
+    let mut row_has_rowspan = vec![false; row_count];
+    let mut row_metas: Vec<Option<TableRowMeta>> = vec![None; row_count];
+    let mut skipped_cells = vec![false; row_count];
     let mut cells: Vec<TableCellSlot<'_>> = Vec::new();
-    for (row_index, row) in rows.iter().enumerate() {
-        let group_end = rows
+    let mut column_count: usize = 0;
+    let mut max_borders = [0.0_f32; 4];
+    let mut ends_at = if style.border_collapse {
+        vec![0.0_f32; row_count]
+    } else {
+        Vec::new()
+    };
+    let mut starts_at = if style.border_collapse {
+        vec![0.0_f32; row_count]
+    } else {
+        Vec::new()
+    };
+    let row_groups: Vec<usize> = rows.iter().map(|row| row.group).collect();
+
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        let cached_meta = if fixed_meta_eligible
+            && row_index > 0
+            && !row_has_rowspan[row_index]
+            && !row.momentary
+            && row.cells.is_empty()
+            && let Some((row_node, _)) = row.node
+            && let Some((pass, _, _)) = kept_pass
+        {
+            KEPT.with(|kept| {
+                let kept = kept.borrow();
+                kept.table_rows.get(&row_node.node).and_then(|answers| {
+                    answers.iter().find_map(|entry| {
+                        (!entry.answer.meta.has_rowspan
+                            && entry.inputs.matches_meta(
+                                font_size_bits,
+                                &child_parent,
+                                zero_font,
+                                environment,
+                            )
+                            && (entry.pass == pass
+                                || row_node
+                                    .document
+                                    .unwritten_since(row_node.node, entry.stamp)))
+                        .then_some(entry.answer.meta)
+                    })
+                })
+            })
+        } else {
+            None
+        };
+        if let Some(meta) = cached_meta
+            && !cfg!(feature = "recheck")
+        {
+            column_count = column_count.max(meta.columns);
+            for (max_border, side_width) in max_borders.iter_mut().zip(meta.all_border_max) {
+                *max_border = max_border.max(side_width);
+            }
+            if style.border_collapse {
+                if row_index + 1 < row_count {
+                    ends_at[row_index + 1] = ends_at[row_index + 1].max(meta.cell_border_tb[1]);
+                }
+                if row_index > 0 {
+                    starts_at[row_index] = starts_at[row_index].max(meta.cell_border_tb[0]);
+                }
+            }
+            row_metas[row_index] = Some(meta);
+            skipped_cells[row_index] = true;
+            continue;
+        }
+        if let Some((row_node, row_style)) = row.node {
+            let before_cells = crate::css::moment_reports();
+            let row_parent = parent_of(&row_style, &child_parent);
+            for cell in row_node.children(&NO_GENERATED_CONTENT) {
+                let Child::Element(cell) = cell else {
+                    continue;
+                };
+                let cell_style = style_of(cell, &row_parent);
+                if cell_style.display != Display::None && !cell_style.position.is_out_of_flow() {
+                    row.cells.push((cell, cell_style));
+                }
+            }
+            if crate::css::moment_reports() != before_cells {
+                row.momentary = true;
+            }
+        }
+        let group_end = row_groups[row_index..]
             .iter()
-            .enumerate()
-            .skip(row_index)
-            .take_while(|(_, other)| other.group == row.group)
+            .take_while(|&&group| group == row.group)
             .count();
         let mut column = 0;
+        let mut row_all_border_max = [0.0_f32; 4];
+        let mut row_cell_border_tb = [0.0_f32; 2];
+        let mut row_has_unclamped_rowspan = row_has_rowspan[row_index];
         for &(cell, cell_style) in &row.cells {
             while occupied[row_index].get(column).copied().unwrap_or(false) {
                 column += 1;
@@ -6541,18 +6793,45 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 1
             };
             let spanned_rows = if spans {
+                if !row_has_unclamped_rowspan && table_span(cell, "rowspan", 2) > 1 {
+                    row_has_unclamped_rowspan = true;
+                }
                 table_span(cell, "rowspan", group_end).min(group_end)
             } else {
                 1
             };
             if spanned_rows > 1 {
                 row_has_rowspan[row_index..row_index + spanned_rows].fill(true);
-            }
-            for slots in &mut occupied[row_index..row_index + spanned_rows] {
-                if slots.len() < column + columns {
-                    slots.resize(column + columns, false);
+                for slots in &mut occupied[row_index + 1..row_index + spanned_rows] {
+                    if slots.len() < column + columns {
+                        slots.resize(column + columns, false);
+                    }
+                    slots[column..column + columns].fill(true);
                 }
-                slots[column..column + columns].fill(true);
+            }
+            let cell_border = used_border(&cell_style);
+            let sides = [
+                cell_border.top,
+                cell_border.right,
+                cell_border.bottom,
+                cell_border.left,
+            ];
+            for side in 0..4 {
+                row_all_border_max[side] = row_all_border_max[side].max(sides[side]);
+                max_borders[side] = max_borders[side].max(sides[side]);
+            }
+            if spans {
+                row_cell_border_tb[0] = row_cell_border_tb[0].max(cell_border.top);
+                row_cell_border_tb[1] = row_cell_border_tb[1].max(cell_border.bottom);
+                if style.border_collapse {
+                    let end = row_index + spanned_rows;
+                    if end > 0 && end < row_count {
+                        ends_at[end] = ends_at[end].max(cell_border.bottom);
+                    }
+                    if row_index > 0 && row_index < row_count {
+                        starts_at[row_index] = starts_at[row_index].max(cell_border.top);
+                    }
+                }
             }
             cells.push(TableCellSlot {
                 node: cell,
@@ -6565,22 +6844,29 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             });
             column += columns;
         }
+        let row_columns = column.max(occupied[row_index].len());
+        column_count = column_count.max(row_columns);
+        let fresh_meta = TableRowMeta {
+            columns: row_columns,
+            all_border_max: row_all_border_max,
+            cell_border_tb: row_cell_border_tb,
+            has_rowspan: row_has_unclamped_rowspan,
+        };
+        if let Some(meta) = cached_meta {
+            assert_eq!(
+                fresh_meta, meta,
+                "kept table row metadata went stale for row {row_index}"
+            );
+        }
+        row_metas[row_index] = Some(fresh_meta);
     }
-    let column_count = occupied.iter().map(Vec::len).max().unwrap_or(0);
-    let row_count = rows.len();
 
     // collapsed borders share their width between neighbours, so two that meet overlap by
     // the narrower and a border that meets none keeps its room; separated ones keep spacing
-    let widest = |side: fn(&ResolvedEdges) -> f32| {
-        cells
-            .iter()
-            .map(|cell| side(&used_border(&cell.style)))
-            .fold(0.0_f32, f32::max)
-    };
     let (spacing_x, spacing_y) = if style.border_collapse {
         (
-            -widest(|edges| edges.left).min(widest(|edges| edges.right)),
-            -widest(|edges| edges.top).min(widest(|edges| edges.bottom)),
+            -max_borders[3].min(max_borders[1]),
+            -max_borders[0].min(max_borders[2]),
         )
     } else {
         style.border_spacing
@@ -6592,22 +6878,6 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let row_gaps = if !style.border_collapse {
         vec![spacing_y; row_count.saturating_sub(1)]
     } else {
-        let mut ends_at = vec![0.0_f32; row_count];
-        let mut starts_at = vec![0.0_f32; row_count];
-        for cell in &cells {
-            // a td shown as something else keeps its border to itself
-            if cell.style.display != Display::TableCell {
-                continue;
-            }
-            let border = used_border(&cell.style);
-            let end = cell.row + cell.rows;
-            if end > 0 && end < row_count {
-                ends_at[end] = ends_at[end].max(border.bottom);
-            }
-            if cell.row > 0 && cell.row < row_count {
-                starts_at[cell.row] = starts_at[cell.row].max(border.top);
-            }
-        }
         (1..row_count)
             .map(|below| -ends_at[below].min(starts_at[below]))
             .collect()
@@ -6924,18 +7194,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let mut row_y = Vec::with_capacity(row_count);
     let mut spans_ending: Vec<Vec<usize>> = Vec::new();
     let mut built_rows: Vec<Option<Rc<LayoutBox>>> = vec![None; row_count];
-    let kept_pass = content_height
-        .is_none()
-        .then(|| {
-            KEPT.with(|kept| {
-                let kept = kept.borrow();
-                kept.pass.map(|(pass, stamp)| (pass, stamp, kept.works))
-            })
-        })
-        .flatten();
     let columns_bits = SharedColumns(column_widths.iter().map(|w| w.to_bits()).collect());
-    let zero_font = crate::css::zero_font();
-    let environment = crate::css::layout_environment();
     let mut cell_cursor = 0;
     let mut y = grid_top + edge_y;
     for row_index in 0..row_count {
@@ -6951,10 +7210,48 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         {
             let row_cells_slice = &cells[row_start..row_end];
             let base_height = row_heights[row_index];
+            let row_skipped = skipped_cells[row_index];
             let build_row = |row_top: f32| -> Rc<LayoutBox> {
+                let lazy_cells: Vec<TableCellSlot<'_>>;
+                let active_cells = if row_skipped {
+                    let row_parent = parent_of(&row_style, &child_parent);
+                    let mut column = 0;
+                    let mut built_cells = Vec::new();
+                    for cell in row_node.children(&NO_GENERATED_CONTENT) {
+                        let Child::Element(cell) = cell else {
+                            continue;
+                        };
+                        let cell_style = style_of(cell, &row_parent);
+                        if cell_style.display == Display::None
+                            || cell_style.position.is_out_of_flow()
+                        {
+                            continue;
+                        }
+                        let spans = cell_style.display == Display::TableCell;
+                        let columns = if spans {
+                            table_span(cell, "colspan", 1000)
+                        } else {
+                            1
+                        };
+                        built_cells.push(TableCellSlot {
+                            node: cell,
+                            style: cell_style,
+                            row: row_index,
+                            column,
+                            rows: 1,
+                            columns,
+                            layout: None,
+                        });
+                        column += columns;
+                    }
+                    lazy_cells = built_cells;
+                    &lazy_cells[..]
+                } else {
+                    row_cells_slice
+                };
                 let mut height = base_height;
-                let mut laid = Vec::with_capacity(row_cells_slice.len());
-                for cell in row_cells_slice {
+                let mut laid = Vec::with_capacity(active_cells.len());
+                for cell in active_cells {
                     let cell_x = table_x + column_x[cell.column];
                     let cell_box = lay_out_cell(cell, cell_x, row_top);
                     if let Some(ref layout) = cell_box {
@@ -6963,7 +7260,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     laid.push(cell_box);
                 }
                 let mut finished = Vec::with_capacity(laid.len());
-                for (cell, cell_box) in row_cells_slice.iter().zip(laid) {
+                for (cell, cell_box) in active_cells.iter().zip(laid) {
                     let Some(mut laid_out) = cell_box else {
                         continue;
                     };
@@ -7019,6 +7316,11 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 row_box.has_child_shift = false;
                 row_box.has_sticky = row_box.position == Position::Sticky
                     || row_box.children.iter().any(|child| child.has_sticky);
+                row_box.has_stacking_descendant = box_has_stacking(&row_box.children);
+                row_box.has_backdrop_filter = row_box
+                    .children
+                    .iter()
+                    .any(|child| child.has_backdrop_filter);
                 Rc::new(row_box)
             };
             let row_box = if let Some((pass, stamp, works)) = kept_pass {
@@ -7046,20 +7348,24 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     zero_font,
                     environment,
                 };
-                let known = KEPT.with(|kept| {
-                    kept_answer(
-                        &mut kept.borrow_mut().table_rows,
-                        (&row_node.node, &row_inputs),
-                        (pass, works),
-                        |since| row_node.document.unwritten_since(row_node.node, since),
-                    )
-                });
+                let known = if rows[row_index].momentary {
+                    None
+                } else {
+                    KEPT.with(|kept| {
+                        kept_answer(
+                            &mut kept.borrow_mut().table_rows,
+                            (&row_node.node, &row_inputs),
+                            (pass, works),
+                            |since| row_node.document.unwritten_since(row_node.node, since),
+                        )
+                    })
+                };
                 if let Some((cached, earlier)) = known {
                     if cfg!(feature = "recheck") {
                         let reported = crate::css::moment_reports();
                         let fresh = build_row(y);
                         assert!(
-                            *fresh == *cached,
+                            *fresh == *cached.layout,
                             "a kept table row went stale: {:?}",
                             row_node.node
                         );
@@ -7069,13 +7375,20 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                             row_node.node
                         );
                     }
-                    cached
+                    cached.layout
                 } else {
                     let (reported, looked_up) =
                         (crate::css::moment_reports(), crate::svg::reference_reads());
                     let built = build_row(y);
-                    let momentary = crate::css::moment_reports() != reported;
+                    let momentary =
+                        rows[row_index].momentary || crate::css::moment_reports() != reported;
                     let refers = crate::svg::reference_reads() != looked_up;
+                    let meta = row_metas[row_index].unwrap_or(TableRowMeta {
+                        columns: 0,
+                        all_border_max: [0.0; 4],
+                        cell_border_tb: [0.0; 2],
+                        has_rowspan: true,
+                    });
                     KEPT.with(|kept| {
                         let mut kept = kept.borrow_mut();
                         kept.worked = true;
@@ -7084,7 +7397,10 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                             row_node.node,
                             Kept {
                                 inputs: row_inputs,
-                                answer: built.clone(),
+                                answer: KeptTableRow {
+                                    layout: built.clone(),
+                                    meta,
+                                },
                                 pass,
                                 used: works,
                                 stamp,
@@ -7233,6 +7549,11 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     row_box.children.iter().any(|child| child.has_child_shift);
                 row_box.has_sticky = row_box.position == Position::Sticky
                     || row_box.children.iter().any(|child| child.has_sticky);
+                row_box.has_stacking_descendant = box_has_stacking(&row_box.children);
+                row_box.has_backdrop_filter = row_box
+                    .children
+                    .iter()
+                    .any(|child| child.has_backdrop_filter);
                 grouped_rows[row.group].push(Rc::new(row_box));
             }
             None => {
@@ -7261,6 +7582,11 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     group_box.children.iter().any(|child| child.has_child_shift);
                 group_box.has_sticky = group_box.position == Position::Sticky
                     || group_box.children.iter().any(|child| child.has_sticky);
+                group_box.has_stacking_descendant = box_has_stacking(&group_box.children);
+                group_box.has_backdrop_filter = group_box
+                    .children
+                    .iter()
+                    .any(|child| child.has_backdrop_filter);
                 children.push(Rc::new(group_box));
             }
             None => children.extend(contents),
@@ -7287,6 +7613,10 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let has_child_shift = children.iter().any(|child| child.has_child_shift);
     let has_sticky =
         style.position == Position::Sticky || children.iter().any(|child| child.has_sticky);
+    let has_stacking_descendant = box_has_stacking(&children);
+    let filters = crate::filter::Filters::of(&style, font_size);
+    let has_backdrop_filter =
+        !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
     let mut layout = LayoutBox {
         node: node.node,
         tag: node.name().to_string(),
@@ -7304,7 +7634,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadows: resolve_shadows(style.shadows, content_width, font_size),
-        filters: crate::filter::Filters::of(&style, font_size),
+        filters,
         border: BoxBorder::of(&style),
         outline: box_outline(&style),
         text: Vec::new(),
@@ -7346,6 +7676,8 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         child_shift: (0.0, 0.0),
         has_child_shift,
         has_sticky,
+        has_stacking_descendant,
+        has_backdrop_filter,
     };
     if mode != LayoutMode::Flow {
         position_layout_box(
@@ -9179,15 +9511,18 @@ fn flush_child_shifts(layout: &mut LayoutBox, shift: (f32, f32)) {
     }
 }
 
-// flushes deferred shifts only along branches holding sticky boxes, leaving non-sticky
-// subtrees shared until the outer layout pass needs them
+// flushes deferred shifts only along branches holding sticky boxes, pushing any own shift
+// one level down so non-sticky subtrees stay shared until the outer layout pass needs them
 fn flush_sticky_child_shifts(layout: &mut LayoutBox) {
     if !layout.has_child_shift || !layout.has_sticky {
         return;
     }
-    if layout.child_shift != (0.0, 0.0) {
-        flush_child_shifts(layout, (0.0, 0.0));
-        return;
+    let own_shift = layout.child_shift;
+    if own_shift != (0.0, 0.0) {
+        layout.child_shift = (0.0, 0.0);
+        for child in &mut layout.children {
+            translate_layout_box(Rc::make_mut(child), own_shift.0, own_shift.1);
+        }
     }
     let mut still_has_shift = false;
     for child in &mut layout.children {
@@ -9949,14 +10284,20 @@ fn flush_line(
         return;
     }
     let available = line.available(content_width);
-    if line.ellipsis && line.used > available + 0.5 {
+    let truncated = line.ellipsis && line.used > available + 0.5;
+    if truncated {
         truncate_with_ellipsis(line, available);
     }
     let end = (available - line.used).max(0.0);
-    let offset = match (align, line.rtl) {
-        (TextAlign::Left, _) | (TextAlign::Start, false) | (TextAlign::End, true) => 0.0,
-        (TextAlign::Center, _) => end / 2.0,
-        _ => end,
+    // overflowing lines start-align even after text-overflow: ellipsis shortens them
+    let offset = if truncated {
+        if line.rtl { end } else { 0.0 }
+    } else {
+        match (align, line.rtl) {
+            (TextAlign::Left, _) | (TextAlign::Start, false) | (TextAlign::End, true) => 0.0,
+            (TextAlign::Center, _) => end / 2.0,
+            _ => end,
+        }
     };
     let mut x = content_x + line.left + offset;
     let line_start = x;
@@ -10650,22 +10991,19 @@ pub(crate) fn repaint_motion(
             moved.insert(node, (last_style, next_style, font_size));
         }
     }
+    let mut ancestors = crate::hashing::HashSet::default();
+    for &node in moved.keys() {
+        ancestors.extend(document.ancestors(node));
+    }
     let mut next = last.clone();
-    patch_motion(&mut next.root, document, &moved).then_some(next)
-}
-
-fn subtree_has_moved(layout: &LayoutBox, moved: &HashMap<NodeId, (Style, Style, f32)>) -> bool {
-    moved.contains_key(&layout.node)
-        || layout
-            .children
-            .iter()
-            .any(|child| subtree_has_moved(child, moved))
+    patch_motion(&mut next.root, document, &moved, &ancestors).then_some(next)
 }
 
 fn patch_motion(
     layout: &mut LayoutBox,
     document: &Document,
     moved: &HashMap<NodeId, (Style, Style, f32)>,
+    ancestors: &crate::hashing::HashSet<NodeId>,
 ) -> bool {
     // a field moves only when it holds what the last style gives it
     fn swap<T: PartialEq>(field: &mut T, [last, next]: [T; 2]) -> bool {
@@ -10691,8 +11029,26 @@ fn patch_motion(
         } else {
             swap(&mut layout.shadows, shadows)
         };
+        // block, flex and grid children inherit opacity 1.0 unless wrapped as ::text or table parts
+        let opacity_moved = if last.opacity == next.opacity {
+            true
+        } else if !layout.inline
+            && layout.opacity == last.opacity
+            && !matches!(
+                layout.tag.as_str(),
+                "table" | "thead" | "tbody" | "tfoot" | "tr"
+            )
+            && !layout.children.iter().any(|child| child.tag == "::text")
+        {
+            layout.opacity = next.opacity;
+            layout.creates_stacking_context = creates_stacking_context(*next) || next.opacity < 1.0;
+            true
+        } else {
+            false
+        };
         let moved = layout.control.is_none()
             && shadows_moved
+            && opacity_moved
             && swap(&mut layout.background, styles.map(|style| style.background))
             && swap(&mut layout.backgrounds, styles.map(Style::layers))
             && swap(
@@ -10708,13 +11064,20 @@ fn patch_motion(
         }
     }
     // leave subtrees with no moving node shared so damage skips them by pointer identity
+    let mut visited_child = false;
     for child in &mut layout.children {
-        if !subtree_has_moved(child, moved) {
+        if child.tag.starts_with("::")
+            || (!moved.contains_key(&child.node) && !ancestors.contains(&child.node))
+        {
             continue;
         }
-        if !patch_motion(Rc::make_mut(child), document, moved) {
+        visited_child = true;
+        if !patch_motion(Rc::make_mut(child), document, moved, ancestors) {
             return false;
         }
+    }
+    if visited_child {
+        layout.has_stacking_descendant = box_has_stacking(&layout.children);
     }
     true
 }
@@ -10992,6 +11355,8 @@ impl LayoutBox {
             child_shift: _,
             has_child_shift: _,
             has_sticky: _,
+            has_stacking_descendant: _,
+            has_backdrop_filter: _,
         } = self;
         *node == other.node
             && *tag == other.tag
@@ -14173,5 +14538,110 @@ mod tests {
             ),
             (0.0, 0.0, 800.0, 600.0)
         );
+    }
+
+    #[test]
+    fn centered_ellipsis_overflow_aligns_to_start() {
+        let document = Document::parse_markup(
+            r#"<style>
+                .box {
+                    width: 60px;
+                    text-align: center;
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    font-size: 12px;
+                }
+            </style>
+            <div id="long" class="box">capture_20261122_211619.png</div>
+            <div id="short" class="box">hi</div>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let result = layout(
+            &document,
+            &stylesheet,
+            Size {
+                width: 200.0,
+                height: 100.0,
+            },
+        );
+        let long_id = document.find_element_by_id("long").expect("long");
+        let short_id = document.find_element_by_id("short").expect("short");
+        let long_box = result
+            .root
+            .children
+            .iter()
+            .find(|layout| layout.node == long_id)
+            .expect("long box");
+        let short_box = result
+            .root
+            .children
+            .iter()
+            .find(|layout| layout.node == short_id)
+            .expect("short box");
+        assert!(
+            (long_box.text[0].x - long_box.rect.x).abs() < 0.01,
+            "overflowing ellipsis line should start-align: text_x={} rect_x={}",
+            long_box.text[0].x,
+            long_box.rect.x
+        );
+        assert!(
+            short_box.text[0].x > short_box.rect.x + 5.0,
+            "non-overflowing line should remain centered: text_x={} rect_x={}",
+            short_box.text[0].x,
+            short_box.rect.x
+        );
+    }
+
+    #[test]
+    fn opacity_motion_patches_without_relayout_and_matches_fresh_layout() {
+        let document = Document::parse_markup(
+            r#"<style>
+                @keyframes pulse {
+                    0% { opacity: 1; }
+                    50% { opacity: 0.4; }
+                    100% { opacity: 1; }
+                }
+                #badge {
+                    width: 40px;
+                    height: 20px;
+                    background: #cc4422;
+                    animation: pulse 1000ms linear infinite;
+                }
+            </style>
+            <div id="badge">off</div>
+            <div id="other">steady</div>"#,
+        )
+        .expect("document should parse");
+        let stylesheet = Stylesheet::parse(&document.style_text()).expect("css should parse");
+        let badge = document.find_element_by_id("badge").expect("badge");
+        let viewport = Size {
+            width: 200.0,
+            height: 100.0,
+        };
+        let mut start_state = StyleState {
+            clock: 0,
+            ..StyleState::default()
+        };
+        start_state.animation_starts = crate::css::Shared::new([(badge, 0)].into_iter().collect());
+        crate::css::record_motion();
+        let initial = layout_with_state(&document, &stylesheet, viewport, &start_state);
+        let nodes = crate::css::take_motion().expect("opacity animation should be repaint-only");
+        assert!(nodes.contains(&badge));
+        let mid_state = StyleState {
+            clock: 500,
+            ..start_state.clone()
+        };
+        let patched = repaint_motion(
+            &document,
+            &stylesheet,
+            viewport,
+            [&start_state, &mid_state],
+            (&nodes, &initial),
+        )
+        .expect("opacity motion should patch without full relayout");
+        let fresh = layout_afresh(&document, &stylesheet, viewport, &mid_state);
+        assert_eq!(patched, fresh);
     }
 }

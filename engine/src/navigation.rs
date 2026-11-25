@@ -2036,8 +2036,54 @@ impl Browser {
         if settled && unchanged {
             return Ok(false);
         }
-        let incremental_eligible = !unchanged
-            && self.motion_since != 0
+        if unchanged {
+            let mut events = Vec::new();
+            for (node, run) in &mut self.animations {
+                run.advance(*node, clock, &mut events);
+            }
+            if !self.transitions.is_empty() {
+                let mut expired = false;
+                for (key, active) in &self.transitions {
+                    let start = active.started + active.delay;
+                    if active.delay > 0
+                        && previous_clock.is_some_and(|previous| previous < start)
+                        && start <= clock
+                    {
+                        events.push(MotionEvent::transition(key, "transitionstart", 0));
+                    }
+                    if clock > active.finishes {
+                        expired = true;
+                        events.push(MotionEvent::transition(
+                            key,
+                            "transitionend",
+                            active.duration,
+                        ));
+                    }
+                }
+                if expired {
+                    self.transitions
+                        .make_mut()
+                        .retain(|_, active| clock <= active.finishes);
+                    if self.transitions.is_empty() {
+                        self.transitions = Shared::default();
+                    }
+                    page.layout_inputs.borrow_mut().extras.transitions = self.transitions.clone();
+                }
+            }
+            drop(document);
+            if events.is_empty() {
+                return Ok(false);
+            }
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            for event in events {
+                page.runtime
+                    .dispatch_motion_event(event.node, event.kind, &event.name, event.elapsed)
+                    .map_err(script_error)?;
+            }
+            self.process_pending_navigation()?;
+            return Ok(true);
+        }
+        let incremental_eligible = self.motion_since != 0
             && stylesheet.follows_versions()
             && !document.has_shadow_roots()
             && self.motion_read.as_ref().is_some_and(
@@ -2060,18 +2106,11 @@ impl Browser {
         let styles = crate::css::memoize_styles();
         let mut scanned = HashMap::default();
         let mut used_incremental = false;
-        let (candidates, mut prior_nodes, custom_unchanged) = if unchanged {
-            seen.extend(self.declared.keys().cloned());
-            seen_animations.extend(self.animations.keys().copied());
-            for (node, run) in &mut self.animations {
-                run.advance(*node, clock, &mut events);
-            }
-            (Vec::new(), HashMap::default(), true)
-        } else {
-            self.motion_since = document.change_stamp();
-            let dirty = incremental_eligible
-                .then(|| dirty_motion_nodes(&document, &stylesheet, previous_since))
-                .flatten();
+        self.motion_since = document.change_stamp();
+        let dirty = incremental_eligible
+            .then(|| dirty_motion_nodes(&document, &stylesheet, previous_since))
+            .flatten();
+        let (candidates, mut prior_nodes, custom_unchanged) =
             if let Some((dirty_set, dirty_elements)) = dirty {
                 if !self.motion_nodes.is_empty() || !dirty_elements.is_empty() {
                     page.populate_custom_properties(&document, &mut state);
@@ -2120,8 +2159,7 @@ impl Browser {
                     std::mem::take(&mut self.motion_nodes),
                     custom_unchanged,
                 )
-            }
-        };
+            };
         let default_text = crate::css::SharedText::default();
         let mut parsed_transitions: HashMap<
             (usize, usize),
@@ -2260,24 +2298,22 @@ impl Browser {
                 },
             );
         }
-        if !unchanged {
-            if cfg!(feature = "recheck") && used_incremental {
-                let full = collect_motion_candidates(&stylesheet, &state, &document);
-                assert_eq!(
-                    scanned.len(),
-                    full.len(),
-                    "incremental motion scan candidate count drifted"
+        if cfg!(feature = "recheck") && used_incremental {
+            let full = collect_motion_candidates(&stylesheet, &state, &document);
+            assert_eq!(
+                scanned.len(),
+                full.len(),
+                "incremental motion scan candidate count drifted"
+            );
+            for node in full {
+                assert!(
+                    scanned.contains_key(&node),
+                    "incremental motion scan missed candidate {node:?}"
                 );
-                for node in full {
-                    assert!(
-                        scanned.contains_key(&node),
-                        "incremental motion scan missed candidate {node:?}"
-                    );
-                }
             }
-            self.motion_nodes = scanned;
-            self.motion_custom = state.custom_properties.clone();
         }
+        self.motion_nodes = scanned;
+        self.motion_custom = state.custom_properties.clone();
         // starts after a delay and ends are noticed as the clock passes them
         for (key, active) in &self.transitions {
             let start = active.started + active.delay;

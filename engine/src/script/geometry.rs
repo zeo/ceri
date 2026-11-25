@@ -541,9 +541,12 @@ impl ScriptRuntime {
             let held = measured
                 .holds_until
                 .is_some_and(|until| (measured.state.clock..until).contains(&state.clock));
+            // repaint-only motion never moves or resizes boxes, so geometry stays valid
+            let paint_only = measured.motion.is_some();
             measured.version != version
                 || measured.stylesheet != stylesheet
-                || (measured.state != state && !(only_the_clock && (measured.timeless || held)))
+                || (measured.state != state
+                    && !(only_the_clock && (measured.timeless || held || paint_only)))
         });
         if stale && let Some(measured) = self.measured.borrow().as_ref() {
             crate::profile::count(if measured.version != version {

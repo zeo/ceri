@@ -658,25 +658,26 @@ impl LengthTerms {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn resolve(self, containing: f32, font_size: f32) -> f32 {
-        if self.em == 0.0
-            && self.percent == 0.0
-            && self.rem == 0.0
-            && self.viewport_width == 0.0
-            && self.viewport_height == 0.0
-            && self.zero_width == 0.0
-        {
-            return self.px;
+        let env_bits = (self.rem.to_bits()
+            | self.viewport_width.to_bits()
+            | self.viewport_height.to_bits()
+            | self.zero_width.to_bits())
+            & 0x7fff_ffff;
+        if env_bits == 0 {
+            if ((self.em.to_bits() | self.percent.to_bits()) & 0x7fff_ffff) == 0 {
+                return self.px;
+            }
+            return self.px + self.em * font_size + self.percent * containing / 100.0;
         }
+        self.resolve_env(containing, font_size)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn resolve_env(self, containing: f32, font_size: f32) -> f32 {
         let base = self.px + self.em * font_size + self.percent * containing / 100.0;
-        if self.rem == 0.0
-            && self.viewport_width == 0.0
-            && self.viewport_height == 0.0
-            && self.zero_width == 0.0
-        {
-            return base;
-        }
         let environment = layout_environment();
         base + self.rem * environment.root_font_size
             + self.viewport_width * environment.viewport.width / 100.0
@@ -753,11 +754,20 @@ impl Length {
         })
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn resolve(self, containing: f32, font_size: f32) -> Option<f32> {
         match self {
             Self::Auto => None,
             Self::Terms(terms) => Some(terms.resolve(containing, font_size)),
+            other => other.resolve_function(containing, font_size),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn resolve_function(self, containing: f32, font_size: f32) -> Option<f32> {
+        match self {
+            Self::Auto | Self::Terms(_) => unreachable!(),
             Self::Clamp(list) => match *list.terms() {
                 [minimum, preferred, maximum] => {
                     let minimum = minimum.resolve(containing, font_size);
@@ -1302,7 +1312,7 @@ thread_local! {
 }
 
 // properties whose motion repaints a box without moving, resizing or restacking anything
-const REPAINT_ONLY: [&str; 8] = [
+const REPAINT_ONLY: [&str; 9] = [
     "box-shadow",
     "background-color",
     "border-color",
@@ -1311,6 +1321,7 @@ const REPAINT_ONLY: [&str; 8] = [
     "border-bottom-color",
     "border-left-color",
     "outline-color",
+    "opacity",
 ];
 
 pub(crate) fn record_motion() {
@@ -2908,22 +2919,26 @@ impl RuleIndex {
         if is_root && self.root_only.iter().any(|&index| check(index)) {
             return true;
         }
-        if let Some(bucket) = self.by_tag.get(&subject.name)
+        if !self.by_tag.is_empty()
+            && let Some(bucket) = self.by_tag.get(&subject.name)
             && bucket.iter().any(|&index| check(index))
         {
             return true;
         }
-        if let Some(id) = subject.attr("id")
+        if !self.by_id.is_empty()
+            && let Some(id) = subject.attr("id")
             && let Some(bucket) = self.by_id.get(id)
             && bucket.iter().any(|&index| check(index))
         {
             return true;
         }
-        for class in subject.classes() {
-            if let Some(bucket) = self.by_class.get(class)
-                && bucket.iter().any(|&index| check(index))
-            {
-                return true;
+        if !self.by_class.is_empty() {
+            for class in subject.classes() {
+                if let Some(bucket) = self.by_class.get(class)
+                    && bucket.iter().any(|&index| check(index))
+                {
+                    return true;
+                }
             }
         }
         if !self.by_attr.is_empty() && !subject.attrs.is_empty() {
@@ -4028,6 +4043,42 @@ impl Stylesheet {
         }
     }
 
+    // checks ::before and ::after together so elements without matching content rules skip memo lookups
+    pub(crate) fn generated_content_pair(
+        &self,
+        document: &Document,
+        node: NodeId,
+        state: &StyleState,
+    ) -> [Option<String>; 2] {
+        if !self.has_generated_content() {
+            return [None, None];
+        }
+        if !document.has_shadow_roots() {
+            let Some(element) = document.element(node) else {
+                return [None, None];
+            };
+            let is_root = is_root_element(document, node, state);
+            if !self
+                .generated_content_index
+                .any_candidate(element, is_root, |_| true)
+            {
+                return [None, None];
+            }
+        }
+        [PseudoElement::Before, PseudoElement::After].map(|pseudo| {
+            self.generated_content(StyleContext {
+                document,
+                node,
+                pseudo: Some(pseudo),
+                parent_font_size: 16.0,
+                parent_color: Color::BLACK,
+                parent_weight: FontWeight::NORMAL,
+                parent_text: SharedText::default(),
+                state,
+            })
+        })
+    }
+
     // the content string of a generated box, which is what decides whether it exists
     pub(crate) fn generated_content(&self, context: StyleContext<'_>) -> Option<String> {
         if !self.has_generated_content() {
@@ -5089,8 +5140,12 @@ impl Stylesheet {
                 .flatten()
                 .collect();
             let mut roots = Vec::new();
+            let mut visited = crate::hashing::HashSet::default();
             for node in written {
                 for above in std::iter::once(node).chain(document.ancestors(node)) {
+                    if !visited.insert(above) {
+                        break;
+                    }
                     let Some(element) = document.element(above) else {
                         continue;
                     };
@@ -5408,27 +5463,32 @@ impl Stylesheet {
 // the attributes of an svg element that style it, with bare numbers on the outer svg's
 // width and height read as pixels
 fn presentation_hints(element: &Element) -> impl Iterator<Item = (&'static str, Cow<'_, str>)> {
-    let sizes = (element.name == "svg")
-        .then_some(["width", "height"])
-        .into_iter()
-        .flatten();
-    crate::svg::PRESENTATION_ATTRIBUTES
-        .iter()
-        .copied()
-        .chain(sizes)
-        .filter_map(move |name| {
-            let value = element.attr(name)?.trim();
-            let pixels =
-                matches!(name, "width" | "height" | "font-size") && value.parse::<f32>().is_ok();
-            Some((
-                name,
-                if pixels {
-                    Cow::Owned(format!("{value}px"))
-                } else {
-                    Cow::Borrowed(value)
-                },
-            ))
-        })
+    let is_svg = element.name == "svg";
+    element.attrs.iter().filter_map(move |(attr_name, raw)| {
+        let name = if is_svg && attr_name == "width" {
+            "width"
+        } else if is_svg && attr_name == "height" {
+            "height"
+        } else if let Some(&hint) = crate::svg::PRESENTATION_ATTRIBUTES
+            .iter()
+            .find(|&&hint| hint == attr_name.as_str())
+        {
+            hint
+        } else {
+            return None;
+        };
+        let value = raw.trim();
+        let pixels =
+            matches!(name, "width" | "height" | "font-size") && value.parse::<f32>().is_ok();
+        Some((
+            name,
+            if pixels {
+                Cow::Owned(format!("{value}px"))
+            } else {
+                Cow::Borrowed(value)
+            },
+        ))
+    })
 }
 
 // a rule that matches an element, as devtools lists it: where its selector and its

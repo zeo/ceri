@@ -7,8 +7,9 @@ use crate::image::Image;
 use crate::layout::{
     BoxBorder, ControlPaint, CornerRadii, ImageLayer, LayoutBox, LayoutDocument, ProseSpan, Rect,
     ResolvedEdges, SQUARE_CORNERS, Scrollbar, StackingContextEntry, TextRun, ThumbPlacement,
-    overflow_clip_rect, paint_order, part_box, scrollbar_metrics, stacking_context_entries,
-    thumb_placement, translate_rect, user_scroll_range, visual_offset_for, visual_rect_for,
+    for_each_paint_order, overflow_clip_rect, part_box, scrollbar_metrics,
+    stacking_context_entries, thumb_placement, translate_rect, user_scroll_range,
+    visual_offset_for, visual_rect_for,
 };
 use crate::png::encode_png;
 use std::cell::RefCell;
@@ -706,11 +707,10 @@ impl Canvas {
         let steady = paint.steady();
         let ramp_setup = match (paint, steady) {
             (Paint::Ramp(ramp), Steady::Nowhere) => {
-                let table = ramp.table.get_or_init(|| RampTable::new(ramp)).as_ref();
                 let (first, last) = (ramp.stops[0].0, ramp.stops[ramp.stops.len() - 1].0);
                 let before_first = premul_to_color(ramp.stops[0].1);
                 let at_or_after_last = premul_to_color(ramp.stops[ramp.stops.len() - 1].1);
-                Some((ramp, table, first, last, before_first, at_or_after_last))
+                Some((ramp, first, last, before_first, at_or_after_last))
             }
             _ => None,
         };
@@ -756,11 +756,54 @@ impl Canvas {
             match steady {
                 // the row is one color between the first and the last pixel its tile covers
                 Steady::AlongRows => {
-                    let drawn = run_where(whole, |pixel_x| color_at(pixel_x).alpha != 0);
-                    if drawn.is_empty() {
+                    if whole.is_empty() {
                         continue;
                     }
-                    let color = color_at(drawn.start);
+                    let (drawn, color) = match paint {
+                        Paint::Solid(color) => {
+                            if color.alpha == 0 {
+                                continue;
+                            }
+                            (whole, *color)
+                        }
+                        Paint::Ramp(ramp) => {
+                            let drawn = if ramp.repeat.0 {
+                                whole
+                            } else {
+                                let lo = (ramp.corner.0 - 0.5)
+                                    .floor()
+                                    .clamp(whole.start as f32, whole.end as f32)
+                                    as u32;
+                                let hi = (ramp.corner.0 + ramp.size.0 * ramp.scale - 0.5)
+                                    .ceil()
+                                    .clamp(whole.start as f32, whole.end as f32)
+                                    as u32;
+                                let mut start =
+                                    lo.saturating_sub(1).max(whole.start).min(whole.end);
+                                let mut end = hi.saturating_add(2).min(whole.end);
+                                let inside = |pixel: u32| {
+                                    (0.0..ramp.size.0).contains(
+                                        &((pixel as f32 + 0.5 - ramp.corner.0) / ramp.scale),
+                                    )
+                                };
+                                while start < end && !inside(start) {
+                                    start += 1;
+                                }
+                                while end > start && !inside(end - 1) {
+                                    end -= 1;
+                                }
+                                start..end
+                            };
+                            if drawn.is_empty() {
+                                continue;
+                            }
+                            let color = color_at(drawn.start);
+                            if color.alpha == 0 {
+                                continue;
+                            }
+                            (drawn, color)
+                        }
+                    };
                     let at = pixel_y as usize * stride;
                     if unmasked_all {
                         let run = at + drawn.start as usize * 4..at + drawn.end as usize * 4;
@@ -785,26 +828,85 @@ impl Canvas {
                     if !paint.covers_row(row) {
                         continue;
                     }
-                    let colors = columns
-                        .get_or_insert_with(|| (left..right).map(color_at).collect::<Vec<_>>());
-                    if unmasked_all {
+                    let (non_zero, uniform) = columns.get_or_insert_with(|| {
+                        let non_zero: Vec<(u32, Color)> = (left..right)
+                            .filter_map(|px| {
+                                let color = color_at(px);
+                                (color.alpha != 0).then_some((px, color))
+                            })
+                            .collect();
+                        let uniform = non_zero.first().and_then(|&(_, first)| {
+                            non_zero
+                                .iter()
+                                .all(|&(_, color)| color == first)
+                                .then_some(first)
+                        });
+                        (non_zero, uniform)
+                    });
+                    if non_zero.is_empty() || whole.is_empty() {
+                        continue;
+                    }
+                    let slice_range = |range: std::ops::Range<u32>| -> &[(u32, Color)] {
+                        if range.is_empty() {
+                            return &[];
+                        }
+                        if range.start == left && range.end == right {
+                            return non_zero;
+                        }
+                        let lo = non_zero.partition_point(|&(px, _)| px < range.start);
+                        let hi = lo + non_zero[lo..].partition_point(|&(px, _)| px < range.end);
+                        &non_zero[lo..hi]
+                    };
+                    let unmasked = if unmasked_all {
+                        whole.clone()
+                    } else {
+                        self.masks_whole_run(row, whole.clone())
+                    };
+                    for &(pixel_x, color) in slice_range(whole.start..unmasked.start) {
+                        self.blend_pixel(pixel_x, pixel_y, color);
+                    }
+                    for &(pixel_x, color) in slice_range(unmasked.end..whole.end) {
+                        self.blend_pixel(pixel_x, pixel_y, color);
+                    }
+                    let active = slice_range(unmasked);
+                    if !active.is_empty() {
                         let row_pixels = &mut self.pixels
                             [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
-                        for pixel_x in whole {
-                            let color = colors[(pixel_x - left) as usize];
-                            if color.alpha != 0 {
+                        if let Some(color) = *uniform {
+                            if color.alpha == 255 {
+                                let rgba = [color.red, color.green, color.blue, 255];
+                                for &(pixel_x, _) in active {
+                                    let at = pixel_x as usize * 4;
+                                    row_pixels[at..at + 4].copy_from_slice(&rgba);
+                                }
+                            } else {
+                                let alpha = color.alpha as u32;
+                                let inverse = 255 - alpha;
+                                let (sr, sg, sb, sa) = (
+                                    color.red as u32 * alpha,
+                                    color.green as u32 * alpha,
+                                    color.blue as u32 * alpha,
+                                    alpha * 255,
+                                );
+                                for &(pixel_x, _) in active {
+                                    let at = pixel_x as usize * 4;
+                                    row_pixels[at] =
+                                        ((sr + row_pixels[at] as u32 * inverse) / 255) as u8;
+                                    row_pixels[at + 1] =
+                                        ((sg + row_pixels[at + 1] as u32 * inverse) / 255) as u8;
+                                    row_pixels[at + 2] =
+                                        ((sb + row_pixels[at + 2] as u32 * inverse) / 255) as u8;
+                                    row_pixels[at + 3] =
+                                        ((sa + row_pixels[at + 3] as u32 * inverse) / 255) as u8;
+                                }
+                            }
+                        } else {
+                            for &(pixel_x, color) in active {
                                 let at = pixel_x as usize * 4;
                                 let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
                                     .try_into()
                                     .expect("four bytes per pixel");
                                 blend_rgba(pixel, color);
-                            }
-                        }
-                    } else {
-                        for pixel_x in whole {
-                            let color = colors[(pixel_x - left) as usize];
-                            if color.alpha != 0 {
-                                self.blend_pixel(pixel_x, pixel_y, color);
                             }
                         }
                     }
@@ -813,12 +915,25 @@ impl Canvas {
                     if whole.is_empty() {
                         continue;
                     }
-                    if unmasked_all
-                        && let Some((ramp, table, first, last, before_first, at_or_after_last)) =
-                            ramp_setup
+                    let unmasked = if unmasked_all {
+                        whole.clone()
+                    } else {
+                        self.masks_whole_run(row, whole.clone())
+                    };
+                    for pixel_x in (whole.start..unmasked.start).chain(unmasked.end..whole.end) {
+                        let color = paint.pixel_color(steady, (pixel_x as f32 + 0.5, row));
+                        if color.alpha != 0 {
+                            self.blend_pixel(pixel_x, pixel_y, color);
+                        }
+                    }
+                    if unmasked.is_empty() {
+                        continue;
+                    }
+                    if let Some((ramp, first, last, before_first, at_or_after_last)) = ramp_setup
                         && !ramp.repeating
-                        && (whole.start as f32 + 0.5 - ramp.corner.0) / ramp.scale >= 0.0
-                        && ((whole.end - 1) as f32 + 0.5 - ramp.corner.0) / ramp.scale < ramp.size.0
+                        && (unmasked.start as f32 + 0.5 - ramp.corner.0) / ramp.scale >= 0.0
+                        && ((unmasked.end - 1) as f32 + 0.5 - ramp.corner.0) / ramp.scale
+                            < ramp.size.0
                     {
                         let mut y = (row - ramp.corner.1) / ramp.scale;
                         if ramp.repeat.1 {
@@ -841,7 +956,8 @@ impl Canvas {
                                 };
                                 if last >= 0.0 && dy2 >= last_sq_hi {
                                     if at_or_after_last.alpha != 0 {
-                                        let run = whole.start as usize * 4..whole.end as usize * 4;
+                                        let run =
+                                            unmasked.start as usize * 4..unmasked.end as usize * 4;
                                         fill_solid_span(&mut row_pixels[run], at_or_after_last);
                                     }
                                     continue;
@@ -854,12 +970,17 @@ impl Canvas {
                                     let max_x =
                                         ((center.0 + dx_span) * ramp.scale + ramp.corner.0 + 1.5)
                                             .ceil();
-                                    let start = whole.start.max(min_x.max(0.0) as u32);
-                                    let end = whole.end.min(max_x.max(0.0) as u32);
+                                    let start = unmasked.start.max(min_x.max(0.0) as u32);
+                                    let end = unmasked.end.min(max_x.max(0.0) as u32);
                                     start..end.max(start)
                                 } else {
-                                    whole.clone()
+                                    unmasked.clone()
                                 };
+                                if active.is_empty() {
+                                    continue;
+                                }
+                                let table =
+                                    ramp.table.get_or_init(|| RampTable::new(ramp)).as_ref();
                                 for pixel_x in active {
                                     let x = (pixel_x as f32 + 0.5 - ramp.corner.0) / ramp.scale;
                                     let dx = (x - center.0) / radii.0;
@@ -887,7 +1008,48 @@ impl Canvas {
                             }
                             RampShape::Linear(start, axis) => {
                                 let y_term = (y - start.1) * axis.1;
-                                for pixel_x in whole {
+                                let x0 = (unmasked.start as f32 + 0.5 - ramp.corner.0) / ramp.scale;
+                                let x1 =
+                                    ((unmasked.end - 1) as f32 + 0.5 - ramp.corner.0) / ramp.scale;
+                                let o0 = (x0 - start.0) * axis.0 + y_term;
+                                let o1 = (x1 - start.0) * axis.0 + y_term;
+                                if o0 < first && o1 < first {
+                                    if before_first.alpha != 0 {
+                                        let run =
+                                            unmasked.start as usize * 4..unmasked.end as usize * 4;
+                                        fill_solid_span(&mut row_pixels[run], before_first);
+                                    }
+                                    continue;
+                                }
+                                if o0 >= last && o1 >= last {
+                                    if at_or_after_last.alpha != 0 {
+                                        let run =
+                                            unmasked.start as usize * 4..unmasked.end as usize * 4;
+                                        fill_solid_span(&mut row_pixels[run], at_or_after_last);
+                                    }
+                                    continue;
+                                }
+                                let table =
+                                    ramp.table.get_or_init(|| RampTable::new(ramp)).as_ref();
+                                if let Some(table) = table
+                                    && (first..last).contains(&o0)
+                                    && (first..last).contains(&o1)
+                                {
+                                    let step0 = ((o0 - first) * table.steps_per_offset) as usize;
+                                    let step1 = ((o1 - first) * table.steps_per_offset) as usize;
+                                    if step0 == step1
+                                        && let Some(color) =
+                                            table.colors.get(step0).copied().flatten()
+                                    {
+                                        if color.alpha != 0 {
+                                            let run = unmasked.start as usize * 4
+                                                ..unmasked.end as usize * 4;
+                                            fill_solid_span(&mut row_pixels[run], color);
+                                        }
+                                        continue;
+                                    }
+                                }
+                                for pixel_x in unmasked {
                                     let x = (pixel_x as f32 + 0.5 - ramp.corner.0) / ramp.scale;
                                     let offset = (x - start.0) * axis.0 + y_term;
                                     let color = ramp.lookup_non_repeating(
@@ -910,25 +1072,16 @@ impl Canvas {
                         }
                         continue;
                     }
-                    if unmasked_all {
-                        let row_pixels = &mut self.pixels
-                            [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
-                        for pixel_x in whole {
-                            let color = paint.pixel_color(steady, (pixel_x as f32 + 0.5, row));
-                            if color.alpha != 0 {
-                                let at = pixel_x as usize * 4;
-                                let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
-                                    .try_into()
-                                    .expect("four bytes per pixel");
-                                blend_rgba(pixel, color);
-                            }
-                        }
-                    } else {
-                        for pixel_x in whole {
-                            let color = paint.pixel_color(steady, (pixel_x as f32 + 0.5, row));
-                            if color.alpha != 0 {
-                                self.blend_pixel(pixel_x, pixel_y, color);
-                            }
+                    let row_pixels = &mut self.pixels
+                        [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                    for pixel_x in unmasked {
+                        let color = paint.pixel_color(steady, (pixel_x as f32 + 0.5, row));
+                        if color.alpha != 0 {
+                            let at = pixel_x as usize * 4;
+                            let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
+                                .try_into()
+                                .expect("four bytes per pixel");
+                            blend_rgba(pixel, color);
                         }
                     }
                 }
@@ -1277,6 +1430,8 @@ impl Canvas {
             [0.0; 4]
         };
         let frame_square = frame.is_square();
+        let frame_touch_x = narrow_axis(left..right, frame.x, frame.width);
+        let shape_touch_x = narrow_axis(left..right, shape.x, shape.width);
         let unmasked_all = self.masks_cover_rect(left, top, right, bottom);
         let stride = self.width as usize * 4;
         let mut blurred = Blurred::new(shape, sigma, left..right);
@@ -1296,12 +1451,26 @@ impl Canvas {
             if inset && frame_y_outside {
                 continue;
             }
+            let blurred_row = blurred.row(y);
+            if !inset {
+                match blurred_row {
+                    BlurredRow::Square(down) if down <= 0.0 => continue,
+                    BlurredRow::Sharp {
+                        y_outside: true, ..
+                    } => continue,
+                    _ => {}
+                }
+            }
             let frame_whole = if frame_y_outside {
                 left..left
             } else {
                 frame.whole_run(y, left..right)
             };
-            let blurred_row = blurred.row(y);
+            let frame_touch = if frame_y_outside {
+                left..left
+            } else {
+                frame_touch_x.clone()
+            };
             let skipped = if inset {
                 if row >= hollow[1] && row + 1.0 <= hollow[3] && hollow[0] < hollow[2] {
                     hollow[0].max(0.0) as u32..hollow[2].max(0.0) as u32
@@ -1311,17 +1480,78 @@ impl Canvas {
             } else {
                 frame_whole.clone()
             };
-            let unmasked = if unmasked_all {
-                left..right
+            let settled: [(std::ops::Range<u32>, f32); 2] = match &blurred_row {
+                BlurredRow::Square(down) => [(blurred.square_settled.clone(), *down), (0..0, 0.0)],
+                BlurredRow::Sharp {
+                    y_outside, whole, ..
+                } => {
+                    if *y_outside {
+                        [(left..right, 0.0), (0..0, 0.0)]
+                    } else {
+                        [(whole.clone(), 1.0), (0..0, 0.0)]
+                    }
+                }
+                BlurredRow::Rounded(halves, _) => {
+                    [halves[0].settled.clone(), halves[1].settled.clone()]
+                }
+            };
+            let (row_start, row_end) = if inset {
+                (frame_touch.start, frame_touch.end)
+            } else if matches!(blurred_row, BlurredRow::Sharp { .. }) {
+                (shape_touch_x.start, shape_touch_x.end)
             } else {
-                self.masks_whole_run(y, left..right)
+                (left, right)
+            };
+            if row_start >= row_end {
+                continue;
+            }
+            let unmasked = if unmasked_all {
+                row_start..row_end
+            } else {
+                self.masks_whole_run(y, row_start..row_end)
             };
             let row_base = pixel_y as usize * stride;
-            let mut pixel_x = left;
-            while pixel_x < right {
+            let mut pixel_x = row_start;
+            while pixel_x < row_end {
                 if skipped.contains(&pixel_x) {
-                    pixel_x = skipped.end;
+                    pixel_x = skipped.end.min(row_end);
                     continue;
+                }
+                let settled_hit = if settled[0].0.contains(&pixel_x) {
+                    Some((settled[0].0.end, settled[0].1))
+                } else if settled[1].0.contains(&pixel_x) {
+                    Some((settled[1].0.end, settled[1].1))
+                } else {
+                    None
+                };
+                if let Some((run_end, covered)) = settled_hit {
+                    let alpha = if inset { 1.0 - covered } else { covered };
+                    if alpha <= 0.0 {
+                        pixel_x = run_end.min(row_end);
+                        continue;
+                    }
+                    let shade_end = if inset {
+                        frame_whole.contains(&pixel_x).then_some(frame_whole.end)
+                    } else if frame_y_outside || pixel_x >= frame_touch.end {
+                        Some(row_end)
+                    } else if pixel_x < frame_touch.start {
+                        Some(frame_touch.start)
+                    } else {
+                        None
+                    };
+                    if let Some(shade_end) = shade_end
+                        && unmasked.contains(&pixel_x)
+                    {
+                        let span_end = run_end.min(shade_end).min(unmasked.end).min(row_end);
+                        let drawn = color.scale_alpha(alpha.min(1.0));
+                        if drawn.alpha != 0 {
+                            let run =
+                                row_base + pixel_x as usize * 4..row_base + span_end as usize * 4;
+                            fill_solid_span(&mut self.pixels[run], drawn);
+                        }
+                        pixel_x = span_end;
+                        continue;
+                    }
                 }
                 let px = pixel_x;
                 let x = px as f32 + 0.5;
@@ -1618,7 +1848,6 @@ impl Canvas {
         let factor = (opacity.clamp(0.0, 1.0) * 256.0).round() as u32;
         let stride = self.width as usize * 4;
         let layer_stride = layer.width as usize * 4;
-        let masked = !self.masks.is_empty();
         let origin = |from: f32, to: f32| ((from - to) * self.scale).round() as i64;
         let origin = (
             origin(layer.shift.0, self.shift.0),
@@ -1638,10 +1867,17 @@ impl Canvas {
             right: right as u32,
             bottom: bottom as u32,
         };
+        let unmasked_all =
+            self.masks_cover_rect(bounds.left, bounds.top, bounds.right, bounds.bottom);
         let first = (top - origin.1) as usize * layer_stride + (left - origin.0) as usize * 4;
         for (row, source_row) in
             (bounds.top..bounds.bottom).zip(layer.pixels[first..].chunks(layer_stride))
         {
+            let unmasked = if unmasked_all {
+                bounds.left..bounds.right
+            } else {
+                self.masks_whole_run(row as f32 + 0.5, bounds.left..bounds.right)
+            };
             let start = row as usize * stride + bounds.left as usize * 4;
             let end = row as usize * stride + bounds.right as usize * 4;
             for (column, (target, source)) in self.pixels[start..end]
@@ -1654,14 +1890,12 @@ impl Canvas {
                 if source[3] == 0 {
                     continue;
                 }
-                let factor = if masked {
-                    let center = (
-                        (bounds.left as usize + column) as f32 + 0.5,
-                        row as f32 + 0.5,
-                    );
-                    (factor as f32 * mask_coverage(&self.masks, center)).round() as u32
-                } else {
+                let px = bounds.left + column as u32;
+                let factor = if unmasked.contains(&px) {
                     factor
+                } else {
+                    let center = (px as f32 + 0.5, row as f32 + 0.5);
+                    (factor as f32 * mask_coverage(&self.masks, center)).round() as u32
                 };
                 let alpha = (u32::from(source[3]) * factor) >> 8;
                 let inverse = 255 - alpha;
@@ -1775,18 +2009,6 @@ fn narrow(bounds: [u32; 4], clip: Option<Shape>) -> [u32; 4] {
     let xs = narrow_axis(left..right, clip.x, clip.width);
     let ys = narrow_axis(top..bottom, clip.y, clip.height);
     [xs.start, ys.start, xs.end, ys.end]
-}
-
-// the pixels from the first to the last that pass a test which holds over one unbroken run
-fn run_where(pixels: std::ops::Range<u32>, holds: impl Fn(u32) -> bool) -> std::ops::Range<u32> {
-    let Some(start) = pixels.clone().find(|&pixel| holds(pixel)) else {
-        return pixels.start..pixels.start;
-    };
-    let end = pixels
-        .rev()
-        .find(|&pixel| holds(pixel))
-        .map_or(start, |last| last + 1);
-    start..end
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2683,6 +2905,8 @@ struct Blurred {
     sigma: f32,
     left: u32,
     columns: u32,
+    // columns where a square shape's horizontal blur coverage is exactly one
+    square_settled: std::ops::Range<u32>,
     // by column: a square shape's coverage across, or a rounded one's span on the rows clear
     // of its corners, with the reach the span was worked out for
     across: Vec<Option<(u32, f32)>>,
@@ -2723,12 +2947,33 @@ fn blurred_axis(start: f32, length: f32, at: f32, sigma: f32) -> f32 {
 
 impl Blurred {
     fn new(shape: Shape, sigma: f32, columns: std::ops::Range<u32>) -> Self {
-        let needs_cache = shape.is_square() || sigma >= 0.5;
+        let is_square = shape.is_square();
+        let needs_cache = is_square || sigma >= 0.5;
+        let square_settled = if is_square {
+            let margin = if sigma < 0.5 {
+                0.5
+            } else {
+                4.5 * sigma * std::f32::consts::SQRT_2
+            };
+            let from =
+                ((shape.x + margin).ceil().max(columns.start as f32) as u32).min(columns.end);
+            let to = ((shape.x + shape.width - margin).floor().max(0.0) as u32).min(columns.end);
+            let one =
+                |pixel: u32| blurred_axis(shape.x, shape.width, pixel as f32 + 0.5, sigma) == 1.0;
+            if from < to && one(from) && one(to - 1) {
+                from..to
+            } else {
+                0..0
+            }
+        } else {
+            0..0
+        };
         Self {
             shape,
             sigma,
             left: columns.start,
             columns: columns.len() as u32,
+            square_settled,
             across: if needs_cache {
                 vec![None; columns.len()]
             } else {
@@ -3321,7 +3566,7 @@ pub(crate) fn paint_frame(
         scale,
         base,
     );
-    if planes && !has_backdrop(&document.root) {
+    if planes && !document.root.has_backdrop_filter {
         canvas.planes = Some(Vec::new());
     }
     paint_document(&mut canvas, document, images, None);
@@ -3429,7 +3674,7 @@ pub(crate) fn damage(
     match area.rects {
         rects if rects.is_empty() => Damage::Nothing,
         // a backdrop filter reads what lies around it, so a change anywhere may reach it
-        _ if has_backdrop(&new.root) => Damage::Everything,
+        _ if new.root.has_backdrop_filter => Damage::Everything,
         rects => Damage::Areas(rects),
     }
 }
@@ -3501,11 +3746,6 @@ fn has_node(layout_box: &LayoutBox, nodes: &[crate::dom::NodeId]) -> bool {
             .children
             .iter()
             .any(|child| has_node(child, nodes))
-}
-
-fn has_backdrop(layout_box: &LayoutBox) -> bool {
-    !layout_box.filters.backdrop.is_empty()
-        || layout_box.children.iter().any(|child| has_backdrop(child))
 }
 
 // everything a box and its subtree can paint where it lands, none when a transform turns it
@@ -3722,7 +3962,7 @@ pub(crate) fn scroll_repaint(
             .zip(&new.children)
             .all(|(old, new)| settle((old, new), inner, (clip, delta), repairs))
     }
-    if !canvas.planes().is_empty() || has_backdrop(&after.root) {
+    if !canvas.planes().is_empty() || after.root.has_backdrop_filter {
         return None;
     }
     let mut found = Vec::new();
@@ -4590,10 +4830,10 @@ fn paint_non_context_children(
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
 ) {
-    for index in paint_order(&layout_box.children) {
+    for_each_paint_order(&layout_box.children, |index| {
         let child = &layout_box.children[index];
         if child.creates_stacking_context || child.inline || child.paints_positioned() {
-            continue;
+            return;
         }
         paint_non_context_subtree(
             canvas,
@@ -4603,7 +4843,7 @@ fn paint_non_context_children(
             clip,
             ancestor_offset,
         );
-    }
+    });
 }
 
 fn paint_non_context_subtree(
@@ -6209,48 +6449,114 @@ fn paint_text_shadow(
     }
     // three box blurs approach a gaussian with the blur radius as twice its deviation
     let radius = ((shadow.blur / 2.0) * canvas.scale).round().max(1.0) as usize;
-    for _ in 0..3 {
-        box_blur(&mut layer, radius);
-    }
+    box_blur_passes(&mut layer, radius, 3);
     canvas.composite(layer, bounds, 1.0);
 }
 
-// a box blur of a layer's premultiplied pixels, horizontally then vertically
-fn box_blur(layer: &mut Canvas, radius: usize) {
+// box blur of a layer's premultiplied pixels, horizontally then vertically, repeated `passes` times
+fn box_blur_passes(layer: &mut Canvas, radius: usize, passes: usize) {
     let (width, height) = (layer.width as usize, layer.height as usize);
-    let mut buffer = layer.pixels.clone();
+    if width == 0 || height == 0 || passes == 0 {
+        return;
+    }
+    let len = layer.pixels.len();
+    let mut buffer = LAYER_BUFFERS
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_default();
+    buffer.resize(len, 0);
     let window = (radius * 2 + 1) as u32;
-    for (pass, (outer, inner, stride_outer, stride_inner)) in
-        [(height, width, width * 4, 4), (width, height, 4, width * 4)]
-            .into_iter()
-            .enumerate()
-    {
-        let (source, target) = if pass == 0 {
-            (&layer.pixels, &mut buffer)
-        } else {
-            (&buffer.clone(), &mut layer.pixels)
-        };
-        for line in 0..outer {
-            let base = line * stride_outer;
-            for channel in 0..4 {
-                let at =
-                    |position: usize| u32::from(source[base + position * stride_inner + channel]);
-                let mut sum = 0_u32;
-                for position in 0..=radius.min(inner.saturating_sub(1)) {
-                    sum += at(position);
+    // exact reciprocal division for sum <= 255 * window when window < 4096
+    let fast_inv = (window < 4096).then(|| (1_u64 << 32).div_ceil(u64::from(window)));
+    let divide = |sum: u32| -> u8 {
+        match fast_inv {
+            Some(inv) => ((u64::from(sum) * inv) >> 32) as u8,
+            None => (sum / window) as u8,
+        }
+    };
+    let initial_h = radius.min(width - 1);
+    let initial_v = radius.min(height - 1);
+    let row_stride = width * 4;
+    for _ in 0..passes {
+        for row in 0..height {
+            let base = row * row_stride;
+            let src = &layer.pixels[base..base + row_stride];
+            let dst = &mut buffer[base..base + row_stride];
+            if src.iter().all(|&byte| byte == 0) {
+                dst.fill(0);
+                continue;
+            }
+            let mut sum = [0_u32; 4];
+            for position in 0..=initial_h {
+                let at = position * 4;
+                sum[0] += u32::from(src[at]);
+                sum[1] += u32::from(src[at + 1]);
+                sum[2] += u32::from(src[at + 2]);
+                sum[3] += u32::from(src[at + 3]);
+            }
+            for position in 0..width {
+                let at = position * 4;
+                if (sum[0] | sum[1] | sum[2] | sum[3]) == 0 {
+                    dst[at..at + 4].fill(0);
+                } else {
+                    dst[at] = divide(sum[0]);
+                    dst[at + 1] = divide(sum[1]);
+                    dst[at + 2] = divide(sum[2]);
+                    dst[at + 3] = divide(sum[3]);
                 }
-                for position in 0..inner {
-                    target[base + position * stride_inner + channel] = (sum / window) as u8;
-                    if position + radius + 1 < inner {
-                        sum += at(position + radius + 1);
-                    }
-                    if position >= radius {
-                        sum -= at(position - radius);
-                    }
+                if position + radius + 1 < width {
+                    let add = (position + radius + 1) * 4;
+                    sum[0] += u32::from(src[add]);
+                    sum[1] += u32::from(src[add + 1]);
+                    sum[2] += u32::from(src[add + 2]);
+                    sum[3] += u32::from(src[add + 3]);
+                }
+                if position >= radius {
+                    let sub = (position - radius) * 4;
+                    sum[0] -= u32::from(src[sub]);
+                    sum[1] -= u32::from(src[sub + 1]);
+                    sum[2] -= u32::from(src[sub + 2]);
+                    sum[3] -= u32::from(src[sub + 3]);
+                }
+            }
+        }
+        for column in 0..width {
+            let col_base = column * 4;
+            let mut sum = [0_u32; 4];
+            for position in 0..=initial_v {
+                let at = position * row_stride + col_base;
+                sum[0] += u32::from(buffer[at]);
+                sum[1] += u32::from(buffer[at + 1]);
+                sum[2] += u32::from(buffer[at + 2]);
+                sum[3] += u32::from(buffer[at + 3]);
+            }
+            for position in 0..height {
+                let at = position * row_stride + col_base;
+                if (sum[0] | sum[1] | sum[2] | sum[3]) == 0 {
+                    layer.pixels[at..at + 4].fill(0);
+                } else {
+                    layer.pixels[at] = divide(sum[0]);
+                    layer.pixels[at + 1] = divide(sum[1]);
+                    layer.pixels[at + 2] = divide(sum[2]);
+                    layer.pixels[at + 3] = divide(sum[3]);
+                }
+                if position + radius + 1 < height {
+                    let add = (position + radius + 1) * row_stride + col_base;
+                    sum[0] += u32::from(buffer[add]);
+                    sum[1] += u32::from(buffer[add + 1]);
+                    sum[2] += u32::from(buffer[add + 2]);
+                    sum[3] += u32::from(buffer[add + 3]);
+                }
+                if position >= radius {
+                    let sub = (position - radius) * row_stride + col_base;
+                    sum[0] -= u32::from(buffer[sub]);
+                    sum[1] -= u32::from(buffer[sub + 1]);
+                    sum[2] -= u32::from(buffer[sub + 2]);
+                    sum[3] -= u32::from(buffer[sub + 3]);
                 }
             }
         }
     }
+    recycle_layer(buffer);
 }
 
 // underline, overline and line-through, placed from the font's ascent, in the decoration's
@@ -7639,6 +7945,8 @@ mod tests {
                 child_shift: (0.0, 0.0),
                 has_child_shift: false,
                 has_sticky: false,
+                has_stacking_descendant: false,
+                has_backdrop_filter: false,
             },
             images: Vec::new(),
             prose_selections: vec![crate::layout::ProseSpan {
@@ -8343,6 +8651,8 @@ mod tests {
                 child_shift: (0.0, 0.0),
                 has_child_shift: false,
                 has_sticky: false,
+                has_stacking_descendant: false,
+                has_backdrop_filter: false,
             },
             images: Vec::new(),
             prose_selections: Vec::new(),
@@ -8507,6 +8817,8 @@ mod tests {
                 child_shift: (0.0, 0.0),
                 has_child_shift: false,
                 has_sticky: false,
+                has_stacking_descendant: false,
+                has_backdrop_filter: false,
             },
             images: Vec::new(),
             prose_selections: Vec::new(),

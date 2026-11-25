@@ -58,6 +58,7 @@ impl Attributes {
         Self::default()
     }
 
+    #[inline]
     pub fn get(&self, name: &str) -> Option<&String> {
         self.0
             .iter()
@@ -65,6 +66,7 @@ impl Attributes {
             .map(|(_, value)| value)
     }
 
+    #[inline]
     pub fn contains_key(&self, name: &str) -> bool {
         self.get(name).is_some()
     }
@@ -2552,17 +2554,26 @@ impl Element {
         }
     }
 
+    #[inline]
     pub fn attr(&self, name: &str) -> Option<&str> {
+        if self.attrs.is_empty() {
+            return None;
+        }
         if let Some(value) = self.attrs.get(name) {
             return Some(value);
         }
         if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            return self
-                .attrs
-                .get(&name.to_ascii_lowercase())
-                .map(String::as_str);
+            return self.attr_lowercase(name);
         }
         None
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn attr_lowercase(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
     }
 
     pub fn classes(&self) -> impl Iterator<Item = &str> {
