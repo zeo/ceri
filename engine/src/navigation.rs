@@ -1060,10 +1060,12 @@ pub struct Browser {
     animations: BTreeMap<NodeId, AnimationRun>,
     animation_starts: Shared<BTreeMap<NodeId, u64>>,
     motion_clock: Option<u64>,
-    // what the last motion sample read: the document's selector version, which text edits
-    // leave alone as they change no declared value, the sheet, the state without the clock
-    // and the viewport, so a frame that changed none of them and has nothing moving skips
-    motion_read: Option<(u64, SheetIdentity, StyleState, Size)>,
+    // what the last motion sample read: the document identity, rules and selector versions,
+    // the sheet, the state without the clock and the viewport, so a frame that changed none
+    // of them and has nothing moving skips
+    motion_read: Option<(u64, u64, u64, SheetIdentity, StyleState, Size)>,
+    // the document change stamp of the last full or incremental motion scan
+    motion_since: u64,
     // each motion candidate's kept cascade at the last scan and the transitions it declared,
     // with the custom properties that scan read, so an element neither changed is not read again
     motion_nodes: HashMap<NodeId, MotionNode>,
@@ -1323,6 +1325,10 @@ impl Drop for Browser {
 impl Browser {
     // lets the page go and the cycles its script made with it
     fn drop_page(&mut self) {
+        self.motion_read = None;
+        self.motion_since = 0;
+        self.motion_nodes.clear();
+        self.motion_custom = Shared::default();
         if let Some(page) = self.page.take() {
             let Page { runtime, .. } = page;
             runtime.release_heap();
@@ -1368,6 +1374,7 @@ impl Browser {
             animation_starts: Shared::default(),
             motion_clock: None,
             motion_read: None,
+            motion_since: 0,
             motion_nodes: HashMap::default(),
             motion_custom: Shared::default(),
             host_runtime_info: None,
@@ -1989,6 +1996,10 @@ impl Browser {
             self.declared.clear();
             self.animations.clear();
             self.animation_starts = Shared::default();
+            self.motion_read = None;
+            self.motion_since = 0;
+            self.motion_nodes.clear();
+            self.motion_custom = Shared::default();
             let mut inputs = page.layout_inputs.borrow_mut();
             inputs.extras.transitions = Shared::default();
             inputs.extras.animation_starts = Shared::default();
@@ -2010,6 +2021,8 @@ impl Browser {
             .map(|node| (node, crate::css::PseudoElement::ScrollbarThumb));
         state.container_sizes = self.container_sizes.borrow().clone();
         let read = (
+            document.identity(),
+            document.rules_version(),
             document.selector_version(),
             SheetIdentity::of(&stylesheet),
             state.clone(),
@@ -2023,33 +2036,99 @@ impl Browser {
         if settled && unchanged {
             return Ok(false);
         }
+        let incremental_eligible = !unchanged
+            && self.motion_since != 0
+            && stylesheet.follows_versions()
+            && !document.has_shadow_roots()
+            && self.motion_read.as_ref().is_some_and(
+                |(prev_doc, prev_rules, _, prev_sheet, prev_state, prev_viewport)| {
+                    *prev_doc == read.0
+                        && *prev_rules == read.1
+                        && *prev_sheet == read.3
+                        && *prev_state == read.4
+                        && *prev_viewport == read.5
+                },
+            );
+        let previous_since = self.motion_since;
         self.motion_read = Some(read);
 
         let mut seen = BTreeSet::new();
         let mut seen_animations = BTreeSet::new();
         let mut events = Vec::new();
         let mut changed = false;
-        // with nothing they read changed, the declared values are the last scan's, and only the
-        // clock moves what runs: a looping animation costs its own timing, not a cascade of
-        // every element that declares motion
-        let candidates = if unchanged {
+        // the scan reads cascades through the ones kept from layout to layout
+        let styles = crate::css::memoize_styles();
+        let mut scanned = HashMap::default();
+        let mut used_incremental = false;
+        let (candidates, mut prior_nodes, custom_unchanged) = if unchanged {
             seen.extend(self.declared.keys().cloned());
             seen_animations.extend(self.animations.keys().copied());
             for (node, run) in &mut self.animations {
                 run.advance(*node, clock, &mut events);
             }
-            Vec::new()
+            (Vec::new(), HashMap::default(), true)
         } else {
-            collect_motion_candidates(&stylesheet, &state, &document)
+            self.motion_since = document.change_stamp();
+            let dirty = incremental_eligible
+                .then(|| dirty_motion_nodes(&document, &stylesheet, previous_since))
+                .flatten();
+            if let Some((dirty_set, dirty_elements)) = dirty {
+                if !self.motion_nodes.is_empty() || !dirty_elements.is_empty() {
+                    page.populate_custom_properties(&document, &mut state);
+                }
+                let custom_unchanged = self.motion_custom == state.custom_properties;
+                if custom_unchanged {
+                    used_incremental = true;
+                    let mut prior = HashMap::default();
+                    for (node, last) in self.motion_nodes.drain() {
+                        if !document.is_connected(node) {
+                            continue;
+                        }
+                        if dirty_set.contains(&node) {
+                            prior.insert(node, last);
+                            continue;
+                        }
+                        seen.extend(last.keys.iter().copied());
+                        if let Some(run) = self.animations.get_mut(&node) {
+                            seen_animations.insert(node);
+                            run.advance(node, clock, &mut events);
+                        }
+                        scanned.insert(node, last);
+                    }
+                    let candidates = dirty_elements
+                        .into_iter()
+                        .filter(|&node| {
+                            document.element(node).is_some_and(|element| {
+                                stylesheet.may_animate_element(&document, node, element, &state)
+                            })
+                        })
+                        .collect();
+                    (candidates, prior, true)
+                } else {
+                    let candidates = collect_motion_candidates(&stylesheet, &state, &document);
+                    (candidates, std::mem::take(&mut self.motion_nodes), false)
+                }
+            } else {
+                let candidates = collect_motion_candidates(&stylesheet, &state, &document);
+                // custom properties cost a document-wide pass, so only pages with moving elements pay it
+                if !candidates.is_empty() {
+                    page.populate_custom_properties(&document, &mut state);
+                }
+                let custom_unchanged = self.motion_custom == state.custom_properties;
+                (
+                    candidates,
+                    std::mem::take(&mut self.motion_nodes),
+                    custom_unchanged,
+                )
+            }
         };
-        // the scan reads cascades through the ones kept from layout to layout
-        let styles = crate::css::memoize_styles();
-        // custom properties cost a document-wide pass, so only pages with moving elements pay it
-        if !candidates.is_empty() {
-            page.populate_custom_properties(&document, &mut state);
-        }
-        let custom_unchanged = self.motion_custom == state.custom_properties;
-        let mut scanned = HashMap::default();
+        let default_text = crate::css::SharedText::default();
+        let mut parsed_transitions: HashMap<
+            (usize, usize),
+            [Option<crate::css::Transition>; crate::css::MAX_TRANSITIONS],
+        > = HashMap::default();
+        let mut parsed_animations: HashMap<(usize, usize), Option<crate::css::Animation>> =
+            HashMap::default();
         for node in candidates {
             let context = StyleContext {
                 document: &document,
@@ -2058,13 +2137,13 @@ impl Browser {
                 parent_font_size: 16.0,
                 parent_color: crate::css::Color::BLACK,
                 parent_weight: crate::css::FontWeight::NORMAL,
-                parent_text: Default::default(),
+                parent_text: default_text.clone(),
                 state: &state,
             };
             let identity = stylesheet.cascade_identity(context);
             // the same kept cascade under the same custom properties declares the same values
             if custom_unchanged
-                && let Some(last) = self.motion_nodes.remove(&node)
+                && let Some(last) = prior_nodes.remove(&node)
                 && last.cascade == identity
             {
                 seen.extend(last.keys.iter().copied());
@@ -2078,11 +2157,14 @@ impl Browser {
             let mut keys = Vec::new();
             let custom_properties =
                 crate::css::inherited_custom_properties(&state, &document, node);
-            for transition in identity
-                .transitions(custom_properties)
-                .into_iter()
-                .flatten()
-            {
+            let parse_key = (
+                identity.ptr(),
+                custom_properties.map_or(0, |props| std::ptr::from_ref(props) as usize),
+            );
+            let transitions = *parsed_transitions
+                .entry(parse_key)
+                .or_insert_with(|| identity.transitions(custom_properties));
+            for transition in transitions.into_iter().flatten() {
                 for property in transition.property.expand() {
                     let Some(value) = identity.value(property.name(), custom_properties) else {
                         continue;
@@ -2136,9 +2218,12 @@ impl Browser {
                     self.declared.insert(key, value.into_owned());
                 }
             }
-            if let Some(animation) = identity
-                .animation(custom_properties)
-                .filter(|animation| stylesheet.has_keyframes(&animation.name))
+            let animation = parsed_animations
+                .entry(parse_key)
+                .or_insert_with(|| identity.animation(custom_properties))
+                .clone();
+            if let Some(animation) =
+                animation.filter(|animation| stylesheet.has_keyframes(&animation.name))
             {
                 seen_animations.insert(node);
                 if self
@@ -2176,6 +2261,20 @@ impl Browser {
             );
         }
         if !unchanged {
+            if cfg!(feature = "recheck") && used_incremental {
+                let full = collect_motion_candidates(&stylesheet, &state, &document);
+                assert_eq!(
+                    scanned.len(),
+                    full.len(),
+                    "incremental motion scan candidate count drifted"
+                );
+                for node in full {
+                    assert!(
+                        scanned.contains_key(&node),
+                        "incremental motion scan missed candidate {node:?}"
+                    );
+                }
+            }
             self.motion_nodes = scanned;
             self.motion_custom = state.custom_properties.clone();
         }
@@ -4395,6 +4494,71 @@ fn collect_motion_candidates(
         .filter(|&(node, element)| stylesheet.may_animate_element(document, node, element, state))
         .map(|(node, _)| node)
         .collect()
+}
+
+// connected elements whose motion rules or cascade could have changed since `since`, or none
+// when selector reach requires a full document walk
+fn dirty_motion_nodes(
+    document: &Document,
+    stylesheet: &Stylesheet,
+    since: u64,
+) -> Option<(crate::hashing::HashSet<NodeId>, Vec<NodeId>)> {
+    use crate::css::SelectorReach;
+    let written = document.written_since(since);
+    if written.is_empty() {
+        return Some((crate::hashing::HashSet::default(), Vec::new()));
+    }
+    let mut roots = Vec::with_capacity(written.len());
+    let mut reach = stylesheet.selector_reach();
+    let has_written_element = written.iter().any(|&node| document.element(node).is_some());
+    if reach == SelectorReach::Anywhere && has_written_element {
+        let has_roots = stylesheet.has_reach(
+            document,
+            written
+                .iter()
+                .copied()
+                .filter(|&node| document.element(node).is_some()),
+        )?;
+        roots.extend(has_roots);
+        reach = SelectorReach::Siblings;
+    }
+    if reach == SelectorReach::Siblings {
+        let changes = document.selector_changes_since(since)?;
+        for (node, _) in changes.filter(|(_, changed)| stylesheet.reaches_siblings(changed)) {
+            let Some(parent) = document.parent(node) else {
+                continue;
+            };
+            if !document.is_connected(parent) {
+                continue;
+            }
+            for &sibling in document.children(parent) {
+                if sibling != node {
+                    roots.push(sibling);
+                }
+            }
+        }
+    }
+    roots.extend(written);
+    let mut dirty = crate::hashing::HashSet::default();
+    let mut elements = Vec::new();
+    let mut stack = Vec::new();
+    for root in roots {
+        if !dirty.insert(root) {
+            continue;
+        }
+        stack.push(root);
+        while let Some(node) = stack.pop() {
+            if document.element(node).is_some() {
+                elements.push(node);
+            }
+            for &child in document.children(node).iter().rev() {
+                if dirty.insert(child) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    Some((dirty, elements))
 }
 
 // image elements and boxes with background or mask images, in tree order

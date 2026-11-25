@@ -658,7 +658,17 @@ impl LengthTerms {
         }
     }
 
+    #[inline]
     fn resolve(self, containing: f32, font_size: f32) -> f32 {
+        if self.em == 0.0
+            && self.percent == 0.0
+            && self.rem == 0.0
+            && self.viewport_width == 0.0
+            && self.viewport_height == 0.0
+            && self.zero_width == 0.0
+        {
+            return self.px;
+        }
         let base = self.px + self.em * font_size + self.percent * containing / 100.0;
         if self.rem == 0.0
             && self.viewport_width == 0.0
@@ -696,6 +706,7 @@ impl LengthTerms {
 
 impl Length {
     // a percentage needs a definite basis, which an auto-height parent does not give
+    #[inline]
     pub(crate) fn has_percent(self) -> bool {
         match self {
             Self::Auto => false,
@@ -742,6 +753,7 @@ impl Length {
         })
     }
 
+    #[inline]
     pub(crate) fn resolve(self, containing: f32, font_size: f32) -> Option<f32> {
         match self {
             Self::Auto => None,
@@ -835,12 +847,12 @@ pub(crate) fn restore_animation_wake(wake: Option<u64>) {
 }
 
 // everything a cascade reads besides the element, so a layout pass computes each style once
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct StyleInputs {
     stylesheet: *const Stylesheet,
     document: *const Document,
     state: *const StyleState,
-    parent: (f32, Color, FontWeight, InheritedText),
+    parent: (f32, Color, FontWeight, SharedText),
     environment: LayoutEnvironment,
     zero_font: (crate::font::FontStack, crate::font::FontStyle),
 }
@@ -857,7 +869,7 @@ struct CascadeStyleKey {
     hidden: bool,
     color_scheme: ColorScheme,
     reduced_motion: bool,
-    parent: (f32, Color, FontWeight, InheritedText),
+    parent: (f32, Color, FontWeight, SharedText),
     environment: LayoutEnvironment,
     zero_font: (crate::font::FontStack, crate::font::FontStyle),
 }
@@ -1128,15 +1140,20 @@ struct Cascades {
     // the style pass the matching was last checked in
     pass: u64,
     entries: HashMap<(NodeId, Option<PseudoElement>), KeptCascade>,
+    // pseudo-elements present in entries, so localized invalidation removes them without scanning
+    seen_pseudos: Vec<PseudoElement>,
     // the distinct cascades kept, by a hash of their declarations, so the many elements a
     // page styles alike hold one between them
     shared: HashMap<u64, Vec<std::rc::Weak<Cascade>>>,
 }
 
-// one cascade for every element whose declarations come out the same
-fn share_cascade(
+type BorrowedCascade<'a> = HashMap<Cow<'a, str>, (Specificity, usize, Cow<'a, str>)>;
+
+// one cascade for every element whose declarations come out the same, hashing borrowed
+// declarations first so cache hits allocate no owned strings or maps
+fn share_borrowed_cascade(
     shared: &mut HashMap<u64, Vec<std::rc::Weak<Cascade>>>,
-    cascade: Cascade,
+    cascade: BorrowedCascade<'_>,
 ) -> Rc<Cascade> {
     use std::hash::{Hash, Hasher};
     // the declarations in any order give the same hash
@@ -1144,7 +1161,7 @@ fn share_cascade(
         .iter()
         .fold(0u64, |sum, (property, (_, order, value))| {
             let mut hasher = crate::hashing::Fast::default();
-            (property, order, value).hash(&mut hasher);
+            (property.as_ref(), order, value.as_ref()).hash(&mut hasher);
             sum.wrapping_add(hasher.finish())
         });
     let alike = shared.entry(hash).or_default();
@@ -1152,11 +1169,24 @@ fn share_cascade(
     if let Some(found) = alike
         .iter()
         .filter_map(std::rc::Weak::upgrade)
-        .find(|kept| **kept == cascade)
+        .find(|kept| {
+            kept.len() == cascade.len()
+                && cascade.iter().all(|(property, (rank, order, value))| {
+                    kept.get(property.as_ref()).is_some_and(|(kr, ko, kv)| {
+                        kr == rank && ko == order && kv.as_str() == value.as_ref()
+                    })
+                })
+        })
     {
         return found;
     }
-    let cascade = Rc::new(cascade);
+    let owned: Cascade = cascade
+        .into_iter()
+        .map(|(property, (rank, order, value))| {
+            (property.into_owned(), (rank, order, value.into_owned()))
+        })
+        .collect();
+    let cascade = Rc::new(owned);
     alike.push(Rc::downgrade(&cascade));
     cascade
 }
@@ -1171,11 +1201,16 @@ thread_local! {
 
 // the sheet, document and version a custom property pass read, with the state it read, and
 // what it found
-type CustomPropertyPass = (
-    (u64, u64, (u64, u64), StyleState),
-    Shared<HashMap<NodeId, BTreeMap<String, String>>>,
-    Option<NodeId>,
-);
+struct CustomPropertyPass {
+    sheet: u64,
+    document: u64,
+    rules_version: u64,
+    version: (u64, u64),
+    since: u64,
+    state: StyleState,
+    properties: Shared<HashMap<NodeId, BTreeMap<String, String>>>,
+    root: Option<NodeId>,
+}
 
 pub(crate) struct MemoizedStyles {
     previous: (Option<StyleMemo>, Option<ContentMemo>),
@@ -1476,6 +1511,63 @@ impl Default for InheritedText {
             font_features: crate::font::FontFeatures::default(),
             decoration: TextDecoration::default(),
             svg: crate::svg::Presentation::default(),
+        }
+    }
+}
+
+// inherited text settings shared behind Rc so style and layout caches compare by pointer first
+#[derive(Clone, Debug)]
+pub(crate) struct SharedText(Rc<InheritedText>);
+
+impl PartialEq for SharedText {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl std::ops::Deref for SharedText {
+    type Target = InheritedText;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Default for SharedText {
+    fn default() -> Self {
+        thread_local! {
+            static DEFAULT_TEXT: Rc<InheritedText> = Rc::new(InheritedText::default());
+        }
+        Self(DEFAULT_TEXT.with(Rc::clone))
+    }
+}
+
+impl SharedText {
+    pub(crate) fn of(text: &InheritedText) -> Self {
+        const KEPT_TEXTS: usize = 64;
+        thread_local! {
+            static TEXTS: RefCell<Vec<Rc<InheritedText>>> = const { RefCell::new(Vec::new()) };
+        }
+        TEXTS.with(|texts| {
+            let mut texts = texts.borrow_mut();
+            let shared = match texts.iter().position(|known| **known == *text) {
+                Some(at) => texts.remove(at),
+                None => Rc::new(*text),
+            };
+            texts.truncate(KEPT_TEXTS - 1);
+            texts.insert(0, shared.clone());
+            Self(shared)
+        })
+    }
+
+    pub(crate) fn child(&self, style: &Style) -> Self {
+        let next = inherited_text(style);
+        if next == *self.0 {
+            self.clone()
+        } else {
+            Self::of(&next)
         }
     }
 }
@@ -1963,7 +2055,7 @@ impl StyleState {
 }
 
 // the element being styled, or the generated box of one of its pseudo-elements
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct StyleContext<'a> {
     pub(crate) document: &'a Document,
     pub(crate) node: NodeId,
@@ -1971,7 +2063,7 @@ pub(crate) struct StyleContext<'a> {
     pub(crate) parent_font_size: f32,
     pub(crate) parent_color: Color,
     pub(crate) parent_weight: FontWeight,
-    pub(crate) parent_text: InheritedText,
+    pub(crate) parent_text: SharedText,
     pub(crate) state: &'a StyleState,
 }
 
@@ -3632,43 +3724,192 @@ impl Stylesheet {
     // size it reads, so the last two are kept by the sheet, the document version and the state
     // they read; layout and transition sampling read different states
     pub(crate) fn populate_custom_properties(&self, document: &Document, state: &mut StyleState) {
-        let document_key = if !self.follows_versions() || document.has_shadow_roots() {
+        let versioned = self.follows_versions() && !document.has_shadow_roots();
+        let document_key = if !versioned {
             (document.version(), 0)
         } else {
             (document.selector_version(), document.custom_style_version())
         };
-        let key = (
-            self.identity,
-            document.identity(),
-            document_key,
-            StyleState {
-                clock: 0,
-                transitions: Shared::default(),
-                animation_starts: Shared::default(),
-                custom_properties: Shared::default(),
-                root: None,
-                ..state.clone()
-            },
-        );
+        let doc_id = document.identity();
+        let rules_version = document.rules_version();
+        let state_key = StyleState {
+            clock: 0,
+            transitions: Shared::default(),
+            animation_starts: Shared::default(),
+            custom_properties: Shared::default(),
+            root: None,
+            ..state.clone()
+        };
         let known = CUSTOM_PROPERTY_PASSES.with(|passes| {
             passes
                 .borrow()
                 .iter()
-                .find(|(read, _, _)| *read == key)
-                .map(|(_, properties, root)| (properties.clone(), *root))
+                .find(|pass| {
+                    pass.sheet == self.identity
+                        && pass.document == doc_id
+                        && pass.rules_version == rules_version
+                        && pass.version == document_key
+                        && pass.state == state_key
+                })
+                .map(|pass| (pass.properties.clone(), pass.root))
         });
         if let Some((properties, root)) = known {
             state.custom_properties = properties;
             state.root = root;
             return;
         }
+        // when only selector_version moved, reuse the last pass if nothing written or reached
+        // could add, remove, or change any element's custom properties
+        if versioned {
+            let candidate = CUSTOM_PROPERTY_PASSES.with(|passes| {
+                passes
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, pass)| {
+                        pass.sheet == self.identity
+                            && pass.document == doc_id
+                            && pass.rules_version == rules_version
+                            && pass.version.1 == document_key.1
+                            && pass.since != 0
+                            && pass.state == state_key
+                    })
+                    .map(|(index, pass)| (index, pass.since, pass.properties.clone(), pass.root))
+            });
+            if let Some((index, since, properties, root)) = candidate
+                && self.custom_properties_unchanged_since(document, state, since, root, &properties)
+            {
+                let stamp = document.change_stamp();
+                CUSTOM_PROPERTY_PASSES.with(|passes| {
+                    if let Some(pass) = passes.borrow_mut().get_mut(index) {
+                        pass.version = document_key;
+                        pass.since = stamp;
+                    }
+                });
+                if cfg!(feature = "recheck") {
+                    let mut fresh = state.clone();
+                    self.populate_custom_properties_afresh(document, &mut fresh);
+                    assert_eq!(
+                        properties, fresh.custom_properties,
+                        "incremental custom property reuse went stale"
+                    );
+                    assert_eq!(
+                        root, fresh.root,
+                        "incremental root element reuse went stale"
+                    );
+                }
+                state.custom_properties = properties;
+                state.root = root;
+                return;
+            }
+        }
         crate::profile::count("style: custom properties worked out again");
+        let stamp = document.change_stamp();
         self.populate_custom_properties_afresh(document, state);
         CUSTOM_PROPERTY_PASSES.with(|passes| {
             let mut passes = passes.borrow_mut();
-            passes.insert(0, (key, state.custom_properties.clone(), state.root));
+            passes.insert(
+                0,
+                CustomPropertyPass {
+                    sheet: self.identity,
+                    document: doc_id,
+                    rules_version,
+                    version: document_key,
+                    since: stamp,
+                    state: state_key,
+                    properties: state.custom_properties.clone(),
+                    root: state.root,
+                },
+            );
             passes.truncate(2);
         });
+    }
+
+    fn custom_properties_unchanged_since(
+        &self,
+        document: &Document,
+        state: &mut StyleState,
+        since: u64,
+        cached_root: Option<NodeId>,
+        cached: &HashMap<NodeId, BTreeMap<String, String>>,
+    ) -> bool {
+        let written = document.written_since(since);
+        if written.is_empty() {
+            return cached.keys().all(|&node| document.is_connected(node))
+                && cached_root.is_none_or(|root| document.is_connected(root));
+        }
+        let mut roots = Vec::with_capacity(written.len());
+        let mut reach = self.selector_reach();
+        let has_written_element = written.iter().any(|&node| document.element(node).is_some());
+        if reach == SelectorReach::Anywhere && has_written_element {
+            let Some(has_roots) = self.has_reach(
+                document,
+                written
+                    .iter()
+                    .copied()
+                    .filter(|&node| document.element(node).is_some()),
+            ) else {
+                return false;
+            };
+            roots.extend(has_roots);
+            reach = SelectorReach::Siblings;
+        }
+        if reach == SelectorReach::Siblings {
+            let Some(changes) = document.selector_changes_since(since) else {
+                return false;
+            };
+            for (node, _) in changes.filter(|(_, changed)| self.reaches_siblings(changed)) {
+                let Some(parent) = document.parent(node) else {
+                    continue;
+                };
+                if !document.is_connected(parent) {
+                    continue;
+                }
+                for &sibling in document.children(parent) {
+                    if sibling != node {
+                        roots.push(sibling);
+                    }
+                }
+            }
+        }
+        roots.extend(written);
+        let mut dirty = crate::hashing::HashSet::default();
+        let mut stack = Vec::new();
+        let doc_root = document.root();
+        for root in roots {
+            if !dirty.insert(root) {
+                continue;
+            }
+            stack.push(root);
+            while let Some(node) = stack.pop() {
+                if node == doc_root {
+                    return false;
+                }
+                for &child in document.children(node) {
+                    if dirty.insert(child) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        if cached_root.is_some_and(|root| !document.is_connected(root) || dirty.contains(&root)) {
+            return false;
+        }
+        if cached
+            .keys()
+            .any(|&node| !document.is_connected(node) || dirty.contains(&node))
+        {
+            return false;
+        }
+        let saved_root = state.root;
+        state.root = cached_root;
+        let unchanged = !dirty.iter().any(|&node| {
+            document.element(node).is_some_and(|element| {
+                self.may_declare_custom_property(document, node, element, state)
+            })
+        });
+        state.root = saved_root;
+        unchanged
     }
 
     fn may_declare_custom_property(
@@ -3862,26 +4103,23 @@ impl Stylesheet {
         let key = (context.node, context.pseudo);
         let environment = layout_environment();
         let zero_font = ZERO_FONT.with(std::cell::Cell::get);
-        let inputs = StyleInputs {
-            stylesheet: self,
-            document: context.document,
-            state: context.state,
-            parent: (
-                context.parent_font_size,
-                context.parent_color,
-                context.parent_weight,
-                context.parent_text,
-            ),
-            environment,
-            zero_font,
-        };
         let known = STYLE_MEMO.with(|memo| {
             memo.borrow()
                 .as_ref()?
                 .entries
                 .get(&key)?
                 .iter()
-                .find(|(seen, _, _, _)| *seen == inputs)
+                .find(|(seen, _, _, _)| {
+                    seen.stylesheet == self
+                        && seen.document == context.document
+                        && seen.state == context.state
+                        && seen.parent.0 == context.parent_font_size
+                        && seen.parent.1 == context.parent_color
+                        && seen.parent.2 == context.parent_weight
+                        && seen.parent.3 == context.parent_text
+                        && seen.environment == environment
+                        && seen.zero_font == zero_font
+                })
                 .map(|(_, style, wake, moving)| (**style, *wake, *moving))
         });
         if let Some((style, wake, moving)) = known {
@@ -3894,6 +4132,19 @@ impl Stylesheet {
             }
             return style;
         }
+        let inputs = StyleInputs {
+            stylesheet: self,
+            document: context.document,
+            state: context.state,
+            parent: (
+                context.parent_font_size,
+                context.parent_color,
+                context.parent_weight,
+                context.parent_text.clone(),
+            ),
+            environment,
+            zero_font,
+        };
         let own = context.pseudo.is_none().then_some(context.node);
         let element = own.and_then(|node| context.document.element(node));
         let name = match context.pseudo {
@@ -3937,7 +4188,7 @@ impl Stylesheet {
                     context.parent_font_size,
                     context.parent_color,
                     context.parent_weight,
-                    context.parent_text,
+                    context.parent_text.clone(),
                 ),
                 environment,
                 zero_font,
@@ -3958,14 +4209,14 @@ impl Stylesheet {
                 memo.entries
                     .entry(key)
                     .or_insert_with(|| Vec::with_capacity(1))
-                    .push((inputs, shared.clone(), None, false));
+                    .push((inputs.clone(), shared.clone(), None, false));
                 Some(*shared)
             });
             if let Some(style) = hit {
                 if cfg!(feature = "recheck") {
                     let mut ignored = true;
                     let fresh = self.compute_style_with(
-                        context,
+                        &context,
                         name,
                         hidden,
                         &cascaded,
@@ -3981,7 +4232,7 @@ impl Stylesheet {
         let reported = moment_reports();
         let mut shareable = cascade_key.is_some();
         let style = self.compute_style_with(
-            context,
+            &context,
             name,
             hidden,
             &cascaded,
@@ -4036,7 +4287,7 @@ impl Stylesheet {
             inherited_custom_properties(context.state, context.document, context.node);
         let mut shareable = false;
         self.compute_style_with(
-            context,
+            &context,
             name,
             hidden,
             &cascaded,
@@ -4047,7 +4298,7 @@ impl Stylesheet {
 
     fn compute_style_with(
         &self,
-        context: StyleContext<'_>,
+        context: &StyleContext<'_>,
         name: &str,
         hidden: bool,
         cascaded: &Cascade,
@@ -4062,15 +4313,16 @@ impl Stylesheet {
             parent_font_size,
             parent_color,
             parent_weight,
-            parent_text,
+            ref parent_text,
             state,
-        } = context;
+        } = *context;
+        let parent_text_value = **parent_text;
         let mut style = Style::default_for(
             name,
             parent_font_size,
             parent_color,
             parent_weight,
-            parent_text,
+            parent_text_value,
         );
         // the user agent hides elements with the hidden attribute, below any author display
         if hidden {
@@ -4113,7 +4365,7 @@ impl Stylesheet {
                     parent_font_size,
                     parent_color,
                     parent_weight,
-                    parent_text,
+                    parent_text_value,
                 ),
                 None => style,
             };
@@ -4352,7 +4604,7 @@ impl Stylesheet {
     // the parent's own cascade, for a property that does not inherit by default; its
     // inherited values are approximated by the child's, which only its own non-inherited
     // properties are read from anyway
-    fn parent_style(&self, context: StyleContext<'_>) -> Option<Style> {
+    fn parent_style(&self, context: &StyleContext<'_>) -> Option<Style> {
         let node = match context.pseudo {
             Some(_) => context.node,
             None => context
@@ -4363,7 +4615,7 @@ impl Stylesheet {
         Some(self.style_for(StyleContext {
             node,
             pseudo: None,
-            ..context
+            ..context.clone()
         }))
     }
 
@@ -4388,7 +4640,7 @@ impl Stylesheet {
         let mut font_size = 16.0;
         let mut color = Color::BLACK;
         let mut weight = FontWeight::NORMAL;
-        let mut text = InheritedText::default();
+        let mut text = SharedText::default();
         let mut computed = None;
         for current in chain {
             let style = self.style_for(StyleContext {
@@ -4398,7 +4650,7 @@ impl Stylesheet {
                 parent_font_size: font_size,
                 parent_color: color,
                 parent_weight: weight,
-                parent_text: text,
+                parent_text: text.clone(),
                 state,
             });
             font_size = style
@@ -4408,7 +4660,7 @@ impl Stylesheet {
                 .max(0.0);
             color = style.color;
             weight = style.font_weight;
-            text = inherited_text(&style);
+            text = text.child(&style);
             computed = Some((style, font_size));
         }
         computed
@@ -4430,7 +4682,7 @@ impl Stylesheet {
             parent_font_size,
             parent_color: parent.color,
             parent_weight: parent.font_weight,
-            parent_text: inherited_text(parent),
+            parent_text: SharedText::of(&inherited_text(parent)),
             state,
         });
         let font_size = style
@@ -4753,23 +5005,23 @@ impl Stylesheet {
     fn drop_reached_cascades(
         &self,
         entries: &mut HashMap<(NodeId, Option<PseudoElement>), KeptCascade>,
+        seen_pseudos: &[PseudoElement],
         document: &Document,
         since: u64,
     ) {
         crate::profile::count("kept: cascades dropped where written");
-        let mut siblings = crate::hashing::HashSet::default();
+        let written = document.written_since(since);
+        if written.is_empty() {
+            return;
+        }
+        let mut extra_roots = crate::hashing::HashSet::default();
         let mut reach = self.selector_reach();
         if reach == SelectorReach::Anywhere {
-            let written = document.written_since(since);
             let Some(roots) = self.has_reach(document, written.iter().copied()) else {
                 entries.clear();
                 return;
             };
-            let stale: std::collections::HashSet<NodeId> = roots
-                .iter()
-                .flat_map(|&root| document.subtree(root))
-                .collect();
-            entries.retain(|(node, _), _| !stale.contains(node));
+            extra_roots.extend(roots);
             reach = self.reach_besides_has();
         }
         match reach {
@@ -4785,18 +5037,38 @@ impl Stylesheet {
                 };
                 for (node, _) in changes.filter(|(_, changed)| self.reaches_siblings(changed)) {
                     if let Some(parent) = document.parent(node) {
-                        siblings.extend(document.children(parent).iter().copied());
+                        extra_roots.extend(document.children(parent).iter().copied());
                     }
                 }
             }
         }
-        entries.retain(|(node, _), _| {
-            document.unwritten_since(*node, since)
-                && !document
-                    .ancestors(*node)
-                    .chain(std::iter::once(*node))
-                    .any(|above| siblings.contains(&above))
-        });
+        // for localized writes walk only the dirty subtrees instead of scanning every kept entry
+        if (written.len() + extra_roots.len()).saturating_mul(16) < entries.len() {
+            let mut visited = crate::hashing::HashSet::default();
+            for root in written.into_iter().chain(extra_roots) {
+                if !visited.insert(root) {
+                    continue;
+                }
+                for node in document.subtree(root) {
+                    entries.remove(&(node, None));
+                    for &pseudo in seen_pseudos {
+                        entries.remove(&(node, Some(pseudo)));
+                    }
+                }
+            }
+            return;
+        }
+        if extra_roots.is_empty() {
+            entries.retain(|(node, _), _| document.unwritten_chain_since(*node, since));
+        } else {
+            entries.retain(|(node, _), _| {
+                document.unwritten_chain_since(*node, since)
+                    && !extra_roots.contains(node)
+                    && !document
+                        .ancestors(*node)
+                        .any(|above| extra_roots.contains(&above))
+            });
+        }
     }
 
     // where the written elements reach through :has(): the parent of each :has() anchor at or
@@ -4922,7 +5194,12 @@ impl Stylesheet {
                 if written_only && cascades.matching.as_ref() != Some(&matching) {
                     // writes to the tree restyle what they reach, not the whole document
                     let since = cascades.since;
-                    self.drop_reached_cascades(&mut cascades.entries, document, since);
+                    let Cascades {
+                        entries,
+                        seen_pseudos,
+                        ..
+                    } = &mut *cascades;
+                    self.drop_reached_cascades(entries, seen_pseudos, document, since);
                     cascades.matching = Some(matching);
                 } else if cascades.matching.as_ref() != Some(&matching) {
                     crate::profile::count("kept: all cascades dropped");
@@ -4930,6 +5207,7 @@ impl Stylesheet {
                         kept.count_differences(&matching);
                     }
                     cascades.entries.clear();
+                    cascades.seen_pseudos.clear();
                     cascades.matching = Some(matching);
                 }
                 if cascades.hovered != state.hovered {
@@ -4943,7 +5221,10 @@ impl Stylesheet {
                                 .entries
                                 .retain(|(node, _), _| !restyled.contains(node));
                         }
-                        None => cascades.entries.clear(),
+                        None => {
+                            cascades.entries.clear();
+                            cascades.seen_pseudos.clear();
+                        }
                     }
                 }
                 cascades.hovered = state.hovered;
@@ -4959,13 +5240,38 @@ impl Stylesheet {
                 return values.clone();
             }
         }
-        let fresh = Rc::try_unwrap(cascade()).unwrap_or_else(|shared| (*shared).clone());
+        let values = self.cascade_shared(document, node, pseudo, state);
         let mut cascades = self.cascades.borrow_mut();
-        let values = share_cascade(&mut cascades.shared, fresh);
+        if let Some(pseudo) = pseudo
+            && !cascades.seen_pseudos.contains(&pseudo)
+        {
+            cascades.seen_pseudos.push(pseudo);
+        }
         cascades
             .entries
             .insert(key, (inline.map(str::to_string), values.clone()));
         values
+    }
+
+    fn cascade_shared(
+        &self,
+        document: &Document,
+        node: NodeId,
+        pseudo: Option<PseudoElement>,
+        state: &StyleState,
+    ) -> Rc<Cascade> {
+        let _profile = crate::profile::scope("style: cascade");
+        // a generated box carries the id, classes and tag of the element that owns it
+        let Some(element) = document.element(node) else {
+            let mut cascades = self.cascades.borrow_mut();
+            return share_borrowed_cascade(&mut cascades.shared, HashMap::default());
+        };
+        with_user_agent_sheet(|ua| {
+            let mut values: BorrowedCascade<'_> = HashMap::default();
+            self.fill_cascade_borrowed(ua, element, document, node, pseudo, state, &mut values);
+            let mut cascades = self.cascades.borrow_mut();
+            share_borrowed_cascade(&mut cascades.shared, values)
+        })
     }
 
     fn cascade(
@@ -4981,101 +5287,8 @@ impl Stylesheet {
             return HashMap::default();
         };
         with_user_agent_sheet(|ua| {
-            let mut values: HashMap<Cow<'_, str>, (Specificity, usize, Cow<'_, str>)> =
-                HashMap::default();
-            // a shadow tree is styled by its own style elements, and its host also takes the
-            // :host rules there, below anything the outer document says
-            let shadows = document.has_shadow_roots();
-            let root = if shadows {
-                document.tree_root(node)
-            } else {
-                document.root()
-            };
-            let in_shadow = shadows && document.shadow_host(root).is_some();
-            if in_shadow {
-                if let Some(sheet) = self.shadow_sheet(document, root) {
-                    for (property, (specificity, order, value)) in
-                        sheet.matched_declarations(element, document, node, pseudo, state, false)
-                    {
-                        values.insert(
-                            Cow::Owned(property),
-                            (specificity, order, Cow::Owned(value)),
-                        );
-                    }
-                }
-            } else {
-                // the user agent's rules go in first and lose to any author rule for a property
-                let target = CascadeTarget {
-                    element,
-                    document,
-                    node,
-                    pseudo,
-                    state,
-                    host_only: false,
-                };
-                ua.collect_declarations(target, &mut values);
-                self.collect_declarations(target, &mut values);
-            }
-            if shadows
-                && let Some(shadow) = document.shadow_root(node)
-                && let Some(sheet) = self.shadow_sheet(document, shadow)
-            {
-                for (property, (specificity, order, value)) in
-                    sheet.matched_declarations(element, document, node, pseudo, state, true)
-                {
-                    values.entry(Cow::Owned(property)).or_insert((
-                        specificity,
-                        order,
-                        Cow::Owned(value),
-                    ));
-                }
-            }
-            if in_shadow {
-                for (property, value) in
-                    ua.borrowed_declarations(element, document, node, pseudo, state, false)
-                {
-                    values.entry(property).or_insert(value);
-                }
-            }
-            // svg presentation attributes beat the user agent's rules and lose to every author rule
-            if element.namespace == Namespace::Svg && pseudo.is_none() {
-                let author = Specificity(1 << LAYER_SHIFT, 0, 0);
-                for (property, value) in presentation_hints(element) {
-                    if values
-                        .get(property)
-                        .is_none_or(|current| current.0 < author)
-                    {
-                        values.insert(Cow::Borrowed(property), (Specificity(0, 0, 0), 0, value));
-                    }
-                }
-            }
-            let mut inline_dropped = Vec::new();
-            if let Some(inline) = element
-                .attr("style")
-                .filter(|_| pseudo.is_none() && !document.style_blocked(node))
-                && let Ok(declarations) = parse_declarations(inline, Some(&mut inline_dropped))
-            {
-                for (position, declaration) in declarations.into_iter().enumerate() {
-                    let specificity = if declaration.important {
-                        Specificity::INLINE_IMPORTANT
-                    } else {
-                        Specificity::INLINE
-                    };
-                    let replace = values
-                        .get(declaration.property.as_str())
-                        .is_none_or(|current| specificity >= current.0);
-                    if replace {
-                        values.insert(
-                            Cow::Owned(declaration.property),
-                            (
-                                specificity,
-                                (usize::MAX >> 1) | position,
-                                Cow::Owned(declaration.value),
-                            ),
-                        );
-                    }
-                }
-            }
+            let mut values: BorrowedCascade<'_> = HashMap::default();
+            self.fill_cascade_borrowed(ua, element, document, node, pseudo, state, &mut values);
             values
                 .into_iter()
                 .map(|(property, (rank, order, value))| {
@@ -5083,6 +5296,112 @@ impl Stylesheet {
                 })
                 .collect()
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill_cascade_borrowed<'a>(
+        &'a self,
+        ua: &'a Stylesheet,
+        element: &'a Element,
+        document: &Document,
+        node: NodeId,
+        pseudo: Option<PseudoElement>,
+        state: &StyleState,
+        values: &mut BorrowedCascade<'a>,
+    ) {
+        // a shadow tree is styled by its own style elements, and its host also takes the
+        // :host rules there, below anything the outer document says
+        let shadows = document.has_shadow_roots();
+        let root = if shadows {
+            document.tree_root(node)
+        } else {
+            document.root()
+        };
+        let in_shadow = shadows && document.shadow_host(root).is_some();
+        if in_shadow {
+            if let Some(sheet) = self.shadow_sheet(document, root) {
+                for (property, (specificity, order, value)) in
+                    sheet.matched_declarations(element, document, node, pseudo, state, false)
+                {
+                    values.insert(
+                        Cow::Owned(property),
+                        (specificity, order, Cow::Owned(value)),
+                    );
+                }
+            }
+        } else {
+            // the user agent's rules go in first and lose to any author rule for a property
+            let target = CascadeTarget {
+                element,
+                document,
+                node,
+                pseudo,
+                state,
+                host_only: false,
+            };
+            ua.collect_declarations(target, values);
+            self.collect_declarations(target, values);
+        }
+        if shadows
+            && let Some(shadow) = document.shadow_root(node)
+            && let Some(sheet) = self.shadow_sheet(document, shadow)
+        {
+            for (property, (specificity, order, value)) in
+                sheet.matched_declarations(element, document, node, pseudo, state, true)
+            {
+                values.entry(Cow::Owned(property)).or_insert((
+                    specificity,
+                    order,
+                    Cow::Owned(value),
+                ));
+            }
+        }
+        if in_shadow {
+            for (property, value) in
+                ua.borrowed_declarations(element, document, node, pseudo, state, false)
+            {
+                values.entry(property).or_insert(value);
+            }
+        }
+        // svg presentation attributes beat the user agent's rules and lose to every author rule
+        if element.namespace == Namespace::Svg && pseudo.is_none() {
+            let author = Specificity(1 << LAYER_SHIFT, 0, 0);
+            for (property, value) in presentation_hints(element) {
+                if values
+                    .get(property)
+                    .is_none_or(|current| current.0 < author)
+                {
+                    values.insert(Cow::Borrowed(property), (Specificity(0, 0, 0), 0, value));
+                }
+            }
+        }
+        let mut inline_dropped = Vec::new();
+        if let Some(inline) = element
+            .attr("style")
+            .filter(|_| pseudo.is_none() && !document.style_blocked(node))
+            && let Ok(declarations) = parse_declarations(inline, Some(&mut inline_dropped))
+        {
+            for (position, declaration) in declarations.into_iter().enumerate() {
+                let specificity = if declaration.important {
+                    Specificity::INLINE_IMPORTANT
+                } else {
+                    Specificity::INLINE
+                };
+                let replace = values
+                    .get(declaration.property.as_str())
+                    .is_none_or(|current| specificity >= current.0);
+                if replace {
+                    values.insert(
+                        Cow::Owned(declaration.property),
+                        (
+                            specificity,
+                            (usize::MAX >> 1) | position,
+                            Cow::Owned(declaration.value),
+                        ),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -9568,6 +9887,10 @@ fn parse_number(value: &str) -> Option<f32> {
 
 // an element without its own entry reads its nearest ancestor's properties
 impl CascadeIdentity {
+    pub(crate) fn ptr(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+
     pub(crate) fn value<'a>(
         &'a self,
         property: &str,
@@ -10284,7 +10607,7 @@ mod tests {
             parent_font_size: 16.0,
             parent_color: Color::BLACK,
             parent_weight: FontWeight::NORMAL,
-            parent_text: InheritedText::default(),
+            parent_text: SharedText::default(),
             state,
         }
     }
@@ -10447,7 +10770,9 @@ mod tests {
             let element = Element::new(tag);
             let placed = placed(&element, &[]);
             stylesheet.style_for(StyleContext {
-                parent_text: parent.map_or(InheritedText::default(), inherited_text),
+                parent_text: parent.map_or_else(SharedText::default, |style| {
+                    SharedText::of(&inherited_text(style))
+                }),
                 ..context(&placed, &StyleState::default())
             })
         };
@@ -10560,10 +10885,10 @@ mod tests {
         // the inherited thumb and track colors reach the children of a scroller
         let child = placed(&Element::new("p"), &[&Element::new("div")]);
         let inherited = stylesheet.style_for(StyleContext {
-            parent_text: InheritedText {
+            parent_text: SharedText::of(&InheritedText {
                 scrollbar_color: style.scrollbar_color,
                 ..InheritedText::default()
-            },
+            }),
             ..context(&child, &StyleState::default())
         });
         assert_eq!(inherited.scrollbar_color, style.scrollbar_color);

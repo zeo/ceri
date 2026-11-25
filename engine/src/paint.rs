@@ -704,6 +704,16 @@ impl Canvas {
         let unmasked_all = self.masks_cover_rect(left, top, right, bottom);
         let stride = self.width as usize * 4;
         let steady = paint.steady();
+        let ramp_setup = match (paint, steady) {
+            (Paint::Ramp(ramp), Steady::Nowhere) => {
+                let table = ramp.table.get_or_init(|| RampTable::new(ramp)).as_ref();
+                let (first, last) = (ramp.stops[0].0, ramp.stops[ramp.stops.len() - 1].0);
+                let before_first = premul_to_color(ramp.stops[0].1);
+                let at_or_after_last = premul_to_color(ramp.stops[ramp.stops.len() - 1].1);
+                Some((ramp, table, first, last, before_first, at_or_after_last))
+            }
+            _ => None,
+        };
         let mut columns = None;
         for pixel_y in top..bottom {
             let row = pixel_y as f32 + 0.5;
@@ -800,6 +810,106 @@ impl Canvas {
                     }
                 }
                 Steady::Nowhere => {
+                    if whole.is_empty() {
+                        continue;
+                    }
+                    if unmasked_all
+                        && let Some((ramp, table, first, last, before_first, at_or_after_last)) =
+                            ramp_setup
+                        && !ramp.repeating
+                        && (whole.start as f32 + 0.5 - ramp.corner.0) / ramp.scale >= 0.0
+                        && ((whole.end - 1) as f32 + 0.5 - ramp.corner.0) / ramp.scale < ramp.size.0
+                    {
+                        let mut y = (row - ramp.corner.1) / ramp.scale;
+                        if ramp.repeat.1 {
+                            y = y.rem_euclid(ramp.size.1);
+                        } else if !(0.0..ramp.size.1).contains(&y) {
+                            continue;
+                        }
+                        let row_pixels = &mut self.pixels
+                            [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                        match ramp.shape {
+                            RampShape::Radial(center, radii) => {
+                                let dy = (y - center.1) / radii.1;
+                                let dy2 = dy * dy;
+                                // guard sqrt boundary by 1e-5 so rounding never disagrees with offset_at
+                                let last_sq_hi = if last >= 0.0 {
+                                    let hi = last + 1e-5;
+                                    hi * hi
+                                } else {
+                                    -1.0
+                                };
+                                if last >= 0.0 && dy2 >= last_sq_hi {
+                                    if at_or_after_last.alpha != 0 {
+                                        let run = whole.start as usize * 4..whole.end as usize * 4;
+                                        fill_solid_span(&mut row_pixels[run], at_or_after_last);
+                                    }
+                                    continue;
+                                }
+                                let active = if at_or_after_last.alpha == 0 && last >= 0.0 {
+                                    let dx_span = (last_sq_hi - dy2).sqrt() * radii.0;
+                                    let min_x = ((center.0 - dx_span) * ramp.scale + ramp.corner.0
+                                        - 1.5)
+                                        .floor();
+                                    let max_x =
+                                        ((center.0 + dx_span) * ramp.scale + ramp.corner.0 + 1.5)
+                                            .ceil();
+                                    let start = whole.start.max(min_x.max(0.0) as u32);
+                                    let end = whole.end.min(max_x.max(0.0) as u32);
+                                    start..end.max(start)
+                                } else {
+                                    whole.clone()
+                                };
+                                for pixel_x in active {
+                                    let x = (pixel_x as f32 + 0.5 - ramp.corner.0) / ramp.scale;
+                                    let dx = (x - center.0) / radii.0;
+                                    let d2 = dx * dx + dy2;
+                                    let color = if last >= 0.0 && d2 >= last_sq_hi {
+                                        at_or_after_last
+                                    } else {
+                                        ramp.lookup_non_repeating(
+                                            d2.sqrt(),
+                                            table,
+                                            first,
+                                            last,
+                                            before_first,
+                                            at_or_after_last,
+                                        )
+                                    };
+                                    if color.alpha != 0 {
+                                        let at = pixel_x as usize * 4;
+                                        let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
+                                            .try_into()
+                                            .expect("four bytes per pixel");
+                                        blend_rgba(pixel, color);
+                                    }
+                                }
+                            }
+                            RampShape::Linear(start, axis) => {
+                                let y_term = (y - start.1) * axis.1;
+                                for pixel_x in whole {
+                                    let x = (pixel_x as f32 + 0.5 - ramp.corner.0) / ramp.scale;
+                                    let offset = (x - start.0) * axis.0 + y_term;
+                                    let color = ramp.lookup_non_repeating(
+                                        offset,
+                                        table,
+                                        first,
+                                        last,
+                                        before_first,
+                                        at_or_after_last,
+                                    );
+                                    if color.alpha != 0 {
+                                        let at = pixel_x as usize * 4;
+                                        let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
+                                            .try_into()
+                                            .expect("four bytes per pixel");
+                                        blend_rgba(pixel, color);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if unmasked_all {
                         let row_pixels = &mut self.pixels
                             [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
@@ -1758,6 +1868,9 @@ fn subtree_bounds(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Rect {
 }
 
 fn subtree_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent {
+    if layout_box.children.is_empty() {
+        return measure_subtree_extent(layout_box, ancestor_offset);
+    }
     let key = (
         std::ptr::from_ref(layout_box) as usize,
         [ancestor_offset.0.to_bits(), ancestor_offset.1.to_bits()],
@@ -2312,6 +2425,33 @@ impl Ramp {
             .map_or(Color::transparent(), |offset| self.sample(offset))
     }
 
+    #[inline(always)]
+    fn lookup_non_repeating(
+        &self,
+        offset: f32,
+        table: Option<&RampTable>,
+        first: f32,
+        last: f32,
+        before_first: Color,
+        at_or_after_last: Color,
+    ) -> Color {
+        if offset < first {
+            before_first
+        } else if offset >= last {
+            at_or_after_last
+        } else if let Some(table) = table {
+            let step = ((offset - first) * table.steps_per_offset) as usize;
+            table
+                .colors
+                .get(step)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| self.sample(offset))
+        } else {
+            self.sample(offset)
+        }
+    }
+
     // as color_at, from the table of the ramp's colors where it has one
     fn tabled_color_at(&self, point: (f32, f32)) -> Color {
         let Some(offset) = self.offset_at(point) else {
@@ -2321,9 +2461,15 @@ impl Ramp {
         let offset = if self.repeating {
             first + (offset - first).rem_euclid(last - first)
         } else {
+            if offset < first {
+                return premul_to_color(self.stops[0].1);
+            }
+            if offset >= last {
+                return premul_to_color(self.stops[self.stops.len() - 1].1);
+            }
             offset
         };
-        let table = self.table.get_or_init(|| RampTable::new(self));
+        let table = self.table.get_or_init(|| RampTable::new(self)).as_ref();
         match table {
             Some(table) if (first..last).contains(&offset) => {
                 let step = ((offset - first) * table.steps_per_offset) as usize;
@@ -2385,17 +2531,22 @@ impl Ramp {
             (Some(stop), None) | (None, Some(stop)) => stop.1,
             (None, None) => return Color::transparent(),
         };
-        let alpha = color[3];
-        if alpha <= 0.0 {
-            return Color::transparent();
-        }
-        let channel = |value: f32| (value / alpha).round().clamp(0.0, 255.0) as u8;
-        Color {
-            red: channel(color[0]),
-            green: channel(color[1]),
-            blue: channel(color[2]),
-            alpha: (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
-        }
+        premul_to_color(color)
+    }
+}
+
+#[inline]
+fn premul_to_color(color: [f32; 4]) -> Color {
+    let alpha = color[3];
+    if alpha <= 0.0 {
+        return Color::transparent();
+    }
+    let channel = |value: f32| (value / alpha).round().clamp(0.0, 255.0) as u8;
+    Color {
+        red: channel(color[0]),
+        green: channel(color[1]),
+        blue: channel(color[2]),
+        alpha: (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
     }
 }
 
@@ -4799,7 +4950,21 @@ fn paint_backgrounds(
     opacity: f32,
     clip: Option<Rect>,
 ) {
-    if let Some(clip) = clip
+    let backdrop_clip = clip.or_else(|| {
+        let likely_opaque = layout_box.background.alpha == 255
+            || layout_box.backgrounds.iter().any(|layer| {
+                layer.size == crate::css::BackgroundSize::Auto
+                    && layer.repeat.x
+                    && layer.repeat.y
+                    && matches!(
+                        &layer.image,
+                        LayerImage::Gradient(gradient)
+                            if gradient.stops.iter().all(|stop| stop.color.alpha == 255)
+                    )
+            });
+        likely_opaque.then(|| canvas.extent())
+    });
+    if let Some(clip) = backdrop_clip
         && paint_cached_backdrop(canvas, layout_box, (outer, surface), opacity, clip)
     {
         return;
@@ -4823,8 +4988,17 @@ fn paint_backgrounds(
 // a large box's opaque background of gradients, painted once whole and copied from where a
 // repaint asks for it: a page backdrop under a list whose rows change each second otherwise
 // works every gradient out again over each changed area
+#[derive(PartialEq)]
+struct BackdropKey {
+    background: Color,
+    backgrounds: Vec<crate::css::BackgroundLayer>,
+    shapes: [u32; 16],
+    scale: u32,
+    font_size: u32,
+}
+
 struct Backdrop {
-    key: (Color, Vec<crate::css::BackgroundLayer>, String, [u32; 2]),
+    key: BackdropKey,
     // the device pixels the box covers, and its pixels there; none where the stack lets
     // something through, which paints as layers do
     bounds: [u32; 4],
@@ -4872,12 +5046,32 @@ fn paint_cached_backdrop(
     {
         return false;
     }
-    let key = (
-        layout_box.background,
-        layout_box.backgrounds.clone(),
-        format!("{outer:?} {surface:?}"),
-        [canvas.scale.to_bits(), layout_box.font_size.to_bits()],
-    );
+    let shapes = [
+        outer.x,
+        outer.y,
+        outer.width,
+        outer.height,
+        surface.x,
+        surface.y,
+        surface.width,
+        surface.height,
+        surface.radii[0].0,
+        surface.radii[0].1,
+        surface.radii[1].0,
+        surface.radii[1].1,
+        surface.radii[2].0,
+        surface.radii[2].1,
+        surface.radii[3].0,
+        surface.radii[3].1,
+    ]
+    .map(f32::to_bits);
+    let key = BackdropKey {
+        background: layout_box.background,
+        backgrounds: layout_box.backgrounds.clone(),
+        shapes,
+        scale: canvas.scale.to_bits(),
+        font_size: layout_box.font_size.to_bits(),
+    };
     let bounds = [
         device.x.round() as u32,
         device.y.round() as u32,

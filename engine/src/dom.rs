@@ -713,6 +713,26 @@ impl Document {
         true
     }
 
+    // whether neither the node itself nor any ancestor was written after the stamp: what an
+    // element's cascade hangs on once :has() is accounted for separately
+    pub(crate) fn unwritten_chain_since(&self, id: NodeId, stamp: u64) -> bool {
+        let Some(mut data) = self.data(id) else {
+            return false;
+        };
+        loop {
+            if data.written > stamp {
+                return false;
+            }
+            let Some(parent) = data.parent else {
+                return true;
+            };
+            let Some(next) = self.data(parent) else {
+                return false;
+            };
+            data = next;
+        }
+    }
+
     fn append_raw(&mut self, parent: NodeId, child: NodeId) {
         if let Some(data) = self.data_mut(child) {
             data.parent = Some(parent);

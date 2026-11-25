@@ -1267,7 +1267,7 @@ impl ScriptRuntime {
                     parent_font_size: 16.0,
                     parent_color: crate::Color::BLACK,
                     parent_weight: FontWeight::NORMAL,
-                    parent_text: crate::css::InheritedText::default(),
+                    parent_text: crate::css::SharedText::default(),
                     state,
                 })
             };
