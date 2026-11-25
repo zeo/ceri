@@ -276,16 +276,17 @@ pub(super) struct AsyncFunctionData {
 }
 
 #[derive(Clone)]
-struct Handler {
+pub(super) struct Handler {
     catch: u32,
     finally: u32,
     stack: usize,
     scopes: u16,
     chains: usize,
+    iters: usize,
 }
 
 #[derive(Clone)]
-enum Pending {
+pub(super) enum Pending {
     Normal,
     Throw(Value),
     Return(Value),
@@ -294,6 +295,15 @@ enum Pending {
         handlers: u16,
         scopes: u16,
     },
+}
+
+impl Pending {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        match self {
+            Self::Throw(value) | Self::Return(value) => tracer.trace_value(value),
+            Self::Normal | Self::Jump { .. } => {}
+        }
+    }
 }
 
 const FLAG_USES_REGS: u8 = 1 << 0;
@@ -362,6 +372,10 @@ pub(super) struct Frame {
     pub(super) reg_base: usize,
     stack_base: usize,
     return_base: usize,
+    pub(super) handler_base: u32,
+    chain_base: u32,
+    pending_base: u32,
+    iter_base: u32,
     pub(super) scope: Option<ScopeRef>,
     pub(super) this: Value,
     function: Value,
@@ -428,13 +442,11 @@ impl Frame {
     }
 
     // whether a throw in this frame lands in one of its catch blocks
-    pub(super) fn catches(&self) -> bool {
-        self.extra.as_ref().is_some_and(|extra| {
-            extra
-                .handlers
-                .iter()
-                .any(|handler| handler.catch != NO_TARGET)
-        })
+    pub(super) fn catches(&self, handlers: &[Handler], end: usize) -> bool {
+        let start = self.handler_base as usize;
+        handlers
+            .get(start..end)
+            .is_some_and(|slice| slice.iter().any(|handler| handler.catch != NO_TARGET))
     }
 
     fn function_value(&self, vm_stack: &[Value]) -> Value {
@@ -853,6 +865,10 @@ impl ScriptRuntime {
         let mirror_base = self.debugger.mirror.len();
         let frame_floor = self.frames.len();
         let stack_floor = self.vm_stack.len();
+        let handler_floor = self.vm_handlers.len();
+        let chain_floor = self.vm_chains.len();
+        let pending_floor = self.vm_pending.len();
+        let iter_floor = self.vm_iters.len();
         if code.uses_regs {
             let reg_count = code.registers as usize;
             let param_count = code.param_slots.len();
@@ -874,6 +890,10 @@ impl ScriptRuntime {
                 reg_base: arg_start,
                 stack_base: arg_start + reg_count,
                 return_base: stack_floor,
+                handler_base: handler_floor as u32,
+                chain_base: chain_floor as u32,
+                pending_base: pending_floor as u32,
+                iter_base: iter_floor as u32,
                 scope: closure.scope.clone(),
                 this,
                 function: Value::Undefined,
@@ -899,6 +919,10 @@ impl ScriptRuntime {
                 reg_base: arg_start,
                 stack_base: arg_start,
                 return_base: stack_floor,
+                handler_base: handler_floor as u32,
+                chain_base: chain_floor as u32,
+                pending_base: pending_floor as u32,
+                iter_base: iter_floor as u32,
                 scope: Some(scope),
                 this,
                 function: Value::Undefined,
@@ -911,9 +935,17 @@ impl ScriptRuntime {
         if result.is_err() {
             self.frames.truncate(frame_floor);
             truncate_stack(&mut self.vm_stack, stack_floor);
+            self.vm_handlers.truncate(handler_floor);
+            self.vm_chains.truncate(chain_floor);
+            self.vm_pending.truncate(pending_floor);
+            self.vm_iters.truncate(iter_floor);
         }
         debug_assert_eq!(self.frames.len(), frame_floor);
         debug_assert_eq!(self.vm_stack.len(), stack_floor);
+        debug_assert_eq!(self.vm_handlers.len(), handler_floor);
+        debug_assert_eq!(self.vm_chains.len(), chain_floor);
+        debug_assert_eq!(self.vm_pending.len(), pending_floor);
+        debug_assert_eq!(self.vm_iters.len(), iter_floor);
         self.debugger.mirror.truncate(mirror_base);
         self.nested_runs -= 1;
         if self.nested_runs == 0 {
@@ -1382,7 +1414,7 @@ impl ScriptRuntime {
         };
         let scope = self.new_scope(code.layout.clone(), parent);
         let simple = code.simple_params;
-        let moves = simple && !code.reads_arguments;
+        let moves = !code.reads_arguments;
         let mut frame = Frame::new(
             code.clone(),
             Some(closure.clone()),
@@ -1501,6 +1533,21 @@ impl ScriptRuntime {
         let base = self.vm_stack.len();
         frame.return_base = base;
         frame.reg_base = base;
+        frame.handler_base = self.vm_handlers.len() as u32;
+        frame.chain_base = self.vm_chains.len() as u32;
+        frame.pending_base = self.vm_pending.len() as u32;
+        frame.iter_base = self.vm_iters.len() as u32;
+        if let Some(extra) = frame.extra.as_mut() {
+            if !extra.handlers.is_empty() {
+                self.vm_handlers.append(&mut extra.handlers);
+            }
+            if !extra.chains.is_empty() {
+                self.vm_chains.append(&mut extra.chains);
+            }
+            if !extra.pending.is_empty() {
+                self.vm_pending.append(&mut extra.pending);
+            }
+        }
         if frame.uses_regs() {
             let reg_count = frame.code.registers as usize;
             self.vm_stack.resize(base + reg_count, Value::Undefined);
@@ -1521,10 +1568,13 @@ impl ScriptRuntime {
             frame.stack_base = base + reg_count;
         } else {
             frame.stack_base = base;
-            if let Some(extra) = frame.extra.as_mut()
-                && !extra.saved_stack.is_empty()
-            {
-                self.vm_stack.append(&mut extra.saved_stack);
+            if let Some(extra) = frame.extra.as_mut() {
+                if !extra.saved_stack.is_empty() {
+                    self.vm_stack.append(&mut extra.saved_stack);
+                }
+                if extra.is_empty() {
+                    frame.extra = None;
+                }
             }
         }
         self.frames.push(frame);
@@ -1545,14 +1595,26 @@ impl ScriptRuntime {
         let mirror_base = self.debugger.mirror.len();
         let frame_floor = self.frames.len();
         let stack_floor = self.vm_stack.len();
+        let handler_floor = self.vm_handlers.len();
+        let chain_floor = self.vm_chains.len();
+        let pending_floor = self.vm_pending.len();
+        let iter_floor = self.vm_iters.len();
         self.push_frame(frame);
         let result = self.run_frames(frame_floor);
         if result.is_err() {
             self.frames.truncate(frame_floor);
             truncate_stack(&mut self.vm_stack, stack_floor);
+            self.vm_handlers.truncate(handler_floor);
+            self.vm_chains.truncate(chain_floor);
+            self.vm_pending.truncate(pending_floor);
+            self.vm_iters.truncate(iter_floor);
         }
         debug_assert_eq!(self.frames.len(), frame_floor);
         debug_assert_eq!(self.vm_stack.len(), stack_floor);
+        debug_assert_eq!(self.vm_handlers.len(), handler_floor);
+        debug_assert_eq!(self.vm_chains.len(), chain_floor);
+        debug_assert_eq!(self.vm_pending.len(), pending_floor);
+        debug_assert_eq!(self.vm_iters.len(), iter_floor);
         self.debugger.mirror.truncate(mirror_base);
         self.nested_runs -= 1;
         if self.nested_runs == 0 {
@@ -1684,24 +1746,27 @@ impl ScriptRuntime {
                 return Err(self.throw_value(thrown));
             }
             let top = self.frames.len() - 1;
-            let handler = self.frames[top]
-                .extra
-                .as_mut()
-                .and_then(|extra| extra.handlers.pop());
+            let handler_base = self.frames[top].handler_base as usize;
+            let handler = if self.vm_handlers.len() > handler_base {
+                self.vm_handlers.pop()
+            } else {
+                None
+            };
             if let Some(handler) = handler {
                 let target_stack = self.frames[top].stack_base + handler.stack;
                 truncate_stack(&mut self.vm_stack, target_stack);
                 let frame = &mut self.frames[top];
                 Self::restore_scopes(frame, handler.scopes);
-                if let Some(extra) = frame.extra.as_mut() {
-                    extra.chains.truncate(handler.chains);
-                }
+                self.vm_chains
+                    .truncate(frame.chain_base as usize + handler.chains);
+                self.vm_iters
+                    .truncate(frame.iter_base as usize + handler.iters);
                 if handler.catch != NO_TARGET {
                     self.vm_stack.push(thrown);
                     frame.pc = handler.catch as usize;
                     self.note_caught();
                 } else {
-                    frame.extra_mut().pending.push(Pending::Throw(thrown));
+                    self.vm_pending.push(Pending::Throw(thrown));
                     frame.pc = handler.finally as usize;
                 }
                 return Ok(None);
@@ -1711,6 +1776,10 @@ impl ScriptRuntime {
             }
             let finished = self.frames.pop().expect("frame");
             truncate_stack(&mut self.vm_stack, finished.return_base);
+            self.vm_handlers.truncate(finished.handler_base as usize);
+            self.vm_chains.truncate(finished.chain_base as usize);
+            self.vm_pending.truncate(finished.pending_base as usize);
+            self.vm_iters.truncate(finished.iter_base as usize);
         }
     }
 
@@ -1981,26 +2050,29 @@ impl ScriptRuntime {
         value: Value,
     ) -> Result<Option<RunResult>, ScriptError> {
         let top = self.frames.len() - 1;
-        while let Some(handler) = self.frames[top]
-            .extra
-            .as_mut()
-            .and_then(|extra| extra.handlers.pop())
-        {
+        let handler_base = self.frames[top].handler_base as usize;
+        while self.vm_handlers.len() > handler_base {
+            let handler = self.vm_handlers.pop().expect("checked above");
             if handler.finally != NO_TARGET {
                 let target_stack = self.frames[top].stack_base + handler.stack;
                 truncate_stack(&mut self.vm_stack, target_stack);
                 let frame = &mut self.frames[top];
                 Self::restore_scopes(frame, handler.scopes);
-                if let Some(extra) = frame.extra.as_mut() {
-                    extra.chains.truncate(handler.chains);
-                }
-                frame.extra_mut().pending.push(Pending::Return(value));
+                self.vm_chains
+                    .truncate(frame.chain_base as usize + handler.chains);
+                self.vm_iters
+                    .truncate(frame.iter_base as usize + handler.iters);
+                self.vm_pending.push(Pending::Return(value));
                 frame.pc = handler.finally as usize;
                 return Ok(None);
             }
         }
         let mut finished = self.frames.pop().expect("a frame is running");
         truncate_stack(&mut self.vm_stack, finished.return_base);
+        self.vm_handlers.truncate(finished.handler_base as usize);
+        self.vm_chains.truncate(finished.chain_base as usize);
+        self.vm_pending.truncate(finished.pending_base as usize);
+        self.vm_iters.truncate(finished.iter_base as usize);
         let value = if finished.construct() {
             match value {
                 // host objects such as nodes count as objects, so a custom element's
@@ -2070,8 +2142,7 @@ impl ScriptRuntime {
             }
         };
         let code = closure.code.clone();
-        if !code.simple_params
-            || code.reads_arguments
+        if code.reads_arguments
             || code.self_scope.is_some()
             || code.is_generator
             || code.is_async
@@ -2097,6 +2168,10 @@ impl ScriptRuntime {
         } else {
             this
         };
+        let handler_base = self.vm_handlers.len() as u32;
+        let chain_base = self.vm_chains.len() as u32;
+        let pending_base = self.vm_pending.len() as u32;
+        let iter_base = self.vm_iters.len() as u32;
         if code.uses_regs {
             let reg_count = code.registers as usize;
             let param_count = code.param_slots.len();
@@ -2135,6 +2210,10 @@ impl ScriptRuntime {
                 reg_base: arg_start,
                 stack_base: arg_start + reg_count,
                 return_base,
+                handler_base,
+                chain_base,
+                pending_base,
+                iter_base,
                 scope,
                 this,
                 function: Value::Undefined,
@@ -2145,19 +2224,33 @@ impl ScriptRuntime {
             return true;
         }
         let mut slots = vec![Value::Undefined; code.layout.names.len()];
-        // every parameter is written, the ones past the arguments as undefined, so the
-        // last of two parameters with one name decides its value
-        for (position, slot) in code.param_slots.iter().enumerate() {
-            if let Some(slot) = slot {
-                slots[*slot as usize] = if position < count {
-                    std::mem::replace(
-                        unsafe { self.vm_stack.get_unchecked_mut(arg_start + position) },
-                        Value::Undefined,
-                    )
-                } else {
-                    Value::Undefined
-                };
+        if code.simple_params {
+            // every parameter is written, the ones past the arguments as undefined, so the
+            // last of two parameters with one name decides its value
+            for (position, slot) in code.param_slots.iter().enumerate() {
+                if let Some(slot) = slot {
+                    slots[*slot as usize] = if position < count {
+                        std::mem::replace(
+                            unsafe { self.vm_stack.get_unchecked_mut(arg_start + position) },
+                            Value::Undefined,
+                        )
+                    } else {
+                        Value::Undefined
+                    };
+                }
             }
+            truncate_stack(&mut self.vm_stack, arg_start);
+            reserve_headroom(&mut self.vm_stack, code.max_pushes as usize);
+        } else {
+            // non-simple parameter lists unpack arguments from an array pushed at stack_base
+            let args_vec = if count == 0 {
+                Vec::new()
+            } else {
+                self.vm_stack.split_off(arg_start)
+            };
+            let args_array = heap.alloc_array_fast(ArrayData::from(args_vec));
+            reserve_headroom(&mut self.vm_stack, 1 + code.max_pushes as usize);
+            unsafe { push_unchecked(&mut self.vm_stack, Value::Array(args_array)) };
         }
         let scope = heap.alloc_scope_fast(Scope {
             slots,
@@ -2165,8 +2258,6 @@ impl ScriptRuntime {
             layout: code.layout.clone(),
             extra: Grown::default(),
         });
-        truncate_stack(&mut self.vm_stack, arg_start);
-        reserve_headroom(&mut self.vm_stack, code.max_pushes as usize);
         let pc = code.entry;
         self.frames.push(Frame {
             code,
@@ -2175,6 +2266,10 @@ impl ScriptRuntime {
             reg_base: arg_start,
             stack_base: arg_start,
             return_base,
+            handler_base,
+            chain_base,
+            pending_base,
+            iter_base,
             scope: Some(scope),
             this,
             function: Value::Undefined,
@@ -2205,27 +2300,51 @@ impl ScriptRuntime {
             String(super::strings::StringMethod),
             ArrayPush,
             ArrayPop,
+            ArrayIsArray,
             FunctionCall,
+            Collection(super::collections::CollectionMethod),
+            ObjectGetOwnPropertyDescriptor,
+            Dom(super::interfaces::DomMember),
         }
-        let hot = {
-            let Value::Object(object) = (unsafe { self.vm_stack.get_unchecked(callee_at) }) else {
-                return Ok(FastNativeCall::NotHandled);
-            };
-            let Some(borrowed) = (unsafe { heap.object_ref(object) }) else {
-                return Ok(FastNativeCall::NotHandled);
-            };
-            match &borrowed.class {
-                ObjectClass::Native(native) => match native.as_ref() {
-                    Native::String(m) if count <= 4 => HotNative::String(*m),
-                    Native::Array(super::arrays::ArrayMethod::Push) if method => {
-                        HotNative::ArrayPush
-                    }
-                    Native::Array(super::arrays::ArrayMethod::Pop) if method => HotNative::ArrayPop,
-                    Native::FunctionCall if method => HotNative::FunctionCall,
+        let hot = match unsafe { self.vm_stack.get_unchecked(callee_at) } {
+            Value::Builtin(Builtin::ArrayIsArray) => HotNative::ArrayIsArray,
+            Value::Object(object) => {
+                let Some(borrowed) = (unsafe { heap.object_ref(object) }) else {
+                    return Ok(FastNativeCall::NotHandled);
+                };
+                match &borrowed.class {
+                    ObjectClass::Native(native) => match native.as_ref() {
+                        Native::String(m) if count <= 4 => HotNative::String(*m),
+                        Native::Array(super::arrays::ArrayMethod::Push) if method => {
+                            HotNative::ArrayPush
+                        }
+                        Native::Array(super::arrays::ArrayMethod::Pop) if method => {
+                            HotNative::ArrayPop
+                        }
+                        Native::FunctionCall if method => HotNative::FunctionCall,
+                        Native::Collection(
+                            m @ (super::collections::CollectionMethod::Get
+                            | super::collections::CollectionMethod::Has
+                            | super::collections::CollectionMethod::Set
+                            | super::collections::CollectionMethod::Add),
+                        ) if method && count <= 2 => HotNative::Collection(*m),
+                        Native::ObjectGetOwnPropertyDescriptor if count == 2 => {
+                            HotNative::ObjectGetOwnPropertyDescriptor
+                        }
+                        Native::Dom(member)
+                            if method
+                                && count <= 4
+                                && self.custom_definitions.is_empty()
+                                && member.is_hot() =>
+                        {
+                            HotNative::Dom(*member)
+                        }
+                        _ => return Ok(FastNativeCall::NotHandled),
+                    },
                     _ => return Ok(FastNativeCall::NotHandled),
-                },
-                _ => return Ok(FastNativeCall::NotHandled),
+                }
             }
+            _ => return Ok(FastNativeCall::NotHandled),
         };
         match hot {
             HotNative::String(string_method) => {
@@ -2253,8 +2372,193 @@ impl ScriptRuntime {
                 for slot in &mut args[..count] {
                     std::mem::replace(slot, Value::Undefined).fast_drop();
                 }
+                // every element of args is Undefined, so skip drop_in_place<[Value; 4]>
+                std::mem::forget(args);
                 self.vm_stack.push(result?);
                 Ok(FastNativeCall::Done)
+            }
+            HotNative::ArrayIsArray => {
+                let is_arr = if count == 0 {
+                    Ok(false)
+                } else {
+                    match unsafe { self.vm_stack.get_unchecked(arg_start) } {
+                        Value::Array(_) => Ok(true),
+                        Value::Object(obj) => {
+                            if unsafe { heap.object_ref(obj) }
+                                .is_some_and(|o| !matches!(o.class, ObjectClass::Proxy(_)))
+                            {
+                                Ok(false)
+                            } else {
+                                let arg = unsafe { self.vm_stack.get_unchecked(arg_start).clone() };
+                                self.is_array(&arg)
+                            }
+                        }
+                        other
+                            if other.is_copy()
+                                || matches!(other, Value::String(_) | Value::Element(_)) =>
+                        {
+                            Ok(false)
+                        }
+                        _ => {
+                            let arg = unsafe { self.vm_stack.get_unchecked(arg_start).clone() };
+                            self.is_array(&arg)
+                        }
+                    }
+                };
+                truncate_stack(&mut self.vm_stack, return_base);
+                self.vm_stack.push(Value::Bool(is_arr?));
+                Ok(FastNativeCall::Done)
+            }
+            HotNative::Collection(col_method) => {
+                use super::collections::CollectionMethod as M;
+                let Value::Object(obj) = (unsafe { self.vm_stack.get_unchecked(return_base) })
+                else {
+                    return Ok(FastNativeCall::NotHandled);
+                };
+                let Some(borrowed) = (unsafe { heap.object_ref(obj) }) else {
+                    return Ok(FastNativeCall::NotHandled);
+                };
+                let collection = match (&borrowed.class, col_method) {
+                    (ObjectClass::Map(col), M::Get | M::Has | M::Set)
+                    | (ObjectClass::Set(col), M::Has | M::Add) => col.clone(),
+                    _ => return Ok(FastNativeCall::NotHandled),
+                };
+                if matches!(col_method, M::Set | M::Add)
+                    && collection.borrow().len() >= MAX_RUNTIME_ARRAY_LENGTH
+                {
+                    return Ok(FastNativeCall::NotHandled);
+                }
+                let result = match col_method {
+                    M::Get => {
+                        let value = if count == 0 {
+                            collection.borrow().get(&Value::Undefined)
+                        } else {
+                            let key = unsafe { self.vm_stack.get_unchecked(arg_start) };
+                            collection.borrow().get(key)
+                        }
+                        .unwrap_or(Value::Undefined);
+                        truncate_stack(&mut self.vm_stack, return_base);
+                        value
+                    }
+                    M::Has => {
+                        let has = if count == 0 {
+                            collection.borrow().has(&Value::Undefined)
+                        } else {
+                            let key = unsafe { self.vm_stack.get_unchecked(arg_start) };
+                            collection.borrow().has(key)
+                        };
+                        truncate_stack(&mut self.vm_stack, return_base);
+                        Value::Bool(has)
+                    }
+                    M::Set | M::Add => {
+                        // safety: this and callee are Copy Value::Object; move args out directly
+                        let (this_val, key, val) = unsafe {
+                            let ptr = self.vm_stack.as_ptr();
+                            let this_val = std::ptr::read(ptr.add(return_base));
+                            let key = if count >= 1 {
+                                std::ptr::read(ptr.add(arg_start))
+                            } else {
+                                Value::Undefined
+                            };
+                            let val = if matches!(col_method, M::Set) && count >= 2 {
+                                std::ptr::read(ptr.add(arg_start + 1))
+                            } else {
+                                if count >= 2 {
+                                    std::ptr::read(ptr.add(arg_start + 1)).fast_drop();
+                                }
+                                Value::Undefined
+                            };
+                            self.vm_stack.set_len(return_base);
+                            (this_val, key, val)
+                        };
+                        collection.borrow_mut().set(key, val);
+                        this_val
+                    }
+                    _ => unreachable!(),
+                };
+                self.vm_stack.push(result);
+                Ok(FastNativeCall::Done)
+            }
+            HotNative::ObjectGetOwnPropertyDescriptor => {
+                let (Value::Object(obj), Value::String(key)) =
+                    (unsafe { self.vm_stack.get_unchecked(arg_start) }, unsafe {
+                        self.vm_stack.get_unchecked(arg_start + 1)
+                    })
+                else {
+                    return Ok(FastNativeCall::NotHandled);
+                };
+                let Some(borrowed) = (unsafe { heap.object_ref(obj) }) else {
+                    return Ok(FastNativeCall::NotHandled);
+                };
+                if matches!(
+                    borrowed.class,
+                    ObjectClass::Proxy(_) | ObjectClass::String(_)
+                ) {
+                    return Ok(FastNativeCall::NotHandled);
+                }
+                let found = borrowed.property(key).map(|prop| prop.to_property());
+                truncate_stack(&mut self.vm_stack, return_base);
+                let result = match found {
+                    Some(property) => self.descriptor_value(&property),
+                    None => Value::Undefined,
+                };
+                self.vm_stack.push(result);
+                Ok(FastNativeCall::Done)
+            }
+            HotNative::Dom(member) => {
+                let this_ok = matches!(
+                    unsafe { self.vm_stack.get_unchecked(return_base) },
+                    Value::Element(_) | Value::Document
+                );
+                if !this_ok {
+                    return Ok(FastNativeCall::NotHandled);
+                }
+                let mut args = [
+                    Value::Undefined,
+                    Value::Undefined,
+                    Value::Undefined,
+                    Value::Undefined,
+                ];
+                // safety: arg_start + count == vm_stack.len(), callee is Copy Value::Object
+                let this = unsafe {
+                    let base = self.vm_stack.as_ptr();
+                    for (i, slot) in args.iter_mut().take(count).enumerate() {
+                        *slot = std::ptr::read(base.add(arg_start + i));
+                    }
+                    let this = std::ptr::read(base.add(return_base));
+                    self.vm_stack.set_len(return_base);
+                    this
+                };
+                let outcome = self.call_dom_hot(member, &this, &args[..count]);
+                match outcome {
+                    Ok(Some(value)) => {
+                        for slot in &mut args[..count] {
+                            std::mem::replace(slot, Value::Undefined).fast_drop();
+                        }
+                        std::mem::forget(args);
+                        this.fast_drop();
+                        self.vm_stack.push(value);
+                        Ok(FastNativeCall::Done)
+                    }
+                    Ok(None) => {
+                        let mut arguments = Vec::with_capacity(count);
+                        for slot in &mut args[..count] {
+                            arguments.push(std::mem::replace(slot, Value::Undefined));
+                        }
+                        std::mem::forget(args);
+                        let value = self.call_dom(member, this, arguments)?;
+                        self.vm_stack.push(value);
+                        Ok(FastNativeCall::Done)
+                    }
+                    Err(error) => {
+                        for slot in &mut args[..count] {
+                            std::mem::replace(slot, Value::Undefined).fast_drop();
+                        }
+                        std::mem::forget(args);
+                        this.fast_drop();
+                        Err(error)
+                    }
+                }
             }
             HotNative::ArrayPush => {
                 let Value::Array(array_handle) =
@@ -2404,7 +2708,7 @@ impl ScriptRuntime {
             }
             (Value::Object(obj), Value::String(key)) => {
                 let data = unsafe { heap.object_ref(obj)? };
-                data.own_data_value(key)
+                data.own_data_or_missing(heap, key)
             }
             (Value::String(text), Value::Number(number))
                 if text.is_ascii() && *number >= 0.0 && number.fract() == 0.0 =>
@@ -2457,7 +2761,7 @@ impl ScriptRuntime {
                 let Some(data) = (unsafe { heap.object_mut(obj) }) else {
                     return Err(value);
                 };
-                data.set_own_plain_data(key, value)
+                data.set_own_plain_data_or_add(obj, heap, key, value)
             }
             _ => Err(value),
         }
@@ -2466,27 +2770,19 @@ impl ScriptRuntime {
     // leaves try regions down to a depth, running each finally block before the jump lands
     fn do_exit(&mut self, target: u32, handlers: u16, scopes: u16) {
         let top = self.frames.len() - 1;
-        while self.frames[top]
-            .extra
-            .as_ref()
-            .is_some_and(|extra| extra.handlers.len() > handlers as usize)
-        {
-            let handler = self.frames[top]
-                .extra
-                .as_mut()
-                .expect("checked above")
-                .handlers
-                .pop()
-                .expect("checked above");
+        let stop_at = self.frames[top].handler_base as usize + handlers as usize;
+        while self.vm_handlers.len() > stop_at {
+            let handler = self.vm_handlers.pop().expect("checked above");
             if handler.finally != NO_TARGET {
                 let target_stack = self.frames[top].stack_base + handler.stack;
                 truncate_stack(&mut self.vm_stack, target_stack);
                 let frame = &mut self.frames[top];
                 Self::restore_scopes(frame, handler.scopes);
-                if let Some(extra) = frame.extra.as_mut() {
-                    extra.chains.truncate(handler.chains);
-                }
-                frame.extra_mut().pending.push(Pending::Jump {
+                self.vm_chains
+                    .truncate(frame.chain_base as usize + handler.chains);
+                self.vm_iters
+                    .truncate(frame.iter_base as usize + handler.iters);
+                self.vm_pending.push(Pending::Jump {
                     target,
                     handlers,
                     scopes,
@@ -2711,12 +3007,11 @@ impl ScriptRuntime {
                             .as_ref()
                             .and_then(|start| (&*heap_ptr).scope_at_ref(start, depth))
                             .and_then(|scope| match scope.slots.get(index as usize) {
-                                Some(
-                                    Value::Binding(_)
-                                    | Value::ConstBinding(_)
-                                    | Value::Uninitialized,
-                                )
-                                | None => None,
+                                Some(Value::Binding(cell) | Value::ConstBinding(cell)) => {
+                                    let inner = cell.borrow();
+                                    (!matches!(*inner, Value::Uninitialized)).then(|| inner.clone())
+                                }
+                                Some(Value::Uninitialized) | None => None,
                                 Some(value) => Some(value.clone()),
                             })
                     };
@@ -3445,12 +3740,22 @@ impl ScriptRuntime {
                                 safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                             }
                             unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
-                            if !self.call_plain(unsafe { &*heap_ptr }, 0, true) {
+                            let heap = unsafe { &*heap_ptr };
+                            if self.call_plain(heap, 0, true) {
+                                reload_frame!();
+                            } else if matches!(
+                                self.call_fast_native(heap, 0, true)?,
+                                FastNativeCall::Done
+                            ) {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                            } else {
                                 let callee = pop_fast(&mut self.vm_stack);
                                 let this = pop_fast(&mut self.vm_stack);
                                 self.call_in_loop(callee, this, Vec::new())?;
+                                reload_frame!();
                             }
-                            reload_frame!();
                         }
                         None => {
                             unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
@@ -3493,12 +3798,22 @@ impl ScriptRuntime {
                                 safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                             }
                             unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
-                            if !self.call_plain(unsafe { &*heap_ptr }, 0, true) {
+                            let heap = unsafe { &*heap_ptr };
+                            if self.call_plain(heap, 0, true) {
+                                reload_frame!();
+                            } else if matches!(
+                                self.call_fast_native(heap, 0, true)?,
+                                FastNativeCall::Done
+                            ) {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                            } else {
                                 let callee = pop_fast(&mut self.vm_stack);
                                 let this = pop_fast(&mut self.vm_stack);
                                 self.call_in_loop(callee, this, Vec::new())?;
+                                reload_frame!();
                             }
-                            reload_frame!();
                         }
                         None => {
                             let recv = receiver.clone();
@@ -3530,12 +3845,21 @@ impl ScriptRuntime {
                             .as_ref()
                             .and_then(|start| heap.scope_at_ref(start, depth))
                             .and_then(|scope| match scope.slots.get(index as usize) {
-                                Some(
-                                    Value::Binding(_)
-                                    | Value::ConstBinding(_)
-                                    | Value::Uninitialized,
-                                )
-                                | None => None,
+                                Some(Value::Binding(cell) | Value::ConstBinding(cell)) => {
+                                    let inner = cell.borrow();
+                                    if matches!(*inner, Value::Uninitialized) {
+                                        return None;
+                                    }
+                                    match self.ic_get_value(heap, &inner, cache) {
+                                        Some(IcGetHit::Value(v)) => Some(Ok(IcGetHit::Value(v))),
+                                        Some(IcGetHit::Missing) => Some(Ok(IcGetHit::Missing)),
+                                        Some(IcGetHit::Getter(g)) => {
+                                            Some(Err((inner.clone(), Some(g))))
+                                        }
+                                        None => Some(Err((inner.clone(), None))),
+                                    }
+                                }
+                                Some(Value::Uninitialized) | None => None,
                                 Some(receiver) => match self.ic_get_value(heap, receiver, cache) {
                                     Some(IcGetHit::Value(v)) => Some(Ok(IcGetHit::Value(v))),
                                     Some(IcGetHit::Missing) => Some(Ok(IcGetHit::Missing)),
@@ -3563,12 +3887,22 @@ impl ScriptRuntime {
                                 safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                             }
                             unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
-                            if !self.call_plain(unsafe { &*heap_ptr }, 0, true) {
+                            let heap = unsafe { &*heap_ptr };
+                            if self.call_plain(heap, 0, true) {
+                                reload_frame!();
+                            } else if matches!(
+                                self.call_fast_native(heap, 0, true)?,
+                                FastNativeCall::Done
+                            ) {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                            } else {
                                 let callee = pop_fast(&mut self.vm_stack);
                                 let this = pop_fast(&mut self.vm_stack);
                                 self.call_in_loop(callee, this, Vec::new())?;
+                                reload_frame!();
                             }
-                            reload_frame!();
                         }
                         Some(Err((recv, None))) => {
                             unsafe { push_unchecked(&mut self.vm_stack, recv) };
@@ -3630,12 +3964,22 @@ impl ScriptRuntime {
                                 safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                             }
                             unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
-                            if !self.call_plain(unsafe { &*heap_ptr }, 0, true) {
+                            let heap = unsafe { &*heap_ptr };
+                            if self.call_plain(heap, 0, true) {
+                                reload_frame!();
+                            } else if matches!(
+                                self.call_fast_native(heap, 0, true)?,
+                                FastNativeCall::Done
+                            ) {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                            } else {
                                 let callee = pop_fast(&mut self.vm_stack);
                                 let this = pop_fast(&mut self.vm_stack);
                                 self.call_in_loop(callee, this, Vec::new())?;
+                                reload_frame!();
                             }
-                            reload_frame!();
                         }
                         None => {
                             let recv2 = recv.clone();
@@ -3669,12 +4013,11 @@ impl ScriptRuntime {
                             .as_ref()
                             .and_then(|start| (&*heap_ptr).scope_at_ref(start, depth))
                             .and_then(|scope| match scope.slots.get(index as usize) {
-                                Some(
-                                    Value::Binding(_)
-                                    | Value::ConstBinding(_)
-                                    | Value::Uninitialized,
-                                )
-                                | None => None,
+                                Some(Value::Binding(cell) | Value::ConstBinding(cell)) => {
+                                    let inner = cell.borrow();
+                                    (!matches!(*inner, Value::Uninitialized)).then(|| inner.clone())
+                                }
+                                Some(Value::Uninitialized) | None => None,
                                 Some(value) => Some(value.clone()),
                             })
                     };
@@ -3707,12 +4050,22 @@ impl ScriptRuntime {
                                 safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                             }
                             unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
-                            if !self.call_plain(unsafe { &*heap_ptr }, 0, true) {
+                            let heap = unsafe { &*heap_ptr };
+                            if self.call_plain(heap, 0, true) {
+                                reload_frame!();
+                            } else if matches!(
+                                self.call_fast_native(heap, 0, true)?,
+                                FastNativeCall::Done
+                            ) {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                            } else {
                                 let callee = pop_fast(&mut self.vm_stack);
                                 let this = pop_fast(&mut self.vm_stack);
                                 self.call_in_loop(callee, this, Vec::new())?;
+                                reload_frame!();
                             }
-                            reload_frame!();
                         }
                         None => {
                             let recv2 = recv.clone();
@@ -3962,12 +4315,421 @@ impl ScriptRuntime {
                         }
                     }
                 }
+                Op::GlobalThis => unsafe {
+                    push_unchecked(&mut self.vm_stack, Value::Window);
+                },
+                Op::RequireCoercible => {
+                    if matches!(
+                        self.vm_stack.last(),
+                        Some(Value::Undefined | Value::Null) | None
+                    ) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        return Err(self.type_error("cannot destructure null or undefined"));
+                    }
+                }
+                Op::Uninitialize { index, count } => {
+                    if let Some(scope_ref) =
+                        unsafe { self.frames.get_unchecked(top) }.scope.as_ref()
+                    {
+                        if let Some(scope) = unsafe { (&*heap_ptr).scope_at_mut(scope_ref, 0) } {
+                            let end = (index as usize + count as usize).min(scope.slots.len());
+                            for slot in &mut scope.slots[index as usize..end] {
+                                let old = std::mem::replace(slot, Value::Uninitialized);
+                                old.fast_drop();
+                            }
+                        } else {
+                            let mut scope = scope_ref.borrow_mut();
+                            let end = (index as usize + count as usize).min(scope.slots.len());
+                            for slot in &mut scope.slots[index as usize..end] {
+                                let old = std::mem::replace(slot, Value::Uninitialized);
+                                old.fast_drop();
+                            }
+                        }
+                    }
+                }
+                Op::Negate => {
+                    if let Some(Value::Number(number)) = self.vm_stack.last_mut() {
+                        *number = -*number;
+                    } else {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let value = pop_fast(&mut self.vm_stack);
+                        let result = self.negate_numeric(value)?;
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                        unsafe { push_unchecked(&mut self.vm_stack, result) };
+                    }
+                }
+                Op::Plus => {
+                    if !matches!(self.vm_stack.last(), Some(Value::Number(_))) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let value = pop_fast(&mut self.vm_stack);
+                        let number = self.coerce_number(value)?;
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                        unsafe { push_unchecked(&mut self.vm_stack, Value::Number(number)) };
+                    }
+                }
+                Op::Increment | Op::Decrement => {
+                    let delta = if matches!(op, Op::Increment) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    if let Some(Value::Number(number)) = self.vm_stack.last_mut() {
+                        *number += delta;
+                    } else {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let value = pop_fast(&mut self.vm_stack);
+                        let delta_i = if matches!(op, Op::Increment) { 1 } else { -1 };
+                        let result = match self.coerce_numeric(value)? {
+                            Value::BigInt(value) => Value::BigInt(Rc::new(
+                                value.add(&super::bigint::BigInt::from_i64(delta_i)),
+                            )),
+                            numeric => Value::Number(self.coerce_number(numeric)? + delta),
+                        };
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                        unsafe { push_unchecked(&mut self.vm_stack, result) };
+                    }
+                }
+                Op::ToPropertyKey => {
+                    if !matches!(self.vm_stack.last(), Some(Value::String(_))) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let value = pop_fast(&mut self.vm_stack);
+                        let key = self.coerce_key(value)?;
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                        unsafe { push_unchecked(&mut self.vm_stack, Value::String(key.into())) };
+                    }
+                }
+                Op::ChainStart => {
+                    let offset =
+                        self.vm_stack.len() - unsafe { self.frames.get_unchecked(top) }.stack_base;
+                    self.vm_chains.push(offset);
+                }
+                Op::ChainEnd => {
+                    let base = unsafe { self.frames.get_unchecked(top) }.chain_base as usize;
+                    if self.vm_chains.len() > base {
+                        self.vm_chains.pop();
+                    }
+                }
+                Op::JumpIfNullishChain(target) => {
+                    if matches!(
+                        self.vm_stack.last(),
+                        Some(Value::Undefined | Value::Null) | None
+                    ) {
+                        let frame = unsafe { self.frames.get_unchecked(top) };
+                        let stack_base = frame.stack_base;
+                        let chain_base = frame.chain_base as usize;
+                        let mark = if self.vm_chains.len() > chain_base {
+                            stack_base + self.vm_chains.pop().expect("checked above")
+                        } else {
+                            self.vm_stack.len()
+                        };
+                        truncate_stack(&mut self.vm_stack, mark);
+                        unsafe { push_unchecked(&mut self.vm_stack, Value::Undefined) };
+                        pc = target as usize;
+                        block_start = pc;
+                    }
+                }
+                Op::PushHandler { catch, finally } => {
+                    let frame = unsafe { self.frames.get_unchecked(top) };
+                    let stack_offset = self.vm_stack.len() - frame.stack_base;
+                    let chains = self.vm_chains.len() - frame.chain_base as usize;
+                    let iters = self.vm_iters.len() - frame.iter_base as usize;
+                    self.vm_handlers.push(Handler {
+                        catch,
+                        finally,
+                        stack: stack_offset,
+                        scopes: frame.scopes,
+                        chains,
+                        iters,
+                    });
+                }
+                Op::PopHandler => {
+                    let base = unsafe { self.frames.get_unchecked(top) }.handler_base as usize;
+                    if self.vm_handlers.len() > base {
+                        self.vm_handlers.pop();
+                    }
+                }
+                Op::CompletionNormal => {
+                    self.vm_pending.push(Pending::Normal);
+                }
+                Op::EndFinally => {
+                    let pending_base =
+                        unsafe { self.frames.get_unchecked(top) }.pending_base as usize;
+                    let pending = if self.vm_pending.len() > pending_base {
+                        self.vm_pending.pop().expect("checked above")
+                    } else {
+                        Pending::Normal
+                    };
+                    match pending {
+                        Pending::Normal => {}
+                        Pending::Throw(value) => {
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            return Err(self.throw_value(value));
+                        }
+                        Pending::Return(value) => {
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            if let Some(result) = self.do_return(frame_floor, value)? {
+                                return Ok(result);
+                            }
+                            reload_frame!();
+                        }
+                        Pending::Jump {
+                            target,
+                            handlers,
+                            scopes,
+                        } => {
+                            self.do_exit(target, handlers, scopes);
+                            pc = unsafe { self.frames.get_unchecked(top) }.pc;
+                            block_start = pc;
+                        }
+                    }
+                }
+                Op::Exit {
+                    target,
+                    handlers,
+                    scopes,
+                } => {
+                    self.do_exit(target, handlers, scopes);
+                    pc = unsafe { self.frames.get_unchecked(top) }.pc;
+                    if pc <= op_pc {
+                        self.steps += (op_pc + 1).saturating_sub(block_start).max(1) as u64;
+                        if self.steps >= safepoint_at {
+                            safepoint_at = self.hit_safepoint(sampling, pc)?;
+                        }
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                    }
+                    block_start = pc;
+                }
+                Op::ArgumentsIterator => {
+                    let len = self.vm_stack.len();
+                    let slot = unsafe { self.vm_stack.get_unchecked_mut(len - 1) };
+                    let Value::Array(array) = slot.clone() else {
+                        unreachable!("arguments arrive as an array");
+                    };
+                    let iter_slot = self.vm_iters.len() as u32;
+                    self.vm_iters.push((array, 0));
+                    *slot = Value::ArrayIter(iter_slot);
+                }
+                Op::GetIterator(callsite) => {
+                    let fast = if let Some(Value::Array(array)) = self.vm_stack.last() {
+                        let heap = unsafe { &*heap_ptr };
+                        let plain_array =
+                            unsafe { heap.array_ref(array) }.is_some_and(|a| a.extra.is_none());
+                        let proto_ok = plain_array
+                            && unsafe { heap.object_ref(&self.intrinsics.array_prototype) }
+                                .is_some_and(|p| {
+                                    p.array_iterator_intact(&self.intrinsics.array_values)
+                                });
+                        proto_ok.then(|| array.clone())
+                    } else {
+                        None
+                    };
+                    if let Some(array) = fast {
+                        let len = self.vm_stack.len();
+                        let iter_slot = self.vm_iters.len() as u32;
+                        self.vm_iters.push((array, 0));
+                        unsafe {
+                            *self.vm_stack.get_unchecked_mut(len - 1) = Value::ArrayIter(iter_slot);
+                        }
+                    } else {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let value = pop_fast(&mut self.vm_stack);
+                        self.iterable_callsite = callsite.map(|index| {
+                            Callsite::Source(unsafe {
+                                (&*code).names.get_unchecked(index as usize).clone()
+                            })
+                        });
+                        let iterator = self.get_iterator(value);
+                        self.iterable_callsite = None;
+                        let iterator = iterator?;
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                        unsafe { push_unchecked(&mut self.vm_stack, iterator) };
+                    }
+                }
+                Op::IterValue => {
+                    let len = self.vm_stack.len();
+                    let fast = if len > 0
+                        && let Value::ArrayIter(iter_slot) =
+                            unsafe { self.vm_stack.get_unchecked(len - 1) }
+                    {
+                        let (array, index) =
+                            unsafe { self.vm_iters.get_unchecked_mut(*iter_slot as usize) };
+                        if *index == u32::MAX {
+                            Some(Value::Undefined)
+                        } else if let Some(data) = unsafe { (&*heap_ptr).array_ref(array) } {
+                            let idx = *index as usize;
+                            if let Some(val) = data.values.get(idx) {
+                                *index = (idx + 1) as u32;
+                                Some(val.clone().filled())
+                            } else {
+                                *index = u32::MAX;
+                                Some(Value::Undefined)
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(value) = fast {
+                        unsafe { push_unchecked(&mut self.vm_stack, value) };
+                    } else {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
+                        let value = self.iterator_step(&iterator)?.unwrap_or(Value::Undefined);
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                        unsafe { push_unchecked(&mut self.vm_stack, value) };
+                    }
+                }
+                Op::IterStep(target) => {
+                    let len = self.vm_stack.len();
+                    let fast = if len > 0
+                        && let Value::ArrayIter(iter_slot) =
+                            unsafe { self.vm_stack.get_unchecked(len - 1) }
+                    {
+                        let (array, index) =
+                            unsafe { self.vm_iters.get_unchecked_mut(*iter_slot as usize) };
+                        if *index == u32::MAX {
+                            Some(None)
+                        } else if let Some(data) = unsafe { (&*heap_ptr).array_ref(array) } {
+                            let idx = *index as usize;
+                            if let Some(val) = data.values.get(idx) {
+                                *index = (idx + 1) as u32;
+                                Some(Some(val.clone().filled()))
+                            } else {
+                                *index = u32::MAX;
+                                Some(None)
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    match fast {
+                        Some(Some(value)) => unsafe { push_unchecked(&mut self.vm_stack, value) },
+                        Some(None) => {
+                            let target = target as usize;
+                            if target <= op_pc {
+                                self.steps += (op_pc + 1).saturating_sub(block_start).max(1) as u64;
+                                if self.steps >= safepoint_at {
+                                    safepoint_at = self.hit_safepoint(sampling, target)?;
+                                }
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                            }
+                            pc = target;
+                            block_start = pc;
+                        }
+                        None => {
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            let iterator =
+                                self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
+                            match self.iterator_step(&iterator)? {
+                                Some(value) => {
+                                    reserve_headroom(&mut self.vm_stack, unsafe {
+                                        (&*code).max_pushes as usize
+                                    });
+                                    unsafe { push_unchecked(&mut self.vm_stack, value) };
+                                }
+                                None => {
+                                    pc = target as usize;
+                                    block_start = pc;
+                                }
+                            }
+                        }
+                    }
+                }
+                Op::IterRest => {
+                    let len = self.vm_stack.len();
+                    let fast = if len > 0
+                        && let Value::ArrayIter(iter_slot) =
+                            unsafe { self.vm_stack.get_unchecked(len - 1) }
+                    {
+                        let (array, index) =
+                            unsafe { self.vm_iters.get_unchecked_mut(*iter_slot as usize) };
+                        if *index == u32::MAX {
+                            Some(Vec::new())
+                        } else if let Some(data) = unsafe { (&*heap_ptr).array_ref(array) } {
+                            let idx = *index as usize;
+                            *index = u32::MAX;
+                            if idx < data.values.len() {
+                                Some(
+                                    data.values[idx..]
+                                        .iter()
+                                        .map(|v| v.clone().filled())
+                                        .collect(),
+                                )
+                            } else {
+                                Some(Vec::new())
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(rest) = fast {
+                        let array = unsafe { &*heap_ptr }.alloc_array_fast(ArrayData::from(rest));
+                        unsafe { push_unchecked(&mut self.vm_stack, Value::Array(array)) };
+                    } else {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
+                        let mut rest = Vec::new();
+                        while let Some(value) = self.iterator_step(&iterator)? {
+                            rest.push(value);
+                        }
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                        unsafe { push_unchecked(&mut self.vm_stack, Self::new_array(rest)) };
+                    }
+                }
+                Op::IterClose => {
+                    let value = pop_fast(&mut self.vm_stack);
+                    if let Value::ArrayIter(iter_slot) = value {
+                        let slot = iter_slot as usize;
+                        if slot < self.vm_iters.len() {
+                            self.vm_iters.truncate(slot);
+                        }
+                    } else {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        self.iterator_close(&value)?;
+                        value.fast_drop();
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                    }
+                }
                 Op::Return => {
                     let value = pop_fast(&mut self.vm_stack);
                     let frame = unsafe { self.frames.get_unchecked(top) };
-                    if frame.extra.is_none() && !frame.construct() {
+                    if self.vm_handlers.len() == frame.handler_base as usize && !frame.construct() {
                         let mut finished = self.frames.pop().expect("a frame is running");
                         truncate_stack(&mut self.vm_stack, finished.return_base);
+                        if self.vm_chains.len() > finished.chain_base as usize {
+                            self.vm_chains.truncate(finished.chain_base as usize);
+                        }
+                        if self.vm_pending.len() > finished.pending_base as usize {
+                            self.vm_pending.truncate(finished.pending_base as usize);
+                        }
+                        if self.vm_iters.len() > finished.iter_base as usize {
+                            self.vm_iters.truncate(finished.iter_base as usize);
+                        }
                         if (finished.flags & (FLAG_OWNS_SCOPE | FLAG_SCOPE_ESCAPED))
                             == FLAG_OWNS_SCOPE
                             && let Some(scope) = finished.scope.take()
@@ -5198,7 +5960,7 @@ impl ScriptRuntime {
             }
             Op::ChainStart => {
                 let offset = self.vm_stack.len() - self.frames[top].stack_base;
-                self.frames[top].extra_mut().chains.push(offset);
+                self.vm_chains.push(offset);
             }
             Op::JumpIfNullishChain(target) => {
                 if matches!(
@@ -5206,19 +5968,21 @@ impl ScriptRuntime {
                     Some(Value::Undefined | Value::Null) | None
                 ) {
                     let stack_base = self.frames[top].stack_base;
-                    let mark = self.frames[top]
-                        .extra
-                        .as_mut()
-                        .and_then(|extra| extra.chains.pop())
-                        .map_or(self.vm_stack.len(), |offset| stack_base + offset);
+                    let chain_base = self.frames[top].chain_base as usize;
+                    let mark = if self.vm_chains.len() > chain_base {
+                        stack_base + self.vm_chains.pop().expect("checked above")
+                    } else {
+                        self.vm_stack.len()
+                    };
                     truncate_stack(&mut self.vm_stack, mark);
                     self.vm_stack.push(Value::Undefined);
                     self.frames[top].pc = target as usize;
                 }
             }
             Op::ChainEnd => {
-                if let Some(extra) = self.frames[top].extra.as_mut() {
-                    extra.chains.pop();
+                let chain_base = self.frames[top].chain_base as usize;
+                if self.vm_chains.len() > chain_base {
+                    self.vm_chains.pop();
                 }
             }
             Op::GetIterator(callsite) => {
@@ -5250,9 +6014,9 @@ impl ScriptRuntime {
                 let Value::Array(array) = self.pop() else {
                     unreachable!("arguments arrive as an array")
                 };
-                self.vm_stack.push(Value::VmIterator(Rc::new(RefCell::new(
-                    VmIterator::Array { array, index: 0 },
-                ))));
+                let iter_slot = self.vm_iters.len() as u32;
+                self.vm_iters.push((array, 0));
+                self.vm_stack.push(Value::ArrayIter(iter_slot));
             }
             Op::GetAsyncIterator => {
                 let value = self.pop();
@@ -5260,27 +6024,94 @@ impl ScriptRuntime {
                 self.vm_stack.push(iterator);
             }
             Op::IterValue => {
-                let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
-                let value = self.iterator_step(&iterator)?.unwrap_or(Value::Undefined);
-                self.vm_stack.push(value);
+                if let Some(&Value::ArrayIter(iter_slot)) = self.vm_stack.last() {
+                    let (array, index) = &mut self.vm_iters[iter_slot as usize];
+                    let value = if *index == u32::MAX {
+                        Value::Undefined
+                    } else {
+                        let idx = *index as usize;
+                        match array.borrow().get(idx).cloned() {
+                            Some(val) => {
+                                *index = (idx + 1) as u32;
+                                val.filled()
+                            }
+                            None => {
+                                *index = u32::MAX;
+                                Value::Undefined
+                            }
+                        }
+                    };
+                    self.vm_stack.push(value);
+                } else {
+                    let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
+                    let value = self.iterator_step(&iterator)?.unwrap_or(Value::Undefined);
+                    self.vm_stack.push(value);
+                }
             }
             Op::IterRest => {
-                let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
-                let mut rest = Vec::new();
-                while let Some(value) = self.iterator_step(&iterator)? {
-                    rest.push(value);
+                if let Some(&Value::ArrayIter(iter_slot)) = self.vm_stack.last() {
+                    let (array, index) = &mut self.vm_iters[iter_slot as usize];
+                    let rest = if *index == u32::MAX {
+                        Vec::new()
+                    } else {
+                        let idx = *index as usize;
+                        *index = u32::MAX;
+                        let borrowed = array.borrow();
+                        if idx < borrowed.len() {
+                            borrowed[idx..].iter().map(|v| v.clone().filled()).collect()
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    self.vm_stack.push(Self::new_array(rest));
+                } else {
+                    let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
+                    let mut rest = Vec::new();
+                    while let Some(value) = self.iterator_step(&iterator)? {
+                        rest.push(value);
+                    }
+                    self.vm_stack.push(Self::new_array(rest));
                 }
-                self.vm_stack.push(Self::new_array(rest));
             }
             Op::IterClose => {
                 let iterator = self.pop();
-                self.iterator_close(&iterator)?;
+                if let Value::ArrayIter(iter_slot) = iterator {
+                    let slot = iter_slot as usize;
+                    if slot < self.vm_iters.len() {
+                        self.vm_iters.truncate(slot);
+                    }
+                } else {
+                    self.iterator_close(&iterator)?;
+                }
             }
             Op::IterStep(target) => {
-                let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
-                match self.iterator_step(&iterator)? {
-                    Some(value) => self.vm_stack.push(value),
-                    None => self.frames[top].pc = target as usize,
+                if let Some(&Value::ArrayIter(iter_slot)) = self.vm_stack.last() {
+                    let (array, index) = &mut self.vm_iters[iter_slot as usize];
+                    let next = if *index == u32::MAX {
+                        None
+                    } else {
+                        let idx = *index as usize;
+                        match array.borrow().get(idx).cloned() {
+                            Some(val) => {
+                                *index = (idx + 1) as u32;
+                                Some(val.filled())
+                            }
+                            None => {
+                                *index = u32::MAX;
+                                None
+                            }
+                        }
+                    };
+                    match next {
+                        Some(value) => self.vm_stack.push(value),
+                        None => self.frames[top].pc = target as usize,
+                    }
+                } else {
+                    let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
+                    match self.iterator_step(&iterator)? {
+                        Some(value) => self.vm_stack.push(value),
+                        None => self.frames[top].pc = target as usize,
+                    }
                 }
             }
             Op::AsyncIterNext => {
@@ -5329,30 +6160,33 @@ impl ScriptRuntime {
             Op::PushHandler { catch, finally } => {
                 let stack_offset = self.vm_stack.len() - self.frames[top].stack_base;
                 let scopes = self.frames[top].scopes;
-                let extra = self.frames[top].extra_mut();
-                let chains = extra.chains.len();
-                extra.handlers.push(Handler {
+                let chains = self.vm_chains.len() - self.frames[top].chain_base as usize;
+                let iters = self.vm_iters.len() - self.frames[top].iter_base as usize;
+                self.vm_handlers.push(Handler {
                     catch,
                     finally,
                     stack: stack_offset,
                     scopes,
                     chains,
+                    iters,
                 });
             }
             Op::PopHandler => {
-                if let Some(extra) = self.frames[top].extra.as_mut() {
-                    extra.handlers.pop();
+                let base = self.frames[top].handler_base as usize;
+                if self.vm_handlers.len() > base {
+                    self.vm_handlers.pop();
                 }
             }
             Op::CompletionNormal => {
-                self.frames[top].extra_mut().pending.push(Pending::Normal);
+                self.vm_pending.push(Pending::Normal);
             }
             Op::EndFinally => {
-                let pending = self.frames[top]
-                    .extra
-                    .as_mut()
-                    .and_then(|extra| extra.pending.pop())
-                    .unwrap_or(Pending::Normal);
+                let base = self.frames[top].pending_base as usize;
+                let pending = if self.vm_pending.len() > base {
+                    self.vm_pending.pop().expect("checked above")
+                } else {
+                    Pending::Normal
+                };
                 match pending {
                     Pending::Normal => {}
                     Pending::Throw(value) => return Err(self.throw_value(value)),
@@ -5400,13 +6234,53 @@ impl ScriptRuntime {
                     return Err(runtime_error("yield outside a resumable frame"));
                 }
                 let mut frame = self.frames.pop().expect("generator frame");
-                let saved = self.vm_stack.split_off(frame.stack_base);
+                let mut saved = self.vm_stack.split_off(frame.stack_base);
                 truncate_stack(&mut self.vm_stack, frame.return_base);
-                frame.extra_mut().saved_stack = saved;
+                // materialize inline array iterators before suspending so vm_iters stays LIFO
+                for value in &mut saved {
+                    if let Value::ArrayIter(iter_slot) = *value {
+                        let (array, index) = self.vm_iters[iter_slot as usize].clone();
+                        let state = if index == u32::MAX {
+                            VmIterator::Done
+                        } else {
+                            VmIterator::Array {
+                                array,
+                                index: index as usize,
+                            }
+                        };
+                        *value = Value::VmIterator(Rc::new(RefCell::new(state)));
+                    }
+                }
+                self.vm_iters.truncate(frame.iter_base as usize);
+                let handlers = self.vm_handlers.split_off(frame.handler_base as usize);
+                let chains = self.vm_chains.split_off(frame.chain_base as usize);
+                let pending = self.vm_pending.split_off(frame.pending_base as usize);
+                let extra = frame.extra_mut();
+                extra.saved_stack = saved;
+                extra.handlers = handlers;
+                extra.chains = chains;
+                extra.pending = pending;
                 return Ok(Some(RunResult::Yield(value, Box::new(frame))));
             }
             Op::DelegateCall => {
                 let sent = self.pop();
+                if let Some(Value::ArrayIter(iter_slot)) = self.vm_stack.last() {
+                    let iter_slot = *iter_slot;
+                    let (array, index) = self.vm_iters[iter_slot as usize].clone();
+                    let state = if index == u32::MAX {
+                        VmIterator::Done
+                    } else {
+                        VmIterator::Array {
+                            array,
+                            index: index as usize,
+                        }
+                    };
+                    if (iter_slot as usize) < self.vm_iters.len() {
+                        self.vm_iters.truncate(iter_slot as usize);
+                    }
+                    *self.vm_stack.last_mut().expect("checked above") =
+                        Value::VmIterator(Rc::new(RefCell::new(state)));
+                }
                 let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
                 let extra = self.frames[top].extra_mut();
                 let mode = std::mem::replace(&mut extra.delegate_mode, ResumeMode::Next);
@@ -5438,6 +6312,23 @@ impl ScriptRuntime {
             }
             Op::DelegateStep(target) => {
                 let sent = self.pop();
+                if let Some(Value::ArrayIter(iter_slot)) = self.vm_stack.last() {
+                    let iter_slot = *iter_slot;
+                    let (array, index) = self.vm_iters[iter_slot as usize].clone();
+                    let state = if index == u32::MAX {
+                        VmIterator::Done
+                    } else {
+                        VmIterator::Array {
+                            array,
+                            index: index as usize,
+                        }
+                    };
+                    if (iter_slot as usize) < self.vm_iters.len() {
+                        self.vm_iters.truncate(iter_slot as usize);
+                    }
+                    *self.vm_stack.last_mut().expect("checked above") =
+                        Value::VmIterator(Rc::new(RefCell::new(state)));
+                }
                 let iterator = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
                 let mode = self.frames[top]
                     .extra
@@ -5479,9 +6370,31 @@ impl ScriptRuntime {
                     return Err(runtime_error("await outside a resumable frame"));
                 }
                 let mut frame = self.frames.pop().expect("async frame");
-                let saved = self.vm_stack.split_off(frame.stack_base);
+                let mut saved = self.vm_stack.split_off(frame.stack_base);
                 truncate_stack(&mut self.vm_stack, frame.return_base);
-                frame.extra_mut().saved_stack = saved;
+                for value in &mut saved {
+                    if let Value::ArrayIter(iter_slot) = *value {
+                        let (array, index) = self.vm_iters[iter_slot as usize].clone();
+                        let state = if index == u32::MAX {
+                            VmIterator::Done
+                        } else {
+                            VmIterator::Array {
+                                array,
+                                index: index as usize,
+                            }
+                        };
+                        *value = Value::VmIterator(Rc::new(RefCell::new(state)));
+                    }
+                }
+                self.vm_iters.truncate(frame.iter_base as usize);
+                let handlers = self.vm_handlers.split_off(frame.handler_base as usize);
+                let chains = self.vm_chains.split_off(frame.chain_base as usize);
+                let pending = self.vm_pending.split_off(frame.pending_base as usize);
+                let extra = frame.extra_mut();
+                extra.saved_stack = saved;
+                extra.handlers = handlers;
+                extra.chains = chains;
+                extra.pending = pending;
                 return Ok(Some(RunResult::Await(value, Box::new(frame))));
             }
             Op::DynamicImport => {
@@ -6252,6 +7165,10 @@ impl Frame {
             reg_base: 0,
             stack_base: 0,
             return_base: 0,
+            handler_base: 0,
+            chain_base: 0,
+            pending_base: 0,
+            iter_base: 0,
             scope,
             this,
             function,

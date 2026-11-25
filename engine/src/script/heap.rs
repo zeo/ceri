@@ -1223,6 +1223,7 @@ impl Tracer {
             | Value::IndexedDbNameList(_) => {}
             Value::Object(handle) => self.mark_object(handle.clone()),
             Value::Array(handle) => self.mark_array(handle.clone()),
+            Value::ArrayIter(_) => {}
             Value::Binding(cell) | Value::ConstBinding(cell) => {
                 if self.visit_rc(cell) {
                     self.trace_value(&cell.borrow());

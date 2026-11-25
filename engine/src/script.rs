@@ -335,6 +335,8 @@ enum Value {
     Number(f64),
     Object(ObjectHandle),
     Array(ArrayHandle),
+    // index into ScriptRuntime::vm_iters for inline array iteration
+    ArrayIter(u32),
     String(JsStr),
     Element(ElementHandle),
     Symbol(JsStr),
@@ -821,6 +823,11 @@ pub struct ScriptRuntime {
     frames: Vec<vm::Frame>,
     // shared runtime value stack holding registers and operands of active frames
     vm_stack: Vec<Value>,
+    // shared try/finally handler, optional-chain, pending-completion, and array-iter stacks
+    vm_handlers: Vec<vm::Handler>,
+    vm_chains: Vec<usize>,
+    vm_pending: Vec<vm::Pending>,
+    vm_iters: Vec<(ArrayHandle, u32)>,
     // the length and name a bound function starts with, by its target's name and its length
     bound_templates: HashMap<(JsStr, u64), object::ObjectTemplate>,
     // milliseconds from an animation frame request to its callback
@@ -2047,6 +2054,10 @@ impl ScriptRuntime {
             active_module_scopes: Vec::new(),
             frames: Vec::new(),
             vm_stack: Vec::new(),
+            vm_handlers: Vec::new(),
+            vm_chains: Vec::new(),
+            vm_pending: Vec::new(),
+            vm_iters: Vec::new(),
             bound_templates: HashMap::default(),
             frame_interval: crate::navigation::FRAME_INTERVAL,
             visible: true,
@@ -2581,9 +2592,38 @@ impl ScriptRuntime {
         match old_parent {
             Some(old_parent) => self.refresh_select_state_after_move(old_parent, node),
             None => {
-                for &child in &inserted {
-                    self.refresh_select_state_after_append(parent, child);
+                // scan once for select or script elements before taking any slow refresh path
+                let (has_select, parent_in_select, has_script) = {
+                    let document = self.document.borrow();
+                    let mut found_select = false;
+                    let mut found_script = false;
+                    for &child in &inserted {
+                        let connected = document.is_connected(child);
+                        for candidate in document.subtree(child) {
+                            if let Some(element) = document.element(candidate) {
+                                if element.name == "select" {
+                                    found_select = true;
+                                } else if connected && element.name == "script" {
+                                    found_script = true;
+                                }
+                            }
+                        }
+                    }
+                    let in_select = document
+                        .element(parent)
+                        .is_some_and(|element| element.name == "select")
+                        || document.select_ancestor(parent).is_some();
+                    (found_select, in_select, found_script)
+                };
+                if has_select || parent_in_select {
+                    for &child in &inserted {
+                        self.refresh_select_state_after_append(parent, child);
+                    }
                 }
+                if has_script {
+                    self.prepare_inserted_scripts(&inserted)?;
+                }
+                return Ok(inserted);
             }
         }
         self.prepare_inserted_scripts(&inserted)?;
@@ -4764,18 +4804,17 @@ impl ScriptRuntime {
             },
             Value::Element(handle) => {
                 let node = handle.id;
-                let is_text = self.is_text_node(&handle);
-                let character_data = self.document.borrow().character_data(node).is_some();
-                let element_name = self
-                    .document
-                    .borrow()
-                    .element(node)
-                    .map(|element| element.name.clone());
-                let is_named = |name: &str| element_name.as_deref() == Some(name);
                 let bound =
                     |builtin: fn(ElementHandle) -> Builtin| Value::Builtin(builtin(handle.clone()));
                 let related = |related: Option<NodeId>| {
                     related.map_or(Value::Null, |related| self.node_value(related))
+                };
+                let is_element = || self.document.borrow().element(node).is_some();
+                let is_named = |name: &str| {
+                    self.document
+                        .borrow()
+                        .element(node)
+                        .is_some_and(|element| element.name == name)
                 };
                 let value = match property {
                     "nodeType" => Value::Number(match self.document.borrow().kind(node) {
@@ -4787,13 +4826,23 @@ impl ScriptRuntime {
                     }),
                     "nodeName" => Value::String(self.element_node_name(&handle).into()),
                     "nodeValue" | "data" => self.element_node_value(&handle),
-                    "splitText" if is_text => bound(Builtin::ElementSplitText),
+                    "splitText" if self.is_text_node(&handle) => bound(Builtin::ElementSplitText),
                     "normalize" => bound(Builtin::ElementNormalize),
-                    "substringData" if character_data => bound(Builtin::ElementSubstringData),
-                    "appendData" if character_data => bound(Builtin::ElementAppendData),
-                    "insertData" if character_data => bound(Builtin::ElementInsertData),
-                    "deleteData" if character_data => bound(Builtin::ElementDeleteData),
-                    "replaceData" if character_data => bound(Builtin::ElementReplaceData),
+                    "substringData" if self.document.borrow().character_data(node).is_some() => {
+                        bound(Builtin::ElementSubstringData)
+                    }
+                    "appendData" if self.document.borrow().character_data(node).is_some() => {
+                        bound(Builtin::ElementAppendData)
+                    }
+                    "insertData" if self.document.borrow().character_data(node).is_some() => {
+                        bound(Builtin::ElementInsertData)
+                    }
+                    "deleteData" if self.document.borrow().character_data(node).is_some() => {
+                        bound(Builtin::ElementDeleteData)
+                    }
+                    "replaceData" if self.document.borrow().character_data(node).is_some() => {
+                        bound(Builtin::ElementReplaceData)
+                    }
                     "textContent" => {
                         Value::String(self.document.borrow().text_content(node).into())
                     }
@@ -4808,10 +4857,10 @@ impl ScriptRuntime {
                             .unwrap_or_default()
                             .into(),
                     ),
-                    "innerHTML" if element_name.is_some() => {
+                    "innerHTML" if is_element() => {
                         Value::String(self.document.borrow().inner_html(node).into())
                     }
-                    "outerHTML" if element_name.is_some() => {
+                    "outerHTML" if is_element() => {
                         Value::String(self.document.borrow().outer_html(node).into())
                     }
                     "childNodes" => self.element_child_nodes(&handle),
@@ -7471,38 +7520,48 @@ impl ScriptRuntime {
     fn set_element_attribute(&mut self, handle: &ElementHandle, name: &str, value: String) -> bool {
         let node = handle.id;
         let changed = self.document.borrow_mut().set_attribute(node, name, value);
-        if changed
-            && name.eq_ignore_ascii_case("checked")
-            && !self.dirty_checked_controls.contains(&node)
-        {
-            self.control_checked.insert(node, true);
-            self.checked_version = self.checked_version.wrapping_add(1);
-        }
-        if changed && name.eq_ignore_ascii_case("value") && !self.dirty_controls.contains(&node) {
-            self.control_values.remove(&node);
-            self.text_selections.remove(&node);
-        }
-        if changed && name.eq_ignore_ascii_case("selected") && !self.dirty_options.contains(&node) {
-            self.set_option_selected_state(node, true, false);
-        }
-        if changed
-            && name.eq_ignore_ascii_case("multiple")
-            && self
-                .document
-                .borrow()
-                .element(node)
-                .is_some_and(|element| element.name == "select")
-        {
-            self.normalize_select_selection(node, false);
-        }
-        // setting src to the value it already has still loads it again, and setting a canvas
-        // size to the one it has still clears it
-        if name.eq_ignore_ascii_case("src") {
-            self.update_image(node);
-            self.load_media(node);
-        }
-        if name.eq_ignore_ascii_case("width") || name.eq_ignore_ascii_case("height") {
-            self.reset_canvas(node);
+        // dispatch special reflected attributes by length so common names skip all checks
+        match name.len() {
+            3 if name.eq_ignore_ascii_case("src") => {
+                // setting src to the value it already has still loads it again
+                self.update_image(node);
+                self.load_media(node);
+            }
+            5 => {
+                if changed
+                    && name.eq_ignore_ascii_case("value")
+                    && !self.dirty_controls.contains(&node)
+                {
+                    self.control_values.remove(&node);
+                    self.text_selections.remove(&node);
+                } else if name.eq_ignore_ascii_case("width") {
+                    self.reset_canvas(node);
+                }
+            }
+            6 if name.eq_ignore_ascii_case("height") => {
+                self.reset_canvas(node);
+            }
+            7 if changed
+                && name.eq_ignore_ascii_case("checked")
+                && !self.dirty_checked_controls.contains(&node) =>
+            {
+                self.control_checked.insert(node, true);
+                self.checked_version = self.checked_version.wrapping_add(1);
+            }
+            8 if changed => {
+                if name.eq_ignore_ascii_case("selected") && !self.dirty_options.contains(&node) {
+                    self.set_option_selected_state(node, true, false);
+                } else if name.eq_ignore_ascii_case("multiple")
+                    && self
+                        .document
+                        .borrow()
+                        .element(node)
+                        .is_some_and(|element| element.name == "select")
+                {
+                    self.normalize_select_selection(node, false);
+                }
+            }
+            _ => {}
         }
         changed
     }
@@ -11960,6 +12019,7 @@ impl Value {
                 | Self::Number(_)
                 | Self::Object(_)
                 | Self::Array(_)
+                | Self::ArrayIter(_)
         )
     }
 
@@ -11975,6 +12035,7 @@ impl Value {
             | Self::String(_)
             | Self::Object(_)
             | Self::Array(_)
+            | Self::ArrayIter(_)
             | Self::Element(_) => unreachable!("handled in Clone::clone"),
             Self::Symbol(symbol) => Self::Symbol(symbol.clone()),
             Self::BigInt(value) => Self::BigInt(value.clone()),
@@ -12176,7 +12237,7 @@ impl Value {
             Self::FileConstructor => "[function File]".to_string(),
             Self::AbortControllerConstructor => "[function AbortController]".to_string(),
             Self::WorkerConstructor => "[function Worker]".to_string(),
-            Self::VmIterator(_) => "[object Iterator]".to_string(),
+            Self::VmIterator(_) | Self::ArrayIter(_) => "[object Iterator]".to_string(),
             Self::Builtin(_) => "function () { [native code] }".to_string(),
         }
     }
@@ -15261,6 +15322,7 @@ fn value_typeof(value: &Value) -> &'static str {
         Value::Null
         | Value::Object(_)
         | Value::VmIterator(_)
+        | Value::ArrayIter(_)
         | Value::Array(_)
         | Value::NodeList(_)
         | Value::Iterator(_)
@@ -15819,6 +15881,7 @@ fn values_equal_slow(left: &Value, right: &Value) -> bool {
         (Value::Error(left), Value::Error(right)) => Rc::ptr_eq(left, right),
         (Value::Response(left), Value::Response(right)) => Rc::ptr_eq(left, right),
         (Value::VmIterator(left), Value::VmIterator(right)) => Rc::ptr_eq(left, right),
+        (Value::ArrayIter(left), Value::ArrayIter(right)) => left == right,
         (Value::Dataset(left), Value::Dataset(right))
         | (Value::ClassList(left), Value::ClassList(right))
         | (Value::AnimatedClass(left), Value::AnimatedClass(right)) => Rc::ptr_eq(left, right),
@@ -16211,6 +16274,10 @@ impl ScriptRuntime {
             active_module_scopes,
             frames,
             vm_stack,
+            vm_handlers: _,
+            vm_chains: _,
+            vm_pending,
+            vm_iters,
             bound_templates,
             frame_interval: _,
             visible: _,
@@ -16357,6 +16424,12 @@ impl ScriptRuntime {
         }
         for value in vm_stack {
             tracer.trace_value(value);
+        }
+        for pending in vm_pending {
+            pending.trace(tracer);
+        }
+        for (array, _) in vm_iters {
+            tracer.mark_array(array.clone());
         }
         for template in bound_templates.values() {
             tracer.trace_object_template(template);

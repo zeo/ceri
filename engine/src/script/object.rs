@@ -453,9 +453,35 @@ pub(super) struct BoundFunction {
     pub(super) arguments: Vec<Value>,
 }
 
-const PIC_SIZE: usize = 4;
+const PIC_SIZE: usize = 8;
 
-// per-site 4-entry polymorphic inline cache for GetProp and SetProp; holds shapes weakly so
+// keeps a shape allocation pinned so its raw address stays unique while enabling single-cmp IC checks
+struct ShapePin {
+    _weak: Weak<Shape>,
+    ptr: *const Shape,
+}
+
+impl ShapePin {
+    #[inline(always)]
+    fn new(shape: &Rc<Shape>) -> Self {
+        Self {
+            ptr: Rc::as_ptr(shape),
+            _weak: Rc::downgrade(shape),
+        }
+    }
+
+    #[inline(always)]
+    fn matches(&self, shape_ptr: *const Shape) -> bool {
+        self.ptr == shape_ptr
+    }
+
+    #[inline(always)]
+    fn upgrade(&self) -> Option<Rc<Shape>> {
+        self._weak.upgrade()
+    }
+}
+
+// per-site 8-entry polymorphic inline cache for GetProp and SetProp; holds shapes weakly so
 // their addresses stay unique while referenced
 pub(super) struct PropIc(UnsafeCell<PropIcInner>);
 
@@ -467,12 +493,7 @@ struct PropIcInner {
 impl Default for PropIc {
     fn default() -> Self {
         Self(UnsafeCell::new(PropIcInner {
-            entries: [
-                IcEntry::Empty,
-                IcEntry::Empty,
-                IcEntry::Empty,
-                IcEntry::Empty,
-            ],
+            entries: [const { IcEntry::Empty }; PIC_SIZE],
             next: 0,
         }))
     }
@@ -485,58 +506,67 @@ pub(super) enum IcGetHit {
 }
 
 struct DeepProtoChain {
-    skipped: Vec<(ObjectWeak, Weak<Shape>)>,
+    skipped: Vec<(ObjectWeak, ShapePin)>,
     holder: ObjectWeak,
-    holder_shape: Weak<Shape>,
+    holder_shape: ShapePin,
     index: u16,
     accessor: bool,
 }
 
+struct DeepMissingChain {
+    // full prototype chain from immediate prototype through the terminal null-proto object
+    chain: Vec<(ObjectWeak, ShapePin)>,
+}
+
 struct ProtoGuard {
     holder: ObjectWeak,
-    shape: Weak<Shape>,
+    shape: ShapePin,
 }
 
 enum IcEntry {
     Empty,
     OwnData {
-        shape: Weak<Shape>,
+        shape: ShapePin,
         index: u16,
         writable: bool,
     },
     OwnAccessor {
-        shape: Weak<Shape>,
+        shape: ShapePin,
         index: u16,
     },
     OwnAdd {
-        from: Weak<Shape>,
-        to: Weak<Shape>,
+        from: ShapePin,
+        to: ShapePin,
         proto: Option<Box<ProtoGuard>>,
     },
     ProtoData {
-        receiver: Option<Weak<Shape>>,
+        receiver: Option<ShapePin>,
         holder: ObjectWeak,
-        holder_shape: Weak<Shape>,
+        holder_shape: ShapePin,
         index: u16,
     },
     ProtoAccessor {
-        receiver: Weak<Shape>,
+        receiver: ShapePin,
         holder: ObjectWeak,
-        holder_shape: Weak<Shape>,
+        holder_shape: ShapePin,
         index: u16,
     },
     DeepProto {
-        receiver: Weak<Shape>,
+        receiver: ShapePin,
         chain: Box<DeepProtoChain>,
     },
     StringMethod {
         holder: ObjectWeak,
-        holder_shape: Weak<Shape>,
+        holder_shape: ShapePin,
         index: u16,
     },
     Missing {
-        receiver: Weak<Shape>,
+        receiver: ShapePin,
         proto: Option<Box<ProtoGuard>>,
+    },
+    DeepMissing {
+        receiver: ShapePin,
+        chain: Box<DeepMissingChain>,
     },
     ArrayLength,
     StringLength,
@@ -914,41 +944,118 @@ impl JsObject {
     }
 
     #[inline]
-    pub(super) fn own_data_value(&self, key: &str) -> Option<Value> {
+    pub(super) fn own_data_or_missing(&self, heap: &super::heap::Heap, key: &str) -> Option<Value> {
         if matches!(self.class, ObjectClass::Proxy(_) | ObjectClass::String(_)) {
             return None;
         }
-        let index = self.shape.position(key)?;
-        match self.properties.get(index)? {
-            Slot::Data(value) => Some(value.resolve()),
-            Slot::Accessor(_) => None,
+        if let Some(index) = self.shape.position(key) {
+            return match self.properties.get(index)? {
+                Slot::Data(value) => Some(value.resolve()),
+                Slot::Accessor(_) => None,
+            };
+        }
+        if self.orphan {
+            return None;
+        }
+        match &self.prototype {
+            None => Some(Value::Undefined),
+            Some(proto) => {
+                // safety: non-reentrant read of prototype inside run_fast
+                let borrowed = unsafe { heap.object_ref(proto)? };
+                if borrowed.prototype.is_none()
+                    && !borrowed.orphan
+                    && matches!(borrowed.class, ObjectClass::Ordinary)
+                    && borrowed.shape.position(key).is_none()
+                {
+                    Some(Value::Undefined)
+                } else {
+                    None
+                }
+            }
         }
     }
 
     #[inline]
-    pub(super) fn set_own_plain_data(&mut self, key: &str, value: Value) -> Result<(), Value> {
+    pub(super) fn array_iterator_intact(&self, expected: &Value) -> bool {
+        let Value::Object(expected_obj) = expected else {
+            return false;
+        };
+        // realm creates Array.prototype with "values" at 0 and "@@iterator" at 1
+        let index = if self.shape.keys.get(1).is_some_and(|k| &**k == "@@iterator") {
+            1
+        } else {
+            let Some(pos) = self.shape.position("@@iterator") else {
+                return false;
+            };
+            pos
+        };
+        matches!(
+            self.properties.get(index),
+            Some(Slot::Data(Value::Object(actual))) if ObjectHandle::ptr_eq(actual, expected_obj)
+        )
+    }
+
+    #[inline]
+    pub(super) fn set_own_plain_data_or_add(
+        &mut self,
+        receiver: &ObjectHandle,
+        heap: &super::heap::Heap,
+        key: &str,
+        value: Value,
+    ) -> Result<(), Value> {
         if !matches!(self.class, ObjectClass::Ordinary) {
             return Err(value);
         }
-        let Some(index) = self.shape.position(key) else {
-            return Err(value);
-        };
-        let attrs = self.shape.attrs[index];
-        if (attrs & ATTR_ACCESSOR) != 0 || (attrs & ATTR_WRITABLE) == 0 {
+        if let Some(index) = self.shape.position(key) {
+            let attrs = self.shape.attrs[index];
+            if (attrs & ATTR_ACCESSOR) != 0 || (attrs & ATTR_WRITABLE) == 0 {
+                return Err(value);
+            }
+            let plain = matches!(
+                self.properties.get(index),
+                Some(Slot::Data(current))
+                    if !matches!(current, Value::Binding(_) | Value::ConstBinding(_))
+            );
+            if !plain {
+                return Err(value);
+            }
+            if let Slot::Data(slot) = &mut self.properties.as_mut_slice()[index] {
+                let old = std::mem::replace(slot, value);
+                old.fast_drop();
+            }
+            return Ok(());
+        }
+        if !self.extensible || self.orphan {
             return Err(value);
         }
-        let plain = matches!(
-            self.properties.get(index),
-            Some(Slot::Data(current))
-                if !matches!(current, Value::Binding(_) | Value::ConstBinding(_))
-        );
-        if !plain {
-            return Err(value);
+        if let Some(proto) = &self.prototype {
+            if ObjectHandle::ptr_eq(receiver, proto) {
+                return Err(value);
+            }
+            // safety: receiver != proto and non-reentrant inside run_fast
+            let Some(borrowed) = (unsafe { heap.object_ref(proto) }) else {
+                return Err(value);
+            };
+            if borrowed.prototype.is_some()
+                || borrowed.orphan
+                || !matches!(borrowed.class, ObjectClass::Ordinary)
+                || borrowed.shape.position(key).is_some()
+            {
+                return Err(value);
+            }
         }
-        if let Slot::Data(slot) = &mut self.properties.as_mut_slice()[index] {
-            let old = std::mem::replace(slot, value);
-            old.fast_drop();
+        if self.shape.own || self.properties.len() >= SHARED_KEYS {
+            self.own_shape().push_own(Rc::from(key), ATTR_DATA);
+        } else {
+            self.shape = self.shape.with_key_attrs(key, ATTR_DATA);
+            let length = self.properties.len();
+            if length == self.properties.capacity() {
+                let doubled = (length * 2).max(4);
+                let wanted = self.shape.longest.get().clamp(length + 1, doubled);
+                self.properties.reserve_exact(wanted - length);
+            }
         }
+        self.properties.push(Slot::Data(value));
         Ok(())
     }
 
@@ -964,14 +1071,14 @@ impl JsObject {
             match entry {
                 IcEntry::Empty => break,
                 IcEntry::OwnData { shape, index, .. } => {
-                    if std::ptr::eq(shape.as_ptr(), shape_ptr)
+                    if shape.matches(shape_ptr)
                         && let Some(Slot::Data(value)) = self.properties.get(*index as usize)
                     {
                         return Some(IcGetHit::Value(value.resolve()));
                     }
                 }
                 IcEntry::OwnAccessor { shape, index } => {
-                    if std::ptr::eq(shape.as_ptr(), shape_ptr)
+                    if shape.matches(shape_ptr)
                         && let Some(Slot::Accessor(accessors)) =
                             self.properties.get(*index as usize)
                     {
@@ -987,7 +1094,7 @@ impl JsObject {
                     holder_shape,
                     index,
                 } => {
-                    if std::ptr::eq(receiver.as_ptr(), shape_ptr)
+                    if receiver.matches(shape_ptr)
                         && !matches!(self.class, ObjectClass::String(_))
                         && let Some(prototype) = &self.prototype
                         && holder.matches(prototype)
@@ -1003,7 +1110,7 @@ impl JsObject {
                     holder_shape,
                     index,
                 } => {
-                    if std::ptr::eq(receiver.as_ptr(), shape_ptr)
+                    if receiver.matches(shape_ptr)
                         && !matches!(self.class, ObjectClass::String(_))
                         && let Some(prototype) = &self.prototype
                         && holder.matches(prototype)
@@ -1014,7 +1121,7 @@ impl JsObject {
                     }
                 }
                 IcEntry::DeepProto { receiver, chain } => {
-                    if std::ptr::eq(receiver.as_ptr(), shape_ptr)
+                    if receiver.matches(shape_ptr)
                         && !matches!(self.class, ObjectClass::String(_))
                         && let Some(prototype) = &self.prototype
                         && let Some(hit) = Self::check_chain_fast(
@@ -1031,7 +1138,7 @@ impl JsObject {
                     }
                 }
                 IcEntry::Missing { receiver, proto }
-                    if std::ptr::eq(receiver.as_ptr(), shape_ptr)
+                    if receiver.matches(shape_ptr)
                         && !matches!(self.class, ObjectClass::String(_))
                         && !self.orphan
                         && Self::check_missing_proto_fast(
@@ -1042,6 +1149,16 @@ impl JsObject {
                         ) =>
                 {
                     return Some(IcGetHit::Missing);
+                }
+                IcEntry::DeepMissing { receiver, chain } => {
+                    if receiver.matches(shape_ptr)
+                        && !matches!(self.class, ObjectClass::String(_))
+                        && !self.orphan
+                        && let Some(prototype) = &self.prototype
+                        && Self::check_deep_missing_fast(heap, prototype, &chain.chain)
+                    {
+                        return Some(IcGetHit::Missing);
+                    }
                 }
                 _ => {}
             }
@@ -1071,7 +1188,7 @@ impl JsObject {
                     index,
                     writable: true,
                 } => {
-                    if std::ptr::eq(shape.as_ptr(), shape_ptr) {
+                    if shape.matches(shape_ptr) {
                         let index = *index as usize;
                         let plain = matches!(
                             self.properties.get(index),
@@ -1089,7 +1206,7 @@ impl JsObject {
                     }
                 }
                 IcEntry::OwnAdd { from, to, proto } => {
-                    if std::ptr::eq(from.as_ptr(), shape_ptr)
+                    if from.matches(shape_ptr)
                         && self.extensible
                         && !self.orphan
                         && Self::check_missing_proto_fast(
@@ -1198,22 +1315,57 @@ impl JsObject {
                         borrowed.class,
                         ObjectClass::Proxy(_) | ObjectClass::String(_)
                     )
-                    && std::ptr::eq(Rc::as_ptr(&borrowed.shape), guard.shape.as_ptr())
+                    && guard.shape.matches(Rc::as_ptr(&borrowed.shape))
             }
             _ => false,
         }
     }
 
     #[inline]
+    fn check_deep_missing_fast(
+        heap: &super::heap::Heap,
+        current: &ObjectHandle,
+        chain: &[(ObjectWeak, ShapePin)],
+    ) -> bool {
+        let mut cursor = current;
+        let last = chain.len() - 1;
+        for (i, (expected, shape)) in chain.iter().enumerate() {
+            if !expected.matches(cursor) {
+                return false;
+            }
+            let Some(borrowed) = (unsafe { heap.object_ref(cursor) }) else {
+                return false;
+            };
+            if borrowed.orphan
+                || matches!(
+                    borrowed.class,
+                    ObjectClass::Proxy(_) | ObjectClass::String(_)
+                )
+                || !shape.matches(Rc::as_ptr(&borrowed.shape))
+            {
+                return false;
+            }
+            if i == last {
+                return borrowed.prototype.is_none();
+            }
+            let Some(next) = borrowed.prototype.as_ref() else {
+                return false;
+            };
+            cursor = next;
+        }
+        false
+    }
+
+    #[inline]
     fn held_data_fast(
         heap: &super::heap::Heap,
         holder: &ObjectHandle,
-        shape: &Weak<Shape>,
+        shape: &ShapePin,
         index: usize,
     ) -> Option<Value> {
         let holder = unsafe { heap.object_ref(holder)? };
         if matches!(holder.class, ObjectClass::Proxy(_))
-            || !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&holder.shape))
+            || !shape.matches(Rc::as_ptr(&holder.shape))
         {
             return None;
         }
@@ -1224,12 +1376,12 @@ impl JsObject {
     fn held_accessor_fast(
         heap: &super::heap::Heap,
         holder: &ObjectHandle,
-        shape: &Weak<Shape>,
+        shape: &ShapePin,
         index: usize,
     ) -> Option<IcGetHit> {
         let holder = unsafe { heap.object_ref(holder)? };
         if matches!(holder.class, ObjectClass::Proxy(_))
-            || !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&holder.shape))
+            || !shape.matches(Rc::as_ptr(&holder.shape))
         {
             return None;
         }
@@ -1245,9 +1397,9 @@ impl JsObject {
     fn check_chain_fast(
         heap: &super::heap::Heap,
         current: &ObjectHandle,
-        skipped: &[(ObjectWeak, Weak<Shape>)],
+        skipped: &[(ObjectWeak, ShapePin)],
         holder: &ObjectWeak,
-        holder_shape: &Weak<Shape>,
+        holder_shape: &ShapePin,
         index: usize,
         accessor: bool,
     ) -> Option<IcGetHit> {
@@ -1260,7 +1412,7 @@ impl JsObject {
             if matches!(
                 borrowed.class,
                 ObjectClass::Proxy(_) | ObjectClass::String(_)
-            ) || !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&borrowed.shape))
+            ) || !shape.matches(Rc::as_ptr(&borrowed.shape))
             {
                 return None;
             }
@@ -1288,12 +1440,12 @@ impl JsObject {
             let attrs = self.shape.attrs[index];
             let entry = if (attrs & ATTR_ACCESSOR) != 0 {
                 IcEntry::OwnAccessor {
-                    shape: Rc::downgrade(&self.shape),
+                    shape: ShapePin::new(&self.shape),
                     index: index_u16,
                 }
             } else {
                 IcEntry::OwnData {
-                    shape: Rc::downgrade(&self.shape),
+                    shape: ShapePin::new(&self.shape),
                     index: index_u16,
                     writable: (attrs & ATTR_WRITABLE) != 0,
                 }
@@ -1301,7 +1453,7 @@ impl JsObject {
             ic.replace_or_insert(
                 |existing| match existing {
                     IcEntry::OwnData { shape, .. } | IcEntry::OwnAccessor { shape, .. } => {
-                        std::ptr::eq(shape.as_ptr(), shape_ptr)
+                        shape.matches(shape_ptr)
                     }
                     _ => false,
                 },
@@ -1316,10 +1468,10 @@ impl JsObject {
             if !self.orphan {
                 ic.replace_or_insert(
                     |existing| {
-                        matches!(existing, IcEntry::Missing { receiver, .. } if std::ptr::eq(receiver.as_ptr(), shape_ptr))
+                        matches!(existing, IcEntry::Missing { receiver, .. } if receiver.matches(shape_ptr))
                     },
                     IcEntry::Missing {
-                        receiver: Rc::downgrade(&self.shape),
+                        receiver: ShapePin::new(&self.shape),
                         proto: None,
                     },
                 );
@@ -1327,7 +1479,8 @@ impl JsObject {
             return;
         };
         // walk up to 6 prototype hops (covers HTML* -> Element -> Node -> EventTarget -> Object)
-        let mut skipped: Vec<(ObjectWeak, Weak<Shape>)> = Vec::new();
+        // using a stack buffer so uncacheable chains allocate nothing
+        let mut skipped: [Option<(ObjectWeak, ShapePin)>; 6] = [const { None }; 6];
         let mut current = first_proto;
         for depth in 0..6 {
             let Ok(object) = current.try_borrow() else {
@@ -1346,26 +1499,30 @@ impl JsObject {
                 let entry = if depth == 0 {
                     if accessor {
                         IcEntry::ProtoAccessor {
-                            receiver: Rc::downgrade(&self.shape),
+                            receiver: ShapePin::new(&self.shape),
                             holder: current.downgrade(),
-                            holder_shape: Rc::downgrade(&object.shape),
+                            holder_shape: ShapePin::new(&object.shape),
                             index: index_u16,
                         }
                     } else {
                         IcEntry::ProtoData {
-                            receiver: Some(Rc::downgrade(&self.shape)),
+                            receiver: Some(ShapePin::new(&self.shape)),
                             holder: current.downgrade(),
-                            holder_shape: Rc::downgrade(&object.shape),
+                            holder_shape: ShapePin::new(&object.shape),
                             index: index_u16,
                         }
                     }
                 } else {
+                    let hops = skipped[..depth]
+                        .iter_mut()
+                        .filter_map(Option::take)
+                        .collect();
                     IcEntry::DeepProto {
-                        receiver: Rc::downgrade(&self.shape),
+                        receiver: ShapePin::new(&self.shape),
                         chain: Box::new(DeepProtoChain {
-                            skipped,
+                            skipped: hops,
                             holder: current.downgrade(),
-                            holder_shape: Rc::downgrade(&object.shape),
+                            holder_shape: ShapePin::new(&object.shape),
                             index: index_u16,
                             accessor,
                         }),
@@ -1379,9 +1536,8 @@ impl JsObject {
                         }
                         | IcEntry::ProtoAccessor { receiver, .. }
                         | IcEntry::DeepProto { receiver, .. }
-                        | IcEntry::Missing { receiver, .. } => {
-                            std::ptr::eq(receiver.as_ptr(), shape_ptr)
-                        }
+                        | IcEntry::Missing { receiver, .. }
+                        | IcEntry::DeepMissing { receiver, .. } => receiver.matches(shape_ptr),
                         _ => false,
                     },
                     entry,
@@ -1389,24 +1545,47 @@ impl JsObject {
                 return;
             }
             if object.prototype.is_none() {
-                if depth == 0 && !object.orphan && !self.orphan {
-                    ic.replace_or_insert(
-                        |existing| {
-                            matches!(existing, IcEntry::Missing { receiver, .. } if std::ptr::eq(receiver.as_ptr(), shape_ptr))
-                        },
+                if !object.orphan && !self.orphan {
+                    let entry = if depth == 0 {
                         IcEntry::Missing {
-                            receiver: Rc::downgrade(&self.shape),
+                            receiver: ShapePin::new(&self.shape),
                             proto: Some(Box::new(ProtoGuard {
                                 holder: current.downgrade(),
-                                shape: Rc::downgrade(&object.shape),
+                                shape: ShapePin::new(&object.shape),
                             })),
+                        }
+                    } else {
+                        let mut hops: Vec<(ObjectWeak, ShapePin)> = Vec::with_capacity(depth + 1);
+                        for slot in &mut skipped[..depth] {
+                            if let Some(pair) = slot.take() {
+                                hops.push(pair);
+                            }
+                        }
+                        hops.push((current.downgrade(), ShapePin::new(&object.shape)));
+                        IcEntry::DeepMissing {
+                            receiver: ShapePin::new(&self.shape),
+                            chain: Box::new(DeepMissingChain { chain: hops }),
+                        }
+                    };
+                    ic.replace_or_insert(
+                        |existing| {
+                            matches!(
+                                existing,
+                                IcEntry::Missing { receiver, .. }
+                                    | IcEntry::DeepMissing { receiver, .. }
+                                    if receiver.matches(shape_ptr)
+                            )
                         },
+                        entry,
                     );
                 }
                 return;
             }
+            if object.orphan {
+                return;
+            }
             let next = object.prototype.clone().expect("checked above");
-            skipped.push((current.downgrade(), Rc::downgrade(&object.shape)));
+            skipped[depth] = Some((current.downgrade(), ShapePin::new(&object.shape)));
             drop(object);
             current = next;
         }
@@ -1448,7 +1627,7 @@ impl JsObject {
                     .then(|| {
                         Some(Box::new(ProtoGuard {
                             holder: proto.downgrade(),
-                            shape: Rc::downgrade(&borrowed.shape),
+                            shape: ShapePin::new(&borrowed.shape),
                         }))
                     })
                 }),
@@ -1457,11 +1636,11 @@ impl JsObject {
                 let from_ptr = Rc::as_ptr(&from);
                 ic.replace_or_insert(
                     |existing| {
-                        matches!(existing, IcEntry::OwnAdd { from, .. } if std::ptr::eq(from.as_ptr(), from_ptr))
+                        matches!(existing, IcEntry::OwnAdd { from, .. } if from.matches(from_ptr))
                     },
                     IcEntry::OwnAdd {
-                        from: Rc::downgrade(&from),
-                        to: Rc::downgrade(&self.shape),
+                        from: ShapePin::new(&from),
+                        to: ShapePin::new(&self.shape),
                         proto,
                     },
                 );
@@ -1471,10 +1650,10 @@ impl JsObject {
         let shape_ptr = Rc::as_ptr(&self.shape);
         ic.replace_or_insert(
             |existing| {
-                matches!(existing, IcEntry::OwnData { shape, .. } if std::ptr::eq(shape.as_ptr(), shape_ptr))
+                matches!(existing, IcEntry::OwnData { shape, .. } if shape.matches(shape_ptr))
             },
             IcEntry::OwnData {
-                shape: Rc::downgrade(&self.shape),
+                shape: ShapePin::new(&self.shape),
                 index: index_u16,
                 writable: true,
             },
@@ -1497,7 +1676,7 @@ impl JsObject {
                 IcEntry::ProtoData {
                     receiver: None,
                     holder: prototype.downgrade(),
-                    holder_shape: Rc::downgrade(&object.shape),
+                    holder_shape: ShapePin::new(&object.shape),
                     index: index_u16,
                 },
             );
@@ -1519,7 +1698,7 @@ impl JsObject {
                 |existing| matches!(existing, IcEntry::StringMethod { .. }),
                 IcEntry::StringMethod {
                     holder: prototype.downgrade(),
-                    holder_shape: Rc::downgrade(&object.shape),
+                    holder_shape: ShapePin::new(&object.shape),
                     index: index_u16,
                 },
             );

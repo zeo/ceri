@@ -767,7 +767,7 @@ impl ScriptRuntime {
         let mirror = &mut self.debugger.mirror;
         mirror.clear();
         mirror.reserve(total);
-        for frame in &self.frames {
+        for (index, frame) in self.frames.iter().enumerate() {
             let (scope, reg_base) = if frame.code.uses_regs {
                 let reg_count = frame.code.registers as usize;
                 let slots = self.vm_stack[frame.reg_base..frame.reg_base + reg_count].to_vec();
@@ -777,12 +777,16 @@ impl ScriptRuntime {
             } else {
                 (frame.scope.clone(), None)
             };
+            let handler_end = self
+                .frames
+                .get(index + 1)
+                .map_or(self.vm_handlers.len(), |next| next.handler_base as usize);
             mirror.push(Snapshot {
                 code: frame.code.clone(),
                 pc: frame.pc,
                 scope,
                 this: frame.this.clone(),
-                catches: frame.catches(),
+                catches: frame.catches(&self.vm_handlers, handler_end),
                 reg_base,
             });
         }

@@ -28,6 +28,36 @@ impl DomMember {
         self.entry.0
     }
 
+    #[inline]
+    pub(super) fn is_hot(self) -> bool {
+        matches!(
+            (self.entry.0, self.access),
+            (
+                "setAttribute"
+                    | "removeAttribute"
+                    | "getAttribute"
+                    | "insertBefore"
+                    | "appendChild"
+                    | "removeChild"
+                    | "cloneNode"
+                    | "importNode",
+                Access::Call
+            ) | (
+                "firstChild"
+                    | "lastChild"
+                    | "nextSibling"
+                    | "previousSibling"
+                    | "parentNode"
+                    | "nodeType"
+                    | "nodeName"
+                    | "style"
+                    | "className"
+                    | "data",
+                Access::Get
+            )
+        )
+    }
+
     fn reflect(self) -> Reflect {
         match self.entry.1 {
             Attr(attribute) => Reflect::Text(attribute),
@@ -1227,12 +1257,196 @@ impl ScriptRuntime {
         result
     }
 
+    // direct fast path for the hottest DOM methods and getters, bypassing member() and call_builtin()
+    pub(super) fn call_dom_hot(
+        &mut self,
+        member: DomMember,
+        this: &Value,
+        arguments: &[Value],
+    ) -> Result<Option<Value>, ScriptError> {
+        let name = member.name();
+        match (this, name, member.access) {
+            (Value::Element(handle), "setAttribute", Access::Call) => {
+                let name_owned;
+                let attr: &str = match arguments.first() {
+                    Some(Value::String(s)) => s,
+                    Some(other) => {
+                        name_owned = other.string_value();
+                        &name_owned
+                    }
+                    None => "",
+                };
+                let value = match arguments.get(1) {
+                    Some(Value::String(s)) => s.to_string(),
+                    Some(other) => other.string_value(),
+                    None => String::new(),
+                };
+                self.set_element_attribute(handle, attr, value);
+                Ok(Some(Value::Undefined))
+            }
+            (Value::Element(handle), "removeAttribute", Access::Call) => {
+                let name_owned;
+                let attr: &str = match arguments.first() {
+                    Some(Value::String(s)) => s,
+                    Some(other) => {
+                        name_owned = other.string_value();
+                        &name_owned
+                    }
+                    None => "",
+                };
+                self.remove_element_attribute(handle, attr);
+                Ok(Some(Value::Undefined))
+            }
+            (Value::Element(handle), "getAttribute", Access::Call) => {
+                let name_owned;
+                let attr: &str = match arguments.first() {
+                    Some(Value::String(s)) => s,
+                    Some(other) => {
+                        name_owned = other.string_value();
+                        &name_owned
+                    }
+                    None => "",
+                };
+                Ok(Some(
+                    self.document
+                        .borrow()
+                        .attribute(handle.id, attr)
+                        .map(|text| Value::String(text.into()))
+                        .unwrap_or(Value::Null),
+                ))
+            }
+            (Value::Element(parent), "insertBefore", Access::Call) => {
+                let child = self.node_argument(arguments, 0, "insertBefore")?;
+                let reference = match arguments.get(1).map(Value::resolve) {
+                    None | Some(Value::Null) | Some(Value::Undefined) => None,
+                    Some(Value::Element(reference)) => Some(reference.id),
+                    Some(_) => {
+                        return Err(self.type_error(
+                            "Failed to execute 'insertBefore' on 'Node': parameter 2 is not of type 'Node'.",
+                        ));
+                    }
+                };
+                self.insert_node(parent.id, child, reference)?;
+                Ok(Some(self.node_value(child)))
+            }
+            (Value::Element(parent), "appendChild", Access::Call) => {
+                let child = self.node_argument(arguments, 0, "appendChild")?;
+                self.insert_node(parent.id, child, None)?;
+                Ok(Some(self.node_value(child)))
+            }
+            (Value::Element(parent), "removeChild", Access::Call) => {
+                let child = self.node_argument(arguments, 0, "removeChild")?;
+                if self.document.borrow().parent(child) != Some(parent.id) {
+                    return Err(self.throw_value(dom_exception(
+                        "NotFoundError",
+                        "The node to be removed is not a child of this node.",
+                    )));
+                }
+                self.remove_node(child)?;
+                Ok(Some(self.node_value(child)))
+            }
+            (Value::Element(handle), "cloneNode", Access::Call) => {
+                let deep = arguments.first().is_some_and(Value::truthy);
+                let copy = self
+                    .document
+                    .borrow_mut()
+                    .clone_node(handle.id, deep)
+                    .ok_or_else(|| runtime_error("node is no longer in the document"))?;
+                self.load_images_in(copy);
+                Ok(Some(self.node_value(copy)))
+            }
+            (Value::Document, "importNode", Access::Call) => {
+                let node = match arguments.first().map(Value::resolve) {
+                    Some(Value::Element(handle)) => handle.id,
+                    Some(Value::Document) => {
+                        return Err(self.throw_value(dom_exception(
+                            "NotSupportedError",
+                            "Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.",
+                        )));
+                    }
+                    _ => {
+                        return Err(self.type_error(
+                            "Failed to execute 'importNode' on 'Document': parameter 1 is not of type 'Node'.",
+                        ));
+                    }
+                };
+                if self.document.borrow().shadow_host(node).is_some() {
+                    return Err(self.throw_value(dom_exception(
+                        "NotSupportedError",
+                        "Failed to execute 'importNode' on 'Document': The node provided is a shadow root, which may not be imported.",
+                    )));
+                }
+                let deep = arguments.get(1).is_some_and(Value::truthy);
+                let copy = self
+                    .document
+                    .borrow_mut()
+                    .clone_node(node, deep)
+                    .ok_or_else(|| runtime_error("node is no longer in the document"))?;
+                self.load_images_in(copy);
+                Ok(Some(self.node_value(copy)))
+            }
+            (Value::Element(handle), "firstChild", Access::Get) => {
+                let found = self.document.borrow().children(handle.id).first().copied();
+                Ok(Some(self.optional_node(found)))
+            }
+            (Value::Element(handle), "lastChild", Access::Get) => {
+                let found = self.document.borrow().children(handle.id).last().copied();
+                Ok(Some(self.optional_node(found)))
+            }
+            (Value::Element(handle), "nextSibling", Access::Get) => {
+                let found = self.document.borrow().sibling(handle.id, true);
+                Ok(Some(self.optional_node(found)))
+            }
+            (Value::Element(handle), "previousSibling", Access::Get) => {
+                let found = self.document.borrow().sibling(handle.id, false);
+                Ok(Some(self.optional_node(found)))
+            }
+            (Value::Element(handle), "parentNode", Access::Get) => {
+                let found = self.document.borrow().parent(handle.id);
+                Ok(Some(self.optional_node(found)))
+            }
+            (Value::Element(handle), "nodeType", Access::Get) => Ok(Some(Value::Number(
+                match self.document.borrow().kind(handle.id) {
+                    Some(NodeKind::Text(_)) => 3.0,
+                    Some(NodeKind::Comment(_)) => 8.0,
+                    Some(NodeKind::Fragment) => 11.0,
+                    Some(NodeKind::Document) => 9.0,
+                    _ => 1.0,
+                },
+            ))),
+            (Value::Element(handle), "nodeName", Access::Get) => {
+                Ok(Some(Value::String(self.element_node_name(handle).into())))
+            }
+            (Value::Element(handle), "style", Access::Get) => {
+                Ok(Some(Value::Style(handle.clone())))
+            }
+            (Value::Element(handle), "className", Access::Get) => {
+                Ok(Some(if self.is_svg(handle.id) {
+                    Value::AnimatedClass(handle.clone())
+                } else {
+                    Value::String(
+                        self.element_attribute(handle, "class")
+                            .unwrap_or_default()
+                            .into(),
+                    )
+                }))
+            }
+            (Value::Element(handle), "data", Access::Get) => {
+                Ok(Some(self.element_node_value(handle)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn call_dom_member(
         &mut self,
         member: DomMember,
         this: Value,
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
+        if let Some(result) = self.call_dom_hot(member, &this, &arguments)? {
+            return Ok(result);
+        }
         if let Some(result) = self.call_event_target(member, &this, &arguments)? {
             return Ok(result);
         }

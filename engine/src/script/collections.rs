@@ -416,15 +416,15 @@ impl ScriptRuntime {
         )))
     }
 
-    fn collection_kind(this: &Value) -> Option<CollectionKind> {
+    fn collection_entry(this: &Value) -> Option<(CollectionKind, Rc<RefCell<Collection>>)> {
         let Value::Object(object) = this else {
             return None;
         };
-        match object.borrow().class {
-            ObjectClass::Map(_) => Some(CollectionKind::Map),
-            ObjectClass::Set(_) => Some(CollectionKind::Set),
-            ObjectClass::WeakMap(_) => Some(CollectionKind::WeakMap),
-            ObjectClass::WeakSet(_) => Some(CollectionKind::WeakSet),
+        match &object.borrow().class {
+            ObjectClass::Map(collection) => Some((CollectionKind::Map, collection.clone())),
+            ObjectClass::Set(collection) => Some((CollectionKind::Set, collection.clone())),
+            ObjectClass::WeakMap(collection) => Some((CollectionKind::WeakMap, collection.clone())),
+            ObjectClass::WeakSet(collection) => Some((CollectionKind::WeakSet, collection.clone())),
             _ => None,
         }
     }
@@ -589,12 +589,11 @@ impl ScriptRuntime {
             | M::Size
             | M::ForEach
             | M::Iterate(_) => {
-                let Some(kind) = Self::collection_kind(&this) else {
+                let Some((kind, collection)) = Self::collection_entry(&this) else {
                     return Err(self.type_error(format!(
                         "collection method {method:?} called on incompatible receiver"
                     )));
                 };
-                let collection = self.collection_of(&this, kind, &format!("{method:?}"))?;
                 let weak = matches!(kind, CollectionKind::WeakMap | CollectionKind::WeakSet);
                 match method {
                     M::Get => Ok(collection.borrow().get(&first).unwrap_or(Value::Undefined)),
