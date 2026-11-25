@@ -264,6 +264,7 @@ impl EngineWorker {
             .name("ceri-engine".to_string())
             .stack_size(ENGINE_STACK)
             .spawn(move || {
+                let _allocator = crate::enter_engine_allocator();
                 let browser = match factory() {
                     Ok(browser) => browser,
                     Err(error) => {
@@ -273,6 +274,9 @@ impl EngineWorker {
                 };
                 let _ = ready.send(Ok(()));
                 run_engine_worker(EngineHost::new(browser, viewport), command_receiver, events);
+                crate::font::clear_active_fonts();
+                #[cfg(windows)]
+                crate::dwrite::release_thread();
             })
             .map_err(|error| format!("could not start engine worker: {error}"))?;
         match ready_receiver.recv() {
@@ -321,6 +325,7 @@ impl EngineWorker {
             .name("ceri-engine".to_string())
             .stack_size(ENGINE_STACK)
             .spawn(move || {
+                let _allocator = crate::enter_engine_allocator();
                 if let Some(target) = target {
                     crate::script::set_frame_id(&target);
                 }
@@ -343,6 +348,10 @@ impl EngineWorker {
                     notify,
                     page,
                 );
+                // release thread-local fonts before unregistering the directwrite loader
+                crate::font::clear_active_fonts();
+                #[cfg(windows)]
+                crate::dwrite::release_thread();
             })
             .map_err(|error| format!("could not start engine worker: {error}"))?;
         // the heap a worker leaves behind is only abandoned once its thread has ended, so the
@@ -353,7 +362,7 @@ impl EngineWorker {
                 .stack_size(64 * 1024)
                 .spawn(move || {
                     let _ = worker.join();
-                    crate::release_memory();
+                    crate::release_after_worker_exit();
                     if let Some(on_exit) = on_exit {
                         on_exit();
                     }

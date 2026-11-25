@@ -3,12 +3,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) struct Notifier {
     identifier: String,
     name: String,
-    icon_source: Option<Arc<[u8]>>,
+    icon_source: Mutex<Option<Arc<[u8]>>>,
     profile: PathBuf,
     // the icon file, written and the app id registered on the first notification
     icon: OnceLock<Option<PathBuf>>,
@@ -24,7 +24,7 @@ impl Notifier {
         Self {
             identifier: identifier.to_string(),
             name: name.to_string(),
-            icon_source,
+            icon_source: Mutex::new(icon_source),
             profile: profile.to_path_buf(),
             icon: OnceLock::new(),
         }
@@ -46,7 +46,12 @@ impl Notifier {
     }
 
     fn write_icon(&self) -> Option<PathBuf> {
-        let png = ceri_engine::icon_png(self.icon_source.as_deref()?, 256)?;
+        let source = self
+            .icon_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()?;
+        let png = ceri_engine::icon_png(&source, 256)?;
         let path = self.profile.join("notification-icon.png");
         let written = fs::create_dir_all(&self.profile).and_then(|()| fs::write(&path, png));
         match written {

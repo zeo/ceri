@@ -1117,6 +1117,7 @@ where
             open.act(WindowAction::Focus);
             return;
         }
+        crate::resume_active_memory();
         let viewport = Size {
             width: config.width.max(1) as f32,
             height: config.height.max(1) as f32,

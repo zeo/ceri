@@ -2064,6 +2064,12 @@ pub(crate) fn round_to_device(length: f32) -> f32 {
     (length * scale).round() / scale
 }
 
+pub(crate) fn clear_active_fonts() {
+    let _ = ACTIVE_FONTS.try_with(|active| {
+        *active.borrow_mut() = None;
+    });
+}
+
 pub(crate) fn active_fonts() -> Rc<FontSet> {
     ACTIVE_FONTS.with(|active| {
         let mut active = active.borrow_mut();

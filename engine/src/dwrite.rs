@@ -27,23 +27,55 @@ fn create_factory() -> Option<IDWriteFactory6> {
         })
         .as_ref()?;
     let mut raw: *mut c_void = std::ptr::null_mut();
-    // safety: raw receives an owning IDWriteFactory6 interface pointer on success
+    // safety: isolated factory releases its internal font caches when the worker drops it
     unsafe {
-        create(DWRITE_FACTORY_TYPE_SHARED, &IDWriteFactory6::IID, &mut raw)
-            .ok()
-            .ok()?;
+        create(
+            DWRITE_FACTORY_TYPE_ISOLATED,
+            &IDWriteFactory6::IID,
+            &mut raw,
+        )
+        .ok()
+        .ok()?;
         (!raw.is_null()).then(|| IDWriteFactory6::from_raw(raw))
     }
 }
 
+struct Factory {
+    factory: IDWriteFactory6,
+    loader: IDWriteInMemoryFontFileLoader,
+}
+
+impl Drop for Factory {
+    fn drop(&mut self) {
+        // safety: unregistering breaks the factory's hold on the loader and its font buffers
+        unsafe {
+            let _ = self.factory.UnregisterFontFileLoader(&self.loader);
+        }
+    }
+}
+
 thread_local! {
-    static FACTORY: Option<(IDWriteFactory6, IDWriteInMemoryFontFileLoader)> = unsafe {
-        create_factory().and_then(|factory| {
-            let loader = factory.CreateInMemoryFontFileLoader().ok()?;
-            factory.RegisterFontFileLoader(&loader).ok()?;
-            Some((factory, loader))
-        })
-    };
+    static FACTORY: std::cell::RefCell<Option<Option<Factory>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn with_factory<R>(use_factory: impl FnOnce(&Factory) -> Option<R>) -> Option<R> {
+    FACTORY.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let entry = slot.get_or_insert_with(|| unsafe {
+            create_factory().and_then(|factory| {
+                let loader = factory.CreateInMemoryFontFileLoader().ok()?;
+                factory.RegisterFontFileLoader(&loader).ok()?;
+                Some(Factory { factory, loader })
+            })
+        });
+        use_factory(entry.as_ref()?)
+    })
+}
+
+pub(crate) fn release_thread() {
+    let _ = FACTORY.try_with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 }
 
 // the font bytes directwrite reads in place, released when its last font file goes
@@ -95,8 +127,8 @@ unsafe extern "system" fn release_font_bytes(this: *mut c_void) -> u32 {
 }
 
 pub(crate) fn font_face(data: &Arc<[u8]>, axes: &[([u8; 4], f32)]) -> Option<IDWriteFontFace> {
-    FACTORY.with(|factory| {
-        let (factory, loader) = factory.as_ref()?;
+    with_factory(|entry| {
+        let (factory, loader) = (&entry.factory, &entry.loader);
         let owner = Box::into_raw(Box::new(FontBytes {
             vtable: &FONT_BYTES_VTABLE,
             references: AtomicU32::new(1),
@@ -160,9 +192,9 @@ pub(crate) fn glyph(
         dx: subpixel,
         dy: 0.0,
     };
-    let mask = FACTORY.with(|factory| {
+    let mask = with_factory(|entry| {
         // the original factory's analysis, which takes pixels per dip as skia calls it
-        let factory: &IDWriteFactory = &factory.as_ref()?.0;
+        let factory: &IDWriteFactory = &entry.factory;
         let analysis = unsafe {
             factory.CreateGlyphRunAnalysis(
                 &run,

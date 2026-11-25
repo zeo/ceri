@@ -636,7 +636,7 @@ fn run_app(
         .icon
         .take()
         .or_else(|| app_icon_source(launch.assets.as_ref()))
-        .map(Arc::from);
+        .map(compact_icon);
     let _ = bridge.taskbar.set(Taskbar::new(identifier));
     let _ = bridge.notifier.set(Notifier::new(
         identifier,
@@ -695,6 +695,7 @@ fn run_app(
         return std::thread::Builder::new()
             .name("ceri-engine".to_string())
             .spawn(move || {
+                let _allocator = ceri_engine::enter_engine_allocator();
                 capture(
                     &config,
                     scale,
@@ -881,6 +882,17 @@ fn build_browser(
         Some(locale) => browser.with_locale(locale),
         None => browser,
     })
+}
+
+fn compact_icon(bytes: Vec<u8>) -> Arc<[u8]> {
+    // shrink oversized source icons to the largest size tray, window, or notification icons use
+    if bytes.len() > 64 * 1024
+        && let Some(compact) = ceri_engine::icon_png(&bytes, 256)
+        && compact.len() < bytes.len()
+    {
+        return Arc::from(compact);
+    }
+    Arc::from(bytes)
 }
 
 // the bytes of the first packaged favicon that decodes, for the window, taskbar and tray icons
