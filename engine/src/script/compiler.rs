@@ -288,6 +288,77 @@ pub(super) enum Op {
     DelegateUnpack(u32),
     Await,
     DynamicImport,
+    // fused superinstructions emitted by the post-compile peephole pass
+    GetRegProp {
+        reg: u16,
+        name: u32,
+        ic: u32,
+    },
+    GetLocalProp {
+        depth: u16,
+        index: u16,
+        name: u32,
+        ic: u32,
+    },
+    GetRegMethod {
+        reg: u16,
+        name: u32,
+        ic: u32,
+    },
+    GetLocalMethod {
+        depth: u16,
+        index: u16,
+        name: u32,
+        ic: u32,
+    },
+    SetRegPop {
+        reg: u16,
+    },
+    SetLocalPop {
+        depth: u16,
+        index: u16,
+    },
+    SetPropPop {
+        name: u32,
+        ic: u32,
+    },
+    SetIndexPop,
+    UpdateRegPop {
+        reg: u16,
+        increment: bool,
+    },
+    UpdateLocalPop {
+        depth: u16,
+        index: u16,
+        increment: bool,
+    },
+    JumpIfRegFalse {
+        reg: u16,
+        target: u32,
+    },
+    JumpIfRegTrue {
+        reg: u16,
+        target: u32,
+    },
+    JumpIfNotCompare {
+        op: BinaryOperator,
+        target: u32,
+    },
+    JumpIfNotCompareRegs {
+        left: u16,
+        right: u16,
+        op: BinaryOperator,
+        target: u32,
+    },
+    BinaryRegs {
+        left: u16,
+        right: u16,
+        op: BinaryOperator,
+    },
+    GetRegIndex {
+        array: u16,
+        index: u16,
+    },
 }
 
 pub(super) const NO_TARGET: u32 = u32::MAX;
@@ -341,9 +412,11 @@ pub(super) struct Code {
     // static key lists for MakeObject literals, lazily materialized into shared Shapes
     pub(super) object_shapes: Box<[ObjectShapeEntry]>,
     // what each closure of this code starts as, when it has no prototype of its own
-    pub(super) function_template: std::cell::RefCell<Option<super::object::ObjectTemplate>>,
+    pub(super) function_template: std::cell::OnceCell<super::object::ObjectTemplate>,
     // where a run starts: past the prologue slots no arrow needed, which would only be stepped over
     pub(super) entry: usize,
+    // conservative stack slots needed above current top for one forward pass without backward jumps
+    pub(super) max_pushes: u32,
     // true when this function's own scope lives in flat stack registers instead of a heap Scope
     pub(super) uses_regs: bool,
     pub(super) registers: u16,
@@ -1546,19 +1619,6 @@ impl Compiler {
                 ops[3] = Op::InitHomeSlot(slot);
             }
         }
-        let mut ic_count = 0u32;
-        for op in &mut ops {
-            match op {
-                Op::GetProp { ic, .. } | Op::SetProp { ic, .. } => {
-                    *ic = ic_count;
-                    ic_count += 1;
-                }
-                _ => {}
-            }
-        }
-        let ics = (0..ic_count)
-            .map(|_| super::object::PropIc::default())
-            .collect();
         let object_shapes = state
             .object_shapes
             .into_iter()
@@ -1723,9 +1783,32 @@ impl Compiler {
                 }
             }
         }
+        let mut positions = state.positions;
+        fuse_ops(&mut ops, entry, &mut positions);
+        let mut ic_count = 0u32;
+        for op in &mut ops {
+            match op {
+                Op::GetProp { ic, .. }
+                | Op::GetRegProp { ic, .. }
+                | Op::GetLocalProp { ic, .. }
+                | Op::GetRegMethod { ic, .. }
+                | Op::GetLocalMethod { ic, .. }
+                | Op::SetProp { ic, .. }
+                | Op::SetPropPop { ic, .. } => {
+                    *ic = ic_count;
+                    ic_count += 1;
+                }
+                _ => {}
+            }
+        }
+        let ics = (0..ic_count)
+            .map(|_| super::object::PropIc::default())
+            .collect();
+        let max_pushes = compute_max_pushes(&ops);
         Code {
             ops,
             entry,
+            max_pushes,
             uses_regs,
             registers,
             linear_params,
@@ -1747,7 +1830,7 @@ impl Compiler {
             length,
             source: source.map(|(start, end)| (self.source.clone(), start, end)),
             text: self.source.clone(),
-            positions: state.positions.into(),
+            positions: positions.into(),
             breakpoints: Cell::new(0),
             self_scope,
             simple_params,
@@ -1755,7 +1838,7 @@ impl Compiler {
             eval_context: EvalContext::default(),
             ics,
             object_shapes,
-            function_template: std::cell::RefCell::new(None),
+            function_template: std::cell::OnceCell::new(),
         }
     }
 
@@ -4739,4 +4822,310 @@ fn walk_expression(expression: &Expr, visit: &mut dyn FnMut(&Expr)) {
     for child in children {
         walk_expression(child, visit);
     }
+}
+
+fn is_fusable_compare(op: BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Less
+            | BinaryOperator::LessEqual
+            | BinaryOperator::Greater
+            | BinaryOperator::GreaterEqual
+            | BinaryOperator::StrictEqual
+            | BinaryOperator::StrictNotEqual
+            | BinaryOperator::Equal
+            | BinaryOperator::NotEqual
+    )
+}
+
+fn mark_op_targets(op: Op, barrier: &mut [bool]) {
+    let mut mark = |target: u32| {
+        if target != NO_TARGET && (target as usize) < barrier.len() {
+            barrier[target as usize] = true;
+        }
+    };
+    match op {
+        Op::Jump(t)
+        | Op::JumpIfFalse(t)
+        | Op::JumpIfTrue(t)
+        | Op::JumpIfFalseKeep(t)
+        | Op::JumpIfTrueKeep(t)
+        | Op::JumpIfNotNullishKeep(t)
+        | Op::JumpIfNotUndefined(t)
+        | Op::JumpIfNullishChain(t)
+        | Op::IterStep(t)
+        | Op::IterResultUnpack(t)
+        | Op::ForInNext(t)
+        | Op::DelegateStep(t)
+        | Op::DelegateUnpack(t)
+        | Op::Exit { target: t, .. }
+        | Op::JumpIfRegFalse { target: t, .. }
+        | Op::JumpIfRegTrue { target: t, .. }
+        | Op::JumpIfNotCompare { target: t, .. }
+        | Op::JumpIfNotCompareRegs { target: t, .. } => mark(t),
+        Op::PushHandler { catch, finally } => {
+            mark(catch);
+            mark(finally);
+        }
+        _ => {}
+    }
+}
+
+fn remap_op_targets(op: &mut Op, remap: &[u32]) {
+    let fix = |target: &mut u32| {
+        if *target != NO_TARGET {
+            *target = remap[*target as usize];
+        }
+    };
+    match op {
+        Op::Jump(t)
+        | Op::JumpIfFalse(t)
+        | Op::JumpIfTrue(t)
+        | Op::JumpIfFalseKeep(t)
+        | Op::JumpIfTrueKeep(t)
+        | Op::JumpIfNotNullishKeep(t)
+        | Op::JumpIfNotUndefined(t)
+        | Op::JumpIfNullishChain(t)
+        | Op::IterStep(t)
+        | Op::IterResultUnpack(t)
+        | Op::ForInNext(t)
+        | Op::DelegateStep(t)
+        | Op::DelegateUnpack(t)
+        | Op::Exit { target: t, .. }
+        | Op::JumpIfRegFalse { target: t, .. }
+        | Op::JumpIfRegTrue { target: t, .. }
+        | Op::JumpIfNotCompare { target: t, .. }
+        | Op::JumpIfNotCompareRegs { target: t, .. } => fix(t),
+        Op::PushHandler { catch, finally } => {
+            fix(catch);
+            fix(finally);
+        }
+        _ => {}
+    }
+}
+
+// fuses common straight-line instruction pairs/triples without crossing jump or breakpoint targets
+fn fuse_ops(ops: &mut Vec<Op>, entry: usize, positions: &mut [(u32, u32)]) {
+    let len = ops.len();
+    if len <= entry + 1 {
+        return;
+    }
+    let mut barrier = vec![false; len + 1];
+    barrier[0] = true;
+    barrier[entry.min(len)] = true;
+    barrier[len] = true;
+    for &(pc, _) in positions.iter() {
+        if (pc as usize) < len {
+            barrier[pc as usize] = true;
+        }
+    }
+    for &op in ops.iter() {
+        mark_op_targets(op, &mut barrier);
+    }
+
+    let mut out = Vec::with_capacity(len);
+    let mut remap = vec![0u32; len + 1];
+    let mut i = 0;
+    while i < entry && i < len {
+        remap[i] = out.len() as u32;
+        out.push(ops[i]);
+        i += 1;
+    }
+    while i < len {
+        remap[i] = out.len() as u32;
+        let can2 = i + 2 <= len && !barrier[i + 1];
+        let can3 = can2 && i + 3 <= len && !barrier[i + 2];
+        let can4 = can3 && i + 4 <= len && !barrier[i + 3];
+
+        // 4-op fusion: GetReg + GetReg + Binary(cmp) + JumpIfFalse
+        if can4
+            && let (
+                Op::GetReg { reg: left, .. },
+                Op::GetReg { reg: right, .. },
+                Op::Binary(op),
+                Op::JumpIfFalse(target),
+            ) = (ops[i], ops[i + 1], ops[i + 2], ops[i + 3])
+            && is_fusable_compare(op)
+        {
+            out.push(Op::JumpIfNotCompareRegs {
+                left,
+                right,
+                op,
+                target,
+            });
+            remap[i + 1] = out.len() as u32;
+            remap[i + 2] = out.len() as u32;
+            remap[i + 3] = out.len() as u32;
+            i += 4;
+            continue;
+        }
+
+        // 3-op fusions
+        if can3 {
+            let fused3 = match (ops[i], ops[i + 1], ops[i + 2]) {
+                (Op::GetReg { reg, .. }, Op::Dup, Op::GetProp { name, ic }) => {
+                    Some(Op::GetRegMethod { reg, name, ic })
+                }
+                (Op::GetLocal { depth, index, .. }, Op::Dup, Op::GetProp { name, ic }) => {
+                    Some(Op::GetLocalMethod {
+                        depth,
+                        index,
+                        name,
+                        ic,
+                    })
+                }
+                (Op::GetReg { reg: left, .. }, Op::GetReg { reg: right, .. }, Op::Binary(op)) => {
+                    Some(Op::BinaryRegs { left, right, op })
+                }
+                (Op::GetReg { reg: array, .. }, Op::GetReg { reg: index, .. }, Op::GetIndex) => {
+                    Some(Op::GetRegIndex { array, index })
+                }
+                _ => None,
+            };
+            if let Some(fused) = fused3 {
+                out.push(fused);
+                remap[i + 1] = out.len() as u32;
+                remap[i + 2] = out.len() as u32;
+                i += 3;
+                continue;
+            }
+        }
+
+        // 2-op fusions
+        if can2 {
+            let fused2 = match (ops[i], ops[i + 1]) {
+                (Op::GetReg { reg, .. }, Op::GetProp { name, ic }) => {
+                    Some(Op::GetRegProp { reg, name, ic })
+                }
+                (Op::GetLocal { depth, index, .. }, Op::GetProp { name, ic }) => {
+                    Some(Op::GetLocalProp {
+                        depth,
+                        index,
+                        name,
+                        ic,
+                    })
+                }
+                (Op::SetReg { reg, .. }, Op::Pop) => Some(Op::SetRegPop { reg }),
+                (Op::SetLocal { depth, index, .. }, Op::Pop) => {
+                    Some(Op::SetLocalPop { depth, index })
+                }
+                (Op::SetProp { name, ic }, Op::Pop) => Some(Op::SetPropPop { name, ic }),
+                (Op::SetIndex, Op::Pop) => Some(Op::SetIndexPop),
+                (Op::UpdateReg { reg, increment, .. }, Op::Pop) => {
+                    Some(Op::UpdateRegPop { reg, increment })
+                }
+                (
+                    Op::UpdateLocal {
+                        depth,
+                        index,
+                        increment,
+                        ..
+                    },
+                    Op::Pop,
+                ) => Some(Op::UpdateLocalPop {
+                    depth,
+                    index,
+                    increment,
+                }),
+                (Op::GetReg { reg, .. }, Op::JumpIfFalse(target)) => {
+                    Some(Op::JumpIfRegFalse { reg, target })
+                }
+                (Op::GetReg { reg, .. }, Op::JumpIfTrue(target)) => {
+                    Some(Op::JumpIfRegTrue { reg, target })
+                }
+                (Op::Binary(op), Op::JumpIfFalse(target)) if is_fusable_compare(op) => {
+                    Some(Op::JumpIfNotCompare { op, target })
+                }
+                _ => None,
+            };
+            if let Some(fused) = fused2 {
+                out.push(fused);
+                remap[i + 1] = out.len() as u32;
+                i += 2;
+                continue;
+            }
+        }
+
+        out.push(ops[i]);
+        i += 1;
+    }
+    remap[len] = out.len() as u32;
+
+    if out.len() == len {
+        return;
+    }
+    for op in &mut out {
+        remap_op_targets(op, &remap);
+    }
+    for (pc, _) in positions.iter_mut() {
+        *pc = remap[*pc as usize];
+    }
+    *ops = out;
+}
+
+fn op_max_push(op: Op) -> u32 {
+    match op {
+        Op::Dup3 | Op::GetRegMethod { .. } | Op::GetLocalMethod { .. } => 3,
+        Op::Dup2
+        | Op::CalleeName { .. }
+        | Op::Class { .. }
+        | Op::WithHas(_)
+        | Op::GetRegProp { .. }
+        | Op::GetLocalProp { .. } => 2,
+        Op::Undefined
+        | Op::Null
+        | Op::True
+        | Op::False
+        | Op::Number(_)
+        | Op::BigInt(_)
+        | Op::String(_)
+        | Op::Regex { .. }
+        | Op::TemplateObject(_)
+        | Op::Dup
+        | Op::Home
+        | Op::GetLocal { .. }
+        | Op::UpdateLocal { .. }
+        | Op::GetReg { .. }
+        | Op::UpdateReg { .. }
+        | Op::GetGlobal(_)
+        | Op::GetName { .. }
+        | Op::TypeofName { .. }
+        | Op::DeleteName { .. }
+        | Op::TypeofGlobal(_)
+        | Op::DeleteGlobal(_)
+        | Op::This
+        | Op::GlobalThis
+        | Op::NewTarget
+        | Op::ImportMeta
+        | Op::NewObject
+        | Op::NewArray
+        | Op::MakeArray(0)
+        | Op::GetProp { .. }
+        | Op::GetRegIndex { .. }
+        | Op::BinaryRegs { .. }
+        | Op::Closure(_)
+        | Op::NewPrivateName(_)
+        | Op::IterValue
+        | Op::IterRest
+        | Op::IterStep(_)
+        | Op::AsyncIterNext
+        | Op::ForInNext(_)
+        | Op::GetSuper(_)
+        | Op::GetSuperIndex
+        | Op::DelegateCall
+        | Op::DelegateUnpack(_)
+        | Op::DelegateStep(_)
+        | Op::Yield
+        | Op::YieldDelegating
+        | Op::Await => 1,
+        _ => 0,
+    }
+}
+
+fn compute_max_pushes(ops: &[Op]) -> u32 {
+    let mut total = 16u32;
+    for &op in ops {
+        total = total.saturating_add(op_max_push(op));
+    }
+    total
 }

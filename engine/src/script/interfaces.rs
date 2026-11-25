@@ -1319,7 +1319,11 @@ impl ScriptRuntime {
             }
             Access::Call => {
                 let method = self.member(target.clone(), member.name())?;
-                self.call_function(method, target, arguments)
+                if let Value::Builtin(builtin) = method {
+                    self.call_builtin(builtin, arguments)
+                } else {
+                    self.call_function(method, target, arguments)
+                }
             }
         }
     }

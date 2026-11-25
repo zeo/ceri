@@ -516,90 +516,126 @@ impl ScriptRuntime {
             }
             M::Split => {
                 let data = self.regexp_data(&this, method)?;
-                let text = self.coerce_string(argument(&arguments, 0))?;
-                let subject = units(&text);
+                let text = match argument(&arguments, 0) {
+                    Value::String(text) => text,
+                    other => self.coerce_string(other)?.into(),
+                };
                 let limit = match argument(&arguments, 1) {
                     Value::Undefined => u32::MAX as usize,
                     limit => self.coerce_uint32(limit)? as usize,
                 };
-                let mut parts = Vec::new();
-                if limit == 0 {
-                    return Ok(Self::new_array(parts));
-                }
-                let unicode = data.regex.flags.unicode || data.regex.flags.unicode_sets;
-                if subject.is_empty() {
-                    let found = data
-                        .regex
-                        .find(&subject, 0, true)
-                        .map_err(|message| self.range_error(message))?;
-                    if found.is_none() {
-                        parts.push(Value::String(text.into()));
+                self.regexp_split_str(&data, &text, limit)
+            }
+        }
+    }
+
+    pub(super) fn regexp_split_str(
+        &mut self,
+        data: &RegExpData,
+        text: &JsStr,
+        limit: usize,
+    ) -> Result<Value, ScriptError> {
+        let mut parts = Vec::new();
+        if limit == 0 {
+            return Ok(Self::new_array(parts));
+        }
+        // fast ASCII byte scan for single-character and character-class split patterns
+        if let Some(ascii) = data.regex.ascii_units()
+            && text.is_ascii()
+        {
+            if text.is_empty() {
+                parts.push(Value::String(text.clone()));
+                return Ok(Self::new_array(parts));
+            }
+            let bytes = text.as_bytes();
+            let mut previous = 0;
+            for (position, &byte) in bytes.iter().enumerate() {
+                if (ascii >> byte) & 1 == 1 {
+                    parts.push(Value::String(JsStr::new(&text[previous..position])));
+                    if parts.len() == limit {
+                        return Ok(Self::new_array(parts));
                     }
-                    return Ok(Self::new_array(parts));
+                    previous = position + 1;
                 }
-                // a pattern of one character or class splits at each unit it matches, with no
-                // match run for each position
-                if let Some(ascii) = data.regex.ascii_units() {
-                    let mut previous = 0;
-                    for (position, &unit) in subject.iter().enumerate() {
-                        let found = match unit < 128 {
-                            true => ascii >> unit & 1 == 1,
-                            false => data.regex.unit_match(unit) == Some(true),
-                        };
-                        if found {
-                            parts.push(Value::String(
-                                from_units(&subject[previous..position]).into(),
-                            ));
-                            if parts.len() == limit {
-                                return Ok(Self::new_array(parts));
-                            }
-                            previous = position + 1;
-                        }
-                    }
-                    parts.push(Value::String(from_units(&subject[previous..]).into()));
-                    return Ok(Self::new_array(parts));
-                }
-                let mut previous = 0;
-                let mut position = 0;
-                while position < subject.len() {
-                    let found = data
-                        .regex
-                        .find(&subject, position, true)
-                        .map_err(|message| self.range_error(message))?;
-                    let Some(found) = found else {
-                        position = advance(&subject, position, unicode);
-                        continue;
-                    };
-                    let end = found.captures[0]
-                        .map_or(position, |(_, end)| end)
-                        .min(subject.len());
-                    if end == previous {
-                        position = advance(&subject, position, unicode);
-                        continue;
-                    }
+            }
+            if previous == 0 {
+                parts.push(Value::String(text.clone()));
+            } else {
+                parts.push(Value::String(JsStr::new(&text[previous..])));
+            }
+            return Ok(Self::new_array(parts));
+        }
+        let subject = units(text);
+        let unicode = data.regex.flags.unicode || data.regex.flags.unicode_sets;
+        if subject.is_empty() {
+            let found = data
+                .regex
+                .find(&subject, 0, true)
+                .map_err(|message| self.range_error(message))?;
+            if found.is_none() {
+                parts.push(Value::String(text.clone()));
+            }
+            return Ok(Self::new_array(parts));
+        }
+        // a pattern of one character or class splits at each unit it matches, with no
+        // match run for each position
+        if let Some(ascii) = data.regex.ascii_units() {
+            let mut previous = 0;
+            for (position, &unit) in subject.iter().enumerate() {
+                let found = match unit < 128 {
+                    true => ascii >> unit & 1 == 1,
+                    false => data.regex.unit_match(unit) == Some(true),
+                };
+                if found {
                     parts.push(Value::String(
                         from_units(&subject[previous..position]).into(),
                     ));
                     if parts.len() == limit {
                         return Ok(Self::new_array(parts));
                     }
-                    for capture in &found.captures[1..] {
-                        parts.push(match capture {
-                            Some((start, end)) => {
-                                Value::String(from_units(&subject[*start..*end]).into())
-                            }
-                            None => Value::Undefined,
-                        });
-                        if parts.len() == limit {
-                            return Ok(Self::new_array(parts));
-                        }
-                    }
-                    previous = end;
-                    position = end;
+                    previous = position + 1;
                 }
-                parts.push(Value::String(from_units(&subject[previous..]).into()));
-                Ok(Self::new_array(parts))
             }
+            parts.push(Value::String(from_units(&subject[previous..]).into()));
+            return Ok(Self::new_array(parts));
         }
+        let mut previous = 0;
+        let mut position = 0;
+        while position < subject.len() {
+            let found = data
+                .regex
+                .find(&subject, position, true)
+                .map_err(|message| self.range_error(message))?;
+            let Some(found) = found else {
+                position = advance(&subject, position, unicode);
+                continue;
+            };
+            let end = found.captures[0]
+                .map_or(position, |(_, end)| end)
+                .min(subject.len());
+            if end == previous {
+                position = advance(&subject, position, unicode);
+                continue;
+            }
+            parts.push(Value::String(
+                from_units(&subject[previous..position]).into(),
+            ));
+            if parts.len() == limit {
+                return Ok(Self::new_array(parts));
+            }
+            for capture in &found.captures[1..] {
+                parts.push(match capture {
+                    Some((start, end)) => Value::String(from_units(&subject[*start..*end]).into()),
+                    None => Value::Undefined,
+                });
+                if parts.len() == limit {
+                    return Ok(Self::new_array(parts));
+                }
+            }
+            previous = end;
+            position = end;
+        }
+        parts.push(Value::String(from_units(&subject[previous..]).into()));
+        Ok(Self::new_array(parts))
     }
 }

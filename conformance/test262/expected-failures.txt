@@ -1770,9 +1770,6 @@ test/built-ins/String/prototype/matchAll/regexp-matchAll-not-callable.js
 test/built-ins/String/prototype/matchAll/regexp-prototype-matchAll-v-u-flag.js
 test/built-ins/String/prototype/replace/S15.5.4.11_A1_T1.js
 test/built-ins/String/prototype/replace/regexp-prototype-replace-v-u-flag.js
-test/built-ins/String/prototype/replace/replaceValue-evaluation-order-regexp-object.js
-test/built-ins/String/prototype/replace/replaceValue-evaluation-order.js
-test/built-ins/String/prototype/replaceAll/replaceValue-value-tostring.js
 test/built-ins/String/prototype/replaceAll/searchValue-flags-null-undefined-throws.js
 test/built-ins/String/prototype/replaceAll/searchValue-flags-toString-abrupt.js
 test/built-ins/String/prototype/replaceAll/searchValue-get-flags-abrupt.js

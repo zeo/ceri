@@ -454,11 +454,118 @@ impl Frame {
 
 #[inline(always)]
 fn truncate_stack(stack: &mut Vec<Value>, new_len: usize) {
-    while stack.len() > new_len {
-        if let Some(value) = stack.pop() {
-            value.fast_drop();
+    let len = stack.len();
+    if len <= new_len {
+        return;
+    }
+    let ptr = stack.as_mut_ptr();
+    // safety: shrinking len before dropping prevents double-drop on unwind; new_len..len are live
+    unsafe {
+        stack.set_len(new_len);
+        for index in new_len..len {
+            let slot = ptr.add(index);
+            if !(*slot).is_copy() {
+                drop_value_slow(std::ptr::read(slot));
+            }
         }
     }
+}
+
+#[inline(always)]
+fn reserve_headroom(stack: &mut Vec<Value>, need: usize) {
+    if stack.capacity() - stack.len() < need {
+        reserve_headroom_cold(stack, need);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn reserve_headroom_cold(stack: &mut Vec<Value>, need: usize) {
+    stack.reserve(need);
+}
+
+#[inline(always)]
+unsafe fn push_unchecked(stack: &mut Vec<Value>, value: Value) {
+    let len = stack.len();
+    debug_assert!(len < stack.capacity());
+    unsafe {
+        stack.as_mut_ptr().add(len).write(value);
+        stack.set_len(len + 1);
+    }
+}
+
+#[inline(always)]
+fn pop_fast(stack: &mut Vec<Value>) -> Value {
+    let len = stack.len();
+    if len == 0 {
+        return Value::Undefined;
+    }
+    let next = len - 1;
+    // safety: next < len so slot is initialized and uniquely owned once len shrinks
+    unsafe {
+        stack.set_len(next);
+        std::ptr::read(stack.as_ptr().add(next))
+    }
+}
+
+#[inline(always)]
+fn fast_compare(op: super::ast::BinaryOperator, left: &Value, right: &Value) -> Option<bool> {
+    use super::ast::BinaryOperator as B;
+    match (left, right) {
+        (Value::Number(l), Value::Number(r)) => Some(match op {
+            B::Less => l < r,
+            B::LessEqual => l <= r,
+            B::Greater => l > r,
+            B::GreaterEqual => l >= r,
+            B::StrictEqual | B::Equal => l == r,
+            B::StrictNotEqual | B::NotEqual => l != r,
+            _ => return None,
+        }),
+        _ => match op {
+            B::StrictEqual => Some(values_equal(left, right)),
+            B::StrictNotEqual => Some(!values_equal(left, right)),
+            B::Equal | B::NotEqual => {
+                let eq = match (left, right) {
+                    (Value::Undefined | Value::Null, Value::Undefined | Value::Null) => true,
+                    (Value::Undefined | Value::Null, _) | (_, Value::Undefined | Value::Null) => {
+                        false
+                    }
+                    (Value::String(l), Value::String(r)) => l == r,
+                    (Value::Bool(l), Value::Bool(r)) => l == r,
+                    (Value::Object(l), Value::Object(r)) => ObjectHandle::ptr_eq(l, r),
+                    (Value::Array(l), Value::Array(r)) => super::heap::ArrayHandle::ptr_eq(l, r),
+                    (Value::Element(l), Value::Element(r)) => Rc::ptr_eq(l, r),
+                    _ => return None,
+                };
+                Some(if matches!(op, B::Equal) { eq } else { !eq })
+            }
+            B::Less | B::LessEqual | B::Greater | B::GreaterEqual => {
+                if let (Value::String(l), Value::String(r)) = (left, right)
+                    && l.is_ascii()
+                    && r.is_ascii()
+                {
+                    let ls: &str = l;
+                    let rs: &str = r;
+                    return Some(match op {
+                        B::Less => ls < rs,
+                        B::LessEqual => ls <= rs,
+                        B::Greater => ls > rs,
+                        _ => ls >= rs,
+                    });
+                }
+                None
+            }
+            _ => None,
+        },
+    }
+}
+
+enum FastNativeCall {
+    NotHandled,
+    Done,
+    FramePushed,
+    // Function.prototype.call rewrote vm_stack to a CallMethod(new_count) for fallback
+    FallbackMethod(usize),
 }
 
 pub(super) enum RunResult {
@@ -594,7 +701,7 @@ impl ScriptRuntime {
         );
         let own_prototype = code.is_generator || (constructible && !code.is_async);
         // the closures of one arrow or method share their length and name until one changes
-        if !own_prototype && let Some(template) = code.function_template.borrow().as_ref() {
+        if !own_prototype && let Some(template) = code.function_template.get() {
             return Value::Object(new_object(JsObject::from_template(
                 template,
                 Some(prototype),
@@ -622,8 +729,8 @@ impl ScriptRuntime {
                 configurable: true,
             },
         );
-        if !own_prototype {
-            *code.function_template.borrow_mut() = object.template();
+        if !own_prototype && let Some(template) = object.template() {
+            let _ = code.function_template.set(template);
         }
         let handle = new_object(object);
         if code.is_generator {
@@ -686,6 +793,138 @@ impl ScriptRuntime {
         }
     }
 
+    // checks whether callee is an ordinary JS closure eligible for direct stack-frame entry
+    pub(super) fn simple_closure(callee: &Value) -> Option<Rc<Closure>> {
+        let Value::Object(object) = callee else {
+            return None;
+        };
+        let borrowed = object.try_borrow().ok()?;
+        let ObjectClass::Function(closure) = &borrowed.class else {
+            return None;
+        };
+        let code = &closure.code;
+        if code.simple_params
+            && !code.reads_arguments
+            && code.self_scope.is_none()
+            && !code.is_generator
+            && !code.is_async
+            && !matches!(
+                code.kind,
+                FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor
+            )
+            && (!code.uses_regs || code.linear_params)
+        {
+            Some(closure.clone())
+        } else {
+            None
+        }
+    }
+
+    // runs a pre-checked JS closure directly on vm_stack without allocating Vec<Value> or FrameExtra
+    pub(super) fn call_simple_closure(
+        &mut self,
+        closure: &Rc<Closure>,
+        callee: &Value,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, ScriptError> {
+        let _heap = super::heap::enter(self.heap_id);
+        let marker = 0u8;
+        let here = std::hint::black_box(&marker) as *const u8 as usize;
+        if self.nested_runs == 0 {
+            self.stack_base = here;
+        } else if self.nested_runs >= MAX_NESTED_RUNS
+            || self.stack_base.saturating_sub(here) > NATIVE_STACK_BUDGET
+        {
+            return Err(self.range_error("Maximum call stack size exceeded"));
+        }
+        if self.frames.len() >= MAX_FRAMES {
+            return Err(self.range_error("Maximum call stack size exceeded"));
+        }
+        let code = &closure.code;
+        let this = if code.strict || code.kind == FunctionKind::Arrow {
+            this
+        } else if matches!(this, Value::Undefined | Value::Null) {
+            Value::Window
+        } else {
+            this
+        };
+        self.nested_runs += 1;
+        let mirror_base = self.debugger.mirror.len();
+        let frame_floor = self.frames.len();
+        let stack_floor = self.vm_stack.len();
+        if code.uses_regs {
+            let reg_count = code.registers as usize;
+            let param_count = code.param_slots.len();
+            reserve_headroom(&mut self.vm_stack, 1 + reg_count + code.max_pushes as usize);
+            self.vm_stack.push(callee.clone());
+            let arg_start = self.vm_stack.len();
+            let keep = args.len().min(param_count);
+            for value in &args[..keep] {
+                self.vm_stack.push(value.clone());
+            }
+            if keep < reg_count {
+                self.vm_stack
+                    .resize(arg_start + reg_count, Value::Undefined);
+            }
+            self.frames.push(Frame {
+                code: code.clone(),
+                closure: Some(closure.clone()),
+                pc: code.entry,
+                reg_base: arg_start,
+                stack_base: arg_start + reg_count,
+                return_base: stack_floor,
+                scope: closure.scope.clone(),
+                this,
+                function: Value::Undefined,
+                scopes: 0,
+                flags: FLAG_USES_REGS | FLAG_CALLEE_ON_STACK,
+                extra: None,
+            });
+        } else {
+            let mut slots = vec![Value::Undefined; code.layout.names.len()];
+            for (position, slot) in code.param_slots.iter().enumerate() {
+                if let Some(slot) = slot {
+                    slots[*slot as usize] = args.get(position).cloned().unwrap_or(Value::Undefined);
+                }
+            }
+            let scope = Scope::new_with_slots(code.layout.clone(), closure.scope.clone(), slots);
+            reserve_headroom(&mut self.vm_stack, 1 + code.max_pushes as usize);
+            self.vm_stack.push(callee.clone());
+            let arg_start = self.vm_stack.len();
+            self.frames.push(Frame {
+                code: code.clone(),
+                closure: Some(closure.clone()),
+                pc: code.entry,
+                reg_base: arg_start,
+                stack_base: arg_start,
+                return_base: stack_floor,
+                scope: Some(scope),
+                this,
+                function: Value::Undefined,
+                scopes: 0,
+                flags: FLAG_OWNS_SCOPE | FLAG_CALLEE_ON_STACK,
+                extra: None,
+            });
+        }
+        let result = self.run_frames(frame_floor);
+        if result.is_err() {
+            self.frames.truncate(frame_floor);
+            truncate_stack(&mut self.vm_stack, stack_floor);
+        }
+        debug_assert_eq!(self.frames.len(), frame_floor);
+        debug_assert_eq!(self.vm_stack.len(), stack_floor);
+        self.debugger.mirror.truncate(mirror_base);
+        self.nested_runs -= 1;
+        if self.nested_runs == 0 {
+            self.debug_task_ended();
+        }
+        match result? {
+            RunResult::Return(value) => Ok(value),
+            _ => Err(runtime_error("a plain call cannot suspend")),
+        }
+    }
+
     pub(super) fn construct(
         &mut self,
         callee: Value,
@@ -726,9 +965,22 @@ impl ScriptRuntime {
     ) -> Result<Prepared, ScriptError> {
         let callee = callee.resolve();
         if let Value::Object(object) = &callee {
-            let class = object.borrow().class.clone();
-            match class {
-                ObjectClass::Function(closure) => {
+            enum CallKind {
+                Function(Rc<Closure>),
+                Bound(Box<super::object::BoundFunction>),
+                Native(Rc<Native>),
+                Proxy(Rc<super::reflect::ProxyData>),
+                NotCallable,
+            }
+            let kind = match &object.borrow().class {
+                ObjectClass::Function(closure) => CallKind::Function(closure.clone()),
+                ObjectClass::Bound(bound) => CallKind::Bound(bound.clone()),
+                ObjectClass::Native(native) => CallKind::Native(native.clone()),
+                ObjectClass::Proxy(proxy) => CallKind::Proxy(proxy.clone()),
+                _ => CallKind::NotCallable,
+            };
+            match kind {
+                CallKind::Function(closure) => {
                     if matches!(
                         closure.code.kind,
                         FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor
@@ -779,7 +1031,7 @@ impl ScriptRuntime {
                     );
                     return Ok(Prepared::Frame(frame));
                 }
-                ObjectClass::Bound(bound) => {
+                CallKind::Bound(bound) => {
                     let super::object::BoundFunction {
                         target,
                         this,
@@ -789,7 +1041,7 @@ impl ScriptRuntime {
                     all.extend(arguments);
                     return self.prepare_call(target, this, all, None);
                 }
-                ObjectClass::Native(native) => match native.as_ref() {
+                CallKind::Native(native) => match native.as_ref() {
                     // keep Function.prototype.call and apply on the bytecode frame stack so
                     // they avoid Rust stack recursion and preserve safepoint GC eligibility
                     Native::FunctionCall => {
@@ -852,15 +1104,11 @@ impl ScriptRuntime {
                             } => self.prepare_call(callee, this, arguments, None),
                         };
                     }
-                    _ => {
-                        return Ok(Prepared::Done(self.call_native(
-                            Rc::unwrap_or_clone(native),
-                            this,
-                            arguments,
-                        )?));
+                    other => {
+                        return Ok(Prepared::Done(self.call_native(other, this, arguments)?));
                     }
                 },
-                ObjectClass::Proxy(proxy) => {
+                CallKind::Proxy(proxy) => {
                     if !proxy.callable {
                         return Err(self.type_error("value is not a function"));
                     }
@@ -875,7 +1123,7 @@ impl ScriptRuntime {
                         None => self.prepare_call(target, this, arguments, None),
                     };
                 }
-                _ => {
+                CallKind::NotCallable => {
                     return Err(self.type_error("value is not a function"));
                 }
             }
@@ -1175,9 +1423,7 @@ impl ScriptRuntime {
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
         match callee {
-            Value::Builtin(Builtin::Native(native)) => {
-                self.call_native(Rc::unwrap_or_clone(native), this, arguments)
-            }
+            Value::Builtin(Builtin::Native(native)) => self.call_native(&native, this, arguments),
             Value::Builtin(builtin) => self.call_builtin(builtin, arguments),
             other if is_callable(&other) => self.call_host_constructor(other, arguments),
             other => Err(self.type_error(format!("{} is not a function", other.string_value()))),
@@ -1552,6 +1798,17 @@ impl ScriptRuntime {
         index: u16,
         name: u32,
     ) -> Result<Value, ScriptError> {
+        let key = self.frames[top].code.names[name as usize].clone();
+        self.read_local_named(top, depth, index, &key)
+    }
+
+    fn read_local_named(
+        &mut self,
+        top: usize,
+        depth: u16,
+        index: u16,
+        name: &str,
+    ) -> Result<Value, ScriptError> {
         let value = Self::with_scope_at(&self.frames[top], depth, |scope| {
             match &scope.slots[index as usize] {
                 Value::Binding(cell) | Value::ConstBinding(cell) => cell.borrow().clone(),
@@ -1559,10 +1816,20 @@ impl ScriptRuntime {
             }
         });
         if matches!(value, Value::Uninitialized) {
-            let name = self.frames[top].code.names[name as usize].clone();
             return Err(self.reference_error(format!("cannot access {name} before initialization")));
         }
         Ok(value)
+    }
+
+    fn local_layout_name(&self, top: usize, depth: u16, index: u16) -> Name {
+        Self::with_scope_at(&self.frames[top], depth, |scope| {
+            scope
+                .layout
+                .names
+                .get(index as usize)
+                .cloned()
+                .unwrap_or_else(|| "".into())
+        })
     }
 
     fn write_local(
@@ -1573,6 +1840,18 @@ impl ScriptRuntime {
         name: u32,
         value: Value,
     ) -> Result<(), ScriptError> {
+        let key = self.frames[top].code.names[name as usize].clone();
+        self.write_local_named(top, depth, index, &key, value)
+    }
+
+    fn write_local_named(
+        &mut self,
+        top: usize,
+        depth: u16,
+        index: u16,
+        name: &str,
+        value: Value,
+    ) -> Result<(), ScriptError> {
         let scope_ref = Self::scope_at(&self.frames[top], depth);
         let mut scope = scope_ref.borrow_mut();
         match &mut scope.slots[index as usize] {
@@ -1581,12 +1860,10 @@ impl ScriptRuntime {
             }
             Value::ConstBinding(_) => {
                 drop(scope);
-                let name = self.frames[top].code.names[name as usize].clone();
                 return Err(self.type_error(format!("Assignment to constant variable '{name}'")));
             }
             Value::Binding(_) | Value::Uninitialized => {
                 drop(scope);
-                let name = self.frames[top].code.names[name as usize].clone();
                 return Err(
                     self.reference_error(format!("cannot access {name} before initialization"))
                 );
@@ -1759,7 +2036,7 @@ impl ScriptRuntime {
     // the ordinary call, done in place on the shared stack: register-only functions reuse
     // their caller's argument slots as registers with zero scope or frame allocation; false
     // leaves the stack unchanged for the general call path
-    fn call_plain(&mut self, count: usize, method: bool) -> bool {
+    fn call_plain(&mut self, heap: &super::heap::Heap, count: usize, method: bool) -> bool {
         if self.frames.len() >= MAX_FRAMES {
             return false;
         }
@@ -1774,16 +2051,23 @@ impl ScriptRuntime {
             return false;
         };
         let closure = {
-            let Value::Object(object) = &self.vm_stack[callee_at] else {
+            let Value::Object(object) = (unsafe { self.vm_stack.get_unchecked(callee_at) }) else {
                 return false;
             };
-            let Ok(object) = object.try_borrow() else {
-                return false;
-            };
-            let ObjectClass::Function(closure) = &object.class else {
-                return false;
-            };
-            closure.clone()
+            if let Some(borrowed) = unsafe { heap.object_ref(object) } {
+                let ObjectClass::Function(closure) = &borrowed.class else {
+                    return false;
+                };
+                closure.clone()
+            } else {
+                let Ok(borrowed) = object.try_borrow() else {
+                    return false;
+                };
+                let ObjectClass::Function(closure) = &borrowed.class else {
+                    return false;
+                };
+                closure.clone()
+            }
         };
         let code = closure.code.clone();
         if !code.simple_params
@@ -1799,7 +2083,10 @@ impl ScriptRuntime {
             return false;
         }
         let this = if method {
-            std::mem::replace(&mut self.vm_stack[return_base], Value::Undefined)
+            std::mem::replace(
+                unsafe { self.vm_stack.get_unchecked_mut(return_base) },
+                Value::Undefined,
+            )
         } else {
             Value::Undefined
         };
@@ -1818,6 +2105,8 @@ impl ScriptRuntime {
                 if count > keep {
                     truncate_stack(&mut self.vm_stack, arg_start + keep);
                 }
+                let grow = reg_count.saturating_sub(keep);
+                reserve_headroom(&mut self.vm_stack, grow + code.max_pushes as usize);
                 if keep < reg_count {
                     self.vm_stack
                         .resize(arg_start + reg_count, Value::Undefined);
@@ -1825,6 +2114,7 @@ impl ScriptRuntime {
             } else {
                 // duplicate parameter names in sloppy mode: last occurrence wins
                 let mut args = self.vm_stack.split_off(arg_start);
+                reserve_headroom(&mut self.vm_stack, reg_count + code.max_pushes as usize);
                 self.vm_stack
                     .resize(arg_start + reg_count, Value::Undefined);
                 for (position, slot) in code.param_slots.iter().enumerate() {
@@ -1854,25 +2144,29 @@ impl ScriptRuntime {
             });
             return true;
         }
-        let scope = self.new_scope(code.layout.clone(), closure.scope.clone());
-        {
-            let mut slots = scope.borrow_mut();
-            // every parameter is written, the ones past the arguments as undefined, so the
-            // last of two parameters with one name decides its value
-            for (position, slot) in code.param_slots.iter().enumerate() {
-                if let Some(slot) = slot {
-                    slots.slots[*slot as usize] = if position < count {
-                        std::mem::replace(
-                            &mut self.vm_stack[arg_start + position],
-                            Value::Undefined,
-                        )
-                    } else {
-                        Value::Undefined
-                    };
-                }
+        let mut slots = vec![Value::Undefined; code.layout.names.len()];
+        // every parameter is written, the ones past the arguments as undefined, so the
+        // last of two parameters with one name decides its value
+        for (position, slot) in code.param_slots.iter().enumerate() {
+            if let Some(slot) = slot {
+                slots[*slot as usize] = if position < count {
+                    std::mem::replace(
+                        unsafe { self.vm_stack.get_unchecked_mut(arg_start + position) },
+                        Value::Undefined,
+                    )
+                } else {
+                    Value::Undefined
+                };
             }
         }
+        let scope = heap.alloc_scope_fast(Scope {
+            slots,
+            parent: closure.scope.clone(),
+            layout: code.layout.clone(),
+            extra: Grown::default(),
+        });
         truncate_stack(&mut self.vm_stack, arg_start);
+        reserve_headroom(&mut self.vm_stack, code.max_pushes as usize);
         let pc = code.entry;
         self.frames.push(Frame {
             code,
@@ -1889,6 +2183,284 @@ impl ScriptRuntime {
             extra: None,
         });
         true
+    }
+
+    // zero-allocation fast paths for the hottest native calls directly from vm_stack
+    fn call_fast_native(
+        &mut self,
+        heap: &super::heap::Heap,
+        count: usize,
+        method: bool,
+    ) -> Result<FastNativeCall, ScriptError> {
+        let Some(arg_start) = self.vm_stack.len().checked_sub(count) else {
+            return Ok(FastNativeCall::NotHandled);
+        };
+        let Some(callee_at) = arg_start.checked_sub(1) else {
+            return Ok(FastNativeCall::NotHandled);
+        };
+        let Some(return_base) = callee_at.checked_sub(usize::from(method)) else {
+            return Ok(FastNativeCall::NotHandled);
+        };
+        enum HotNative {
+            String(super::strings::StringMethod),
+            ArrayPush,
+            ArrayPop,
+            FunctionCall,
+        }
+        let hot = {
+            let Value::Object(object) = (unsafe { self.vm_stack.get_unchecked(callee_at) }) else {
+                return Ok(FastNativeCall::NotHandled);
+            };
+            let Some(borrowed) = (unsafe { heap.object_ref(object) }) else {
+                return Ok(FastNativeCall::NotHandled);
+            };
+            match &borrowed.class {
+                ObjectClass::Native(native) => match native.as_ref() {
+                    Native::String(m) if count <= 4 => HotNative::String(*m),
+                    Native::Array(super::arrays::ArrayMethod::Push) if method => {
+                        HotNative::ArrayPush
+                    }
+                    Native::Array(super::arrays::ArrayMethod::Pop) if method => HotNative::ArrayPop,
+                    Native::FunctionCall if method => HotNative::FunctionCall,
+                    _ => return Ok(FastNativeCall::NotHandled),
+                },
+                _ => return Ok(FastNativeCall::NotHandled),
+            }
+        };
+        match hot {
+            HotNative::String(string_method) => {
+                let mut args = [
+                    Value::Undefined,
+                    Value::Undefined,
+                    Value::Undefined,
+                    Value::Undefined,
+                ];
+                // safety: arg_start + count == vm_stack.len(), callee is Copy Value::Object
+                let this = unsafe {
+                    let base = self.vm_stack.as_ptr();
+                    for (i, slot) in args.iter_mut().take(count).enumerate() {
+                        *slot = std::ptr::read(base.add(arg_start + i));
+                    }
+                    let this = if method {
+                        std::ptr::read(base.add(return_base))
+                    } else {
+                        Value::Undefined
+                    };
+                    self.vm_stack.set_len(return_base);
+                    this
+                };
+                let result = self.call_string_method_slice(string_method, this, &args[..count]);
+                for slot in &mut args[..count] {
+                    std::mem::replace(slot, Value::Undefined).fast_drop();
+                }
+                self.vm_stack.push(result?);
+                Ok(FastNativeCall::Done)
+            }
+            HotNative::ArrayPush => {
+                let Value::Array(array_handle) =
+                    (unsafe { self.vm_stack.get_unchecked(return_base) })
+                else {
+                    return Ok(FastNativeCall::NotHandled);
+                };
+                let array_handle = array_handle.clone();
+                let Some(array) = (unsafe { heap.array_mut(&array_handle) }) else {
+                    return Ok(FastNativeCall::NotHandled);
+                };
+                if array.extra.is_some()
+                    || array.values.len().saturating_add(count) > MAX_RUNTIME_ARRAY_LENGTH
+                {
+                    return Ok(FastNativeCall::NotHandled);
+                }
+                let needed = array.values.len() + count;
+                if needed <= 2 && array.values.capacity() < needed {
+                    array.values.reserve_exact(count);
+                } else if count > 0 {
+                    array.values.reserve(count);
+                }
+                // safety: moving count values from vm_stack[arg_start..]; this and callee are Copy
+                unsafe {
+                    let src = self.vm_stack.as_ptr().add(arg_start);
+                    for i in 0..count {
+                        array.values.push(std::ptr::read(src.add(i)));
+                    }
+                    self.vm_stack.set_len(return_base);
+                }
+                let new_len = array.values.len();
+                self.vm_stack.push(Value::Number(new_len as f64));
+                Ok(FastNativeCall::Done)
+            }
+            HotNative::ArrayPop => {
+                let Value::Array(array_handle) =
+                    (unsafe { self.vm_stack.get_unchecked(return_base) })
+                else {
+                    return Ok(FastNativeCall::NotHandled);
+                };
+                let array_handle = array_handle.clone();
+                let Some(array) = (unsafe { heap.array_mut(&array_handle) }) else {
+                    return Ok(FastNativeCall::NotHandled);
+                };
+                if array.extra.is_some() {
+                    return Ok(FastNativeCall::NotHandled);
+                }
+                let value = array.values.pop().unwrap_or(Value::Undefined).filled();
+                truncate_stack(&mut self.vm_stack, return_base);
+                self.vm_stack.push(value);
+                Ok(FastNativeCall::Done)
+            }
+            HotNative::FunctionCall => {
+                let is_fn = match unsafe { self.vm_stack.get_unchecked(return_base) } {
+                    Value::Object(target) => unsafe { heap.object_ref(target) }
+                        .is_some_and(|obj| matches!(obj.class, ObjectClass::Function(_))),
+                    _ => false,
+                };
+                if !is_fn {
+                    return Ok(FastNativeCall::NotHandled);
+                }
+                if count == 0 {
+                    // safety: both target and call_fn are Copy Value::Object
+                    unsafe {
+                        let ptr = self.vm_stack.as_mut_ptr();
+                        let target = std::ptr::read(ptr.add(return_base));
+                        ptr.add(callee_at).write(target);
+                        ptr.add(return_base).write(Value::Undefined);
+                    }
+                    if self.call_plain(heap, 0, true) {
+                        return Ok(FastNativeCall::FramePushed);
+                    }
+                    return Ok(FastNativeCall::FallbackMethod(0));
+                }
+                let new_count = count - 1;
+                // safety: rewrite [target, call_fn, new_this, a1..] -> [new_this, target, a1..]
+                unsafe {
+                    let ptr = self.vm_stack.as_mut_ptr();
+                    let target = std::ptr::read(ptr.add(return_base));
+                    let new_this = std::ptr::read(ptr.add(arg_start));
+                    ptr.add(return_base).write(new_this);
+                    ptr.add(callee_at).write(target);
+                    if new_count > 0 {
+                        std::ptr::copy(ptr.add(arg_start + 1), ptr.add(arg_start), new_count);
+                    }
+                    self.vm_stack.set_len(arg_start + new_count);
+                }
+                if self.call_plain(heap, new_count, true) {
+                    return Ok(FastNativeCall::FramePushed);
+                }
+                Ok(FastNativeCall::FallbackMethod(new_count))
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn ic_get_value(
+        &self,
+        heap: &super::heap::Heap,
+        receiver: &Value,
+        cache: &super::object::PropIc,
+    ) -> Option<super::object::IcGetHit> {
+        use super::object::IcGetHit;
+        match receiver {
+            Value::Object(handle) => unsafe { heap.object_ref(handle) }
+                .and_then(|object| object.ic_get_fast(heap, cache)),
+            Value::Element(handle) => unsafe { heap.object_ref(&handle.object) }
+                .and_then(|object| object.ic_get_fast(heap, cache)),
+            Value::Array(array) => {
+                if cache.is_array_length() {
+                    unsafe { heap.array_ref(array) }
+                        .map(|a| IcGetHit::Value(Value::Number(a.len() as f64)))
+                } else if unsafe { heap.array_ref(array) }.is_some_and(|a| a.extra.is_none()) {
+                    JsObject::ic_array_get_fast(heap, &self.intrinsics.array_prototype, cache)
+                        .map(IcGetHit::Value)
+                } else {
+                    None
+                }
+            }
+            Value::String(text) => {
+                if cache.is_string_length() {
+                    Some(IcGetHit::Value(Value::Number(
+                        super::strings::utf16_length(text) as f64,
+                    )))
+                } else {
+                    JsObject::ic_string_get_fast(heap, &self.intrinsics.string_prototype, cache)
+                        .map(IcGetHit::Value)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    fn try_fast_get_index(heap: &super::heap::Heap, object: &Value, key: &Value) -> Option<Value> {
+        match (object, key) {
+            (Value::Array(array), Value::Number(number))
+                if *number >= 0.0 && number.fract() == 0.0 =>
+            {
+                let idx = *number as usize;
+                let data = unsafe { heap.array_ref(array)? };
+                let value = data.values.get(idx)?;
+                if matches!(value, Value::Uninitialized) {
+                    return None;
+                }
+                Some(value.clone())
+            }
+            (Value::Object(obj), Value::String(key)) => {
+                let data = unsafe { heap.object_ref(obj)? };
+                data.own_data_value(key)
+            }
+            (Value::String(text), Value::Number(number))
+                if text.is_ascii() && *number >= 0.0 && number.fract() == 0.0 =>
+            {
+                let idx = *number as usize;
+                if idx < text.len() {
+                    Some(Value::String(JsStr::new(&text[idx..idx + 1])))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    fn try_fast_set_index(
+        heap: &super::heap::Heap,
+        object: &Value,
+        key: &Value,
+        value: Value,
+    ) -> Result<(), Value> {
+        match (object, key) {
+            (Value::Array(array), Value::Number(number))
+                if *number >= 0.0 && number.fract() == 0.0 && *number < 4_294_967_295.0 =>
+            {
+                let idx = *number as usize;
+                let Some(data) = (unsafe { heap.array_mut(array) }) else {
+                    return Err(value);
+                };
+                if data.extra.is_some() {
+                    return Err(value);
+                }
+                let len = data.values.len();
+                if idx < len {
+                    let old = std::mem::replace(&mut data.values[idx], value);
+                    old.fast_drop();
+                    return Ok(());
+                }
+                if idx == len && len < MAX_RUNTIME_ARRAY_LENGTH {
+                    if len < 2 && data.values.capacity() <= len {
+                        data.values.reserve_exact(1);
+                    }
+                    data.values.push(value);
+                    return Ok(());
+                }
+                Err(value)
+            }
+            (Value::Object(obj), Value::String(key)) => {
+                let Some(data) = (unsafe { heap.object_mut(obj) }) else {
+                    return Err(value);
+                };
+                data.set_own_plain_data(key, value)
+            }
+            _ => Err(value),
+        }
     }
 
     // leaves try regions down to a depth, running each finally block before the jump lands
@@ -1938,73 +2510,146 @@ impl ScriptRuntime {
         self.vm_stack.split_off(start)
     }
 
-    // unified hot interpreter loop: keeps the active frame's code, pc and register base in
-    // locals, stays inline across calls and returns, and checks safepoints only at backward
-    // jumps and calls
+    // unified hot interpreter loop: keeps the active frame's code, pc, ops pointer, register
+    // base and heap pointer in locals, stays inline across calls and returns, and checks
+    // safepoints and stack headroom only at backward jumps and frame transitions
     fn run_fast(&mut self, frame_floor: usize, sampling: bool) -> Result<RunResult, ScriptError> {
+        let heap_ptr: *const super::heap::Heap = super::heap::heap_ptr(self.heap_id);
         let mut top = self.frames.len() - 1;
         let mut code: *const Code = Rc::as_ptr(&self.frames[top].code);
+        let mut ops_ptr: *const Op = unsafe { (&*code).ops.as_ptr() };
         let mut pc: usize = self.frames[top].pc;
         let mut reg_base: usize = self.frames[top].reg_base;
         let mut block_start: usize = pc;
         let mut safepoint_at: u64 = self.safepoint_target(sampling);
+        reserve_headroom(&mut self.vm_stack, unsafe { (&*code).max_pushes as usize });
+        macro_rules! reload_frame {
+            () => {
+                top = self.frames.len() - 1;
+                let frame = unsafe { self.frames.get_unchecked(top) };
+                code = Rc::as_ptr(&frame.code);
+                ops_ptr = unsafe { (&*code).ops.as_ptr() };
+                pc = frame.pc;
+                reg_base = frame.reg_base;
+                block_start = pc;
+                reserve_headroom(&mut self.vm_stack, unsafe { (&*code).max_pushes as usize });
+            };
+        }
         loop {
             // safety: self.frames[top] owns Rc<Code> until frames changes, at which point we reload
             let op_pc = pc;
-            let op = unsafe { (&*code).ops[op_pc] };
+            debug_assert!(op_pc < unsafe { (&*code).ops.len() });
+            let op = unsafe { *ops_ptr.add(op_pc) };
             pc = op_pc + 1;
             match op {
                 Op::Nop => {}
-                Op::Undefined => self.vm_stack.push(Value::Undefined),
-                Op::Null => self.vm_stack.push(Value::Null),
-                Op::True => self.vm_stack.push(Value::Bool(true)),
-                Op::False => self.vm_stack.push(Value::Bool(false)),
-                Op::Number(value) => self.vm_stack.push(Value::Number(value)),
+                Op::Undefined => unsafe { push_unchecked(&mut self.vm_stack, Value::Undefined) },
+                Op::Null => unsafe { push_unchecked(&mut self.vm_stack, Value::Null) },
+                Op::True => unsafe { push_unchecked(&mut self.vm_stack, Value::Bool(true)) },
+                Op::False => unsafe { push_unchecked(&mut self.vm_stack, Value::Bool(false)) },
+                Op::Number(value) => unsafe {
+                    push_unchecked(&mut self.vm_stack, Value::Number(value));
+                },
                 Op::String(index) => {
-                    let text = unsafe { (&*code).names[index as usize].clone() };
-                    self.vm_stack.push(Value::String(text));
+                    let text = unsafe { (&*code).names.get_unchecked(index as usize).clone() };
+                    unsafe { push_unchecked(&mut self.vm_stack, Value::String(text)) };
                 }
                 Op::Pop => {
-                    if let Some(value) = self.vm_stack.pop() {
-                        value.fast_drop();
+                    let len = self.vm_stack.len();
+                    if len > 0 {
+                        let next = len - 1;
+                        unsafe {
+                            self.vm_stack.set_len(next);
+                            let slot = self.vm_stack.as_ptr().add(next);
+                            if !(*slot).is_copy() {
+                                drop_value_slow(std::ptr::read(slot));
+                            }
+                        }
                     }
                 }
                 Op::Dup => {
-                    let copy = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
-                    self.vm_stack.push(copy);
+                    let len = self.vm_stack.len();
+                    let copy = if len > 0 {
+                        unsafe { self.vm_stack.get_unchecked(len - 1).clone() }
+                    } else {
+                        Value::Undefined
+                    };
+                    unsafe { push_unchecked(&mut self.vm_stack, copy) };
+                }
+                Op::Dup2 => {
+                    let len = self.vm_stack.len();
+                    let a = unsafe { self.vm_stack.get_unchecked(len - 2).clone() };
+                    let b = unsafe { self.vm_stack.get_unchecked(len - 1).clone() };
+                    unsafe {
+                        push_unchecked(&mut self.vm_stack, a);
+                        push_unchecked(&mut self.vm_stack, b);
+                    }
                 }
                 Op::Swap => {
                     let length = self.vm_stack.len();
                     self.vm_stack.swap(length - 1, length - 2);
                 }
                 Op::GetReg { reg, name } => {
-                    let value = &self.vm_stack[reg_base + reg as usize];
+                    let value = unsafe { self.vm_stack.get_unchecked(reg_base + reg as usize) };
                     if matches!(value, Value::Uninitialized) {
-                        self.frames[top].pc = pc;
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
                         let name = unsafe { (&*code).names[name as usize].clone() };
                         return Err(self.reference_error(format!(
                             "cannot access {name} before initialization"
                         )));
                     }
                     let copy = value.clone();
-                    self.vm_stack.push(copy);
+                    unsafe { push_unchecked(&mut self.vm_stack, copy) };
                 }
                 Op::SetReg { reg, name } => {
                     let slot_index = reg_base + reg as usize;
-                    if matches!(self.vm_stack[slot_index], Value::Uninitialized) {
-                        self.frames[top].pc = pc;
+                    if matches!(
+                        unsafe { self.vm_stack.get_unchecked(slot_index) },
+                        Value::Uninitialized
+                    ) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
                         let name = unsafe { (&*code).names[name as usize].clone() };
                         return Err(self.reference_error(format!(
                             "cannot access {name} before initialization"
                         )));
                     }
-                    let value = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
-                    let old = std::mem::replace(&mut self.vm_stack[slot_index], value);
+                    let len = self.vm_stack.len();
+                    let value = if len > 0 {
+                        unsafe { self.vm_stack.get_unchecked(len - 1).clone() }
+                    } else {
+                        Value::Undefined
+                    };
+                    let old = std::mem::replace(
+                        unsafe { self.vm_stack.get_unchecked_mut(slot_index) },
+                        value,
+                    );
+                    old.fast_drop();
+                }
+                Op::SetRegPop { reg } => {
+                    let slot_index = reg_base + reg as usize;
+                    if matches!(
+                        unsafe { self.vm_stack.get_unchecked(slot_index) },
+                        Value::Uninitialized
+                    ) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = unsafe { (&*code).layout.names[reg as usize].clone() };
+                        return Err(self.reference_error(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    let value = pop_fast(&mut self.vm_stack);
+                    let old = std::mem::replace(
+                        unsafe { self.vm_stack.get_unchecked_mut(slot_index) },
+                        value,
+                    );
                     old.fast_drop();
                 }
                 Op::InitReg(reg) => {
-                    let value = self.vm_stack.pop().unwrap_or(Value::Undefined);
-                    let old = std::mem::replace(&mut self.vm_stack[reg_base + reg as usize], value);
+                    let value = pop_fast(&mut self.vm_stack);
+                    let old = std::mem::replace(
+                        unsafe { self.vm_stack.get_unchecked_mut(reg_base + reg as usize) },
+                        value,
+                    );
                     old.fast_drop();
                 }
                 Op::UpdateReg {
@@ -2014,15 +2659,40 @@ impl ScriptRuntime {
                     prefix,
                 } => {
                     let slot_index = reg_base + reg as usize;
-                    if let Value::Number(slot) = &mut self.vm_stack[slot_index] {
+                    if let Value::Number(slot) =
+                        unsafe { self.vm_stack.get_unchecked_mut(slot_index) }
+                    {
                         let old = *slot;
                         let new = if increment { old + 1.0 } else { old - 1.0 };
                         *slot = new;
-                        self.vm_stack
-                            .push(Value::Number(if prefix { new } else { old }));
+                        unsafe {
+                            push_unchecked(
+                                &mut self.vm_stack,
+                                Value::Number(if prefix { new } else { old }),
+                            );
+                        }
                     } else {
-                        self.frames[top].pc = pc;
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
                         self.update_reg_slow(top, reg, name, increment, prefix)?;
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                    }
+                }
+                Op::UpdateRegPop { reg, increment } => {
+                    let slot_index = reg_base + reg as usize;
+                    if let Value::Number(slot) =
+                        unsafe { self.vm_stack.get_unchecked_mut(slot_index) }
+                    {
+                        *slot = if increment { *slot + 1.0 } else { *slot - 1.0 };
+                    } else {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = unsafe { (&*code).layout.names[reg as usize].clone() };
+                        self.update_reg_slow_named(top, reg, &name, increment, false)?;
+                        pop_fast(&mut self.vm_stack).fast_drop();
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
                     }
                 }
                 Op::UninitRegs { index, count } => {
@@ -2034,60 +2704,125 @@ impl ScriptRuntime {
                     }
                 }
                 Op::GetLocal { depth, index, name } => {
-                    let scope_ref = Self::scope_at(&self.frames[top], depth);
-                    let fast = scope_ref.try_borrow().ok().and_then(|scope| {
-                        match scope.slots.get(index as usize) {
-                            Some(
-                                Value::Binding(_) | Value::ConstBinding(_) | Value::Uninitialized,
-                            )
-                            | None => None,
-                            Some(value) => Some(value.clone()),
-                        }
-                    });
+                    let fast = unsafe {
+                        self.frames
+                            .get_unchecked(top)
+                            .scope
+                            .as_ref()
+                            .and_then(|start| (&*heap_ptr).scope_at_ref(start, depth))
+                            .and_then(|scope| match scope.slots.get(index as usize) {
+                                Some(
+                                    Value::Binding(_)
+                                    | Value::ConstBinding(_)
+                                    | Value::Uninitialized,
+                                )
+                                | None => None,
+                                Some(value) => Some(value.clone()),
+                            })
+                    };
                     match fast {
-                        Some(value) => self.vm_stack.push(value),
+                        Some(value) => unsafe { push_unchecked(&mut self.vm_stack, value) },
                         None => {
-                            self.frames[top].pc = pc;
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
                             let value = self.read_local(top, depth, index, name)?;
-                            self.vm_stack.push(value);
+                            unsafe { push_unchecked(&mut self.vm_stack, value) };
                         }
                     }
                 }
                 Op::SetLocal { depth, index, name } => {
-                    let scope_ref = Self::scope_at(&self.frames[top], depth);
-                    let written = scope_ref.try_borrow_mut().ok().is_some_and(|mut scope| {
-                        match scope.slots.get_mut(index as usize) {
-                            Some(
-                                Value::Binding(_) | Value::ConstBinding(_) | Value::Uninitialized,
-                            )
-                            | None => false,
-                            Some(slot) => {
-                                let value =
-                                    self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
-                                let old = std::mem::replace(slot, value);
-                                old.fast_drop();
-                                true
-                            }
-                        }
-                    });
-                    if !written {
-                        self.frames[top].pc = pc;
+                    let len = self.vm_stack.len();
+                    let old_value = unsafe {
+                        self.frames
+                            .get_unchecked(top)
+                            .scope
+                            .as_ref()
+                            .and_then(|start| (&*heap_ptr).scope_at_mut(start, depth))
+                            .and_then(|scope| match scope.slots.get_mut(index as usize) {
+                                Some(
+                                    Value::Binding(_)
+                                    | Value::ConstBinding(_)
+                                    | Value::Uninitialized,
+                                )
+                                | None => None,
+                                Some(slot) => {
+                                    let value = if len > 0 {
+                                        self.vm_stack.get_unchecked(len - 1).clone()
+                                    } else {
+                                        Value::Undefined
+                                    };
+                                    Some(std::mem::replace(slot, value))
+                                }
+                            })
+                    };
+                    if let Some(old) = old_value {
+                        old.fast_drop();
+                    } else {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
                         let value = self.vm_stack.last().cloned().unwrap_or(Value::Undefined);
                         self.write_local(top, depth, index, name, value)?;
                     }
                 }
+                Op::SetLocalPop { depth, index } => {
+                    let value = pop_fast(&mut self.vm_stack);
+                    let written = unsafe {
+                        self.frames
+                            .get_unchecked(top)
+                            .scope
+                            .as_ref()
+                            .and_then(|start| (&*heap_ptr).scope_at_mut(start, depth))
+                            .and_then(|scope| match scope.slots.get_mut(index as usize) {
+                                Some(
+                                    Value::Binding(_)
+                                    | Value::ConstBinding(_)
+                                    | Value::Uninitialized,
+                                )
+                                | None => None,
+                                Some(slot) => Some(slot),
+                            })
+                    };
+                    if let Some(slot) = written {
+                        let old = std::mem::replace(slot, value);
+                        old.fast_drop();
+                    } else {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = self.local_layout_name(top, depth, index);
+                        self.write_local_named(top, depth, index, &name, value)?;
+                    }
+                }
                 Op::InitLocal { depth, index } => {
-                    let value = self.pop();
-                    let scope_ref = Self::scope_at(&self.frames[top], depth);
-                    let mut scope = scope_ref.borrow_mut();
-                    match &scope.slots[index as usize] {
-                        Value::Binding(cell) | Value::ConstBinding(cell) => {
-                            let old = std::mem::replace(&mut *cell.borrow_mut(), value);
-                            old.fast_drop();
+                    let value = pop_fast(&mut self.vm_stack);
+                    let fast = unsafe {
+                        self.frames
+                            .get_unchecked(top)
+                            .scope
+                            .as_ref()
+                            .and_then(|start| (&*heap_ptr).scope_at_mut(start, depth))
+                    };
+                    if let Some(scope) = fast {
+                        match &scope.slots[index as usize] {
+                            Value::Binding(cell) | Value::ConstBinding(cell) => {
+                                let old = std::mem::replace(&mut *cell.borrow_mut(), value);
+                                old.fast_drop();
+                            }
+                            _ => {
+                                let old =
+                                    std::mem::replace(&mut scope.slots[index as usize], value);
+                                old.fast_drop();
+                            }
                         }
-                        _ => {
-                            let old = std::mem::replace(&mut scope.slots[index as usize], value);
-                            old.fast_drop();
+                    } else {
+                        let scope_ref = Self::scope_at(&self.frames[top], depth);
+                        let mut scope = scope_ref.borrow_mut();
+                        match &scope.slots[index as usize] {
+                            Value::Binding(cell) | Value::ConstBinding(cell) => {
+                                let old = std::mem::replace(&mut *cell.borrow_mut(), value);
+                                old.fast_drop();
+                            }
+                            _ => {
+                                let old =
+                                    std::mem::replace(&mut scope.slots[index as usize], value);
+                                old.fast_drop();
+                            }
                         }
                     }
                 }
@@ -2098,50 +2833,211 @@ impl ScriptRuntime {
                     increment,
                     prefix,
                 } => {
-                    let scope_ref = Self::scope_at(&self.frames[top], depth);
-                    let fast = scope_ref.try_borrow_mut().ok().and_then(|mut scope| {
-                        let Value::Number(slot) = scope.slots.get_mut(index as usize)? else {
-                            return None;
-                        };
-                        let old = *slot;
-                        let new = if increment { old + 1.0 } else { old - 1.0 };
-                        *slot = new;
-                        Some(Value::Number(if prefix { new } else { old }))
-                    });
+                    let fast = unsafe {
+                        self.frames
+                            .get_unchecked(top)
+                            .scope
+                            .as_ref()
+                            .and_then(|start| (&*heap_ptr).scope_at_mut(start, depth))
+                            .and_then(|scope| {
+                                let Value::Number(slot) = scope.slots.get_mut(index as usize)?
+                                else {
+                                    return None;
+                                };
+                                let old = *slot;
+                                let new = if increment { old + 1.0 } else { old - 1.0 };
+                                *slot = new;
+                                Some(Value::Number(if prefix { new } else { old }))
+                            })
+                    };
                     match fast {
-                        Some(value) => self.vm_stack.push(value),
+                        Some(value) => unsafe { push_unchecked(&mut self.vm_stack, value) },
                         None => {
-                            self.frames[top].pc = pc;
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
                             self.update_local_slow(top, depth, index, name, increment, prefix)?;
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
                         }
                     }
                 }
+                Op::UpdateLocalPop {
+                    depth,
+                    index,
+                    increment,
+                } => {
+                    let fast = unsafe {
+                        self.frames
+                            .get_unchecked(top)
+                            .scope
+                            .as_ref()
+                            .and_then(|start| (&*heap_ptr).scope_at_mut(start, depth))
+                            .is_some_and(|scope| {
+                                if let Some(Value::Number(slot)) =
+                                    scope.slots.get_mut(index as usize)
+                                {
+                                    *slot = if increment { *slot + 1.0 } else { *slot - 1.0 };
+                                    true
+                                } else {
+                                    false
+                                }
+                            })
+                    };
+                    if !fast {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = self.local_layout_name(top, depth, index);
+                        self.update_local_slow_named(top, depth, index, &name, increment, false)?;
+                        pop_fast(&mut self.vm_stack).fast_drop();
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                    }
+                }
+                Op::GetGlobal(name) => {
+                    let key: &str = unsafe { (&*code).names.get_unchecked(name as usize) };
+                    let fast = {
+                        let global = self.global.borrow();
+                        if global.accessors.is_empty() || !global.accessors.contains_key(key) {
+                            match global.values.get(key) {
+                                Some(Value::Uninitialized) | None => None,
+                                Some(value) => Some(value.resolve()),
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    match fast {
+                        Some(value) => unsafe { push_unchecked(&mut self.vm_stack, value) },
+                        None => {
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            let key = unsafe { (&*code).names[name as usize].clone() };
+                            let value = self.get_global(&key)?;
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
+                            unsafe { push_unchecked(&mut self.vm_stack, value) };
+                        }
+                    }
+                }
+                Op::PushScope(block) => {
+                    let layout = unsafe { (&*code).blocks.get_unchecked(block as usize).clone() };
+                    let frame = unsafe { self.frames.get_unchecked_mut(top) };
+                    let parent = frame.scope.clone();
+                    let slots = vec![Value::Uninitialized; layout.names.len()];
+                    let scope = unsafe { &*heap_ptr }.alloc_scope_fast(Scope {
+                        slots,
+                        parent,
+                        layout,
+                        extra: Grown::default(),
+                    });
+                    frame.flags |= FLAG_SCOPE_ESCAPED;
+                    frame.scope = Some(scope);
+                    frame.scopes += 1;
+                }
+                Op::PushVarScope(block) => {
+                    let layout = unsafe { (&*code).blocks.get_unchecked(block as usize).clone() };
+                    let frame = unsafe { self.frames.get_unchecked_mut(top) };
+                    let parent = frame.scope.clone();
+                    let slots = vec![Value::Undefined; layout.names.len()];
+                    let scope = unsafe { &*heap_ptr }.alloc_scope_fast(Scope {
+                        slots,
+                        parent,
+                        layout,
+                        extra: Grown::default(),
+                    });
+                    frame.flags |= FLAG_SCOPE_ESCAPED;
+                    frame.scope = Some(scope);
+                    frame.scopes += 1;
+                }
+                Op::PopScope => {
+                    let frame = unsafe { self.frames.get_unchecked_mut(top) };
+                    if frame.scopes > 0 {
+                        let parent = frame.scope.as_ref().and_then(|scope| {
+                            unsafe { (&*heap_ptr).scope_at_ref(scope, 0) }
+                                .map(|s| s.parent.clone())
+                                .unwrap_or_else(|| scope.borrow().parent.clone())
+                        });
+                        frame.scope = parent;
+                        frame.scopes -= 1;
+                    }
+                }
+                Op::CloneScope => {
+                    let frame = unsafe { self.frames.get_unchecked_mut(top) };
+                    frame.flags |= FLAG_SCOPE_ESCAPED;
+                    let current = frame.scope.as_ref().expect("a scope to copy");
+                    let cloned =
+                        if let Some(scope) = unsafe { (&*heap_ptr).scope_at_ref(current, 0) } {
+                            Scope {
+                                slots: scope.slots.clone(),
+                                parent: scope.parent.clone(),
+                                layout: scope.layout.clone(),
+                                extra: scope.extra.clone(),
+                            }
+                        } else {
+                            let scope = current.borrow();
+                            Scope {
+                                slots: scope.slots.clone(),
+                                parent: scope.parent.clone(),
+                                layout: scope.layout.clone(),
+                                extra: scope.extra.clone(),
+                            }
+                        };
+                    frame.scope = Some(unsafe { &*heap_ptr }.alloc_scope_fast(cloned));
+                }
                 Op::This => {
-                    if matches!(self.frames[top].this, Value::Uninitialized) {
-                        self.frames[top].pc = pc;
+                    let frame = unsafe { self.frames.get_unchecked(top) };
+                    if matches!(frame.this, Value::Uninitialized) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
                         return Err(self
                             .reference_error("must call super constructor before accessing this"));
                     }
-                    let this = self.frames[top].this.clone();
-                    self.vm_stack.push(this);
+                    let this = frame.this.clone();
+                    unsafe { push_unchecked(&mut self.vm_stack, this) };
                 }
                 Op::Not => {
-                    let value = self.pop();
+                    let value = pop_fast(&mut self.vm_stack);
                     let result = !value.truthy();
                     value.fast_drop();
-                    self.vm_stack.push(Value::Bool(result));
+                    unsafe { push_unchecked(&mut self.vm_stack, Value::Bool(result)) };
+                }
+                Op::TypeOf => {
+                    let value = pop_fast(&mut self.vm_stack);
+                    let kind = self.type_of(&value);
+                    value.fast_drop();
+                    unsafe { push_unchecked(&mut self.vm_stack, Value::String(type_name(kind))) };
+                }
+                Op::ToIndexKey => {
+                    let keep = match self.vm_stack.last() {
+                        Some(Value::String(_)) => true,
+                        Some(Value::Number(number)) => {
+                            *number >= 0.0 && number.fract() == 0.0 && *number < 4_294_967_295.0
+                        }
+                        _ => false,
+                    };
+                    if !keep {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let value = pop_fast(&mut self.vm_stack);
+                        let key = self.coerce_key(value)?;
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                        unsafe { push_unchecked(&mut self.vm_stack, Value::String(key.into())) };
+                    }
                 }
                 Op::Binary(operator) => {
                     let len = self.vm_stack.len();
                     if len >= 2 {
-                        if let (Value::Number(left), Value::Number(right)) =
-                            (&self.vm_stack[len - 2], &self.vm_stack[len - 1])
+                        let left_ref = unsafe { self.vm_stack.get_unchecked(len - 2) };
+                        let right_ref = unsafe { self.vm_stack.get_unchecked(len - 1) };
+                        if let (Value::Number(left), Value::Number(right)) = (left_ref, right_ref)
                             && let Some(value) =
                                 super::operations::number_binary(operator, *left, *right)
                         {
                             // safety: both operands are numbers with no drop glue
-                            unsafe { self.vm_stack.set_len(len - 2) };
-                            self.vm_stack.push(value);
+                            unsafe {
+                                self.vm_stack.as_mut_ptr().add(len - 2).write(value);
+                                self.vm_stack.set_len(len - 1);
+                            }
                             continue;
                         }
                         if matches!(
@@ -2149,23 +3045,69 @@ impl ScriptRuntime {
                             super::ast::BinaryOperator::StrictEqual
                                 | super::ast::BinaryOperator::StrictNotEqual
                         ) {
-                            let equal =
-                                values_equal(&self.vm_stack[len - 2], &self.vm_stack[len - 1]);
-                            let right = self.vm_stack.pop().unwrap_or(Value::Undefined);
-                            let left = self.vm_stack.pop().unwrap_or(Value::Undefined);
+                            let equal = values_equal(left_ref, right_ref);
+                            let right = pop_fast(&mut self.vm_stack);
+                            let left = pop_fast(&mut self.vm_stack);
                             right.fast_drop();
                             left.fast_drop();
                             let result = equal
                                 == matches!(operator, super::ast::BinaryOperator::StrictEqual);
-                            self.vm_stack.push(Value::Bool(result));
+                            unsafe { push_unchecked(&mut self.vm_stack, Value::Bool(result)) };
                             continue;
                         }
                     }
-                    self.frames[top].pc = pc;
-                    let right = self.pop();
-                    let left = self.pop();
+                    unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                    let right = pop_fast(&mut self.vm_stack);
+                    let left = pop_fast(&mut self.vm_stack);
                     let value = self.binary(operator, left, right)?;
-                    self.vm_stack.push(value);
+                    reserve_headroom(&mut self.vm_stack, unsafe { (&*code).max_pushes as usize });
+                    unsafe { push_unchecked(&mut self.vm_stack, value) };
+                }
+                Op::BinaryRegs {
+                    left,
+                    right,
+                    op: operator,
+                } => {
+                    let left_ref = unsafe { self.vm_stack.get_unchecked(reg_base + left as usize) };
+                    if matches!(left_ref, Value::Uninitialized) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = unsafe { (&*code).layout.names[left as usize].clone() };
+                        return Err(self.reference_error(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    let right_ref =
+                        unsafe { self.vm_stack.get_unchecked(reg_base + right as usize) };
+                    if matches!(right_ref, Value::Uninitialized) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = unsafe { (&*code).layout.names[right as usize].clone() };
+                        return Err(self.reference_error(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    if let (Value::Number(l), Value::Number(r)) = (left_ref, right_ref)
+                        && let Some(value) = super::operations::number_binary(operator, *l, *r)
+                    {
+                        unsafe { push_unchecked(&mut self.vm_stack, value) };
+                        continue;
+                    }
+                    if matches!(
+                        operator,
+                        super::ast::BinaryOperator::StrictEqual
+                            | super::ast::BinaryOperator::StrictNotEqual
+                    ) {
+                        let equal = values_equal(left_ref, right_ref);
+                        let result =
+                            equal == matches!(operator, super::ast::BinaryOperator::StrictEqual);
+                        unsafe { push_unchecked(&mut self.vm_stack, Value::Bool(result)) };
+                        continue;
+                    }
+                    let l = left_ref.clone();
+                    let r = right_ref.clone();
+                    unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                    let value = self.binary(operator, l, r)?;
+                    reserve_headroom(&mut self.vm_stack, unsafe { (&*code).max_pushes as usize });
+                    unsafe { push_unchecked(&mut self.vm_stack, value) };
                 }
                 Op::Jump(target) => {
                     let target = target as usize;
@@ -2174,12 +3116,15 @@ impl ScriptRuntime {
                         if self.steps >= safepoint_at {
                             safepoint_at = self.hit_safepoint(sampling, target)?;
                         }
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
                     }
                     pc = target;
                     block_start = pc;
                 }
                 Op::JumpIfFalse(target) | Op::JumpIfTrue(target) => {
-                    let value = self.pop();
+                    let value = pop_fast(&mut self.vm_stack);
                     let test = match &value {
                         Value::Bool(test) => *test,
                         other => other.truthy(),
@@ -2192,6 +3137,134 @@ impl ScriptRuntime {
                             if self.steps >= safepoint_at {
                                 safepoint_at = self.hit_safepoint(sampling, target)?;
                             }
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
+                        }
+                        pc = target;
+                        block_start = pc;
+                    }
+                }
+                Op::JumpIfRegFalse { reg, target } | Op::JumpIfRegTrue { reg, target } => {
+                    let value = unsafe { self.vm_stack.get_unchecked(reg_base + reg as usize) };
+                    if matches!(value, Value::Uninitialized) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = unsafe { (&*code).layout.names[reg as usize].clone() };
+                        return Err(self.reference_error(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    let test = match value {
+                        Value::Bool(test) => *test,
+                        other => other.truthy(),
+                    };
+                    if test == matches!(op, Op::JumpIfRegTrue { .. }) {
+                        let target = target as usize;
+                        if target <= op_pc {
+                            self.steps += (op_pc + 1).saturating_sub(block_start).max(1) as u64;
+                            if self.steps >= safepoint_at {
+                                safepoint_at = self.hit_safepoint(sampling, target)?;
+                            }
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
+                        }
+                        pc = target;
+                        block_start = pc;
+                    }
+                }
+                Op::JumpIfNotCompare {
+                    op: operator,
+                    target,
+                } => {
+                    let len = self.vm_stack.len();
+                    let passed = if len >= 2 {
+                        let left_ref = unsafe { self.vm_stack.get_unchecked(len - 2) };
+                        let right_ref = unsafe { self.vm_stack.get_unchecked(len - 1) };
+                        if let Some(passed) = fast_compare(operator, left_ref, right_ref) {
+                            let right = pop_fast(&mut self.vm_stack);
+                            let left = pop_fast(&mut self.vm_stack);
+                            right.fast_drop();
+                            left.fast_drop();
+                            passed
+                        } else {
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            let right = pop_fast(&mut self.vm_stack);
+                            let left = pop_fast(&mut self.vm_stack);
+                            let result = self.binary(operator, left, right)?;
+                            let truthy = result.truthy();
+                            result.fast_drop();
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
+                            truthy
+                        }
+                    } else {
+                        false
+                    };
+                    if !passed {
+                        let target = target as usize;
+                        if target <= op_pc {
+                            self.steps += (op_pc + 1).saturating_sub(block_start).max(1) as u64;
+                            if self.steps >= safepoint_at {
+                                safepoint_at = self.hit_safepoint(sampling, target)?;
+                            }
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
+                        }
+                        pc = target;
+                        block_start = pc;
+                    }
+                }
+                Op::JumpIfNotCompareRegs {
+                    left,
+                    right,
+                    op: operator,
+                    target,
+                } => {
+                    let left_ref = unsafe { self.vm_stack.get_unchecked(reg_base + left as usize) };
+                    if matches!(left_ref, Value::Uninitialized) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = unsafe { (&*code).layout.names[left as usize].clone() };
+                        return Err(self.reference_error(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    let right_ref =
+                        unsafe { self.vm_stack.get_unchecked(reg_base + right as usize) };
+                    if matches!(right_ref, Value::Uninitialized) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = unsafe { (&*code).layout.names[right as usize].clone() };
+                        return Err(self.reference_error(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    let passed = match fast_compare(operator, left_ref, right_ref) {
+                        Some(passed) => passed,
+                        None => {
+                            let l = left_ref.clone();
+                            let r = right_ref.clone();
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            let result = self.binary(operator, l, r)?;
+                            let truthy = result.truthy();
+                            result.fast_drop();
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
+                            truthy
+                        }
+                    };
+                    if !passed {
+                        let target = target as usize;
+                        if target <= op_pc {
+                            self.steps += (op_pc + 1).saturating_sub(block_start).max(1) as u64;
+                            if self.steps >= safepoint_at {
+                                safepoint_at = self.hit_safepoint(sampling, target)?;
+                            }
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
                         }
                         pc = target;
                         block_start = pc;
@@ -2210,6 +3283,9 @@ impl ScriptRuntime {
                             if self.steps >= safepoint_at {
                                 safepoint_at = self.hit_safepoint(sampling, target)?;
                             }
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
                         }
                         pc = target;
                         block_start = pc;
@@ -2220,22 +3296,38 @@ impl ScriptRuntime {
                         self.vm_stack.last(),
                         Some(Value::Undefined | Value::Null) | None
                     ) {
-                        pc = target as usize;
+                        let target = target as usize;
+                        if target <= op_pc {
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
+                        }
+                        pc = target;
                         block_start = pc;
                     }
                 }
                 Op::JumpIfNotUndefined(target) => {
                     if !matches!(self.vm_stack.last(), Some(Value::Undefined) | None) {
-                        pc = target as usize;
+                        let target = target as usize;
+                        if target <= op_pc {
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
+                        }
+                        pc = target;
                         block_start = pc;
                     }
                 }
                 Op::NewObject => {
-                    let object = self.new_plain_object();
-                    self.vm_stack.push(Value::Object(object));
+                    let object = unsafe { &*heap_ptr }.alloc_object_fast(JsObject::with_prototype(
+                        Some(self.intrinsics.object_prototype.clone()),
+                        ObjectClass::Ordinary,
+                    ));
+                    unsafe { push_unchecked(&mut self.vm_stack, Value::Object(object)) };
                 }
                 Op::MakeObject(template) => {
-                    let (keys, cell) = unsafe { &(&*code).object_shapes[template as usize] };
+                    let (keys, cell) =
+                        unsafe { (&*code).object_shapes.get_unchecked(template as usize) };
                     let shape = cell
                         .get_or_init(|| {
                             let names: Vec<&str> = keys.iter().map(|name| &**name).collect();
@@ -2244,13 +3336,25 @@ impl ScriptRuntime {
                         .clone();
                     let count = shape.len();
                     let start = self.vm_stack.len() - count;
-                    let slots: Vec<Slot> = self.vm_stack.drain(start..).map(Slot::Data).collect();
-                    let object = new_object(JsObject::from_shape(
+                    let mut slots = Vec::with_capacity(count);
+                    // safety: moving count live Values off the tail of vm_stack into slots
+                    unsafe {
+                        let src = self.vm_stack.as_ptr().add(start);
+                        for i in 0..count {
+                            slots.push(Slot::Data(std::ptr::read(src.add(i))));
+                        }
+                        self.vm_stack.set_len(start);
+                    }
+                    let object = unsafe { &*heap_ptr }.alloc_object_fast(JsObject::from_shape(
                         shape,
                         slots,
                         Some(self.intrinsics.object_prototype.clone()),
                     ));
-                    self.vm_stack.push(Value::Object(object));
+                    unsafe { push_unchecked(&mut self.vm_stack, Value::Object(object)) };
+                }
+                Op::NewArray => {
+                    let array = unsafe { &*heap_ptr }.alloc_array_fast(ArrayData::default());
+                    unsafe { push_unchecked(&mut self.vm_stack, Value::Array(array)) };
                 }
                 Op::MakeArray(count) => {
                     let count = count as usize;
@@ -2260,110 +3364,561 @@ impl ScriptRuntime {
                         let start = self.vm_stack.len() - count;
                         self.vm_stack.split_off(start)
                     };
-                    self.vm_stack.push(Self::new_array(values));
+                    let array = unsafe { &*heap_ptr }.alloc_array_fast(ArrayData::from(values));
+                    unsafe { push_unchecked(&mut self.vm_stack, Value::Array(array)) };
+                }
+                Op::ArrayPush => {
+                    let value = pop_fast(&mut self.vm_stack);
+                    if let Some(Value::Array(array)) = self.vm_stack.last() {
+                        if let Some(data) = unsafe { (&*heap_ptr).array_mut(array) } {
+                            data.values.push(value);
+                        } else {
+                            array.borrow_mut().push(value);
+                        }
+                    } else {
+                        value.fast_drop();
+                    }
+                }
+                Op::DefineField(name) => {
+                    let value = pop_fast(&mut self.vm_stack);
+                    if let Some(Value::Object(object)) = self.vm_stack.last() {
+                        let key: &str = unsafe { (&*code).names.get_unchecked(name as usize) };
+                        if let Some(target) = unsafe { (&*heap_ptr).object_mut(object) } {
+                            target.define_key(key, Property::data(value));
+                        } else {
+                            object.borrow_mut().define_key(key, Property::data(value));
+                        }
+                    } else {
+                        value.fast_drop();
+                    }
+                }
+                Op::Closure(index) => {
+                    let child = unsafe { (&*code).children.get_unchecked(index as usize).clone() };
+                    let frame = unsafe { self.frames.get_unchecked_mut(top) };
+                    let scope = if child.captures_nothing {
+                        None
+                    } else {
+                        frame.flags |= FLAG_SCOPE_ESCAPED;
+                        frame.scope.clone()
+                    };
+                    let home = if child.kind == FunctionKind::Arrow {
+                        frame.closure.as_ref().and_then(|closure| closure.home())
+                    } else {
+                        None
+                    };
+                    let closure = Rc::new(Closure::new(child, scope));
+                    if let Some(home) = home {
+                        closure.set_home_object(home);
+                    }
+                    let function = self.function_object(closure);
+                    unsafe { push_unchecked(&mut self.vm_stack, function) };
                 }
                 Op::GetProp { name, ic } => {
                     use super::object::IcGetHit;
-                    let cache = unsafe { &(&*code).ics[ic as usize] };
-                    let hit = match self.vm_stack.last() {
-                        Some(Value::Object(handle)) => handle
-                            .try_borrow()
-                            .ok()
-                            .and_then(|object| object.ic_get(cache)),
-                        Some(Value::Element(handle)) => handle
-                            .object
-                            .try_borrow()
-                            .ok()
-                            .and_then(|object| object.ic_get(cache)),
-                        Some(Value::Array(array)) => {
-                            if cache.is_array_length() {
-                                array
-                                    .try_borrow()
-                                    .ok()
-                                    .map(|a| IcGetHit::Value(Value::Number(a.len() as f64)))
-                            } else if array.try_borrow().ok().is_some_and(|a| a.extra.is_none()) {
-                                JsObject::ic_array_get(&self.intrinsics.array_prototype, cache)
-                                    .map(IcGetHit::Value)
-                            } else {
-                                None
-                            }
-                        }
-                        Some(Value::String(text)) => {
-                            if cache.is_string_length() {
-                                Some(IcGetHit::Value(Value::Number(
-                                    super::strings::utf16_length(text) as f64,
-                                )))
-                            } else {
-                                JsObject::ic_string_get(&self.intrinsics.string_prototype, cache)
-                                    .map(IcGetHit::Value)
-                            }
-                        }
-                        _ => None,
-                    };
+                    let cache = unsafe { (&*code).ics.get_unchecked(ic as usize) };
+                    let hit = self
+                        .vm_stack
+                        .last()
+                        .and_then(|recv| self.ic_get_value(unsafe { &*heap_ptr }, recv, cache));
                     match hit {
                         Some(IcGetHit::Value(value)) => {
-                            if let Some(slot) = self.vm_stack.last_mut() {
-                                let old = std::mem::replace(slot, value);
-                                old.fast_drop();
-                            }
+                            let len = self.vm_stack.len();
+                            let old = std::mem::replace(
+                                unsafe { self.vm_stack.get_unchecked_mut(len - 1) },
+                                value,
+                            );
+                            old.fast_drop();
                         }
                         Some(IcGetHit::Missing) => {
-                            if let Some(slot) = self.vm_stack.last_mut() {
-                                let old = std::mem::replace(slot, Value::Undefined);
-                                old.fast_drop();
-                            }
+                            let len = self.vm_stack.len();
+                            let old = std::mem::replace(
+                                unsafe { self.vm_stack.get_unchecked_mut(len - 1) },
+                                Value::Undefined,
+                            );
+                            old.fast_drop();
                         }
                         Some(IcGetHit::Getter(getter)) => {
                             // push getter before safepoint so GC traces it on vm_stack
-                            self.vm_stack.push(getter);
+                            unsafe { push_unchecked(&mut self.vm_stack, getter) };
                             self.steps += (op_pc + 1).saturating_sub(block_start).max(1) as u64;
                             if self.steps >= safepoint_at {
                                 safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                             }
-                            self.frames[top].pc = pc;
-                            if !self.call_plain(0, true) {
-                                let callee = self.pop();
-                                let this = self.pop();
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            if !self.call_plain(unsafe { &*heap_ptr }, 0, true) {
+                                let callee = pop_fast(&mut self.vm_stack);
+                                let this = pop_fast(&mut self.vm_stack);
                                 self.call_in_loop(callee, this, Vec::new())?;
                             }
-                            top = self.frames.len() - 1;
-                            code = Rc::as_ptr(&self.frames[top].code);
-                            pc = self.frames[top].pc;
-                            reg_base = self.frames[top].reg_base;
-                            block_start = pc;
+                            reload_frame!();
                         }
                         None => {
-                            self.frames[top].pc = pc;
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
                             if self.get_prop_slow(name, ic)? {
-                                top = self.frames.len() - 1;
-                                code = Rc::as_ptr(&self.frames[top].code);
-                                pc = self.frames[top].pc;
-                                reg_base = self.frames[top].reg_base;
-                                block_start = pc;
+                                reload_frame!();
+                            } else {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                            }
+                        }
+                    }
+                }
+                Op::GetRegProp { reg, name, ic } => {
+                    use super::object::IcGetHit;
+                    let receiver = unsafe { self.vm_stack.get_unchecked(reg_base + reg as usize) };
+                    if matches!(receiver, Value::Uninitialized) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = unsafe { (&*code).layout.names[reg as usize].clone() };
+                        return Err(self.reference_error(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    let cache = unsafe { (&*code).ics.get_unchecked(ic as usize) };
+                    match self.ic_get_value(unsafe { &*heap_ptr }, receiver, cache) {
+                        Some(IcGetHit::Value(value)) => unsafe {
+                            push_unchecked(&mut self.vm_stack, value);
+                        },
+                        Some(IcGetHit::Missing) => unsafe {
+                            push_unchecked(&mut self.vm_stack, Value::Undefined);
+                        },
+                        Some(IcGetHit::Getter(getter)) => {
+                            let recv = receiver.clone();
+                            unsafe {
+                                push_unchecked(&mut self.vm_stack, recv);
+                                push_unchecked(&mut self.vm_stack, getter);
+                            }
+                            self.steps += (op_pc + 1).saturating_sub(block_start).max(1) as u64;
+                            if self.steps >= safepoint_at {
+                                safepoint_at = self.hit_safepoint(sampling, op_pc)?;
+                            }
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            if !self.call_plain(unsafe { &*heap_ptr }, 0, true) {
+                                let callee = pop_fast(&mut self.vm_stack);
+                                let this = pop_fast(&mut self.vm_stack);
+                                self.call_in_loop(callee, this, Vec::new())?;
+                            }
+                            reload_frame!();
+                        }
+                        None => {
+                            let recv = receiver.clone();
+                            unsafe { push_unchecked(&mut self.vm_stack, recv) };
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            if self.get_prop_slow(name, ic)? {
+                                reload_frame!();
+                            } else {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                            }
+                        }
+                    }
+                }
+                Op::GetLocalProp {
+                    depth,
+                    index,
+                    name,
+                    ic,
+                } => {
+                    use super::object::IcGetHit;
+                    let cache = unsafe { (&*code).ics.get_unchecked(ic as usize) };
+                    let probe = unsafe {
+                        let heap = &*heap_ptr;
+                        self.frames
+                            .get_unchecked(top)
+                            .scope
+                            .as_ref()
+                            .and_then(|start| heap.scope_at_ref(start, depth))
+                            .and_then(|scope| match scope.slots.get(index as usize) {
+                                Some(
+                                    Value::Binding(_)
+                                    | Value::ConstBinding(_)
+                                    | Value::Uninitialized,
+                                )
+                                | None => None,
+                                Some(receiver) => match self.ic_get_value(heap, receiver, cache) {
+                                    Some(IcGetHit::Value(v)) => Some(Ok(IcGetHit::Value(v))),
+                                    Some(IcGetHit::Missing) => Some(Ok(IcGetHit::Missing)),
+                                    Some(IcGetHit::Getter(g)) => {
+                                        Some(Err((receiver.clone(), Some(g))))
+                                    }
+                                    None => Some(Err((receiver.clone(), None))),
+                                },
+                            })
+                    };
+                    match probe {
+                        Some(Ok(IcGetHit::Value(value))) => unsafe {
+                            push_unchecked(&mut self.vm_stack, value);
+                        },
+                        Some(Ok(IcGetHit::Missing)) => unsafe {
+                            push_unchecked(&mut self.vm_stack, Value::Undefined);
+                        },
+                        Some(Err((recv, Some(getter)))) => {
+                            unsafe {
+                                push_unchecked(&mut self.vm_stack, recv);
+                                push_unchecked(&mut self.vm_stack, getter);
+                            }
+                            self.steps += (op_pc + 1).saturating_sub(block_start).max(1) as u64;
+                            if self.steps >= safepoint_at {
+                                safepoint_at = self.hit_safepoint(sampling, op_pc)?;
+                            }
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            if !self.call_plain(unsafe { &*heap_ptr }, 0, true) {
+                                let callee = pop_fast(&mut self.vm_stack);
+                                let this = pop_fast(&mut self.vm_stack);
+                                self.call_in_loop(callee, this, Vec::new())?;
+                            }
+                            reload_frame!();
+                        }
+                        Some(Err((recv, None))) => {
+                            unsafe { push_unchecked(&mut self.vm_stack, recv) };
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            if self.get_prop_slow(name, ic)? {
+                                reload_frame!();
+                            } else {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                            }
+                        }
+                        Some(Ok(IcGetHit::Getter(_))) => unreachable!(),
+                        None => {
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            let key = self.local_layout_name(top, depth, index);
+                            let recv = self.read_local_named(top, depth, index, &key)?;
+                            self.vm_stack.push(recv);
+                            if self.get_prop_slow(name, ic)? {
+                                reload_frame!();
+                            } else {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                            }
+                        }
+                    }
+                }
+                Op::GetRegMethod { reg, name, ic } => {
+                    use super::object::IcGetHit;
+                    let receiver = unsafe { self.vm_stack.get_unchecked(reg_base + reg as usize) };
+                    if matches!(receiver, Value::Uninitialized) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = unsafe { (&*code).layout.names[reg as usize].clone() };
+                        return Err(self.reference_error(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    let recv = receiver.clone();
+                    let cache = unsafe { (&*code).ics.get_unchecked(ic as usize) };
+                    match self.ic_get_value(unsafe { &*heap_ptr }, &recv, cache) {
+                        Some(IcGetHit::Value(value)) => unsafe {
+                            push_unchecked(&mut self.vm_stack, recv);
+                            push_unchecked(&mut self.vm_stack, value);
+                        },
+                        Some(IcGetHit::Missing) => unsafe {
+                            push_unchecked(&mut self.vm_stack, recv);
+                            push_unchecked(&mut self.vm_stack, Value::Undefined);
+                        },
+                        Some(IcGetHit::Getter(getter)) => {
+                            let recv2 = recv.clone();
+                            unsafe {
+                                push_unchecked(&mut self.vm_stack, recv);
+                                push_unchecked(&mut self.vm_stack, recv2);
+                                push_unchecked(&mut self.vm_stack, getter);
+                            }
+                            self.steps += (op_pc + 1).saturating_sub(block_start).max(1) as u64;
+                            if self.steps >= safepoint_at {
+                                safepoint_at = self.hit_safepoint(sampling, op_pc)?;
+                            }
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            if !self.call_plain(unsafe { &*heap_ptr }, 0, true) {
+                                let callee = pop_fast(&mut self.vm_stack);
+                                let this = pop_fast(&mut self.vm_stack);
+                                self.call_in_loop(callee, this, Vec::new())?;
+                            }
+                            reload_frame!();
+                        }
+                        None => {
+                            let recv2 = recv.clone();
+                            unsafe {
+                                push_unchecked(&mut self.vm_stack, recv);
+                                push_unchecked(&mut self.vm_stack, recv2);
+                            }
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            if self.get_prop_slow(name, ic)? {
+                                reload_frame!();
+                            } else {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                            }
+                        }
+                    }
+                }
+                Op::GetLocalMethod {
+                    depth,
+                    index,
+                    name,
+                    ic,
+                } => {
+                    use super::object::IcGetHit;
+                    let cache = unsafe { (&*code).ics.get_unchecked(ic as usize) };
+                    let recv = unsafe {
+                        self.frames
+                            .get_unchecked(top)
+                            .scope
+                            .as_ref()
+                            .and_then(|start| (&*heap_ptr).scope_at_ref(start, depth))
+                            .and_then(|scope| match scope.slots.get(index as usize) {
+                                Some(
+                                    Value::Binding(_)
+                                    | Value::ConstBinding(_)
+                                    | Value::Uninitialized,
+                                )
+                                | None => None,
+                                Some(value) => Some(value.clone()),
+                            })
+                    };
+                    let recv = match recv {
+                        Some(value) => value,
+                        None => {
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            let key = self.local_layout_name(top, depth, index);
+                            self.read_local_named(top, depth, index, &key)?
+                        }
+                    };
+                    match self.ic_get_value(unsafe { &*heap_ptr }, &recv, cache) {
+                        Some(IcGetHit::Value(value)) => unsafe {
+                            push_unchecked(&mut self.vm_stack, recv);
+                            push_unchecked(&mut self.vm_stack, value);
+                        },
+                        Some(IcGetHit::Missing) => unsafe {
+                            push_unchecked(&mut self.vm_stack, recv);
+                            push_unchecked(&mut self.vm_stack, Value::Undefined);
+                        },
+                        Some(IcGetHit::Getter(getter)) => {
+                            let recv2 = recv.clone();
+                            unsafe {
+                                push_unchecked(&mut self.vm_stack, recv);
+                                push_unchecked(&mut self.vm_stack, recv2);
+                                push_unchecked(&mut self.vm_stack, getter);
+                            }
+                            self.steps += (op_pc + 1).saturating_sub(block_start).max(1) as u64;
+                            if self.steps >= safepoint_at {
+                                safepoint_at = self.hit_safepoint(sampling, op_pc)?;
+                            }
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            if !self.call_plain(unsafe { &*heap_ptr }, 0, true) {
+                                let callee = pop_fast(&mut self.vm_stack);
+                                let this = pop_fast(&mut self.vm_stack);
+                                self.call_in_loop(callee, this, Vec::new())?;
+                            }
+                            reload_frame!();
+                        }
+                        None => {
+                            let recv2 = recv.clone();
+                            unsafe {
+                                push_unchecked(&mut self.vm_stack, recv);
+                                push_unchecked(&mut self.vm_stack, recv2);
+                            }
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            if self.get_prop_slow(name, ic)? {
+                                reload_frame!();
+                            } else {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
                             }
                         }
                     }
                 }
                 Op::SetProp { name, ic } => {
                     let len = self.vm_stack.len();
-                    let cache = unsafe { &(&*code).ics[ic as usize] };
+                    let cache = unsafe { (&*code).ics.get_unchecked(ic as usize) };
                     let hit = len >= 2
-                        && match &self.vm_stack[len - 2] {
+                        && match unsafe { self.vm_stack.get_unchecked(len - 2) } {
                             Value::Object(handle) => {
-                                let value = self.vm_stack[len - 1].clone();
-                                handle
-                                    .try_borrow_mut()
-                                    .is_ok_and(|mut target| target.ic_set(cache, value).is_ok())
+                                let value = unsafe { self.vm_stack.get_unchecked(len - 1).clone() };
+                                unsafe { (&*heap_ptr).object_mut(handle) }.is_some_and(|target| {
+                                    target
+                                        .ic_set_fast(handle, unsafe { &*heap_ptr }, cache, value)
+                                        .is_ok()
+                                })
                             }
                             _ => false,
                         };
                     if hit {
-                        let value = self.vm_stack.pop().unwrap_or(Value::Undefined);
-                        let old = std::mem::replace(&mut self.vm_stack[len - 2], value);
+                        let value = pop_fast(&mut self.vm_stack);
+                        let old = std::mem::replace(
+                            unsafe { self.vm_stack.get_unchecked_mut(len - 2) },
+                            value,
+                        );
                         old.fast_drop();
                     } else {
-                        self.frames[top].pc = pc;
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
                         self.set_prop_slow(name, ic)?;
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                    }
+                }
+                Op::SetPropPop { name, ic } => {
+                    let value = pop_fast(&mut self.vm_stack);
+                    let object = pop_fast(&mut self.vm_stack);
+                    let cache = unsafe { (&*code).ics.get_unchecked(ic as usize) };
+                    let missed = match &object {
+                        Value::Object(handle) => {
+                            let heap = unsafe { &*heap_ptr };
+                            match unsafe { heap.object_mut(handle) } {
+                                Some(target) => target.ic_set_fast(handle, heap, cache, value),
+                                None => Err(value),
+                            }
+                        }
+                        _ => Err(value),
+                    };
+                    if let Err(value) = missed {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        self.set_prop_slow_with(object, value, name, ic, false)?;
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                    } else {
+                        object.fast_drop();
+                    }
+                }
+                Op::GetIndex => {
+                    let len = self.vm_stack.len();
+                    if len >= 2
+                        && let Some(value) = Self::try_fast_get_index(
+                            unsafe { &*heap_ptr },
+                            unsafe { self.vm_stack.get_unchecked(len - 2) },
+                            unsafe { self.vm_stack.get_unchecked(len - 1) },
+                        )
+                    {
+                        let key = pop_fast(&mut self.vm_stack);
+                        key.fast_drop();
+                        let old = std::mem::replace(
+                            unsafe { self.vm_stack.get_unchecked_mut(len - 2) },
+                            value,
+                        );
+                        old.fast_drop();
+                    } else {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let key = pop_fast(&mut self.vm_stack);
+                        let object = pop_fast(&mut self.vm_stack);
+                        match self.get_index_tail(&object, key)? {
+                            super::operations::GetOutcome::Value(value) => {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                                unsafe { push_unchecked(&mut self.vm_stack, value) };
+                            }
+                            super::operations::GetOutcome::Call {
+                                callee,
+                                this,
+                                arguments,
+                            } => {
+                                self.call_in_loop(callee, this, arguments)?;
+                                reload_frame!();
+                            }
+                        }
+                    }
+                }
+                Op::GetRegIndex { array, index } => {
+                    let arr_ref = unsafe { self.vm_stack.get_unchecked(reg_base + array as usize) };
+                    if matches!(arr_ref, Value::Uninitialized) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = unsafe { (&*code).layout.names[array as usize].clone() };
+                        return Err(self.reference_error(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    let idx_ref = unsafe { self.vm_stack.get_unchecked(reg_base + index as usize) };
+                    if matches!(idx_ref, Value::Uninitialized) {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let name = unsafe { (&*code).layout.names[index as usize].clone() };
+                        return Err(self.reference_error(format!(
+                            "cannot access {name} before initialization"
+                        )));
+                    }
+                    if let Some(value) =
+                        Self::try_fast_get_index(unsafe { &*heap_ptr }, arr_ref, idx_ref)
+                    {
+                        unsafe { push_unchecked(&mut self.vm_stack, value) };
+                    } else {
+                        let object = arr_ref.clone();
+                        let key = idx_ref.clone();
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        match self.get_index_tail(&object, key)? {
+                            super::operations::GetOutcome::Value(value) => {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                                unsafe { push_unchecked(&mut self.vm_stack, value) };
+                            }
+                            super::operations::GetOutcome::Call {
+                                callee,
+                                this,
+                                arguments,
+                            } => {
+                                self.call_in_loop(callee, this, arguments)?;
+                                reload_frame!();
+                            }
+                        }
+                    }
+                }
+                Op::SetIndex => {
+                    let len = self.vm_stack.len();
+                    let hit = len >= 3 && {
+                        let value = unsafe { self.vm_stack.get_unchecked(len - 1).clone() };
+                        Self::try_fast_set_index(
+                            unsafe { &*heap_ptr },
+                            unsafe { self.vm_stack.get_unchecked(len - 3) },
+                            unsafe { self.vm_stack.get_unchecked(len - 2) },
+                            value,
+                        )
+                        .is_ok()
+                    };
+                    if hit {
+                        let value = pop_fast(&mut self.vm_stack);
+                        let key = pop_fast(&mut self.vm_stack);
+                        key.fast_drop();
+                        let old = std::mem::replace(
+                            unsafe { self.vm_stack.get_unchecked_mut(len - 3) },
+                            value,
+                        );
+                        old.fast_drop();
+                    } else {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        let value = pop_fast(&mut self.vm_stack);
+                        let key = pop_fast(&mut self.vm_stack);
+                        let object = pop_fast(&mut self.vm_stack);
+                        let strict = unsafe { (&*code).strict };
+                        self.set_index(&object, key, value.clone(), strict)?;
+                        object.fast_drop();
+                        reserve_headroom(&mut self.vm_stack, unsafe {
+                            (&*code).max_pushes as usize
+                        });
+                        unsafe { push_unchecked(&mut self.vm_stack, value) };
+                    }
+                }
+                Op::SetIndexPop => {
+                    let value = pop_fast(&mut self.vm_stack);
+                    let key = pop_fast(&mut self.vm_stack);
+                    let object = pop_fast(&mut self.vm_stack);
+                    match Self::try_fast_set_index(unsafe { &*heap_ptr }, &object, &key, value) {
+                        Ok(()) => {
+                            key.fast_drop();
+                            object.fast_drop();
+                        }
+                        Err(value) => {
+                            unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                            let strict = unsafe { (&*code).strict };
+                            self.set_index(&object, key, value, strict)?;
+                            object.fast_drop();
+                            reserve_headroom(&mut self.vm_stack, unsafe {
+                                (&*code).max_pushes as usize
+                            });
+                        }
                     }
                 }
                 Op::Call(count) | Op::CallMethod(count) => {
@@ -2371,57 +3926,72 @@ impl ScriptRuntime {
                     if self.steps >= safepoint_at {
                         safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                     }
-                    self.frames[top].pc = pc;
+                    unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
                     let method = matches!(op, Op::CallMethod(_));
-                    if !self.call_plain(count as usize, method) {
-                        let arguments = self.pop_arguments(count as usize);
-                        let callee = self.pop();
-                        let this = if method { self.pop() } else { Value::Undefined };
-                        self.call_in_loop(callee, this, arguments)?;
+                    let heap = unsafe { &*heap_ptr };
+                    if self.call_plain(heap, count as usize, method) {
+                        reload_frame!();
+                    } else {
+                        match self.call_fast_native(heap, count as usize, method)? {
+                            FastNativeCall::Done => {
+                                reserve_headroom(&mut self.vm_stack, unsafe {
+                                    (&*code).max_pushes as usize
+                                });
+                            }
+                            FastNativeCall::FramePushed => {
+                                reload_frame!();
+                            }
+                            FastNativeCall::FallbackMethod(new_count) => {
+                                let arguments = self.pop_arguments(new_count);
+                                let callee = pop_fast(&mut self.vm_stack);
+                                let this = pop_fast(&mut self.vm_stack);
+                                self.call_in_loop(callee, this, arguments)?;
+                                reload_frame!();
+                            }
+                            FastNativeCall::NotHandled => {
+                                let arguments = self.pop_arguments(count as usize);
+                                let callee = pop_fast(&mut self.vm_stack);
+                                let this = if method {
+                                    pop_fast(&mut self.vm_stack)
+                                } else {
+                                    Value::Undefined
+                                };
+                                self.call_in_loop(callee, this, arguments)?;
+                                reload_frame!();
+                            }
+                        }
                     }
-                    top = self.frames.len() - 1;
-                    code = Rc::as_ptr(&self.frames[top].code);
-                    pc = self.frames[top].pc;
-                    reg_base = self.frames[top].reg_base;
-                    block_start = pc;
                 }
                 Op::Return => {
-                    let value = self.pop();
-                    if self.frames[top].extra.is_none() && !self.frames[top].construct() {
+                    let value = pop_fast(&mut self.vm_stack);
+                    let frame = unsafe { self.frames.get_unchecked(top) };
+                    if frame.extra.is_none() && !frame.construct() {
                         let mut finished = self.frames.pop().expect("a frame is running");
                         truncate_stack(&mut self.vm_stack, finished.return_base);
                         if (finished.flags & (FLAG_OWNS_SCOPE | FLAG_SCOPE_ESCAPED))
                             == FLAG_OWNS_SCOPE
                             && let Some(scope) = finished.scope.take()
                         {
-                            super::heap::free_scope(scope);
+                            unsafe { &*heap_ptr }.free_scope_fast(scope);
                         }
                         if self.frames.len() == frame_floor {
                             return Ok(RunResult::Return(value));
                         }
                         self.vm_stack.push(value);
                     } else {
-                        self.frames[top].pc = pc;
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
                         if let Some(result) = self.do_return(frame_floor, value)? {
                             return Ok(result);
                         }
                     }
-                    top = self.frames.len() - 1;
-                    code = Rc::as_ptr(&self.frames[top].code);
-                    pc = self.frames[top].pc;
-                    reg_base = self.frames[top].reg_base;
-                    block_start = pc;
+                    reload_frame!();
                 }
                 other => {
-                    self.frames[top].pc = pc;
+                    unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
                     if let Some(result) = self.step_op(other, frame_floor)? {
                         return Ok(result);
                     }
-                    top = self.frames.len() - 1;
-                    code = Rc::as_ptr(&self.frames[top].code);
-                    pc = self.frames[top].pc;
-                    reg_base = self.frames[top].reg_base;
-                    block_start = pc;
+                    reload_frame!();
                 }
             }
         }
@@ -2435,10 +4005,21 @@ impl ScriptRuntime {
         increment: bool,
         prefix: bool,
     ) -> Result<(), ScriptError> {
+        let name = self.frames[top].code.names[name as usize].clone();
+        self.update_reg_slow_named(top, reg, &name, increment, prefix)
+    }
+
+    fn update_reg_slow_named(
+        &mut self,
+        top: usize,
+        reg: u16,
+        name: &str,
+        increment: bool,
+        prefix: bool,
+    ) -> Result<(), ScriptError> {
         let slot_index = self.frames[top].reg_base + reg as usize;
         let current = self.vm_stack[slot_index].clone();
         if matches!(current, Value::Uninitialized) {
-            let name = self.frames[top].code.names[name as usize].clone();
             return Err(self.reference_error(format!("cannot access {name} before initialization")));
         }
         let delta = if increment { 1 } else { -1 };
@@ -2476,7 +4057,20 @@ impl ScriptRuntime {
         increment: bool,
         prefix: bool,
     ) -> Result<(), ScriptError> {
-        let current = self.read_local(top, depth, index, name)?;
+        let name = self.frames[top].code.names[name as usize].clone();
+        self.update_local_slow_named(top, depth, index, &name, increment, prefix)
+    }
+
+    fn update_local_slow_named(
+        &mut self,
+        top: usize,
+        depth: u16,
+        index: u16,
+        name: &str,
+        increment: bool,
+        prefix: bool,
+    ) -> Result<(), ScriptError> {
+        let current = self.read_local_named(top, depth, index, name)?;
         let delta = if increment { 1 } else { -1 };
         let (old, new) = match current {
             Value::Number(number) => (
@@ -2497,7 +4091,7 @@ impl ScriptRuntime {
                 }
             },
         };
-        self.write_local(top, depth, index, name, new.clone())?;
+        self.write_local_named(top, depth, index, name, new.clone())?;
         self.vm_stack.push(if prefix { new } else { old });
         Ok(())
     }
@@ -2559,6 +4153,17 @@ impl ScriptRuntime {
     fn set_prop_slow(&mut self, name: u32, ic: u32) -> Result<(), ScriptError> {
         let value = self.pop();
         let object = self.pop();
+        self.set_prop_slow_with(object, value, name, ic, true)
+    }
+
+    fn set_prop_slow_with(
+        &mut self,
+        object: Value,
+        value: Value,
+        name: u32,
+        ic: u32,
+        push_result: bool,
+    ) -> Result<(), ScriptError> {
         let top = self.frames.len() - 1;
         let code = self.frames[top].code.clone();
         let cache = &code.ics[ic as usize];
@@ -2568,13 +4173,22 @@ impl ScriptRuntime {
             Value::Object(handle) => handle.try_borrow().ok().and_then(|o| o.shape_handle()),
             _ => None,
         };
-        self.set_property(&object, &key, value.clone(), strict)?;
+        let keep = if push_result {
+            let saved = value.clone();
+            self.set_property(&object, &key, value, strict)?;
+            Some(saved)
+        } else {
+            self.set_property(&object, &key, value, strict)?;
+            None
+        };
         if let Value::Object(handle) = &object
             && let Ok(target) = handle.try_borrow()
         {
             target.record_set_ic(&key, from_shape, cache);
         }
-        self.vm_stack.push(value);
+        if let Some(saved) = keep {
+            self.vm_stack.push(saved);
+        }
         Ok(())
     }
 
@@ -3254,7 +4868,8 @@ impl ScriptRuntime {
             }
             Op::Call(count) | Op::CallMethod(count) => {
                 let method = matches!(op, Op::CallMethod(_));
-                if !self.call_plain(count as usize, method) {
+                let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
+                if !self.call_plain(heap, count as usize, method) {
                     let arguments = self.pop_arguments(count as usize);
                     let callee = self.pop();
                     let this = if method { self.pop() } else { Value::Undefined };
@@ -3880,6 +5495,199 @@ impl ScriptRuntime {
                     .or_else(|| self.base_url.clone());
                 let promise = self.dynamic_import_promise(url, specifier, options);
                 self.vm_stack.push(promise);
+            }
+            Op::GetRegProp { reg, name, ic } => {
+                let slot_index = self.frames[top].reg_base + reg as usize;
+                let recv = self.vm_stack[slot_index].clone();
+                if matches!(recv, Value::Uninitialized) {
+                    let key = self.frames[top].code.layout.names[reg as usize].clone();
+                    return Err(
+                        self.reference_error(format!("cannot access {key} before initialization"))
+                    );
+                }
+                self.vm_stack.push(recv);
+                self.get_prop_slow(name, ic)?;
+            }
+            Op::GetLocalProp {
+                depth,
+                index,
+                name,
+                ic,
+            } => {
+                let key = self.local_layout_name(top, depth, index);
+                let recv = self.read_local_named(top, depth, index, &key)?;
+                self.vm_stack.push(recv);
+                self.get_prop_slow(name, ic)?;
+            }
+            Op::GetRegMethod { reg, name, ic } => {
+                let slot_index = self.frames[top].reg_base + reg as usize;
+                let recv = self.vm_stack[slot_index].clone();
+                if matches!(recv, Value::Uninitialized) {
+                    let key = self.frames[top].code.layout.names[reg as usize].clone();
+                    return Err(
+                        self.reference_error(format!("cannot access {key} before initialization"))
+                    );
+                }
+                self.vm_stack.push(recv.clone());
+                self.vm_stack.push(recv);
+                self.get_prop_slow(name, ic)?;
+            }
+            Op::GetLocalMethod {
+                depth,
+                index,
+                name,
+                ic,
+            } => {
+                let key = self.local_layout_name(top, depth, index);
+                let recv = self.read_local_named(top, depth, index, &key)?;
+                self.vm_stack.push(recv.clone());
+                self.vm_stack.push(recv);
+                self.get_prop_slow(name, ic)?;
+            }
+            Op::SetRegPop { reg } => {
+                let slot_index = self.frames[top].reg_base + reg as usize;
+                if matches!(self.vm_stack[slot_index], Value::Uninitialized) {
+                    let key = self.frames[top].code.layout.names[reg as usize].clone();
+                    return Err(
+                        self.reference_error(format!("cannot access {key} before initialization"))
+                    );
+                }
+                let value = self.pop();
+                let old = std::mem::replace(&mut self.vm_stack[slot_index], value);
+                old.fast_drop();
+            }
+            Op::SetLocalPop { depth, index } => {
+                let value = self.pop();
+                let key = self.local_layout_name(top, depth, index);
+                self.write_local_named(top, depth, index, &key, value)?;
+            }
+            Op::SetPropPop { name, ic } => {
+                let value = self.pop();
+                let object = self.pop();
+                self.set_prop_slow_with(object, value, name, ic, false)?;
+            }
+            Op::SetIndexPop => {
+                let value = self.pop();
+                let key = self.pop();
+                let object = self.pop();
+                let strict = self.frames[top].code.strict;
+                self.set_index(&object, key, value, strict)?;
+            }
+            Op::UpdateRegPop { reg, increment } => {
+                let key = self.frames[top].code.layout.names[reg as usize].clone();
+                self.update_reg_slow_named(top, reg, &key, increment, false)?;
+                self.pop().fast_drop();
+            }
+            Op::UpdateLocalPop {
+                depth,
+                index,
+                increment,
+            } => {
+                let key = self.local_layout_name(top, depth, index);
+                self.update_local_slow_named(top, depth, index, &key, increment, false)?;
+                self.pop().fast_drop();
+            }
+            Op::JumpIfRegFalse { reg, target } | Op::JumpIfRegTrue { reg, target } => {
+                let slot_index = self.frames[top].reg_base + reg as usize;
+                let value = self.vm_stack[slot_index].clone();
+                if matches!(value, Value::Uninitialized) {
+                    let key = self.frames[top].code.layout.names[reg as usize].clone();
+                    return Err(
+                        self.reference_error(format!("cannot access {key} before initialization"))
+                    );
+                }
+                let test = value.truthy();
+                value.fast_drop();
+                if test == matches!(op, Op::JumpIfRegTrue { .. }) {
+                    self.frames[top].pc = target as usize;
+                }
+            }
+            Op::JumpIfNotCompare {
+                op: operator,
+                target,
+            } => {
+                let right = self.pop();
+                let left = self.pop();
+                let passed = self.binary(operator, left, right)?.truthy();
+                if !passed {
+                    self.frames[top].pc = target as usize;
+                }
+            }
+            Op::JumpIfNotCompareRegs {
+                left,
+                right,
+                op: operator,
+                target,
+            } => {
+                let base = self.frames[top].reg_base;
+                let l = self.vm_stack[base + left as usize].clone();
+                if matches!(l, Value::Uninitialized) {
+                    let key = self.frames[top].code.layout.names[left as usize].clone();
+                    return Err(
+                        self.reference_error(format!("cannot access {key} before initialization"))
+                    );
+                }
+                let r = self.vm_stack[base + right as usize].clone();
+                if matches!(r, Value::Uninitialized) {
+                    let key = self.frames[top].code.layout.names[right as usize].clone();
+                    return Err(
+                        self.reference_error(format!("cannot access {key} before initialization"))
+                    );
+                }
+                let passed = self.binary(operator, l, r)?.truthy();
+                if !passed {
+                    self.frames[top].pc = target as usize;
+                }
+            }
+            Op::BinaryRegs {
+                left,
+                right,
+                op: operator,
+            } => {
+                let base = self.frames[top].reg_base;
+                let l = self.vm_stack[base + left as usize].clone();
+                if matches!(l, Value::Uninitialized) {
+                    let key = self.frames[top].code.layout.names[left as usize].clone();
+                    return Err(
+                        self.reference_error(format!("cannot access {key} before initialization"))
+                    );
+                }
+                let r = self.vm_stack[base + right as usize].clone();
+                if matches!(r, Value::Uninitialized) {
+                    let key = self.frames[top].code.layout.names[right as usize].clone();
+                    return Err(
+                        self.reference_error(format!("cannot access {key} before initialization"))
+                    );
+                }
+                let value = self.binary(operator, l, r)?;
+                self.vm_stack.push(value);
+            }
+            Op::GetRegIndex { array, index } => {
+                let base = self.frames[top].reg_base;
+                let object = self.vm_stack[base + array as usize].clone();
+                if matches!(object, Value::Uninitialized) {
+                    let key = self.frames[top].code.layout.names[array as usize].clone();
+                    return Err(
+                        self.reference_error(format!("cannot access {key} before initialization"))
+                    );
+                }
+                let key = self.vm_stack[base + index as usize].clone();
+                if matches!(key, Value::Uninitialized) {
+                    let name = self.frames[top].code.layout.names[index as usize].clone();
+                    return Err(
+                        self.reference_error(format!("cannot access {name} before initialization"))
+                    );
+                }
+                match self.get_index_tail(&object, key)? {
+                    super::operations::GetOutcome::Value(value) => self.vm_stack.push(value),
+                    super::operations::GetOutcome::Call {
+                        callee,
+                        this,
+                        arguments,
+                    } => {
+                        self.call_in_loop(callee, this, arguments)?;
+                    }
+                }
             }
         }
         Ok(None)

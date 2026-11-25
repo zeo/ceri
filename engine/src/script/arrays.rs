@@ -469,12 +469,7 @@ impl ScriptRuntime {
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
         use ArrayMethod as M;
-        let name = ARRAY_METHODS
-            .iter()
-            .find(|(_, candidate, _)| {
-                std::mem::discriminant(candidate) == std::mem::discriminant(&method)
-            })
-            .map_or("", |(name, _, _)| *name);
+        let name = ARRAY_METHODS[method as usize].0;
         let mutates = matches!(
             method,
             M::Push
@@ -500,6 +495,7 @@ impl ScriptRuntime {
             M::ForEach | M::Map | M::Filter | M::Some | M::Every | M::Find | M::FindIndex => {
                 let (values, object) = self.callback_receiver(&this, name)?;
                 let callback = self.callback(&arguments, name)?;
+                let fast = Self::simple_closure(&callback);
                 let receiver = argument(&arguments, 1);
                 let length = values.len();
                 let mut mapped = Vec::new();
@@ -525,11 +521,19 @@ impl ScriptRuntime {
                         }
                         value => value,
                     };
-                    let result = self.call_function(
-                        callback.clone(),
-                        receiver.clone(),
-                        vec![value.clone(), Value::Number(index as f64), object.clone()],
-                    )?;
+                    let result = match &fast {
+                        Some(closure) => self.call_simple_closure(
+                            closure,
+                            &callback,
+                            receiver.clone(),
+                            &[value.clone(), Value::Number(index as f64), object.clone()],
+                        )?,
+                        None => self.call_function(
+                            callback.clone(),
+                            receiver.clone(),
+                            vec![value.clone(), Value::Number(index as f64), object.clone()],
+                        )?,
+                    };
                     match method {
                         M::Map => mapped.push(result),
                         M::Filter if result.truthy() => mapped.push(value),
@@ -603,6 +607,7 @@ impl ScriptRuntime {
                         value => value,
                     };
                 }
+                let fast = Self::simple_closure(&callback);
                 let mut accumulator = accumulator.unwrap_or(Value::Undefined);
                 for index in indices {
                     let value = Self::element(&this, &values, index).unwrap_or(Value::Undefined);
@@ -616,16 +621,29 @@ impl ScriptRuntime {
                         }
                         value => value,
                     };
-                    accumulator = self.call_function(
-                        callback.clone(),
-                        Value::Undefined,
-                        vec![
-                            accumulator,
-                            value,
-                            Value::Number(index as f64),
-                            object.clone(),
-                        ],
-                    )?;
+                    accumulator = match &fast {
+                        Some(closure) => self.call_simple_closure(
+                            closure,
+                            &callback,
+                            Value::Undefined,
+                            &[
+                                accumulator,
+                                value,
+                                Value::Number(index as f64),
+                                object.clone(),
+                            ],
+                        )?,
+                        None => self.call_function(
+                            callback.clone(),
+                            Value::Undefined,
+                            vec![
+                                accumulator,
+                                value,
+                                Value::Number(index as f64),
+                                object.clone(),
+                            ],
+                        )?,
+                    };
                 }
                 Ok(accumulator)
             }
@@ -935,6 +953,7 @@ impl ScriptRuntime {
         } else {
             None
         };
+        let fast_comparator = Self::simple_closure(comparator);
         let mut order: Vec<usize> = (0..defined.len()).collect();
         let mut scratch = order.clone();
         self.merge_sort(
@@ -943,6 +962,7 @@ impl ScriptRuntime {
             &defined,
             keys.as_deref(),
             comparator,
+            fast_comparator.as_ref(),
         )?;
         let mut sorted: Vec<Value> = order
             .into_iter()
@@ -959,16 +979,28 @@ impl ScriptRuntime {
         values: &[Value],
         keys: Option<&[Vec<u16>]>,
         comparator: &Value,
+        fast_comparator: Option<&Rc<super::vm::Closure>>,
     ) -> Result<Ordering, ScriptError> {
         if let Some(keys) = keys {
             return Ok(keys[left].cmp(&keys[right]));
         }
-        let result = self.call_function(
-            comparator.clone(),
-            Value::Undefined,
-            vec![values[left].clone(), values[right].clone()],
-        )?;
-        let number = self.coerce_number(result)?;
+        let result = match fast_comparator {
+            Some(closure) => self.call_simple_closure(
+                closure,
+                comparator,
+                Value::Undefined,
+                &[values[left].clone(), values[right].clone()],
+            )?,
+            None => self.call_function(
+                comparator.clone(),
+                Value::Undefined,
+                vec![values[left].clone(), values[right].clone()],
+            )?,
+        };
+        let number = match result {
+            Value::Number(number) => number,
+            other => self.coerce_number(other)?,
+        };
         Ok(if number < 0.0 {
             Ordering::Less
         } else if number > 0.0 {
@@ -985,6 +1017,7 @@ impl ScriptRuntime {
         values: &[Value],
         keys: Option<&[Vec<u16>]>,
         comparator: &Value,
+        fast_comparator: Option<&Rc<super::vm::Closure>>,
     ) -> Result<(), ScriptError> {
         let length = order.len();
         if length <= 1 {
@@ -995,8 +1028,14 @@ impl ScriptRuntime {
             for i in 1..length {
                 let mut j = i;
                 while j > 0
-                    && self.compare_elements(order[j - 1], order[j], values, keys, comparator)?
-                        == Ordering::Greater
+                    && self.compare_elements(
+                        order[j - 1],
+                        order[j],
+                        values,
+                        keys,
+                        comparator,
+                        fast_comparator,
+                    )? == Ordering::Greater
                 {
                     order.swap(j - 1, j);
                     j -= 1;
@@ -1008,13 +1047,33 @@ impl ScriptRuntime {
         {
             let (left, right) = order.split_at_mut(middle);
             let (left_scratch, right_scratch) = scratch.split_at_mut(middle);
-            self.merge_sort(left, left_scratch, values, keys, comparator)?;
-            self.merge_sort(right, right_scratch, values, keys, comparator)?;
+            self.merge_sort(
+                left,
+                left_scratch,
+                values,
+                keys,
+                comparator,
+                fast_comparator,
+            )?;
+            self.merge_sort(
+                right,
+                right_scratch,
+                values,
+                keys,
+                comparator,
+                fast_comparator,
+            )?;
         }
         let (mut i, mut j, mut k) = (0, middle, 0);
         while i < middle && j < length {
-            if self.compare_elements(order[i], order[j], values, keys, comparator)?
-                == Ordering::Greater
+            if self.compare_elements(
+                order[i],
+                order[j],
+                values,
+                keys,
+                comparator,
+                fast_comparator,
+            )? == Ordering::Greater
             {
                 scratch[k] = order[j];
                 j += 1;

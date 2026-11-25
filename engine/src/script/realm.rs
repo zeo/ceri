@@ -2547,10 +2547,34 @@ impl ScriptRuntime {
 
     pub(super) fn call_native(
         &mut self,
-        native: Native,
+        native: &Native,
         this: Value,
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
+        match native {
+            Native::Dom(member) => return self.call_dom(*member, this, arguments),
+            Native::String(method) => {
+                return self.call_string_method_slice(*method, this, &arguments);
+            }
+            Native::Array(method) => {
+                return self
+                    .call_array_method(*method, this, arguments)
+                    .map(Value::filled);
+            }
+            Native::Collection(method) => {
+                return self.call_collection(*method, this, arguments, None);
+            }
+            Native::Math(function) => return self.call_math(*function, arguments),
+            Native::RegExp(method) => return self.call_regexp(*method, this, arguments, None),
+            Native::Reflect(method) => return self.call_reflect(*method, arguments, None),
+            Native::Promise(function) => {
+                return self.call_promise_function((**function).clone(), this, arguments);
+            }
+            Native::Event(member) => return self.call_event_member(*member, this, arguments),
+            Native::Window(method) => return self.call_window_method(*method, this, arguments),
+            Native::Console(method) => return self.call_console(*method, arguments),
+            _ => {}
+        }
         let first = argument(&arguments, 0);
         match native {
             Native::ObjectConstructor => {
@@ -3288,16 +3312,16 @@ impl ScriptRuntime {
                 self.async_generator_enqueue(&data, mode, first)
             }
             Native::AsyncResume(handle, rejected) => {
-                self.async_resume(&handle.0, first, rejected)?;
+                self.async_resume(&handle.0, first, *rejected)?;
                 Ok(Value::Undefined)
             }
-            Native::IterResultWrap(done) => Ok(self.iterator_result(first, done)),
+            Native::IterResultWrap(done) => Ok(self.iterator_result(first, *done)),
             // an index nothing was put at leaves a method as undefined
             Native::Array(method) => self
-                .call_array_method(method, this, arguments)
+                .call_array_method(*method, this, arguments)
                 .map(Value::filled),
-            Native::String(method) => self.call_string_method(method, this, arguments),
-            Native::Math(function) => self.call_math(function, arguments),
+            Native::String(method) => self.call_string_method_slice(*method, this, &arguments),
+            Native::Math(function) => self.call_math(*function, arguments),
             Native::NumberFormat(super::numbers::NumberFormat::Locale) => {
                 let number = self.this_number(&this, "toLocaleString")?;
                 let options = self.number_options(&first, &argument(&arguments, 1))?;
@@ -3307,90 +3331,90 @@ impl ScriptRuntime {
             }
             Native::NumberFormat(format) => {
                 let number = self.this_number(&this, "toFixed")?;
-                self.format_number(format, number, first)
+                self.format_number(*format, number, first)
             }
-            Native::RegExp(method) => self.call_regexp(method, this, arguments, None),
-            Native::Console(method) => self.call_console(method, arguments),
+            Native::RegExp(method) => self.call_regexp(*method, this, arguments, None),
+            Native::Console(method) => self.call_console(*method, arguments),
             Native::Promise(function) => {
-                self.call_promise_function((*function).clone(), this, arguments)
+                self.call_promise_function((**function).clone(), this, arguments)
             }
-            Native::Dom(member) => self.call_dom(member, this, arguments),
+            Native::Dom(member) => self.call_dom(*member, this, arguments),
             Native::DomConstructor(name)
             | Native::EventConstructor(name)
             | Native::RangeConstructor(name) => Err(self.type_error(format!(
                 "Failed to construct '{name}': Please use the 'new' operator"
             ))),
-            Native::Event(member) => self.call_event_member(member, this, arguments),
-            Native::Range(member) => self.call_range_member(member, this, arguments),
-            Native::Window(method) => self.call_window_method(method, this, arguments),
-            Native::Observer(method) => self.call_observer_method(method, this, arguments),
-            Native::Xhr(member) => self.call_xhr(member, this, arguments),
-            Native::Socket(member) => self.call_socket(member, this, arguments),
-            Native::Notice(member) => self.call_notice(member, this, arguments),
-            Native::Channel(member) => self.call_channel(member, this, arguments),
+            Native::Event(member) => self.call_event_member(*member, this, arguments),
+            Native::Range(member) => self.call_range_member(*member, this, arguments),
+            Native::Window(method) => self.call_window_method(*method, this, arguments),
+            Native::Observer(method) => self.call_observer_method(*method, this, arguments),
+            Native::Xhr(member) => self.call_xhr(*member, this, arguments),
+            Native::Socket(member) => self.call_socket(*member, this, arguments),
+            Native::Notice(member) => self.call_notice(*member, this, arguments),
+            Native::Channel(member) => self.call_channel(*member, this, arguments),
             Native::ChannelDeliver => self.deliver_broadcasts(),
-            Native::Reader(member) => self.call_reader(member, this, arguments),
-            Native::ReaderDeliver(id, generation) => self.deliver_reader(id, generation),
-            Native::Port(member) => self.call_port(member, this, arguments),
-            Native::Walk(member) => self.call_walk(member, this, arguments),
-            Native::Helper(member) => self.call_iterator_helper(member, this, arguments),
-            Native::Markup(member) => self.call_markup(member, this, arguments),
-            Native::Path(member) => self.call_path(member, this, arguments),
-            Native::Matrix(member) => self.call_matrix(member, this, arguments),
-            Native::Segmenter(member) => self.call_segmenter(member, this, arguments),
+            Native::Reader(member) => self.call_reader(*member, this, arguments),
+            Native::ReaderDeliver(id, generation) => self.deliver_reader(*id, *generation),
+            Native::Port(member) => self.call_port(*member, this, arguments),
+            Native::Walk(member) => self.call_walk(*member, this, arguments),
+            Native::Helper(member) => self.call_iterator_helper(*member, this, arguments),
+            Native::Markup(member) => self.call_markup(*member, this, arguments),
+            Native::Path(member) => self.call_path(*member, this, arguments),
+            Native::Matrix(member) => self.call_matrix(*member, this, arguments),
+            Native::Segmenter(member) => self.call_segmenter(*member, this, arguments),
             Native::Disposable(member, asynchronous) => {
-                self.call_disposable(member, asynchronous, this, arguments)
+                self.call_disposable(*member, *asynchronous, this, arguments)
             }
-            Native::Atomics(op) => self.call_atomics(op, arguments),
-            Native::Locale(member) => self.call_locale(member, this, arguments),
-            Native::DisplayNames(member) => self.call_display_names(member, this, arguments),
-            Native::DurationFormat(member) => self.call_duration_format(member, this, arguments),
-            Native::Offscreen(member) => self.call_offscreen(member, this, arguments),
-            Native::UrlPattern(member) => self.call_url_pattern(member, this, arguments),
-            Native::XPath(member) => self.call_xpath(member, this, arguments),
-            Native::StyleOm(member) => self.call_style_om(member, this, arguments),
-            Native::WebGl(member) => self.call_webgl(member, this, arguments),
-            Native::Temporal(member) => self.call_temporal(member, this, arguments),
-            Native::PerfObserver(member) => self.call_perf_observer(member, this, arguments),
-            Native::PerfDeliver(observer) => self.deliver_perf_entries(&observer),
+            Native::Atomics(op) => self.call_atomics(*op, arguments),
+            Native::Locale(member) => self.call_locale(*member, this, arguments),
+            Native::DisplayNames(member) => self.call_display_names(*member, this, arguments),
+            Native::DurationFormat(member) => self.call_duration_format(*member, this, arguments),
+            Native::Offscreen(member) => self.call_offscreen(*member, this, arguments),
+            Native::UrlPattern(member) => self.call_url_pattern(*member, this, arguments),
+            Native::XPath(member) => self.call_xpath(*member, this, arguments),
+            Native::StyleOm(member) => self.call_style_om(*member, this, arguments),
+            Native::WebGl(member) => self.call_webgl(*member, this, arguments),
+            Native::Temporal(member) => self.call_temporal(*member, this, arguments),
+            Native::PerfObserver(member) => self.call_perf_observer(*member, this, arguments),
+            Native::PerfDeliver(observer) => self.deliver_perf_entries(observer),
             Native::ViewTransition(transition, which) => {
-                self.step_view_transition(&transition, which, first)
+                self.step_view_transition(transition, *which, first)
             }
-            Native::Cssom(member) => self.call_cssom(member, this, arguments),
-            Native::Font(member) => self.call_font(member, this, arguments),
+            Native::Cssom(member) => self.call_cssom(*member, this, arguments),
+            Native::Font(member) => self.call_font(*member, this, arguments),
             Native::MatrixConstructor(_) => Err(self.type_error(
                 "Failed to construct 'DOMMatrix': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
-            Native::Stream(function) => self.call_stream((*function).clone(), this, arguments),
-            Native::Nav(function) => self.call_nav((*function).clone(), this, arguments),
-            Native::Anim(member) => self.call_animation(member, this, arguments),
-            Native::AnimFinish(id, generation) => self.deliver_animation_finish(id, generation),
-            Native::Shape(member) => self.call_shape(member, this, arguments),
+            Native::Stream(function) => self.call_stream((**function).clone(), this, arguments),
+            Native::Nav(function) => self.call_nav((**function).clone(), this, arguments),
+            Native::Anim(member) => self.call_animation(*member, this, arguments),
+            Native::AnimFinish(id, generation) => self.deliver_animation_finish(*id, *generation),
+            Native::Shape(member) => self.call_shape(*member, this, arguments),
             Native::PortDeliver => self.deliver_port_messages(),
-            Native::Url(member) => self.call_url(member, this, arguments),
-            Native::UrlSearchParams(member) => self.call_url_search_params(member, this, arguments),
+            Native::Url(member) => self.call_url(*member, this, arguments),
+            Native::UrlSearchParams(member) => self.call_url_search_params(*member, this, arguments),
             Native::UrlConstructor => {
                 Err(self.type_error("Failed to construct 'URL': Please use the 'new' operator"))
             }
             Native::UrlSearchParamsConstructor => Err(self.type_error(
                 "Failed to construct 'URLSearchParams': Please use the 'new' operator",
             )),
-            Native::CustomElements(method) => self.call_registry(method, arguments),
-            Native::XhrDeliver(id, generation) => self.deliver_xhr(id, generation),
-            Native::ImageDeliver(node, generation) => self.deliver_image(node, generation),
-            Native::ScriptElement(node) => self.run_script_element(node),
-            Native::DialogClose(node) => self.deliver_dialog_close(node),
-            Native::PopoverToggle(node) => self.deliver_popover_toggle(node),
-            Native::MediaLoad(node, generation) => self.deliver_media_load(node, generation),
+            Native::CustomElements(method) => self.call_registry(*method, arguments),
+            Native::XhrDeliver(id, generation) => self.deliver_xhr(*id, *generation),
+            Native::ImageDeliver(node, generation) => self.deliver_image(*node, *generation),
+            Native::ScriptElement(node) => self.run_script_element(*node),
+            Native::DialogClose(node) => self.deliver_dialog_close(*node),
+            Native::PopoverToggle(node) => self.deliver_popover_toggle(*node),
+            Native::MediaLoad(node, generation) => self.deliver_media_load(*node, *generation),
             Native::MediaCue(cue) => {
-                let (node, generation, cue) = *cue;
+                let (node, generation, cue) = (**cue).clone();
                 self.deliver_media_cue(node, generation, cue)
             }
-            Native::Audio(member) => self.call_audio(member, this, arguments),
-            Native::AudioStateChange(id) => self.deliver_audio_state(id),
+            Native::Audio(member) => self.call_audio(*member, this, arguments),
+            Native::AudioStateChange(id) => self.deliver_audio_state(*id),
             Native::AudioConstructor(class) => Err(self.type_error(format!(
                 "Failed to construct '{}': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
-                super::audio::class_name(class)
+                super::audio::class_name(*class)
             ))),
             Native::XhrConstructor => Err(self
                 .type_error("Failed to construct 'XMLHttpRequest': Please use the 'new' operator")),
@@ -3419,9 +3443,9 @@ impl ScriptRuntime {
             Native::ClipboardItemConstructor => Err(self.type_error(
                 "Failed to construct 'ClipboardItem': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
-            Native::FetchAbort(id) => self.abort_fetch(id),
-            Native::Source(member) => self.call_source(member, this),
-            Native::SourceReconnect(id) => self.reconnect_source(id),
+            Native::FetchAbort(id) => self.abort_fetch(*id),
+            Native::Source(member) => self.call_source(*member, this),
+            Native::SourceReconnect(id) => self.reconnect_source(*id),
             Native::SourceConstructor => Err(self.type_error(
                 "Failed to construct 'EventSource': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
             )),
@@ -3457,7 +3481,7 @@ impl ScriptRuntime {
             },
             Native::EncodeUri(component) => {
                 let text = self.coerce_string(first)?;
-                let keep = if component {
+                let keep = if *component {
                     ""
                 } else {
                     super::strings::URI_RESERVED
@@ -3494,7 +3518,7 @@ impl ScriptRuntime {
             }
             Native::DecodeUri(component) => {
                 let text = self.coerce_string(first)?;
-                let keep = if component {
+                let keep = if *component {
                     ""
                 } else {
                     super::strings::URI_RESERVED
@@ -3507,7 +3531,7 @@ impl ScriptRuntime {
             Native::Escape(escape) => {
                 let units = super::strings::units(&self.coerce_string(first)?);
                 Ok(Value::String(
-                    if escape {
+                    if *escape {
                         super::strings::escape(&units)
                     } else {
                         super::strings::unescape(&units)
@@ -3551,16 +3575,16 @@ impl ScriptRuntime {
                 }
                 Ok(Value::String(text.into()))
             }
-            Native::Reflect(method) => self.call_reflect(method, arguments, None),
+            Native::Reflect(method) => self.call_reflect(*method, arguments, None),
             Native::ProxyRevoke(proxy) => {
                 *proxy.target.borrow_mut() = None;
                 *proxy.handler.borrow_mut() = None;
                 Ok(Value::Undefined)
             }
-            Native::Collection(method) => self.call_collection(method, this, arguments, None),
-            Native::Date(method) => self.call_date(method, this, arguments, None),
-            Native::Typed(method) => self.call_typed(method, this, arguments, None),
-            Native::Codec(method) => self.call_codec(method, this, arguments, None),
+            Native::Collection(method) => self.call_collection(*method, this, arguments, None),
+            Native::Date(method) => self.call_date(*method, this, arguments, None),
+            Native::Typed(method) => self.call_typed(*method, this, arguments, None),
+            Native::Codec(method) => self.call_codec(*method, this, arguments, None),
             Native::BigIntCall => {
                 let primitive = self.coerce_primitive(first, super::operations::Hint::Number)?;
                 match primitive {
@@ -3584,7 +3608,7 @@ impl ScriptRuntime {
                 }
                 let value = self.coerce_bigint(argument(&arguments, 1))?;
                 Ok(Value::BigInt(Rc::new(
-                    value.as_bits(bits.min(1_048_576.0) as usize, signed),
+                    value.as_bits(bits.min(1_048_576.0) as usize, *signed),
                 )))
             }
             Native::BigIntToString | Native::BigIntValueOf => {
@@ -3613,7 +3637,7 @@ impl ScriptRuntime {
                 }
                 Ok(Value::String(value.to_string_radix(radix as u32).into()))
             }
-            Native::Intl(method) => self.call_intl((*method).clone(), this, arguments),
+            Native::Intl(method) => self.call_intl((**method).clone(), this, arguments),
             Native::NumericCompare => {
                 if let (Value::BigInt(left), Value::BigInt(right)) =
                     (&first, &argument(&arguments, 1))
@@ -3715,7 +3739,7 @@ impl ScriptRuntime {
                 self.construct_error_object(kind, arguments, &target)
             }
             Native::BooleanConstructor | Native::NumberConstructor | Native::StringConstructor => {
-                let primitive = self.call_native(native.clone(), Value::Undefined, arguments)?;
+                let primitive = self.call_native(&native, Value::Undefined, arguments)?;
                 let wrapped = self.coerce_object(primitive)?;
                 if subclass && let Value::Object(object) = &wrapped {
                     let prototype = self.prototype_from_constructor(&new_target)?;

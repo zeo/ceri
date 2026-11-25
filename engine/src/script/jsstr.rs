@@ -20,8 +20,20 @@ fn layout_for(len: usize) -> (Layout, usize) {
         .expect("a string fits in memory")
 }
 
+thread_local! {
+    static EMPTY: JsStr = JsStr::alloc_bytes("");
+}
+
 impl JsStr {
+    #[inline]
     pub(crate) fn new(text: &str) -> Self {
+        if text.is_empty() {
+            return EMPTY.with(JsStr::clone);
+        }
+        Self::alloc_bytes(text)
+    }
+
+    fn alloc_bytes(text: &str) -> Self {
         let (layout, offset) = layout_for(text.len());
         // SAFETY: the layout is never zero-sized, as it holds the header; the header and the
         // bytes are written before anything reads them
@@ -39,11 +51,13 @@ impl JsStr {
         }
     }
 
+    #[inline(always)]
     fn header(&self) -> &Header {
         // SAFETY: the header lives while any handle to it does
         unsafe { self.0.as_ref() }
     }
 
+    #[inline(always)]
     pub(crate) fn as_str(&self) -> &str {
         const DATA_OFFSET: usize = std::mem::size_of::<Header>();
         let len = self.header().len;
@@ -54,12 +68,22 @@ impl JsStr {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn ptr_eq(left: &Self, right: &Self) -> bool {
         left.0 == right.0
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn dealloc_slow(&mut self) {
+        let (layout, _) = layout_for(self.header().len);
+        // SAFETY: this was the last handle, and the layout is the one it was made with
+        unsafe { dealloc(self.0.as_ptr().cast(), layout) }
     }
 }
 
 impl Clone for JsStr {
+    #[inline(always)]
     fn clone(&self) -> Self {
         let count = &self.header().count;
         count.set(count.get() + 1);
@@ -68,13 +92,13 @@ impl Clone for JsStr {
 }
 
 impl Drop for JsStr {
+    #[inline]
     fn drop(&mut self) {
         let count = &self.header().count;
-        count.set(count.get() - 1);
-        if count.get() == 0 {
-            let (layout, _) = layout_for(self.header().len);
-            // SAFETY: this was the last handle, and the layout is the one it was made with
-            unsafe { dealloc(self.0.as_ptr().cast(), layout) }
+        let next = count.get() - 1;
+        count.set(next);
+        if next == 0 {
+            self.dealloc_slow();
         }
     }
 }
@@ -82,6 +106,7 @@ impl Drop for JsStr {
 impl std::ops::Deref for JsStr {
     type Target = str;
 
+    #[inline(always)]
     fn deref(&self) -> &str {
         self.as_str()
     }

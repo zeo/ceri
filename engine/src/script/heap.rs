@@ -29,9 +29,6 @@ const MINIMUM_THRESHOLD: usize = 262_144;
 #[derive(Debug)]
 pub(super) struct BorrowError;
 
-#[derive(Debug)]
-pub(super) struct BorrowMutError;
-
 struct Entry<T> {
     meta: Cell<u32>,
     borrow: Cell<i32>,
@@ -304,28 +301,6 @@ impl<T> Slab<T> {
         }
     }
 
-    #[inline(always)]
-    fn try_borrow_mut<'a>(
-        &'a self,
-        index: u32,
-        epoch: u32,
-    ) -> Result<GcRefMut<'a, T>, BorrowMutError> {
-        let Some(entry) = self.entry_if_alive(index, epoch) else {
-            return Err(BorrowMutError);
-        };
-        let state = unsafe { (*entry).borrow.get() };
-        if state != 0 {
-            return Err(BorrowMutError);
-        }
-        unsafe { (*entry).borrow.set(-1) };
-        self.active_borrows.set(self.active_borrows.get() + 1);
-        Ok(GcRefMut {
-            entry,
-            slab_borrows: &self.active_borrows,
-            _marker: PhantomData,
-        })
-    }
-
     #[inline]
     fn is_alive(&self, index: u32, epoch: u32) -> bool {
         self.entry_if_alive(index, epoch).is_some()
@@ -455,7 +430,7 @@ impl<T> Slab<T> {
     }
 }
 
-struct Heap {
+pub(super) struct Heap {
     id: u16,
     objects: Slab<JsObject>,
     arrays: Slab<ArrayData>,
@@ -487,6 +462,151 @@ impl Heap {
             + self.arrays.active_borrows.get()
             + self.scopes.active_borrows.get()
     }
+
+    // direct non-reentrant accessors used inside run_fast where no GC or overlapping borrow
+    // can happen during the reference lifetime
+    #[inline(always)]
+    pub(super) unsafe fn scope_at_ref(&self, start: &ScopeRef, depth: u16) -> Option<&Scope> {
+        let mut raw = start.0;
+        let mut steps = depth;
+        loop {
+            let (heap_id, epoch, index) = unpack_handle(raw);
+            if heap_id != self.id {
+                return None;
+            }
+            let entry = self.scopes.entry_live(index, epoch);
+            if unsafe { (*entry).borrow.get() } < 0 {
+                return None;
+            }
+            let scope = unsafe { (*(*entry).value.get()).as_ref().unwrap_unchecked() };
+            if steps == 0 {
+                return Some(scope);
+            }
+            raw = scope.parent.as_ref()?.0;
+            steps -= 1;
+        }
+    }
+
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub(super) unsafe fn scope_at_mut(&self, start: &ScopeRef, depth: u16) -> Option<&mut Scope> {
+        let mut raw = start.0;
+        let mut steps = depth;
+        loop {
+            let (heap_id, epoch, index) = unpack_handle(raw);
+            if heap_id != self.id {
+                return None;
+            }
+            let entry = self.scopes.entry_live(index, epoch);
+            if steps == 0 {
+                if unsafe { (*entry).borrow.get() } != 0 {
+                    return None;
+                }
+                return Some(unsafe { (*(*entry).value.get()).as_mut().unwrap_unchecked() });
+            }
+            if unsafe { (*entry).borrow.get() } < 0 {
+                return None;
+            }
+            let scope = unsafe { (*(*entry).value.get()).as_ref().unwrap_unchecked() };
+            raw = scope.parent.as_ref()?.0;
+            steps -= 1;
+        }
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn object_ref(&self, handle: &ObjectHandle) -> Option<&JsObject> {
+        let (heap_id, epoch, index) = unpack_handle(handle.0);
+        if heap_id != self.id {
+            return None;
+        }
+        let entry = self.objects.entry_live(index, epoch);
+        if unsafe { (*entry).borrow.get() } < 0 {
+            return None;
+        }
+        Some(unsafe { (*(*entry).value.get()).as_ref().unwrap_unchecked() })
+    }
+
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub(super) unsafe fn object_mut(&self, handle: &ObjectHandle) -> Option<&mut JsObject> {
+        let (heap_id, epoch, index) = unpack_handle(handle.0);
+        if heap_id != self.id {
+            return None;
+        }
+        let entry = self.objects.entry_live(index, epoch);
+        if unsafe { (*entry).borrow.get() } != 0 {
+            return None;
+        }
+        Some(unsafe { (*(*entry).value.get()).as_mut().unwrap_unchecked() })
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn array_ref(&self, handle: &ArrayHandle) -> Option<&ArrayData> {
+        let (heap_id, epoch, index) = unpack_handle(handle.0);
+        if heap_id != self.id {
+            return None;
+        }
+        let entry = self.arrays.entry_live(index, epoch);
+        if unsafe { (*entry).borrow.get() } < 0 {
+            return None;
+        }
+        Some(unsafe { (*(*entry).value.get()).as_ref().unwrap_unchecked() })
+    }
+
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub(super) unsafe fn array_mut(&self, handle: &ArrayHandle) -> Option<&mut ArrayData> {
+        let (heap_id, epoch, index) = unpack_handle(handle.0);
+        if heap_id != self.id {
+            return None;
+        }
+        let entry = self.arrays.entry_live(index, epoch);
+        if unsafe { (*entry).borrow.get() } != 0 {
+            return None;
+        }
+        Some(unsafe { (*(*entry).value.get()).as_mut().unwrap_unchecked() })
+    }
+
+    #[inline(always)]
+    pub(super) fn alloc_object_fast(&self, object: JsObject) -> ObjectHandle {
+        let (index, epoch) = self.objects.alloc(object);
+        self.allocs_since_gc.set(self.allocs_since_gc.get() + 1);
+        ObjectHandle(pack_handle(self.id, epoch, index))
+    }
+
+    #[inline(always)]
+    pub(super) fn alloc_array_fast(&self, array: ArrayData) -> ArrayHandle {
+        let (index, epoch) = self.arrays.alloc(array);
+        self.allocs_since_gc.set(self.allocs_since_gc.get() + 1);
+        ArrayHandle(pack_handle(self.id, epoch, index))
+    }
+
+    #[inline(always)]
+    pub(super) fn alloc_scope_fast(&self, scope: Scope) -> ScopeRef {
+        let (index, epoch) = self.scopes.alloc(scope);
+        self.allocs_since_gc.set(self.allocs_since_gc.get() + 1);
+        ScopeRef(pack_handle(self.id, epoch, index))
+    }
+
+    #[inline(always)]
+    pub(super) fn free_scope_fast(&self, scope: ScopeRef) {
+        let (heap_id, epoch, index) = unpack_handle(scope.0);
+        if heap_id == self.id {
+            if self.scopes.free_slot(index, epoch) {
+                let count = self.allocs_since_gc.get();
+                if count > 0 {
+                    self.allocs_since_gc.set(count - 1);
+                }
+            }
+        } else {
+            free_scope(scope);
+        }
+    }
+}
+
+#[inline(always)]
+pub(super) fn heap_ptr(id: u16) -> *const Heap {
+    heap_for(id).expect("runtime heap is alive")
 }
 
 thread_local! {
@@ -739,15 +859,6 @@ impl ObjectHandle {
     }
 
     #[inline(always)]
-    pub(super) fn try_borrow_mut(&self) -> Result<GcRefMut<'_, JsObject>, BorrowMutError> {
-        let (heap_id, epoch, index) = unpack_handle(self.0);
-        let Some(ptr) = heap_for(heap_id) else {
-            return Err(BorrowMutError);
-        };
-        unsafe { (*ptr).objects.try_borrow_mut(index, epoch) }
-    }
-
-    #[inline(always)]
     pub(super) fn ptr_eq(left: &Self, right: &Self) -> bool {
         left.0 == right.0
     }
@@ -808,15 +919,6 @@ impl ArrayHandle {
     }
 
     #[inline(always)]
-    pub(super) fn try_borrow(&self) -> Result<GcRef<'_, ArrayData>, BorrowError> {
-        let (heap_id, epoch, index) = unpack_handle(self.0);
-        let Some(ptr) = heap_for(heap_id) else {
-            return Err(BorrowError);
-        };
-        unsafe { (*ptr).arrays.try_borrow(index, epoch) }
-    }
-
-    #[inline(always)]
     pub(super) fn ptr_eq(left: &Self, right: &Self) -> bool {
         left.0 == right.0
     }
@@ -843,24 +945,6 @@ impl ScopeRef {
         let (heap_id, epoch, index) = unpack_handle(self.0);
         let heap = unsafe { &*heap_for(heap_id).expect("scope heap is alive") };
         heap.scopes.borrow_mut(index, epoch)
-    }
-
-    #[inline(always)]
-    pub(super) fn try_borrow(&self) -> Result<GcRef<'_, Scope>, BorrowError> {
-        let (heap_id, epoch, index) = unpack_handle(self.0);
-        let Some(ptr) = heap_for(heap_id) else {
-            return Err(BorrowError);
-        };
-        unsafe { (*ptr).scopes.try_borrow(index, epoch) }
-    }
-
-    #[inline(always)]
-    pub(super) fn try_borrow_mut(&self) -> Result<GcRefMut<'_, Scope>, BorrowMutError> {
-        let (heap_id, epoch, index) = unpack_handle(self.0);
-        let Some(ptr) = heap_for(heap_id) else {
-            return Err(BorrowMutError);
-        };
-        unsafe { (*ptr).scopes.try_borrow_mut(index, epoch) }
     }
 }
 
@@ -1774,6 +1858,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<Entry<JsObject>>(), 64);
         assert_eq!(std::mem::size_of::<Entry<ArrayData>>(), 40);
         assert_eq!(std::mem::size_of::<vm::Closure>(), 24);
+        assert_eq!(std::mem::size_of::<Value>(), 16);
+        assert_eq!(std::mem::size_of::<compiler::Op>(), 16);
     }
 
     #[test]

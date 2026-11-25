@@ -211,8 +211,25 @@ pub(super) fn from_units(units: &[u16]) -> String {
     String::from_utf16_lossy(units)
 }
 
+// the substring between two UTF-16 offsets as a JsStr without double-allocating on ASCII
+fn utf16_slice_js(text: &JsStr, start: usize, end: usize) -> JsStr {
+    if text.is_ascii() {
+        let end = end.min(text.len());
+        let start = start.min(end);
+        if start == 0 && end == text.len() {
+            return text.clone();
+        }
+        return JsStr::new(&text[start..end]);
+    }
+    let units = units(text);
+    let end = end.min(units.len());
+    let start = start.min(end);
+    from_units(&units[start..end]).into()
+}
+
 // the substring between two UTF-16 offsets
-pub(super) fn utf16_slice(text: &str, start: usize, end: usize) -> String {
+#[cfg(test)]
+fn utf16_slice(text: &str, start: usize, end: usize) -> String {
     if text.is_ascii() {
         let end = end.min(text.len());
         let start = start.min(end);
@@ -318,22 +335,67 @@ fn argument(arguments: &[Value], index: usize) -> Value {
 }
 
 impl ScriptRuntime {
-    fn this_string(&mut self, this: &Value, method: StringMethod) -> Result<String, ScriptError> {
+    #[inline]
+    fn this_js_str(&mut self, this: &Value, method: StringMethod) -> Result<JsStr, ScriptError> {
         match this {
-            Value::String(text) => Ok(text.to_string()),
+            Value::String(text) => Ok(text.clone()),
             Value::Undefined | Value::Null => Err(self.type_error(format!(
                 "String.prototype.{method:?} called on null or undefined"
             ))),
-            other => self.coerce_string(other.clone()),
+            other => Ok(self.coerce_string(other.clone())?.into()),
         }
     }
 
-    fn string_integer(&mut self, value: Value, default: f64) -> Result<f64, ScriptError> {
-        if matches!(value, Value::Undefined) {
-            return Ok(default);
+    #[inline]
+    fn arg_js_str(&mut self, value: Option<&Value>) -> Result<JsStr, ScriptError> {
+        match value {
+            Some(Value::String(text)) => Ok(text.clone()),
+            Some(other) => Ok(self.coerce_string(other.clone())?.into()),
+            None => Ok(JsStr::new("undefined")),
         }
-        let number = self.coerce_number(value)?;
-        Ok(if number.is_nan() { 0.0 } else { number.trunc() })
+    }
+
+    #[inline]
+    fn string_integer(&mut self, value: Option<&Value>, default: f64) -> Result<f64, ScriptError> {
+        match value {
+            None | Some(Value::Undefined) => Ok(default),
+            Some(Value::Number(number)) => Ok(if number.is_nan() { 0.0 } else { number.trunc() }),
+            Some(other) => {
+                let number = self.coerce_number(other.clone())?;
+                Ok(if number.is_nan() { 0.0 } else { number.trunc() })
+            }
+        }
+    }
+
+    // checks whether pattern is an unmodified RegExp whose @@split resolves to the intrinsic
+    fn intrinsic_regexp_split(&self, pattern: &Value) -> Option<Rc<super::pattern::RegExpData>> {
+        let Value::Object(object) = pattern else {
+            return None;
+        };
+        let borrowed = object.try_borrow().ok()?;
+        let object::ObjectClass::RegExp(data) = &borrowed.class else {
+            return None;
+        };
+        if borrowed.contains_key("@@split") {
+            return None;
+        }
+        let proto = borrowed.own_prototype()?;
+        if !object::ObjectHandle::ptr_eq(proto, &self.intrinsics.regexp_prototype) {
+            return None;
+        }
+        let proto_borrowed = proto.try_borrow().ok()?;
+        let Value::Object(method_obj) = proto_borrowed.property("@@split")?.value()? else {
+            return None;
+        };
+        let method_borrowed = method_obj.try_borrow().ok()?;
+        match &method_borrowed.class {
+            object::ObjectClass::Native(native)
+                if matches!(**native, Native::RegExp(super::regexp::RegExpMethod::Split)) =>
+            {
+                Some(data.clone())
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn template_replacement(
@@ -398,50 +460,65 @@ impl ScriptRuntime {
         Ok(output)
     }
 
-    pub(super) fn call_string_method(
+    pub(super) fn call_string_method_slice(
         &mut self,
         method: StringMethod,
         this: Value,
-        arguments: Vec<Value>,
+        arguments: &[Value],
     ) -> Result<Value, ScriptError> {
         use StringMethod as M;
         // regular-expression aware methods hand an object pattern its own protocol first
-        if let M::Match | M::MatchAll | M::Replace | M::ReplaceAll | M::Search | M::Split = method {
-            let pattern = argument(&arguments, 0);
-            if !matches!(pattern, Value::Undefined | Value::Null | Value::String(_))
-                && !super::operations::is_primitive(&pattern)
+        if let M::Match | M::MatchAll | M::Replace | M::ReplaceAll | M::Search | M::Split = method
+            && let Some(pattern) = arguments.first()
+            && !matches!(pattern, Value::Undefined | Value::Null | Value::String(_))
+            && !super::operations::is_primitive(pattern)
+        {
+            if matches!(method, M::Split)
+                && let Some(data) = self.intrinsic_regexp_split(pattern)
             {
-                let symbol = match method {
-                    M::Match => "@@match",
-                    M::MatchAll => "@@matchAll",
-                    M::Replace | M::ReplaceAll => "@@replace",
-                    M::Search => "@@search",
-                    _ => "@@split",
+                let subject = self.this_js_str(&this, method)?;
+                let limit = match arguments.get(1) {
+                    None | Some(Value::Undefined) => u32::MAX as usize,
+                    Some(limit) => self.coerce_uint32(limit.clone())? as usize,
                 };
-                let protocol = self.get_property(&pattern, symbol)?;
-                if is_callable(&protocol) {
-                    if let M::ReplaceAll | M::MatchAll = method {
-                        let flags = self.get_property(&pattern, "flags")?;
-                        let flags = self.coerce_string(flags)?;
-                        if !flags.contains('g') {
-                            return Err(self.type_error(format!(
-                                "{method:?} must be called with a global RegExp"
-                            )));
-                        }
+                return self.regexp_split_str(&data, &subject, limit);
+            }
+            let pattern = pattern.clone();
+            let symbol = match method {
+                M::Match => "@@match",
+                M::MatchAll => "@@matchAll",
+                M::Replace | M::ReplaceAll => "@@replace",
+                M::Search => "@@search",
+                _ => "@@split",
+            };
+            let protocol = self.get_property(&pattern, symbol)?;
+            if is_callable(&protocol) {
+                if let M::ReplaceAll | M::MatchAll = method {
+                    let flags = self.get_property(&pattern, "flags")?;
+                    let flags = self.coerce_string(flags)?;
+                    if !flags.contains('g') {
+                        return Err(self.type_error(format!(
+                            "{method:?} must be called with a global RegExp"
+                        )));
                     }
-                    let subject = self.this_string(&this, method)?;
-                    let mut forwarded = vec![Value::String(subject.into())];
-                    forwarded.extend(arguments.into_iter().skip(1));
-                    return self.call_function(protocol, pattern, forwarded);
                 }
+                let subject = self.this_js_str(&this, method)?;
+                let mut forwarded = Vec::with_capacity(arguments.len());
+                forwarded.push(Value::String(subject));
+                forwarded.extend(arguments.iter().skip(1).cloned());
+                return self.call_function(protocol, pattern, forwarded);
             }
         }
-        let text = self.this_string(&this, method)?;
-        let first = argument(&arguments, 0);
+        let text = self.this_js_str(&this, method)?;
         Ok(match method {
             M::At | M::CharAt | M::CharCodeAt | M::CodePointAt => {
-                let length = utf16_length(&text);
-                let index = self.string_integer(first, 0.0)?;
+                let ascii = text.is_ascii();
+                let length = if ascii {
+                    text.len()
+                } else {
+                    utf16_length(&text)
+                };
+                let index = self.string_integer(arguments.first(), 0.0)?;
                 let index = if matches!(method, M::At) && index < 0.0 {
                     length as f64 + index
                 } else {
@@ -449,12 +526,20 @@ impl ScriptRuntime {
                 };
                 if index < 0.0 || index >= length as f64 {
                     return Ok(match method {
-                        M::CharAt => Value::String("".into()),
+                        M::CharAt => Value::String(JsStr::new("")),
                         M::CharCodeAt => Value::Number(f64::NAN),
                         _ => Value::Undefined,
                     });
                 }
                 let index = index as usize;
+                if ascii {
+                    return Ok(match method {
+                        M::CharCodeAt | M::CodePointAt => {
+                            Value::Number(f64::from(text.as_bytes()[index]))
+                        }
+                        _ => Value::String(JsStr::new(&text[index..index + 1])),
+                    });
+                }
                 let code_units = units(&text);
                 match method {
                     M::CharCodeAt => Value::Number(f64::from(code_units[index])),
@@ -474,27 +559,89 @@ impl ScriptRuntime {
                 }
             }
             M::Concat => {
-                let mut result = text;
+                if arguments.is_empty() {
+                    return Ok(Value::String(text));
+                }
+                let mut result = text.to_string();
                 for value in arguments {
-                    result.push_str(&self.coerce_string(value)?);
+                    match value {
+                        Value::String(part) => result.push_str(part),
+                        other => result.push_str(&self.coerce_string(other.clone())?),
+                    }
                 }
                 Value::String(result.into())
             }
             M::Includes | M::StartsWith | M::EndsWith | M::IndexOf | M::LastIndexOf => {
                 if let M::Includes | M::StartsWith | M::EndsWith = method
-                    && matches!(first, Value::Object(_))
-                    && self.is_regexp(&first)?
+                    && let Some(first @ Value::Object(_)) = arguments.first()
+                    && self.is_regexp(first)?
                 {
                     return Err(self.type_error(format!(
                         "First argument to String.prototype.{method:?} must not be a regular expression"
                     )));
                 }
-                let search = units(&self.coerce_string(first)?);
+                let search_str = self.arg_js_str(arguments.first())?;
+                if text.is_ascii() && search_str.is_ascii() {
+                    let length = text.len();
+                    let hay: &str = &text;
+                    let needle: &str = &search_str;
+                    return Ok(match method {
+                        M::Includes | M::IndexOf => {
+                            let from = self.string_integer(arguments.get(1), 0.0)?;
+                            let from = from.clamp(0.0, length as f64) as usize;
+                            let found = hay[from..].find(needle).map(|off| from + off);
+                            if matches!(method, M::Includes) {
+                                Value::Bool(found.is_some())
+                            } else {
+                                Value::Number(found.map_or(-1.0, |index| index as f64))
+                            }
+                        }
+                        M::LastIndexOf => {
+                            let from = match arguments.get(1) {
+                                None | Some(Value::Undefined) => length as f64,
+                                Some(Value::Number(number)) => {
+                                    if number.is_nan() {
+                                        length as f64
+                                    } else {
+                                        number.trunc()
+                                    }
+                                }
+                                Some(position) => {
+                                    let number = self.coerce_number(position.clone())?;
+                                    if number.is_nan() {
+                                        length as f64
+                                    } else {
+                                        number.trunc()
+                                    }
+                                }
+                            };
+                            let from = from.clamp(0.0, length as f64) as usize;
+                            let found = if needle.len() > length {
+                                None
+                            } else {
+                                let last = (length - needle.len()).min(from);
+                                hay[..last + needle.len()].rfind(needle)
+                            };
+                            Value::Number(found.map_or(-1.0, |index| index as f64))
+                        }
+                        M::StartsWith => {
+                            let from = self.string_integer(arguments.get(1), 0.0)?;
+                            let start = from.clamp(0.0, length as f64) as usize;
+                            Value::Bool(hay[start..].starts_with(needle))
+                        }
+                        _ => {
+                            let end = self.string_integer(arguments.get(1), length as f64)?;
+                            let end = end.clamp(0.0, length as f64) as usize;
+                            Value::Bool(hay[..end].ends_with(needle))
+                        }
+                    });
+                }
+                let search = units(&search_str);
                 let haystack = units(&text);
                 let length = haystack.len();
                 match method {
                     M::Includes | M::IndexOf => {
-                        let from = self.string_integer(argument(&arguments, 1), 0.0)?;
+                        let from = self.string_integer(arguments.get(1), 0.0)?;
                         let from = from.clamp(0.0, length as f64) as usize;
                         let found = find_units(&haystack, &search, from);
                         if matches!(method, M::Includes) {
@@ -504,11 +651,10 @@ impl ScriptRuntime {
                         }
                     }
                     M::LastIndexOf => {
-                        let position = argument(&arguments, 1);
-                        let from = match position {
-                            Value::Undefined => length as f64,
-                            position => {
-                                let number = self.coerce_number(position)?;
+                        let from = match arguments.get(1) {
+                            None | Some(Value::Undefined) => length as f64,
+                            Some(position) => {
+                                let number = self.coerce_number(position.clone())?;
                                 if number.is_nan() {
                                     length as f64
                                 } else {
@@ -523,21 +669,22 @@ impl ScriptRuntime {
                         )
                     }
                     M::StartsWith => {
-                        let from = self.string_integer(argument(&arguments, 1), 0.0)?;
+                        let from = self.string_integer(arguments.get(1), 0.0)?;
                         let start = from.clamp(0.0, length as f64) as usize;
                         Value::Bool(haystack[start..].starts_with(&search))
                     }
                     _ => {
-                        let end = self.string_integer(argument(&arguments, 1), length as f64)?;
+                        let end = self.string_integer(arguments.get(1), length as f64)?;
                         let end = end.clamp(0.0, length as f64) as usize;
                         Value::Bool(haystack[..end].ends_with(&search))
                     }
                 }
             }
             M::Normalize => {
-                let form = match first {
-                    Value::Undefined => "NFC".to_string(),
-                    form => self.coerce_string(form)?,
+                let form = match arguments.first() {
+                    None | Some(Value::Undefined) => JsStr::new("NFC"),
+                    Some(Value::String(s)) => s.clone(),
+                    Some(form) => self.coerce_string(form.clone())?.into(),
                 };
                 let Some(form) = crate::unicode::NormalizationForm::parse(&form) else {
                     return Err(self.range_error(
@@ -547,9 +694,9 @@ impl ScriptRuntime {
                 Value::String(crate::unicode::normalize(&text, form).into())
             }
             M::IsWellFormed => Value::Bool(true),
-            M::ToWellFormed => Value::String(text.into()),
+            M::ToWellFormed => Value::String(text),
             M::LocaleCompare => {
-                let other = self.coerce_string(first)?;
+                let other = self.arg_js_str(arguments.first())?;
                 let order = locale_compare(&text, &other);
                 Value::Number(match order {
                     std::cmp::Ordering::Less => -1.0,
@@ -558,14 +705,14 @@ impl ScriptRuntime {
                 })
             }
             M::PadStart | M::PadEnd => {
-                let target = self.string_integer(first, 0.0)?;
+                let target = self.string_integer(arguments.first(), 0.0)?;
                 let length = utf16_length(&text);
-                let filler = match argument(&arguments, 1) {
-                    Value::Undefined => vec![u16::from(b' ')],
-                    filler => units(&self.coerce_string(filler)?),
+                let filler = match arguments.get(1) {
+                    None | Some(Value::Undefined) => vec![u16::from(b' ')],
+                    Some(filler) => units(&self.coerce_string(filler.clone())?),
                 };
                 if target <= length as f64 || filler.is_empty() {
-                    return Ok(Value::String(text.into()));
+                    return Ok(Value::String(text));
                 }
                 let needed = target as usize - length;
                 if target as usize > MAX_RUNTIME_STRING_UNITS {
@@ -583,7 +730,7 @@ impl ScriptRuntime {
                 )
             }
             M::Repeat => {
-                let count = self.string_integer(first, 0.0)?;
+                let count = self.string_integer(arguments.first(), 0.0)?;
                 if !(0.0..f64::INFINITY).contains(&count) {
                     return Err(self
                         .range_error(format!("Invalid count value: {}", number_to_string(count))));
@@ -594,8 +741,41 @@ impl ScriptRuntime {
                 Value::String(text.repeat(count as usize).into())
             }
             M::Replace | M::ReplaceAll => {
-                let search = units(&self.coerce_string(first)?);
-                let replacement = argument(&arguments, 1);
+                let search_str = self.arg_js_str(arguments.first())?;
+                let replacement = argument(arguments, 1);
+                if text.is_ascii()
+                    && search_str.is_ascii()
+                    && !search_str.is_empty()
+                    && !is_callable(&replacement)
+                {
+                    let rep_str = match &replacement {
+                        Value::String(s) => s.clone(),
+                        other => self.coerce_string(other.clone())?.into(),
+                    };
+                    if !rep_str.contains('$') {
+                        let hay: &str = &text;
+                        let needle: &str = &search_str;
+                        return Ok(if matches!(method, M::Replace) {
+                            match hay.find(needle) {
+                                None => Value::String(text),
+                                Some(pos) => {
+                                    let mut out = String::with_capacity(
+                                        hay.len() - needle.len() + rep_str.len(),
+                                    );
+                                    out.push_str(&hay[..pos]);
+                                    out.push_str(&rep_str);
+                                    out.push_str(&hay[pos + needle.len()..]);
+                                    Value::String(out.into())
+                                }
+                            }
+                        } else if !hay.contains(needle) {
+                            Value::String(text)
+                        } else {
+                            Value::String(hay.replace(needle, &rep_str).into())
+                        });
+                    }
+                }
+                let search = units(&search_str);
                 let subject = units(&text);
                 let mut positions = Vec::new();
                 match method {
@@ -610,7 +790,7 @@ impl ScriptRuntime {
                     }
                 }
                 if positions.is_empty() {
-                    return Ok(Value::String(text.into()));
+                    return Ok(Value::String(text));
                 }
                 let mut output = Vec::with_capacity(subject.len());
                 let mut last = 0;
@@ -632,9 +812,9 @@ impl ScriptRuntime {
             }
             M::Match | M::MatchAll | M::Search => {
                 // a string pattern becomes a regular expression, as RegExp(pattern) would
-                let pattern = match first {
-                    Value::Undefined => String::new(),
-                    other => self.coerce_string(other)?,
+                let pattern = match arguments.first() {
+                    None | Some(Value::Undefined) => String::new(),
+                    Some(other) => self.coerce_string(other.clone())?,
                 };
                 let flags = if matches!(method, M::MatchAll) {
                     "g"
@@ -651,14 +831,14 @@ impl ScriptRuntime {
                 if !is_callable(&protocol) {
                     return Err(self.type_error("regular expressions are unavailable"));
                 }
-                self.call_function(protocol, regexp, vec![Value::String(text.into())])?
+                self.call_function(protocol, regexp, vec![Value::String(text)])?
             }
             M::Slice | M::Substring | M::Substr => {
                 let length = utf16_length(&text) as f64;
-                let start = self.string_integer(first, 0.0)?;
+                let start = self.string_integer(arguments.first(), 0.0)?;
                 let (start, end) = match method {
                     M::Slice => {
-                        let end = self.string_integer(argument(&arguments, 1), length)?;
+                        let end = self.string_integer(arguments.get(1), length)?;
                         let resolve = |value: f64| {
                             if value < 0.0 {
                                 (length + value).max(0.0)
@@ -669,7 +849,7 @@ impl ScriptRuntime {
                         (resolve(start), resolve(end))
                     }
                     M::Substring => {
-                        let end = self.string_integer(argument(&arguments, 1), length)?;
+                        let end = self.string_integer(arguments.get(1), length)?;
                         let start = start.clamp(0.0, length);
                         let end = end.clamp(0.0, length);
                         (start.min(end), start.max(end))
@@ -680,51 +860,87 @@ impl ScriptRuntime {
                         } else {
                             start.min(length)
                         };
-                        let count = self.string_integer(argument(&arguments, 1), length)?;
+                        let count = self.string_integer(arguments.get(1), length)?;
                         let end = (start + count.max(0.0)).min(length);
                         (start, end)
                     }
                 };
                 if start >= end {
-                    return Ok(Value::String("".into()));
+                    return Ok(Value::String(JsStr::new("")));
                 }
-                Value::String(utf16_slice(&text, start as usize, end as usize).into())
+                Value::String(utf16_slice_js(&text, start as usize, end as usize))
             }
             M::Split => {
-                let limit = match argument(&arguments, 1) {
-                    Value::Undefined => u32::MAX as usize,
-                    limit => self.coerce_uint32(limit)? as usize,
+                let limit = match arguments.get(1) {
+                    None | Some(Value::Undefined) => u32::MAX as usize,
+                    Some(limit) => self.coerce_uint32(limit.clone())? as usize,
                 };
                 if limit == 0 {
                     return Ok(Self::new_array(Vec::new()));
                 }
-                let parts: Vec<Value> = match first {
-                    Value::Undefined => vec![Value::String(text.into())],
-                    separator => {
-                        let separator = units(&self.coerce_string(separator)?);
-                        let subject = units(&text);
-                        if separator.is_empty() {
-                            subject
-                                .iter()
-                                .take(limit)
-                                .map(|unit| Value::String(from_units(&[*unit]).into()))
-                                .collect()
-                        } else {
-                            let mut parts = Vec::new();
-                            let mut last = 0;
-                            while let Some(position) = find_units(&subject, &separator, last) {
-                                parts.push(Value::String(
-                                    from_units(&subject[last..position]).into(),
-                                ));
-                                if parts.len() == limit {
-                                    break;
+                let parts: Vec<Value> = match arguments.first() {
+                    None | Some(Value::Undefined) => vec![Value::String(text)],
+                    Some(separator) => {
+                        let sep_str = match separator {
+                            Value::String(s) => s.clone(),
+                            other => self.coerce_string(other.clone())?.into(),
+                        };
+                        if text.is_ascii() && sep_str.is_ascii() {
+                            if sep_str.is_empty() {
+                                text.as_bytes()
+                                    .iter()
+                                    .take(limit)
+                                    .enumerate()
+                                    .map(|(i, _)| Value::String(JsStr::new(&text[i..i + 1])))
+                                    .collect()
+                            } else {
+                                let mut parts = Vec::new();
+                                let hay: &str = &text;
+                                let needle: &str = &sep_str;
+                                let mut last = 0;
+                                while let Some(off) = hay[last..].find(needle) {
+                                    let pos = last + off;
+                                    parts.push(Value::String(JsStr::new(&hay[last..pos])));
+                                    if parts.len() == limit {
+                                        break;
+                                    }
+                                    last = pos + needle.len();
                                 }
-                                last = position + separator.len();
+                                if parts.len() < limit {
+                                    if last == 0 {
+                                        parts.push(Value::String(text));
+                                    } else {
+                                        parts.push(Value::String(JsStr::new(&hay[last..])));
+                                    }
+                                }
+                                parts
                             }
-                            if parts.len() < limit {
-                                parts.push(Value::String(from_units(&subject[last..]).into()));
+                        } else {
+                            let separator = units(&sep_str);
+                            let subject = units(&text);
+                            if separator.is_empty() {
+                                subject
+                                    .iter()
+                                    .take(limit)
+                                    .map(|unit| Value::String(from_units(&[*unit]).into()))
+                                    .collect()
+                            } else {
+                                let mut parts = Vec::new();
+                                let mut last = 0;
+                                while let Some(position) = find_units(&subject, &separator, last) {
+                                    parts.push(Value::String(
+                                        from_units(&subject[last..position]).into(),
+                                    ));
+                                    if parts.len() == limit {
+                                        break;
+                                    }
+                                    last = position + separator.len();
+                                }
+                                if parts.len() < limit {
+                                    parts.push(Value::String(from_units(&subject[last..]).into()));
+                                }
+                                parts
                             }
-                            parts
                         }
                     }
                 };
@@ -735,17 +951,51 @@ impl ScriptRuntime {
                 }
                 Self::new_array(parts)
             }
-            M::ToLowerCase => Value::String(text.to_lowercase().into()),
-            M::ToUpperCase => Value::String(text.to_uppercase().into()),
-            M::Trim => Value::String(text.trim_matches(is_js_whitespace).into()),
-            M::TrimStart => Value::String(text.trim_start_matches(is_js_whitespace).into()),
-            M::TrimEnd => Value::String(text.trim_end_matches(is_js_whitespace).into()),
+            M::ToLowerCase => {
+                if text.is_ascii() && !text.bytes().any(|b| b.is_ascii_uppercase()) {
+                    Value::String(text)
+                } else {
+                    Value::String(text.to_lowercase().into())
+                }
+            }
+            M::ToUpperCase => {
+                if text.is_ascii() && !text.bytes().any(|b| b.is_ascii_lowercase()) {
+                    Value::String(text)
+                } else {
+                    Value::String(text.to_uppercase().into())
+                }
+            }
+            M::Trim => {
+                let trimmed = text.trim_matches(is_js_whitespace);
+                if trimmed.len() == text.len() {
+                    Value::String(text)
+                } else {
+                    Value::String(JsStr::new(trimmed))
+                }
+            }
+            M::TrimStart => {
+                let trimmed = text.trim_start_matches(is_js_whitespace);
+                if trimmed.len() == text.len() {
+                    Value::String(text)
+                } else {
+                    Value::String(JsStr::new(trimmed))
+                }
+            }
+            M::TrimEnd => {
+                let trimmed = text.trim_end_matches(is_js_whitespace);
+                if trimmed.len() == text.len() {
+                    Value::String(text)
+                } else {
+                    Value::String(JsStr::new(trimmed))
+                }
+            }
             M::Html(index) => {
                 let (tag, attribute) = HTML_METHODS[usize::from(index)];
                 let attribute = match attribute {
                     Some(name) => format!(
                         " {name}=\"{}\"",
-                        self.coerce_string(first)?.replace('"', "&quot;")
+                        self.coerce_string(argument(arguments, 0))?
+                            .replace('"', "&quot;")
                     ),
                     None => String::new(),
                 };
@@ -779,6 +1029,29 @@ impl ScriptRuntime {
 // a locale-insensitive collation: letters compare case-insensitively first, then lowercase
 // before uppercase, as the root collation orders them
 pub(super) fn locale_compare(left: &str, right: &str) -> std::cmp::Ordering {
+    if left.is_ascii() && right.is_ascii() {
+        let (lb, rb) = (left.as_bytes(), right.as_bytes());
+        let mut tie = std::cmp::Ordering::Equal;
+        let min_len = lb.len().min(rb.len());
+        for i in 0..min_len {
+            let (a, b) = (lb[i], rb[i]);
+            if a == b {
+                continue;
+            }
+            let (la, lb_c) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+            if la != lb_c {
+                return la.cmp(&lb_c);
+            }
+            if tie == std::cmp::Ordering::Equal {
+                tie = if a.is_ascii_lowercase() {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+            }
+        }
+        return lb.len().cmp(&rb.len()).then(tie);
+    }
     let folded = left.chars().flat_map(char::to_lowercase);
     folded
         .cmp(right.chars().flat_map(char::to_lowercase))

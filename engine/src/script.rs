@@ -325,6 +325,7 @@ impl fmt::Display for ScriptError {
 impl std::error::Error for ScriptError {}
 
 enum Value {
+    // trivial non-drop variants grouped first so is_copy compiles to one range test
     Undefined,
     // a lexical binding read before its declaration ran, or an array index nothing was put
     // at, which reads as undefined and is no property of the array
@@ -332,17 +333,17 @@ enum Value {
     Null,
     Bool(bool),
     Number(f64),
+    Object(ObjectHandle),
+    Array(ArrayHandle),
     String(JsStr),
+    Element(ElementHandle),
     Symbol(JsStr),
     BigInt(Rc<bigint::BigInt>),
     // a cell shared with the binding it reads, writable or constant
     Binding(Rc<RefCell<Value>>),
     ConstBinding(Rc<RefCell<Value>>),
-    Object(ObjectHandle),
-    Array(ArrayHandle),
     NodeList(NodeListHandle),
     Iterator(IteratorHandle),
-    Element(ElementHandle),
     Validity(ValidityHandle),
     Range(RangeHandle),
     Selection(SelectionHandle),
@@ -8171,9 +8172,7 @@ impl ScriptRuntime {
         arguments: Vec<Value>,
     ) -> Result<Value, ScriptError> {
         match builtin {
-            Builtin::Native(native) => {
-                self.call_native(Rc::unwrap_or_clone(native), Value::Undefined, arguments)
-            }
+            Builtin::Native(native) => self.call_native(&native, Value::Undefined, arguments),
             Builtin::DocumentGetElementById => {
                 let id = arguments
                     .first()
@@ -11935,23 +11934,35 @@ fn delay_milliseconds(value: f64) -> u64 {
 
 // inline fast path for the common variants so hot VM loops avoid out-of-line clone calls
 impl Clone for Value {
-    #[inline]
+    #[inline(always)]
     fn clone(&self) -> Self {
+        if self.is_copy() {
+            // safety: every variant in is_copy is bitwise-copyable with no Drop glue
+            return unsafe { std::ptr::read(self) };
+        }
         match self {
-            Self::Undefined => Self::Undefined,
-            Self::Uninitialized => Self::Uninitialized,
-            Self::Null => Self::Null,
-            Self::Bool(flag) => Self::Bool(*flag),
-            Self::Number(number) => Self::Number(*number),
             Self::String(text) => Self::String(text.clone()),
-            Self::Object(object) => Self::Object(object.clone()),
-            Self::Array(array) => Self::Array(array.clone()),
+            Self::Element(element) => Self::Element(element.clone()),
             other => other.clone_slow(),
         }
     }
 }
 
 impl Value {
+    #[inline(always)]
+    fn is_copy(&self) -> bool {
+        matches!(
+            self,
+            Self::Undefined
+                | Self::Uninitialized
+                | Self::Null
+                | Self::Bool(_)
+                | Self::Number(_)
+                | Self::Object(_)
+                | Self::Array(_)
+        )
+    }
+
     #[cold]
     #[inline(never)]
     fn clone_slow(&self) -> Self {
@@ -11963,14 +11974,14 @@ impl Value {
             | Self::Number(_)
             | Self::String(_)
             | Self::Object(_)
-            | Self::Array(_) => unreachable!("handled in Clone::clone"),
+            | Self::Array(_)
+            | Self::Element(_) => unreachable!("handled in Clone::clone"),
             Self::Symbol(symbol) => Self::Symbol(symbol.clone()),
             Self::BigInt(value) => Self::BigInt(value.clone()),
             Self::Binding(cell) => Self::Binding(cell.clone()),
             Self::ConstBinding(cell) => Self::ConstBinding(cell.clone()),
             Self::NodeList(list) => Self::NodeList(list.clone()),
             Self::Iterator(iterator) => Self::Iterator(iterator.clone()),
-            Self::Element(element) => Self::Element(element.clone()),
             Self::Validity(validity) => Self::Validity(validity.clone()),
             Self::Range(range) => Self::Range(range.clone()),
             Self::Selection(selection) => Self::Selection(selection.clone()),
@@ -12027,18 +12038,11 @@ impl Value {
 
     #[inline(always)]
     fn fast_drop(self) {
-        match self {
-            Self::Undefined
-            | Self::Uninitialized
-            | Self::Null
-            | Self::Bool(_)
-            | Self::Number(_)
-            | Self::Object(_)
-            | Self::Array(_) => {
-                std::mem::forget(self);
-            }
-            other => drop_value_slow(other),
+        if self.is_copy() {
+            std::mem::forget(self);
+            return;
         }
+        drop_value_slow(self);
     }
 
     #[inline(always)]
@@ -15756,6 +15760,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::String(left), Value::String(right)) => left == right,
         (Value::Object(left), Value::Object(right)) => object::ObjectHandle::ptr_eq(left, right),
         (Value::Array(left), Value::Array(right)) => heap::ArrayHandle::ptr_eq(left, right),
+        (Value::Element(left), Value::Element(right)) => Rc::ptr_eq(left, right),
         (Value::Binding(_) | Value::ConstBinding(_), _)
         | (_, Value::Binding(_) | Value::ConstBinding(_)) => {
             values_equal(&left.resolve(), &right.resolve())

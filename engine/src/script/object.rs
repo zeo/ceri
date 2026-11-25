@@ -914,7 +914,46 @@ impl JsObject {
     }
 
     #[inline]
-    pub(super) fn ic_get(&self, ic: &PropIc) -> Option<IcGetHit> {
+    pub(super) fn own_data_value(&self, key: &str) -> Option<Value> {
+        if matches!(self.class, ObjectClass::Proxy(_) | ObjectClass::String(_)) {
+            return None;
+        }
+        let index = self.shape.position(key)?;
+        match self.properties.get(index)? {
+            Slot::Data(value) => Some(value.resolve()),
+            Slot::Accessor(_) => None,
+        }
+    }
+
+    #[inline]
+    pub(super) fn set_own_plain_data(&mut self, key: &str, value: Value) -> Result<(), Value> {
+        if !matches!(self.class, ObjectClass::Ordinary) {
+            return Err(value);
+        }
+        let Some(index) = self.shape.position(key) else {
+            return Err(value);
+        };
+        let attrs = self.shape.attrs[index];
+        if (attrs & ATTR_ACCESSOR) != 0 || (attrs & ATTR_WRITABLE) == 0 {
+            return Err(value);
+        }
+        let plain = matches!(
+            self.properties.get(index),
+            Some(Slot::Data(current))
+                if !matches!(current, Value::Binding(_) | Value::ConstBinding(_))
+        );
+        if !plain {
+            return Err(value);
+        }
+        if let Slot::Data(slot) = &mut self.properties.as_mut_slice()[index] {
+            let old = std::mem::replace(slot, value);
+            old.fast_drop();
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub(super) fn ic_get_fast(&self, heap: &super::heap::Heap, ic: &PropIc) -> Option<IcGetHit> {
         if matches!(self.class, ObjectClass::Proxy(_)) {
             return None;
         }
@@ -953,7 +992,7 @@ impl JsObject {
                         && let Some(prototype) = &self.prototype
                         && holder.matches(prototype)
                         && let Some(value) =
-                            Self::held_data(prototype, holder_shape, *index as usize)
+                            Self::held_data_fast(heap, prototype, holder_shape, *index as usize)
                     {
                         return Some(IcGetHit::Value(value));
                     }
@@ -969,7 +1008,7 @@ impl JsObject {
                         && let Some(prototype) = &self.prototype
                         && holder.matches(prototype)
                         && let Some(hit) =
-                            Self::held_accessor(prototype, holder_shape, *index as usize)
+                            Self::held_accessor_fast(heap, prototype, holder_shape, *index as usize)
                     {
                         return Some(hit);
                     }
@@ -978,7 +1017,8 @@ impl JsObject {
                     if std::ptr::eq(receiver.as_ptr(), shape_ptr)
                         && !matches!(self.class, ObjectClass::String(_))
                         && let Some(prototype) = &self.prototype
-                        && let Some(hit) = Self::check_chain(
+                        && let Some(hit) = Self::check_chain_fast(
+                            heap,
                             prototype,
                             &chain.skipped,
                             &chain.holder,
@@ -994,7 +1034,12 @@ impl JsObject {
                     if std::ptr::eq(receiver.as_ptr(), shape_ptr)
                         && !matches!(self.class, ObjectClass::String(_))
                         && !self.orphan
-                        && Self::check_missing_proto(&self.prototype, proto.as_deref()) =>
+                        && Self::check_missing_proto_fast(
+                            heap,
+                            &self.prototype,
+                            proto.as_deref(),
+                            None,
+                        ) =>
                 {
                     return Some(IcGetHit::Missing);
                 }
@@ -1004,10 +1049,14 @@ impl JsObject {
         None
     }
 
-    // writes an ordinary object's own writable data property, or transitions to a cached shape
-    // when adding a new property on an extensible object with a guarded root prototype
     #[inline]
-    pub(super) fn ic_set(&mut self, ic: &PropIc, value: Value) -> Result<(), Value> {
+    pub(super) fn ic_set_fast(
+        &mut self,
+        receiver: &ObjectHandle,
+        heap: &super::heap::Heap,
+        ic: &PropIc,
+        value: Value,
+    ) -> Result<(), Value> {
         if !matches!(self.class, ObjectClass::Ordinary) {
             return Err(value);
         }
@@ -1043,7 +1092,12 @@ impl JsObject {
                     if std::ptr::eq(from.as_ptr(), shape_ptr)
                         && self.extensible
                         && !self.orphan
-                        && Self::check_missing_proto(&self.prototype, proto.as_deref())
+                        && Self::check_missing_proto_fast(
+                            heap,
+                            &self.prototype,
+                            proto.as_deref(),
+                            Some(receiver),
+                        )
                         && let Some(next_shape) = to.upgrade()
                     {
                         let length = self.properties.len();
@@ -1064,7 +1118,11 @@ impl JsObject {
     }
 
     #[inline]
-    pub(super) fn ic_array_get(prototype: &ObjectHandle, ic: &PropIc) -> Option<Value> {
+    pub(super) fn ic_array_get_fast(
+        heap: &super::heap::Heap,
+        prototype: &ObjectHandle,
+        ic: &PropIc,
+    ) -> Option<Value> {
         let inner = unsafe { &*ic.0.get() };
         for entry in &inner.entries {
             match entry {
@@ -1075,7 +1133,9 @@ impl JsObject {
                     holder_shape,
                     index,
                 } if holder.matches(prototype) => {
-                    if let Some(value) = Self::held_data(prototype, holder_shape, *index as usize) {
+                    if let Some(value) =
+                        Self::held_data_fast(heap, prototype, holder_shape, *index as usize)
+                    {
                         return Some(value);
                     }
                 }
@@ -1086,7 +1146,11 @@ impl JsObject {
     }
 
     #[inline]
-    pub(super) fn ic_string_get(prototype: &ObjectHandle, ic: &PropIc) -> Option<Value> {
+    pub(super) fn ic_string_get_fast(
+        heap: &super::heap::Heap,
+        prototype: &ObjectHandle,
+        ic: &PropIc,
+    ) -> Option<Value> {
         let inner = unsafe { &*ic.0.get() };
         for entry in &inner.entries {
             match entry {
@@ -1096,7 +1160,9 @@ impl JsObject {
                     holder_shape,
                     index,
                 } if holder.matches(prototype) => {
-                    if let Some(value) = Self::held_data(prototype, holder_shape, *index as usize) {
+                    if let Some(value) =
+                        Self::held_data_fast(heap, prototype, holder_shape, *index as usize)
+                    {
                         return Some(value);
                     }
                 }
@@ -1106,14 +1172,24 @@ impl JsObject {
         None
     }
 
-    fn check_missing_proto(prototype: &Option<ObjectHandle>, guard: Option<&ProtoGuard>) -> bool {
+    #[inline]
+    fn check_missing_proto_fast(
+        heap: &super::heap::Heap,
+        prototype: &Option<ObjectHandle>,
+        guard: Option<&ProtoGuard>,
+        exclude: Option<&ObjectHandle>,
+    ) -> bool {
         match (prototype, guard) {
             (None, None) => true,
             (Some(proto), Some(guard)) => {
                 if !guard.holder.matches(proto) {
                     return false;
                 }
-                let Ok(borrowed) = proto.try_borrow() else {
+                if exclude.is_some_and(|ex| ObjectHandle::ptr_eq(ex, proto)) {
+                    return false;
+                }
+                // safety: non-reentrant read; exclude guarantees no alias with a mutable receiver
+                let Some(borrowed) = (unsafe { heap.object_ref(proto) }) else {
                     return false;
                 };
                 borrowed.prototype.is_none()
@@ -1128,8 +1204,14 @@ impl JsObject {
         }
     }
 
-    fn held_data(holder: &ObjectHandle, shape: &Weak<Shape>, index: usize) -> Option<Value> {
-        let holder = holder.try_borrow().ok()?;
+    #[inline]
+    fn held_data_fast(
+        heap: &super::heap::Heap,
+        holder: &ObjectHandle,
+        shape: &Weak<Shape>,
+        index: usize,
+    ) -> Option<Value> {
+        let holder = unsafe { heap.object_ref(holder)? };
         if matches!(holder.class, ObjectClass::Proxy(_))
             || !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&holder.shape))
         {
@@ -1138,8 +1220,14 @@ impl JsObject {
         holder.properties.get(index)?.value().map(Value::resolve)
     }
 
-    fn held_accessor(holder: &ObjectHandle, shape: &Weak<Shape>, index: usize) -> Option<IcGetHit> {
-        let holder = holder.try_borrow().ok()?;
+    #[inline]
+    fn held_accessor_fast(
+        heap: &super::heap::Heap,
+        holder: &ObjectHandle,
+        shape: &Weak<Shape>,
+        index: usize,
+    ) -> Option<IcGetHit> {
+        let holder = unsafe { heap.object_ref(holder)? };
         if matches!(holder.class, ObjectClass::Proxy(_))
             || !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&holder.shape))
         {
@@ -1154,7 +1242,8 @@ impl JsObject {
         }
     }
 
-    fn check_chain(
+    fn check_chain_fast(
+        heap: &super::heap::Heap,
         current: &ObjectHandle,
         skipped: &[(ObjectWeak, Weak<Shape>)],
         holder: &ObjectWeak,
@@ -1162,11 +1251,12 @@ impl JsObject {
         index: usize,
         accessor: bool,
     ) -> Option<IcGetHit> {
-        if let Some(((expected, shape), rest)) = skipped.split_first() {
-            if !expected.matches(current) {
+        let mut cursor = current;
+        for (expected, shape) in skipped {
+            if !expected.matches(cursor) {
                 return None;
             }
-            let borrowed = current.try_borrow().ok()?;
+            let borrowed = unsafe { heap.object_ref(cursor)? };
             if matches!(
                 borrowed.class,
                 ObjectClass::Proxy(_) | ObjectClass::String(_)
@@ -1174,17 +1264,15 @@ impl JsObject {
             {
                 return None;
             }
-            let next = borrowed.prototype.as_ref()?;
-            Self::check_chain(next, rest, holder, holder_shape, index, accessor)
+            cursor = borrowed.prototype.as_ref()?;
+        }
+        if !holder.matches(cursor) {
+            return None;
+        }
+        if accessor {
+            Self::held_accessor_fast(heap, cursor, holder_shape, index)
         } else {
-            if !holder.matches(current) {
-                return None;
-            }
-            if accessor {
-                Self::held_accessor(current, holder_shape, index)
-            } else {
-                Self::held_data(current, holder_shape, index).map(IcGetHit::Value)
-            }
+            Self::held_data_fast(heap, cursor, holder_shape, index).map(IcGetHit::Value)
         }
     }
 
