@@ -439,6 +439,35 @@ impl ScriptRuntime {
         Ok(callback)
     }
 
+    fn callback_fast(
+        &mut self,
+        heap: &super::heap::Heap,
+        arguments: &[Value],
+        method: &str,
+    ) -> Result<Value, ScriptError> {
+        let callback = argument(arguments, 0);
+        let callable = match &callback {
+            Value::Object(object) => unsafe { heap.object_ref(object) }.map_or_else(
+                || is_callable(&callback),
+                |borrowed| match &borrowed.class {
+                    ObjectClass::Function(_) | ObjectClass::Native(_) | ObjectClass::Bound(_) => {
+                        true
+                    }
+                    ObjectClass::Proxy(_) => is_callable(&callback),
+                    _ => false,
+                },
+            ),
+            Value::Builtin(_) => true,
+            _ => false,
+        };
+        if !callable {
+            return Err(self.type_error(format!(
+                "Array.prototype.{method} callback is not a function"
+            )));
+        }
+        Ok(callback)
+    }
+
     fn integer(&mut self, value: Value, default: f64) -> Result<f64, ScriptError> {
         if matches!(value, Value::Undefined) {
             return Ok(default);
@@ -469,39 +498,28 @@ impl ScriptRuntime {
         }
     }
 
-    pub(super) fn call_array_method(
+    pub(super) fn call_array_callback_slice(
         &mut self,
         method: ArrayMethod,
         this: Value,
-        arguments: Vec<Value>,
+        arguments: &[Value],
     ) -> Result<Value, ScriptError> {
         use ArrayMethod as M;
         let name = ARRAY_METHODS[method as usize].0;
-        let mutates = matches!(
-            method,
-            M::Push
-                | M::Pop
-                | M::Shift
-                | M::Unshift
-                | M::Splice
-                | M::Reverse
-                | M::Sort
-                | M::Fill
-                | M::CopyWithin
-        );
-        if mutates && !matches!(this, Value::Array(_)) {
-            return self.mutate_array_like(method, this, arguments, name);
-        }
-        if mutates
-            && let Value::Array(array) = &this
-            && let Some(refusal) = array_method_refusal(method, &array.borrow(), &arguments)
-        {
-            return Err(self.type_error(refusal));
+        if matches!(method, M::Sort) {
+            if !matches!(this, Value::Array(_)) {
+                return self.mutate_array_like(method, this, arguments.to_vec(), name);
+            }
+            if let Value::Array(array) = &this
+                && let Some(refusal) = array_method_refusal(method, &array.borrow(), arguments)
+            {
+                return Err(self.type_error(refusal));
+            }
         }
         match method {
             M::ForEach | M::Map | M::Filter | M::Some | M::Every | M::Find | M::FindIndex => {
+                let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
                 let (values, object, length) = if let Value::Array(array) = &this {
-                    let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
                     let len = unsafe { heap.array_ref(array) }
                         .map_or_else(|| array.borrow().len(), |a| a.len());
                     (Vec::new(), this.clone(), len)
@@ -510,7 +528,7 @@ impl ScriptRuntime {
                     let len = values.len();
                     (values, object, len)
                 };
-                let callback = self.callback(&arguments, name)?;
+                let callback = self.callback_fast(heap, arguments, name)?;
                 if length == 0 {
                     return Ok(match method {
                         M::Map | M::Filter => self.array_species(&this, Vec::new(), false)?,
@@ -521,9 +539,117 @@ impl ScriptRuntime {
                     });
                 }
                 let fast = Self::simple_closure(&callback);
-                let receiver = argument(&arguments, 1);
+                let receiver = argument(arguments, 1);
+                let mut mapped = if matches!(method, M::Map) && matches!(this, Value::Array(_)) {
+                    Vec::with_capacity(length)
+                } else {
+                    Vec::new()
+                };
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                let ran_jit = if let Some(closure) = &fast
+                    && let Some(mut session) = super::jit::JitCallbackSession::try_new(
+                        self,
+                        closure,
+                        callback.clone(),
+                        receiver.clone(),
+                        length,
+                    ) {
+                    let param_count = session.param_count();
+                    let heap_ptr = session.heap_ptr();
+                    let keep_value = matches!(method, M::Filter | M::Find);
+                    for index in 0..length {
+                        let mut value = if let Value::Array(array) = &this {
+                            match unsafe { (&*heap_ptr).array_ref(array) } {
+                                Some(data) => {
+                                    if index >= data.len() {
+                                        break;
+                                    }
+                                    if param_count == 0
+                                        && !keep_value
+                                        && !matches!(data.values[index], Value::Uninitialized)
+                                    {
+                                        Value::Undefined
+                                    } else {
+                                        data.values[index].clone()
+                                    }
+                                }
+                                None => {
+                                    let borrowed = array.borrow();
+                                    if index >= borrowed.len() {
+                                        break;
+                                    }
+                                    borrowed[index].clone()
+                                }
+                            }
+                        } else {
+                            if index >= Self::element_count(&this, &values) {
+                                break;
+                            }
+                            Self::element(&this, &values, index).unwrap_or(Value::Undefined)
+                        };
+                        if matches!(value, Value::Uninitialized) {
+                            if session.with_runtime(|rt| rt.holds(&this, &index.to_string())) {
+                                value = session.with_runtime(|rt| {
+                                    rt.get_index(&this, Value::Number(index as f64))
+                                })?;
+                            } else if matches!(method, M::Find | M::FindIndex) {
+                                value = Value::Undefined;
+                            } else {
+                                if matches!(method, M::Map) {
+                                    mapped.push(Value::Uninitialized);
+                                }
+                                continue;
+                            }
+                        }
+                        let arg0 = if param_count == 0 {
+                            Value::Undefined
+                        } else if keep_value {
+                            value.clone()
+                        } else {
+                            std::mem::replace(&mut value, Value::Undefined)
+                        };
+                        let result = match param_count {
+                            0 => session.call0()?,
+                            1 => session.call1(arg0)?,
+                            2 => session.call2(arg0, Value::Number(index as f64))?,
+                            _ => {
+                                session.call3(arg0, Value::Number(index as f64), object.clone())?
+                            }
+                        };
+                        match method {
+                            M::Map => mapped.push(result),
+                            M::Filter if result.truthy() => mapped.push(value),
+                            M::Some if result.truthy() => return Ok(Value::Bool(true)),
+                            M::Every if !result.truthy() => return Ok(Value::Bool(false)),
+                            M::Find if result.truthy() => return Ok(value),
+                            M::FindIndex if result.truthy() => {
+                                return Ok(Value::Number(index as f64));
+                            }
+                            _ => {}
+                        }
+                    }
+                    true
+                } else {
+                    false
+                };
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                )))]
+                let ran_jit = false;
+                if ran_jit {
+                    return Ok(match method {
+                        M::Map | M::Filter => self.array_species(&this, mapped, false)?,
+                        M::Some => Value::Bool(false),
+                        M::Every => Value::Bool(true),
+                        M::FindIndex => Value::Number(-1.0),
+                        _ => Value::Undefined,
+                    });
+                }
                 let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
-                let mut mapped = Vec::new();
                 for index in 0..length {
                     let value = if let Value::Array(array) = &this {
                         match unsafe { heap.array_ref(array) } {
@@ -595,63 +721,31 @@ impl ScriptRuntime {
                     _ => Value::Undefined,
                 })
             }
-            M::FindLast | M::FindLastIndex => {
-                let (values, object, length) = if let Value::Array(array) = &this {
-                    (Vec::new(), this.clone(), array.borrow().len())
-                } else {
-                    let (values, object) = self.callback_receiver(&this, name)?;
-                    let len = values.len();
-                    (values, object, len)
-                };
-                let callback = self.callback(&arguments, name)?;
-                let receiver = argument(&arguments, 1);
-                for index in (0..length).rev() {
-                    let value = Self::element(&this, &values, index)
-                        .unwrap_or(Value::Undefined)
-                        .filled();
-                    let result = self.call_function(
-                        callback.clone(),
-                        receiver.clone(),
-                        vec![value.clone(), Value::Number(index as f64), object.clone()],
-                    )?;
-                    if result.truthy() {
-                        return Ok(match method {
-                            M::FindLast => value,
-                            _ => Value::Number(index as f64),
-                        });
-                    }
-                }
-                Ok(match method {
-                    M::FindLast => Value::Undefined,
-                    _ => Value::Number(-1.0),
-                })
-            }
             M::Reduce | M::ReduceRight => {
+                let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
                 let (values, object, length) = if let Value::Array(array) = &this {
-                    (Vec::new(), this.clone(), array.borrow().len())
+                    let len = unsafe { heap.array_ref(array) }
+                        .map_or_else(|| array.borrow().len(), |a| a.len());
+                    (Vec::new(), this.clone(), len)
                 } else {
                     let (values, object) = self.callback_receiver(&this, name)?;
                     let len = values.len();
                     (values, object, len)
                 };
-                let callback = self.callback(&arguments, name)?;
-                // each index is looked at when its turn comes, since the callback may fill or
-                // delete what was there when the method began
-                let indices: Vec<usize> = if matches!(method, M::Reduce) {
-                    (0..length).collect()
-                } else {
-                    (0..length).rev().collect()
-                };
-                let mut indices = indices.into_iter();
+                let callback = self.callback_fast(heap, arguments, name)?;
+                let forward = matches!(method, M::Reduce);
+                let mut step = 0usize;
                 let mut accumulator = if arguments.len() >= 2 {
                     Some(arguments[1].clone())
                 } else {
                     None
                 };
                 while accumulator.is_none() {
-                    let Some(first) = indices.next() else {
+                    if step >= length {
                         return Err(self.type_error("Reduce of empty array with no initial value"));
-                    };
+                    }
+                    let first = if forward { step } else { length - 1 - step };
+                    step += 1;
                     accumulator = match Self::element(&this, &values, first) {
                         Some(Value::Uninitialized) if !self.holds(&this, &first.to_string()) => {
                             None
@@ -662,9 +756,77 @@ impl ScriptRuntime {
                         value => value,
                     };
                 }
-                let fast = Self::simple_closure(&callback);
                 let mut accumulator = accumulator.unwrap_or(Value::Undefined);
-                for index in indices {
+                let remaining = length - step;
+                if remaining == 0 {
+                    return Ok(accumulator);
+                }
+                let fast = Self::simple_closure(&callback);
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                if let Some(closure) = &fast
+                    && let Some(mut session) = super::jit::JitCallbackSession::try_new(
+                        self,
+                        closure,
+                        callback.clone(),
+                        Value::Undefined,
+                        remaining,
+                    )
+                {
+                    let param_count = session.param_count();
+                    let heap_ptr = session.heap_ptr();
+                    while step < length {
+                        let index = if forward { step } else { length - 1 - step };
+                        step += 1;
+                        let mut value = if let Value::Array(array) = &this {
+                            match unsafe { (&*heap_ptr).array_ref(array) } {
+                                Some(data) => {
+                                    data.values.get(index).cloned().unwrap_or(Value::Undefined)
+                                }
+                                None => array
+                                    .borrow()
+                                    .get(index)
+                                    .cloned()
+                                    .unwrap_or(Value::Undefined),
+                            }
+                        } else {
+                            Self::element(&this, &values, index).unwrap_or(Value::Undefined)
+                        };
+                        if matches!(value, Value::Uninitialized) {
+                            if !session.with_runtime(|rt| rt.holds(&this, &index.to_string())) {
+                                continue;
+                            }
+                            value = session.with_runtime(|rt| {
+                                rt.get_index(&this, Value::Number(index as f64))
+                            })?;
+                        }
+                        accumulator = match param_count {
+                            0 => {
+                                accumulator.fast_drop();
+                                value.fast_drop();
+                                session.call0()?
+                            }
+                            1 => {
+                                value.fast_drop();
+                                session.call1(accumulator)?
+                            }
+                            2 => session.call2(accumulator, value)?,
+                            3 => session.call3(accumulator, value, Value::Number(index as f64))?,
+                            _ => session.call4(
+                                accumulator,
+                                value,
+                                Value::Number(index as f64),
+                                object.clone(),
+                            )?,
+                        };
+                    }
+                    return Ok(accumulator);
+                }
+                while step < length {
+                    let index = if forward { step } else { length - 1 - step };
+                    step += 1;
                     let value = Self::element(&this, &values, index).unwrap_or(Value::Undefined);
                     // a callback may have deleted what was there when the method began
                     let value = match value {
@@ -701,6 +863,119 @@ impl ScriptRuntime {
                     };
                 }
                 Ok(accumulator)
+            }
+            M::Sort | M::ToSorted => {
+                let comparator = argument(arguments, 0);
+                if !matches!(comparator, Value::Undefined) && !is_callable(&comparator) {
+                    return Err(self.type_error(
+                        "The comparison function must be either a function or undefined",
+                    ));
+                }
+                let values = if matches!(method, M::Sort) {
+                    self.receiver_array(&this, name)?.borrow().to_vec()
+                } else {
+                    self.receiver_values(&this, name)?
+                };
+                let sorted = self.sort_values(values, &comparator)?;
+                if matches!(method, M::Sort) {
+                    let array = self.receiver_array(&this, name)?;
+                    **array.borrow_mut() = sorted;
+                    Ok(this)
+                } else {
+                    Ok(Self::new_array(sorted))
+                }
+            }
+            _ => unreachable!("unexpected array callback method"),
+        }
+    }
+
+    pub(super) fn call_array_method(
+        &mut self,
+        method: ArrayMethod,
+        this: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, ScriptError> {
+        use ArrayMethod as M;
+        if matches!(
+            method,
+            M::ForEach
+                | M::Map
+                | M::Filter
+                | M::Some
+                | M::Every
+                | M::Find
+                | M::FindIndex
+                | M::Reduce
+                | M::ReduceRight
+                | M::Sort
+                | M::ToSorted
+        ) {
+            return self.call_array_callback_slice(method, this, &arguments);
+        }
+        let name = ARRAY_METHODS[method as usize].0;
+        let mutates = matches!(
+            method,
+            M::Push
+                | M::Pop
+                | M::Shift
+                | M::Unshift
+                | M::Splice
+                | M::Reverse
+                | M::Sort
+                | M::Fill
+                | M::CopyWithin
+        );
+        if mutates && !matches!(this, Value::Array(_)) {
+            return self.mutate_array_like(method, this, arguments, name);
+        }
+        if mutates
+            && let Value::Array(array) = &this
+            && let Some(refusal) = array_method_refusal(method, &array.borrow(), &arguments)
+        {
+            return Err(self.type_error(refusal));
+        }
+        match method {
+            M::ForEach
+            | M::Map
+            | M::Filter
+            | M::Some
+            | M::Every
+            | M::Find
+            | M::FindIndex
+            | M::Reduce
+            | M::ReduceRight
+            | M::Sort
+            | M::ToSorted => unreachable!(),
+            M::FindLast | M::FindLastIndex => {
+                let (values, object, length) = if let Value::Array(array) = &this {
+                    (Vec::new(), this.clone(), array.borrow().len())
+                } else {
+                    let (values, object) = self.callback_receiver(&this, name)?;
+                    let len = values.len();
+                    (values, object, len)
+                };
+                let callback = self.callback(&arguments, name)?;
+                let receiver = argument(&arguments, 1);
+                for index in (0..length).rev() {
+                    let value = Self::element(&this, &values, index)
+                        .unwrap_or(Value::Undefined)
+                        .filled();
+                    let result = self.call_function(
+                        callback.clone(),
+                        receiver.clone(),
+                        vec![value.clone(), Value::Number(index as f64), object.clone()],
+                    )?;
+                    if result.truthy() {
+                        return Ok(match method {
+                            M::FindLast => value,
+                            _ => Value::Number(index as f64),
+                        });
+                    }
+                }
+                Ok(match method {
+                    M::FindLast => Value::Undefined,
+                    _ => Value::Number(-1.0),
+                })
             }
             M::Includes | M::IndexOf | M::LastIndexOf => {
                 let mut values = self.receiver_values(&this, name)?;
@@ -964,27 +1239,6 @@ impl ScriptRuntime {
                 values[index as usize] = argument(&arguments, 1);
                 Ok(Self::new_array(values))
             }
-            M::Sort | M::ToSorted => {
-                let comparator = argument(&arguments, 0);
-                if !matches!(comparator, Value::Undefined) && !is_callable(&comparator) {
-                    return Err(self.type_error(
-                        "The comparison function must be either a function or undefined",
-                    ));
-                }
-                let values = if matches!(method, M::Sort) {
-                    self.receiver_array(&this, name)?.borrow().to_vec()
-                } else {
-                    self.receiver_values(&this, name)?
-                };
-                let sorted = self.sort_values(values, &comparator)?;
-                if matches!(method, M::Sort) {
-                    let array = self.receiver_array(&this, name)?;
-                    **array.borrow_mut() = sorted;
-                    Ok(this)
-                } else {
-                    Ok(Self::new_array(sorted))
-                }
-            }
         }
     }
 
@@ -1011,14 +1265,39 @@ impl ScriptRuntime {
         let fast_comparator = Self::simple_closure(comparator);
         let mut order: Vec<usize> = (0..defined.len()).collect();
         let mut scratch = order.clone();
-        self.merge_sort(
-            &mut order,
-            &mut scratch,
-            &defined,
-            keys.as_deref(),
-            comparator,
-            fast_comparator.as_ref(),
-        )?;
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        let sorted_via_jit = if defined.len() >= 2
+            && let Some(closure) = &fast_comparator
+            && let Some(mut session) = super::jit::JitCallbackSession::try_new(
+                self,
+                closure,
+                comparator.clone(),
+                Value::Undefined,
+                defined.len(),
+            ) {
+            merge_sort_jit(&mut session, &mut order, &mut scratch, &defined)?;
+            true
+        } else {
+            false
+        };
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )))]
+        let sorted_via_jit = false;
+        if !sorted_via_jit {
+            self.merge_sort(
+                &mut order,
+                &mut scratch,
+                &defined,
+                keys.as_deref(),
+                comparator,
+                fast_comparator.as_ref(),
+            )?;
+        }
         let mut sorted: Vec<Value> = order
             .into_iter()
             .map(|index| std::mem::replace(&mut defined[index], Value::Undefined))
@@ -1166,6 +1445,93 @@ fn flatten_into(result: &mut Vec<Value>, value: Value, depth: f64) -> Result<(),
             check_length(result.len())?;
         }
     }
+    Ok(())
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn compare_elements_jit(
+    session: &mut super::jit::JitCallbackSession<'_>,
+    left: usize,
+    right: usize,
+    values: &[Value],
+) -> Result<Ordering, ScriptError> {
+    let result = match session.param_count() {
+        0 => session.call0()?,
+        1 => session.call1(values[left].clone())?,
+        _ => session.call2(values[left].clone(), values[right].clone())?,
+    };
+    let number = match result {
+        Value::Number(number) => number,
+        other => session.with_runtime(|rt| rt.coerce_number(other))?,
+    };
+    Ok(if number < 0.0 {
+        Ordering::Less
+    } else if number > 0.0 {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    })
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn merge_sort_jit(
+    session: &mut super::jit::JitCallbackSession<'_>,
+    order: &mut [usize],
+    scratch: &mut [usize],
+    values: &[Value],
+) -> Result<(), ScriptError> {
+    let length = order.len();
+    if length <= 1 {
+        return Ok(());
+    }
+    if length <= 12 {
+        for i in 1..length {
+            let mut j = i;
+            while j > 0
+                && compare_elements_jit(session, order[j - 1], order[j], values)?
+                    == Ordering::Greater
+            {
+                order.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        return Ok(());
+    }
+    let middle = length / 2;
+    {
+        let (left, right) = order.split_at_mut(middle);
+        let (left_scratch, right_scratch) = scratch.split_at_mut(middle);
+        merge_sort_jit(session, left, left_scratch, values)?;
+        merge_sort_jit(session, right, right_scratch, values)?;
+    }
+    let (mut i, mut j, mut k) = (0, middle, 0);
+    while i < middle && j < length {
+        if compare_elements_jit(session, order[i], order[j], values)? == Ordering::Greater {
+            scratch[k] = order[j];
+            j += 1;
+        } else {
+            scratch[k] = order[i];
+            i += 1;
+        }
+        k += 1;
+    }
+    while i < middle {
+        scratch[k] = order[i];
+        i += 1;
+        k += 1;
+    }
+    while j < length {
+        scratch[k] = order[j];
+        j += 1;
+        k += 1;
+    }
+    order.copy_from_slice(&scratch[..length]);
     Ok(())
 }
 

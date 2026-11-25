@@ -1053,7 +1053,8 @@ unsafe fn fill_scope_cache_fast(
 ) {
     unsafe {
         if let Some(s0) = head.as_ref() {
-            if max_scope_depth == 1 {
+            let limit = (max_scope_depth as usize).min(SCOPE_CACHE_DEPTH);
+            if limit == 1 {
                 if let Some((p0, l0, _)) = heap.scope_slots_fast(s0) {
                     ctx.scope_ptrs[0] = p0;
                     ctx.scope_lens[0] = l0;
@@ -1061,18 +1062,27 @@ unsafe fn fill_scope_cache_fast(
                     ctx.cached_scope_depth = 1;
                     return;
                 }
-            } else if max_scope_depth == 2
-                && let Some((p0, l0, parent)) = heap.scope_slots_fast(s0)
-                && let Some(s1) = parent.as_ref()
-                && let Some((p1, l1, _)) = heap.scope_slots_fast(s1)
-            {
-                ctx.scope_ptrs[0] = p0;
-                ctx.scope_lens[0] = l0;
-                ctx.scope_ptrs[1] = p1;
-                ctx.scope_lens[1] = l1;
-                ctx.cached_scope_raw = s0.raw_bits();
-                ctx.cached_scope_depth = 2;
-                return;
+            } else {
+                let mut cur = Some(s0.clone());
+                let mut i = 0usize;
+                while i < limit {
+                    let Some(sr) = cur.as_ref() else {
+                        break;
+                    };
+                    let Some((ptr, len, parent)) = heap.scope_slots_fast(sr) else {
+                        refresh_scope_cache(ctx, rt);
+                        return;
+                    };
+                    *ctx.scope_ptrs.get_unchecked_mut(i) = ptr;
+                    *ctx.scope_lens.get_unchecked_mut(i) = len;
+                    cur = parent;
+                    i += 1;
+                }
+                if i == limit {
+                    ctx.cached_scope_raw = s0.raw_bits();
+                    ctx.cached_scope_depth = limit as u8;
+                    return;
+                }
             }
         }
         refresh_scope_cache(ctx, rt);
@@ -1683,62 +1693,83 @@ extern "sysv64" fn helper_str_concat(
 }
 
 #[inline(always)]
-fn push_stack_bytes(buf: &mut [u8; 256], pos: &mut usize, bytes: &[u8]) -> bool {
+unsafe fn push_stack_bytes(buf: *mut u8, pos: &mut usize, bytes: &[u8]) -> bool {
     let end = *pos + bytes.len();
-    if end > buf.len() {
+    if end > 256 {
         return false;
     }
-    buf[*pos..end].copy_from_slice(bytes);
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.add(*pos), bytes.len()) };
     *pos = end;
     true
 }
 
 #[inline(always)]
-fn push_stack_i64(buf: &mut [u8; 256], pos: &mut usize, n: i64) -> bool {
-    let mut tmp = [0u8; 24];
-    let mut idx = tmp.len();
+unsafe fn push_stack_i64(buf: *mut u8, pos: &mut usize, n: i64) -> bool {
+    let mut tmp = std::mem::MaybeUninit::<[u8; 24]>::uninit();
+    let ptr = tmp.as_mut_ptr() as *mut u8;
+    let mut idx = 24usize;
     let neg = n < 0;
     let mut u = if neg {
         n.wrapping_neg() as u64
     } else {
         n as u64
     };
-    loop {
-        idx -= 1;
-        tmp[idx] = b'0' + (u % 10) as u8;
-        u /= 10;
-        if u == 0 {
-            break;
+    unsafe {
+        loop {
+            idx -= 1;
+            *ptr.add(idx) = b'0' + (u % 10) as u8;
+            u /= 10;
+            if u == 0 {
+                break;
+            }
+        }
+        if neg {
+            idx -= 1;
+            *ptr.add(idx) = b'-';
+        }
+        push_stack_bytes(buf, pos, std::slice::from_raw_parts(ptr.add(idx), 24 - idx))
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn template_concat_heap(slice: &[Value]) -> Option<JsStr> {
+    let mut cap = 0usize;
+    for v in slice {
+        match v {
+            Value::String(s) => cap += s.len(),
+            Value::Number(_) => cap += 16,
+            Value::Bool(_) => cap += 5,
+            Value::Null => cap += 4,
+            Value::Undefined => cap += 9,
+            _ => return None,
         }
     }
-    if neg {
-        idx -= 1;
-        tmp[idx] = b'-';
+    let mut text = String::with_capacity(cap);
+    for v in slice {
+        match v {
+            Value::String(s) => text.push_str(s),
+            Value::Number(num) => text.push_str(&number_to_string(*num)),
+            Value::Bool(b) => text.push_str(if *b { "true" } else { "false" }),
+            Value::Null => text.push_str("null"),
+            Value::Undefined => text.push_str("undefined"),
+            _ => unreachable!(),
+        }
     }
-    push_stack_bytes(buf, pos, &tmp[idx..])
+    Some(JsStr::from(text))
 }
 
 extern "sysv64" fn helper_template_concat(src: *mut Value, count: u32, out: *mut Value) -> u32 {
     unsafe {
         let n = count as usize;
         let slice = std::slice::from_raw_parts(src, n);
-        let mut cap = 0usize;
-        for v in slice {
-            match v {
-                Value::String(s) => cap += s.len(),
-                Value::Number(_) => cap += 16,
-                Value::Bool(_) => cap += 5,
-                Value::Null => cap += 4,
-                Value::Undefined => cap += 9,
-                _ => return 0,
-            }
-        }
-        let mut buf = [0u8; 256];
+        let mut buf = std::mem::MaybeUninit::<[u8; 256]>::uninit();
+        let buf_ptr = buf.as_mut_ptr() as *mut u8;
         let mut pos = 0usize;
         let mut fit = true;
         for v in slice {
             fit = match v {
-                Value::String(s) => push_stack_bytes(&mut buf, &mut pos, s.as_bytes()),
+                Value::String(s) => push_stack_bytes(buf_ptr, &mut pos, s.as_bytes()),
                 Value::Number(num) => {
                     let n_val = *num;
                     let int = n_val as i64;
@@ -1746,18 +1777,18 @@ extern "sysv64" fn helper_template_concat(src: *mut Value, count: u32, out: *mut
                         && (int as f64) == n_val
                         && (-999_999_999_999..=999_999_999_999).contains(&int)
                     {
-                        push_stack_i64(&mut buf, &mut pos, int)
+                        push_stack_i64(buf_ptr, &mut pos, int)
                     } else {
                         let s = number_to_string(n_val);
-                        push_stack_bytes(&mut buf, &mut pos, s.as_bytes())
+                        push_stack_bytes(buf_ptr, &mut pos, s.as_bytes())
                     }
                 }
                 Value::Bool(b) => {
-                    push_stack_bytes(&mut buf, &mut pos, if *b { b"true" } else { b"false" })
+                    push_stack_bytes(buf_ptr, &mut pos, if *b { b"true" } else { b"false" })
                 }
-                Value::Null => push_stack_bytes(&mut buf, &mut pos, b"null"),
-                Value::Undefined => push_stack_bytes(&mut buf, &mut pos, b"undefined"),
-                _ => unreachable!(),
+                Value::Null => push_stack_bytes(buf_ptr, &mut pos, b"null"),
+                Value::Undefined => push_stack_bytes(buf_ptr, &mut pos, b"undefined"),
+                _ => return 0,
             };
             if !fit {
                 break;
@@ -1765,20 +1796,14 @@ extern "sysv64" fn helper_template_concat(src: *mut Value, count: u32, out: *mut
         }
         let res = if fit {
             // safety: every appended piece is valid utf-8
-            JsStr::new(std::str::from_utf8_unchecked(&buf[..pos]))
+            JsStr::new(std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                buf_ptr, pos,
+            )))
         } else {
-            let mut text = String::with_capacity(cap);
-            for v in slice {
-                match v {
-                    Value::String(s) => text.push_str(s),
-                    Value::Number(num) => text.push_str(&number_to_string(*num)),
-                    Value::Bool(b) => text.push_str(if *b { "true" } else { "false" }),
-                    Value::Null => text.push_str("null"),
-                    Value::Undefined => text.push_str("undefined"),
-                    _ => unreachable!(),
-                }
-            }
-            JsStr::from(text)
+            let Some(text) = template_concat_heap(slice) else {
+                return 0;
+            };
+            text
         };
         for i in 0..n {
             let p = src.add(i);
@@ -2020,6 +2045,12 @@ unsafe fn grow_stack_for_jit(
 
 #[cold]
 #[inline(never)]
+fn reserve_frame_slot(frames: &mut Vec<Frame>) {
+    frames.reserve(64);
+}
+
+#[cold]
+#[inline(never)]
 fn push_frame_grow(frames: &mut Vec<Frame>, frame: Frame) {
     frames.reserve(64);
     frames.push(frame);
@@ -2170,6 +2201,246 @@ unsafe fn helper_call_native(
                                     return STATUS_OK;
                                 }
                             }
+                            Native::Array(
+                                m @ (super::arrays::ArrayMethod::ForEach
+                                | super::arrays::ArrayMethod::Map
+                                | super::arrays::ArrayMethod::Filter
+                                | super::arrays::ArrayMethod::Some
+                                | super::arrays::ArrayMethod::Every
+                                | super::arrays::ArrayMethod::Find
+                                | super::arrays::ArrayMethod::FindIndex),
+                            ) if count_usize >= 1 => {
+                                if let Value::Array(arr_h) = &*stack_ptr.add(return_base)
+                                    && let Some(array) = heap.array_ref(arr_h)
+                                    && array.values.is_empty()
+                                {
+                                    let cb_ok = match &*stack_ptr.add(arg_start) {
+                                        Value::Object(cb_h) => {
+                                            heap.object_ref(cb_h).is_some_and(|o| {
+                                                matches!(
+                                                    o.class,
+                                                    ObjectClass::Function(_)
+                                                        | ObjectClass::Native(_)
+                                                        | ObjectClass::Bound(_)
+                                                )
+                                            })
+                                        }
+                                        Value::Builtin(_) => true,
+                                        _ => false,
+                                    };
+                                    if cb_ok {
+                                        let result = match m {
+                                            super::arrays::ArrayMethod::Map
+                                            | super::arrays::ArrayMethod::Filter => {
+                                                if array.extra.is_none()
+                                                    && heap
+                                                        .object_ref(
+                                                            &(*ctx.rt).intrinsics.array_prototype,
+                                                        )
+                                                        .is_some_and(|p| {
+                                                            p.array_constructor_intact(heap)
+                                                        })
+                                                {
+                                                    Some(Value::Array(heap.alloc_array_fast(
+                                                        ArrayData::from(Vec::new()),
+                                                    )))
+                                                } else {
+                                                    None
+                                                }
+                                            }
+                                            super::arrays::ArrayMethod::Some => {
+                                                Some(Value::Bool(false))
+                                            }
+                                            super::arrays::ArrayMethod::Every => {
+                                                Some(Value::Bool(true))
+                                            }
+                                            super::arrays::ArrayMethod::FindIndex => {
+                                                Some(Value::Number(-1.0))
+                                            }
+                                            _ => Some(Value::Undefined),
+                                        };
+                                        if let Some(res) = result {
+                                            for i in arg_start..sp_len {
+                                                let slot = stack_ptr.add(i);
+                                                if !(*slot).is_copy() {
+                                                    drop_value_slow(std::ptr::read(slot));
+                                                }
+                                            }
+                                            std::ptr::write(stack_ptr.add(return_base), res);
+                                            ctx.sp = stack_ptr.add(return_base + 1);
+                                            return STATUS_OK;
+                                        }
+                                    }
+                                }
+                            }
+                            Native::Collection(
+                                col_m @ (super::collections::CollectionMethod::Get
+                                | super::collections::CollectionMethod::Has
+                                | super::collections::CollectionMethod::Set
+                                | super::collections::CollectionMethod::Add
+                                | super::collections::CollectionMethod::Delete
+                                | super::collections::CollectionMethod::Clear
+                                | super::collections::CollectionMethod::Size),
+                            ) if count_usize <= 2 => {
+                                use super::collections::CollectionMethod as CM;
+                                if let Value::Object(recv_h) = &*stack_ptr.add(return_base)
+                                    && let Some(recv_obj) = heap.object_ref(recv_h)
+                                {
+                                    let col_opt = match (&recv_obj.class, col_m) {
+                                        (
+                                            ObjectClass::Map(col),
+                                            CM::Get
+                                            | CM::Has
+                                            | CM::Set
+                                            | CM::Delete
+                                            | CM::Clear
+                                            | CM::Size,
+                                        )
+                                        | (
+                                            ObjectClass::Set(col),
+                                            CM::Has | CM::Add | CM::Delete | CM::Clear | CM::Size,
+                                        ) => Some(col),
+                                        _ => None,
+                                    };
+                                    if let Some(col) = col_opt {
+                                        match col_m {
+                                            CM::Get => {
+                                                if let Ok(map) = col.try_borrow() {
+                                                    let res = if count_usize == 0 {
+                                                        map.get(&Value::Undefined)
+                                                    } else {
+                                                        map.get(&*stack_ptr.add(arg_start))
+                                                    }
+                                                    .unwrap_or(Value::Undefined);
+                                                    drop(map);
+                                                    for i in arg_start..sp_len {
+                                                        let slot = stack_ptr.add(i);
+                                                        if !(*slot).is_copy() {
+                                                            drop_value_slow(std::ptr::read(slot));
+                                                        }
+                                                    }
+                                                    std::ptr::write(
+                                                        stack_ptr.add(return_base),
+                                                        res,
+                                                    );
+                                                    ctx.sp = stack_ptr.add(return_base + 1);
+                                                    return STATUS_OK;
+                                                }
+                                            }
+                                            CM::Has => {
+                                                if let Ok(map) = col.try_borrow() {
+                                                    let has = if count_usize == 0 {
+                                                        map.has(&Value::Undefined)
+                                                    } else {
+                                                        map.has(&*stack_ptr.add(arg_start))
+                                                    };
+                                                    drop(map);
+                                                    for i in arg_start..sp_len {
+                                                        let slot = stack_ptr.add(i);
+                                                        if !(*slot).is_copy() {
+                                                            drop_value_slow(std::ptr::read(slot));
+                                                        }
+                                                    }
+                                                    std::ptr::write(
+                                                        stack_ptr.add(return_base),
+                                                        Value::Bool(has),
+                                                    );
+                                                    ctx.sp = stack_ptr.add(return_base + 1);
+                                                    return STATUS_OK;
+                                                }
+                                            }
+                                            CM::Size => {
+                                                if let Ok(map) = col.try_borrow() {
+                                                    let len = map.len() as f64;
+                                                    drop(map);
+                                                    for i in arg_start..sp_len {
+                                                        let slot = stack_ptr.add(i);
+                                                        if !(*slot).is_copy() {
+                                                            drop_value_slow(std::ptr::read(slot));
+                                                        }
+                                                    }
+                                                    std::ptr::write(
+                                                        stack_ptr.add(return_base),
+                                                        Value::Number(len),
+                                                    );
+                                                    ctx.sp = stack_ptr.add(return_base + 1);
+                                                    return STATUS_OK;
+                                                }
+                                            }
+                                            CM::Delete => {
+                                                if let Ok(mut map) = col.try_borrow_mut() {
+                                                    let deleted = if count_usize == 0 {
+                                                        map.delete(&Value::Undefined)
+                                                    } else {
+                                                        map.delete(&*stack_ptr.add(arg_start))
+                                                    };
+                                                    drop(map);
+                                                    for i in arg_start..sp_len {
+                                                        let slot = stack_ptr.add(i);
+                                                        if !(*slot).is_copy() {
+                                                            drop_value_slow(std::ptr::read(slot));
+                                                        }
+                                                    }
+                                                    std::ptr::write(
+                                                        stack_ptr.add(return_base),
+                                                        Value::Bool(deleted),
+                                                    );
+                                                    ctx.sp = stack_ptr.add(return_base + 1);
+                                                    return STATUS_OK;
+                                                }
+                                            }
+                                            CM::Clear => {
+                                                if let Ok(mut map) = col.try_borrow_mut() {
+                                                    map.clear();
+                                                    drop(map);
+                                                    for i in arg_start..sp_len {
+                                                        let slot = stack_ptr.add(i);
+                                                        if !(*slot).is_copy() {
+                                                            drop_value_slow(std::ptr::read(slot));
+                                                        }
+                                                    }
+                                                    std::ptr::write(
+                                                        stack_ptr.add(return_base),
+                                                        Value::Undefined,
+                                                    );
+                                                    ctx.sp = stack_ptr.add(return_base + 1);
+                                                    return STATUS_OK;
+                                                }
+                                            }
+                                            CM::Set | CM::Add => {
+                                                if let Ok(mut map) = col.try_borrow_mut()
+                                                    && map.len() < MAX_RUNTIME_ARRAY_LENGTH
+                                                {
+                                                    let key = if count_usize >= 1 {
+                                                        std::ptr::read(stack_ptr.add(arg_start))
+                                                    } else {
+                                                        Value::Undefined
+                                                    };
+                                                    let val = if matches!(col_m, CM::Set)
+                                                        && count_usize >= 2
+                                                    {
+                                                        std::ptr::read(stack_ptr.add(arg_start + 1))
+                                                    } else {
+                                                        if count_usize >= 2 {
+                                                            std::ptr::read(
+                                                                stack_ptr.add(arg_start + 1),
+                                                            )
+                                                            .fast_drop();
+                                                        }
+                                                        Value::Undefined
+                                                    };
+                                                    map.set(key, val);
+                                                    drop(map);
+                                                    // return_base already holds Copy receiver this
+                                                    ctx.sp = stack_ptr.add(return_base + 1);
+                                                    return STATUS_OK;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
                             Native::String(super::strings::StringMethod::LocaleCompare) => {
                                 if let Value::String(text) = &*stack_ptr.add(return_base) {
                                     let other_opt = if count_usize == 0 {
@@ -2217,12 +2488,13 @@ unsafe fn helper_call_native(
                                         ctx.sp = stack_ptr.add(return_base + 1);
                                         return STATUS_OK;
                                     } else if bytes.len() <= 256 {
-                                        let mut buf = [0u8; 256];
-                                        for (dst, &b) in buf.iter_mut().zip(bytes.iter()) {
-                                            *dst = b.to_ascii_lowercase();
+                                        let mut buf = std::mem::MaybeUninit::<[u8; 256]>::uninit();
+                                        let ptr = buf.as_mut_ptr() as *mut u8;
+                                        for (i, &b) in bytes.iter().enumerate() {
+                                            *ptr.add(i) = b.to_ascii_lowercase();
                                         }
                                         let lowered = JsStr::new(std::str::from_utf8_unchecked(
-                                            &buf[..bytes.len()],
+                                            std::slice::from_raw_parts(ptr, bytes.len()),
                                         ));
                                         for i in return_base..sp_len {
                                             let slot = stack_ptr.add(i);
@@ -2529,6 +2801,178 @@ unsafe fn helper_call_scoped(
     }
 }
 
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn helper_call_bound(
+    run: *mut JitRun,
+    count: u32,
+    method: u32,
+    next_pc: usize,
+    return_target: *const u8,
+    arg_start: usize,
+    callee_at: usize,
+    return_base: usize,
+) -> u32 {
+    unsafe {
+        let ctx = &mut (*run).ctx;
+        let rt = &mut *ctx.rt;
+        let heap = &*ctx.heap;
+        let count_usize = count as usize;
+        let is_method = method != 0;
+        let resolved = match &*ctx.stack_ptr.add(callee_at) {
+            Value::Object(obj) => heap.object_ref(obj).and_then(|borrowed| {
+                let ObjectClass::Bound(bound) = &borrowed.class else {
+                    return None;
+                };
+                if !bound.arguments.is_empty() {
+                    return None;
+                }
+                let Value::Object(target_h) = &bound.target else {
+                    return None;
+                };
+                let target_obj = heap.object_ref(target_h)?;
+                let ObjectClass::Function(closure) = &target_obj.class else {
+                    return None;
+                };
+                let fast_call = closure.code.fast_call;
+                if fast_call == 0 {
+                    return None;
+                }
+                let jit = closure.code.jit_code.get().and_then(Option::as_ref)?;
+                Some((
+                    fast_call,
+                    jit.target(closure.code.entry),
+                    closure.clone(),
+                    bound.target.clone(),
+                    bound.this.clone(),
+                ))
+            }),
+            _ => None,
+        };
+        let Some((fast_call, entry_target, closure, target_val, bound_this)) = resolved else {
+            return helper_call_slow(run, count, method, next_pc, return_target);
+        };
+        let code = closure.code.clone();
+        rt.frames.get_unchecked_mut(ctx.top).pc = next_pc;
+        std::ptr::write(ctx.stack_ptr.add(callee_at), target_val);
+        if is_method {
+            let old = std::ptr::replace(ctx.stack_ptr.add(return_base), Value::Undefined);
+            old.fast_drop();
+        }
+        let this = if code.uses_lexical_this {
+            bound_this.fast_drop();
+            closure.lexical_this().unwrap_or(Value::Undefined)
+        } else if code.strict_or_arrow || !matches!(bound_this, Value::Undefined | Value::Null) {
+            bound_this
+        } else {
+            Value::Window
+        };
+        let handler_base = rt.vm_handlers.len() as u32;
+        let chain_base = rt.vm_chains.len() as u32;
+        let pending_base = rt.vm_pending.len() as u32;
+        let iter_base = rt.vm_iters.len() as u32;
+        if fast_call == 1 {
+            let max_pushes = code.max_pushes as usize;
+            let max_scope_depth = code.max_scope_depth;
+            let new_top = rt.frames.len();
+            let reg_count = code.registers as usize;
+            let keep = count_usize.min(code.param_slots.len());
+            if count_usize > keep {
+                for i in (arg_start + keep)..(arg_start + count_usize) {
+                    let slot = ctx.stack_ptr.add(i);
+                    if !(*slot).is_copy() {
+                        drop_value_slow(std::ptr::read(slot));
+                    }
+                }
+            }
+            let new_len = arg_start + reg_count;
+            if (ctx.stack_end as usize - ctx.stack_ptr as usize)
+                < (new_len + max_pushes) * std::mem::size_of::<Value>()
+            {
+                grow_stack_for_jit(
+                    ctx,
+                    rt,
+                    arg_start + keep,
+                    reg_count.saturating_sub(keep) + max_pushes,
+                    max_pushes,
+                );
+            } else {
+                ctx.stack_safe_limit = ctx.stack_end.sub(max_pushes);
+            }
+            fill_undefined_fast(
+                ctx.stack_ptr.add(arg_start + keep),
+                new_len - (arg_start + keep),
+            );
+            let pc = code.entry;
+            let new_scope_raw = scope_raw(&closure.scope);
+            let scope = closure.scope.clone();
+            if new_top == rt.frames.capacity() {
+                reserve_frame_slot(&mut rt.frames);
+            }
+            rt.frames.as_mut_ptr().add(new_top).write(Frame {
+                code,
+                closure: Some(closure),
+                pc,
+                reg_base: arg_start,
+                stack_base: new_len,
+                return_base,
+                return_target,
+                handler_base,
+                chain_base,
+                pending_base,
+                iter_base,
+                scope,
+                this,
+                function: Value::Undefined,
+                scopes: 0,
+                escaped_scopes: 0,
+                flags: FLAG_USES_REGS | FLAG_CALLEE_ON_STACK,
+                extra: None,
+            });
+            rt.frames.set_len(new_top + 1);
+            ctx.top = new_top;
+            ctx.reg_base = arg_start;
+            ctx.max_pushes = max_pushes;
+            ctx.sp = ctx.stack_ptr.add(new_len);
+            ctx.regs = ctx.stack_ptr.add(arg_start);
+            ctx.this_ptr = &rt.frames.get_unchecked(new_top).this as *const Value;
+            ctx.next_target = entry_target;
+            if max_scope_depth > 0
+                && (new_scope_raw == 0
+                    || ctx.cached_scope_raw != new_scope_raw
+                    || ctx.cached_scope_depth < max_scope_depth)
+            {
+                fill_scope_cache_fast(
+                    ctx,
+                    rt,
+                    heap,
+                    &rt.frames.get_unchecked(new_top).scope,
+                    max_scope_depth,
+                );
+            }
+            STATUS_DISPATCH_NEXT
+        } else {
+            helper_call_scoped(
+                ctx,
+                rt,
+                heap,
+                code,
+                closure,
+                entry_target,
+                this,
+                arg_start,
+                return_base,
+                count_usize,
+                return_target,
+                handler_base,
+                chain_base,
+                pending_base,
+                iter_base,
+            )
+        }
+    }
+}
+
 extern "sysv64" fn helper_call(
     run: *mut JitRun,
     count: u32,
@@ -2542,200 +2986,194 @@ extern "sysv64" fn helper_call(
         let heap = &*ctx.heap;
         let count_usize = count as usize;
         let is_method = method != 0;
-        let sp_len = (ctx.sp as usize - ctx.stack_ptr as usize) / std::mem::size_of::<Value>();
-        // fused zero-sync fast path for plain JIT-to-JIT JS calls (and 0-arg bound functions)
-        if rt.frames.len() < MAX_FRAMES && sp_len >= count_usize + 1 + usize::from(is_method) {
-            let arg_start = sp_len - count_usize;
-            let callee_at = arg_start - 1;
-            let return_base = callee_at - usize::from(is_method);
-            enum FastCallee {
-                Js(Rc<Closure>, Option<(Value, Value)>),
-                Native,
-                Slow,
-            }
-            let callee_kind = match &*ctx.stack_ptr.add(callee_at) {
+        let stack_ptr = ctx.stack_ptr;
+        let sp = ctx.sp;
+        let needed_bytes =
+            (count_usize + 1 + usize::from(is_method)) * std::mem::size_of::<Value>();
+        // fused zero-sync fast path for plain JIT-to-JIT JS calls
+        if rt.frames.len() < MAX_FRAMES && (sp as usize - stack_ptr as usize) >= needed_bytes {
+            let arg_start_ptr = sp.sub(count_usize);
+            let callee_ptr = arg_start_ptr.sub(1);
+            let (fast_call, entry_target, closure) = match &*callee_ptr {
                 Value::Object(obj) => match heap.object_ref(obj) {
                     Some(borrowed) => match &borrowed.class {
-                        ObjectClass::Function(closure) => FastCallee::Js(closure.clone(), None),
-                        ObjectClass::Native(_) => FastCallee::Native,
-                        ObjectClass::Bound(bound) if bound.arguments.is_empty() => {
-                            if let Value::Object(target_h) = &bound.target
-                                && let Some(target_obj) = heap.object_ref(target_h)
-                                && let ObjectClass::Function(closure) = &target_obj.class
+                        ObjectClass::Function(closure) => {
+                            let fast_call = closure.code.fast_call;
+                            if fast_call != 0
+                                && let Some(jit) =
+                                    closure.code.jit_code.get().and_then(Option::as_ref)
                             {
-                                FastCallee::Js(
-                                    closure.clone(),
-                                    Some((bound.target.clone(), bound.this.clone())),
-                                )
+                                (fast_call, jit.target(closure.code.entry), closure.clone())
                             } else {
-                                FastCallee::Slow
+                                return helper_call_slow(
+                                    run,
+                                    count,
+                                    method,
+                                    next_pc,
+                                    return_target,
+                                );
                             }
                         }
-                        _ => FastCallee::Slow,
+                        ObjectClass::Native(_) => {
+                            return helper_call_native(run, count, method, next_pc, return_target);
+                        }
+                        ObjectClass::Bound(_) => {
+                            let arg_start = (arg_start_ptr as usize - stack_ptr as usize)
+                                / std::mem::size_of::<Value>();
+                            let callee_at = arg_start - 1;
+                            let return_base = callee_at - usize::from(is_method);
+                            return helper_call_bound(
+                                run,
+                                count,
+                                method,
+                                next_pc,
+                                return_target,
+                                arg_start,
+                                callee_at,
+                                return_base,
+                            );
+                        }
+                        _ => {
+                            return helper_call_slow(run, count, method, next_pc, return_target);
+                        }
                     },
-                    None => FastCallee::Slow,
+                    None => {
+                        return helper_call_slow(run, count, method, next_pc, return_target);
+                    }
                 },
-                Value::Builtin(_) => FastCallee::Native,
-                _ => FastCallee::Slow,
-            };
-            match callee_kind {
-                FastCallee::Native => {
+                Value::Builtin(_) => {
                     return helper_call_native(run, count, method, next_pc, return_target);
                 }
-                FastCallee::Slow => {
+                _ => {
                     return helper_call_slow(run, count, method, next_pc, return_target);
                 }
-                FastCallee::Js(closure, bound_opt) => {
-                    let fast_call = closure.code.fast_call;
-                    if fast_call != 0
-                        && let Some(jit) = closure.code.jit_code.get().and_then(Option::as_ref)
-                    {
-                        let code = closure.code.clone();
-                        let entry_target = jit.target(code.entry);
-                        rt.frames.get_unchecked_mut(ctx.top).pc = next_pc;
-                        let raw_this = if let Some((target_val, bound_this)) = bound_opt {
-                            std::ptr::write(ctx.stack_ptr.add(callee_at), target_val);
-                            if is_method {
-                                let old = std::ptr::replace(
-                                    ctx.stack_ptr.add(return_base),
-                                    Value::Undefined,
-                                );
-                                old.fast_drop();
-                            }
-                            bound_this
-                        } else if is_method {
-                            std::ptr::replace(ctx.stack_ptr.add(return_base), Value::Undefined)
-                        } else {
-                            Value::Undefined
-                        };
-                        let this = if code.uses_lexical_this {
-                            raw_this.fast_drop();
-                            closure.lexical_this().unwrap_or(Value::Undefined)
-                        } else if code.strict_or_arrow
-                            || !matches!(raw_this, Value::Undefined | Value::Null)
-                        {
-                            raw_this
-                        } else {
-                            Value::Window
-                        };
-                        let handler_base = rt.vm_handlers.len() as u32;
-                        let chain_base = rt.vm_chains.len() as u32;
-                        let pending_base = rt.vm_pending.len() as u32;
-                        let iter_base = rt.vm_iters.len() as u32;
-                        if fast_call == 1 {
-                            let max_pushes = code.max_pushes as usize;
-                            let max_scope_depth = code.max_scope_depth;
-                            let new_top = rt.frames.len();
-                            let reg_count = code.registers as usize;
-                            let keep = count_usize.min(code.param_slots.len());
-                            if count_usize > keep {
-                                for i in (arg_start + keep)..(arg_start + count_usize) {
-                                    let slot = ctx.stack_ptr.add(i);
-                                    if !(*slot).is_copy() {
-                                        drop_value_slow(std::ptr::read(slot));
-                                    }
-                                }
-                            }
-                            let new_len = arg_start + reg_count;
-                            let cap_slots = (ctx.stack_end as usize - ctx.stack_ptr as usize)
-                                / std::mem::size_of::<Value>();
-                            if new_len + max_pushes > cap_slots {
-                                grow_stack_for_jit(
-                                    ctx,
-                                    rt,
-                                    arg_start + keep,
-                                    reg_count.saturating_sub(keep) + max_pushes,
-                                    max_pushes,
-                                );
-                            } else {
-                                ctx.stack_safe_limit = ctx.stack_end.sub(max_pushes);
-                            }
-                            fill_undefined_fast(
-                                ctx.stack_ptr.add(arg_start + keep),
-                                new_len - (arg_start + keep),
-                            );
-                            let pc = code.entry;
-                            let new_scope_raw = scope_raw(&closure.scope);
-                            let scope = closure.scope.clone();
-                            push_frame_fast(
-                                &mut rt.frames,
-                                Frame {
-                                    code,
-                                    closure: Some(closure),
-                                    pc,
-                                    reg_base: arg_start,
-                                    stack_base: new_len,
-                                    return_base,
-                                    return_target,
-                                    handler_base,
-                                    chain_base,
-                                    pending_base,
-                                    iter_base,
-                                    scope,
-                                    this,
-                                    function: Value::Undefined,
-                                    scopes: 0,
-                                    escaped_scopes: 0,
-                                    flags: FLAG_USES_REGS | FLAG_CALLEE_ON_STACK,
-                                    extra: None,
-                                },
-                            );
-                            ctx.top = new_top;
-                            ctx.reg_base = arg_start;
-                            ctx.max_pushes = max_pushes;
-                            ctx.sp = ctx.stack_ptr.add(new_len);
-                            ctx.regs = ctx.stack_ptr.add(arg_start);
-                            ctx.this_ptr = &rt.frames.get_unchecked(new_top).this as *const Value;
-                            ctx.next_target = entry_target;
-                            if max_scope_depth > 0
-                                && (new_scope_raw == 0
-                                    || ctx.cached_scope_raw != new_scope_raw
-                                    || ctx.cached_scope_depth < max_scope_depth)
-                            {
-                                fill_scope_cache_fast(
-                                    ctx,
-                                    rt,
-                                    heap,
-                                    &rt.frames.get_unchecked(new_top).scope,
-                                    max_scope_depth,
-                                );
-                            }
-                            return STATUS_DISPATCH_NEXT;
-                        } else {
-                            return helper_call_scoped(
-                                ctx,
-                                rt,
-                                heap,
-                                code,
-                                closure,
-                                entry_target,
-                                this,
-                                arg_start,
-                                return_base,
-                                count_usize,
-                                return_target,
-                                handler_base,
-                                chain_base,
-                                pending_base,
-                                iter_base,
-                            );
+            };
+            let arg_start =
+                (arg_start_ptr as usize - stack_ptr as usize) / std::mem::size_of::<Value>();
+            let return_base = arg_start - 1 - usize::from(is_method);
+            let code = closure.code.clone();
+            rt.frames.get_unchecked_mut(ctx.top).pc = next_pc;
+            let raw_this = if is_method {
+                std::ptr::replace(stack_ptr.add(return_base), Value::Undefined)
+            } else {
+                Value::Undefined
+            };
+            let this = if code.uses_lexical_this {
+                raw_this.fast_drop();
+                closure.lexical_this().unwrap_or(Value::Undefined)
+            } else if code.strict_or_arrow || !matches!(raw_this, Value::Undefined | Value::Null) {
+                raw_this
+            } else {
+                Value::Window
+            };
+            let handler_base = rt.vm_handlers.len() as u32;
+            let chain_base = rt.vm_chains.len() as u32;
+            let pending_base = rt.vm_pending.len() as u32;
+            let iter_base = rt.vm_iters.len() as u32;
+            if fast_call == 1 {
+                let max_pushes = code.max_pushes as usize;
+                let max_scope_depth = code.max_scope_depth;
+                let new_top = rt.frames.len();
+                let reg_count = code.registers as usize;
+                let keep = count_usize.min(code.param_slots.len());
+                if count_usize > keep {
+                    for i in (arg_start + keep)..(arg_start + count_usize) {
+                        let slot = stack_ptr.add(i);
+                        if !(*slot).is_copy() {
+                            drop_value_slow(std::ptr::read(slot));
                         }
                     }
                 }
+                let new_len = arg_start + reg_count;
+                if (ctx.stack_end as usize - stack_ptr as usize)
+                    < (new_len + max_pushes) * std::mem::size_of::<Value>()
+                {
+                    grow_stack_for_jit(
+                        ctx,
+                        rt,
+                        arg_start + keep,
+                        reg_count.saturating_sub(keep) + max_pushes,
+                        max_pushes,
+                    );
+                } else {
+                    ctx.stack_safe_limit = ctx.stack_end.sub(max_pushes);
+                }
+                let base_ptr = ctx.stack_ptr;
+                fill_undefined_fast(base_ptr.add(arg_start + keep), new_len - (arg_start + keep));
+                let pc = code.entry;
+                let new_scope_raw = scope_raw(&closure.scope);
+                let scope = closure.scope.clone();
+                if new_top == rt.frames.capacity() {
+                    reserve_frame_slot(&mut rt.frames);
+                }
+                rt.frames.as_mut_ptr().add(new_top).write(Frame {
+                    code,
+                    closure: Some(closure),
+                    pc,
+                    reg_base: arg_start,
+                    stack_base: new_len,
+                    return_base,
+                    return_target,
+                    handler_base,
+                    chain_base,
+                    pending_base,
+                    iter_base,
+                    scope,
+                    this,
+                    function: Value::Undefined,
+                    scopes: 0,
+                    escaped_scopes: 0,
+                    flags: FLAG_USES_REGS | FLAG_CALLEE_ON_STACK,
+                    extra: None,
+                });
+                rt.frames.set_len(new_top + 1);
+                ctx.top = new_top;
+                ctx.reg_base = arg_start;
+                ctx.max_pushes = max_pushes;
+                ctx.sp = base_ptr.add(new_len);
+                ctx.regs = base_ptr.add(arg_start);
+                ctx.this_ptr = &rt.frames.get_unchecked(new_top).this as *const Value;
+                ctx.next_target = entry_target;
+                if max_scope_depth > 0
+                    && (new_scope_raw == 0
+                        || ctx.cached_scope_raw != new_scope_raw
+                        || ctx.cached_scope_depth < max_scope_depth)
+                {
+                    fill_scope_cache_fast(
+                        ctx,
+                        rt,
+                        heap,
+                        &rt.frames.get_unchecked(new_top).scope,
+                        max_scope_depth,
+                    );
+                }
+                return STATUS_DISPATCH_NEXT;
             }
+            return helper_call_scoped(
+                ctx,
+                rt,
+                heap,
+                code,
+                closure,
+                entry_target,
+                this,
+                arg_start,
+                return_base,
+                count_usize,
+                return_target,
+                handler_base,
+                chain_base,
+                pending_base,
+                iter_base,
+            );
         }
         helper_call_slow(run, count, method, next_pc, return_target)
     }
 }
 
 #[inline(never)]
-unsafe fn free_owned_scope_outline(heap: &Heap, scope: super::heap::ScopeRef) {
-    heap.free_scope_fast(scope);
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn clean_return_extras(
+unsafe fn clean_return_slow(
+    ctx: &mut JitCtx,
     rt: &mut ScriptRuntime,
     heap: &Heap,
     top: usize,
@@ -2743,18 +3181,66 @@ unsafe fn clean_return_extras(
     pending_base: usize,
     iter_base: usize,
 ) {
-    if rt.vm_chains.len() > chain_base {
-        rt.vm_chains.truncate(chain_base);
-    }
-    if rt.vm_pending.len() > pending_base {
-        rt.vm_pending.truncate(pending_base);
-    }
-    if rt.vm_iters.len() > iter_base {
-        rt.vm_iters.truncate(iter_base);
-    }
-    let frame = unsafe { rt.frames.get_unchecked_mut(top) };
-    if frame.scopes > 0 {
-        ScriptRuntime::jit_restore_scopes(heap, frame);
+    unsafe {
+        let frame = rt.frames.get_unchecked_mut(top);
+        let has_extras = (rt.vm_chains.len() > chain_base)
+            | (rt.vm_pending.len() > pending_base)
+            | (rt.vm_iters.len() > iter_base)
+            | (frame.scopes > 0);
+        if has_extras {
+            if rt.vm_chains.len() > chain_base {
+                rt.vm_chains.truncate(chain_base);
+            }
+            if rt.vm_pending.len() > pending_base {
+                rt.vm_pending.truncate(pending_base);
+            }
+            if rt.vm_iters.len() > iter_base {
+                rt.vm_iters.truncate(iter_base);
+            }
+            let frame = rt.frames.get_unchecked_mut(top);
+            if frame.scopes > 0 {
+                ScriptRuntime::jit_restore_scopes(heap, frame);
+            }
+            ctx.cached_scope_raw = 0;
+            ctx.cached_scope_depth = 0;
+            let frame = rt.frames.get_unchecked_mut(top);
+            if (frame.flags & FLAG_OWNS_SCOPE) != 0
+                && frame.escaped_scopes == 0
+                && let Some(scope) = frame.scope.take()
+            {
+                heap.free_scope_fast(scope);
+            }
+        } else if (frame.flags & FLAG_OWNS_SCOPE) != 0 {
+            let popped_raw = scope_raw(&frame.scope);
+            if popped_raw != 0 && ctx.cached_scope_raw == popped_raw {
+                let depth = ctx.cached_scope_depth as usize;
+                let parent_raw = if depth >= 2 {
+                    frame
+                        .scope
+                        .as_ref()
+                        .and_then(|s| heap.scope_at_ref(s, 0).map(|sc| scope_raw(&sc.parent)))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                if parent_raw != 0 {
+                    for i in 0..(depth - 1) {
+                        *ctx.scope_ptrs.get_unchecked_mut(i) = *ctx.scope_ptrs.get_unchecked(i + 1);
+                        *ctx.scope_lens.get_unchecked_mut(i) = *ctx.scope_lens.get_unchecked(i + 1);
+                    }
+                    ctx.cached_scope_raw = parent_raw;
+                    ctx.cached_scope_depth = (depth - 1) as u8;
+                } else {
+                    ctx.cached_scope_raw = 0;
+                    ctx.cached_scope_depth = 0;
+                }
+            }
+            if frame.escaped_scopes == 0
+                && let Some(scope) = frame.scope.take()
+            {
+                heap.free_scope_fast(scope);
+            }
+        }
     }
 }
 
@@ -2772,6 +3258,8 @@ unsafe fn helper_return_slow(run: *mut JitRun, next_pc: usize) -> u32 {
                 if let Some(code) = finished_code {
                     (*run).prev_code = Some(code);
                 }
+                (*run).ctx.cached_scope_raw = 0;
+                (*run).ctx.cached_scope_depth = 0;
                 (*run).result = Some(res);
                 STATUS_DONE
             }
@@ -2804,66 +3292,32 @@ extern "sysv64" fn helper_return(run: *mut JitRun, next_pc: usize) -> u32 {
             && !frame.construct()
         {
             let return_base = frame.return_base;
+            let reg_base = frame.reg_base;
             let chain_base = frame.chain_base as usize;
             let pending_base = frame.pending_base as usize;
             let iter_base = frame.iter_base as usize;
             let drop_end = ctx.sp.sub(1);
             let ret_val = std::ptr::read(drop_end);
             let stack_ptr = ctx.stack_ptr;
-            let mut cur = stack_ptr.add(return_base);
+            #[cfg(debug_assertions)]
+            for i in return_base..reg_base {
+                debug_assert!((*stack_ptr.add(i)).is_copy());
+            }
+            // slots in return_base..reg_base hold only Copy receiver/callee placeholders
+            let mut cur = stack_ptr.add(reg_base);
             while cur < drop_end {
                 if !(*cur).is_copy() {
                     drop_value_slow(std::ptr::read(cur));
                 }
                 cur = cur.add(1);
             }
-            let has_extras = (rt.vm_chains.len() > chain_base)
+            let needs_cleanup = (rt.vm_chains.len() > chain_base)
                 | (rt.vm_pending.len() > pending_base)
                 | (rt.vm_iters.len() > iter_base)
-                | (frame.scopes > 0);
-            if has_extras {
-                clean_return_extras(rt, heap, top, chain_base, pending_base, iter_base);
-                ctx.cached_scope_raw = 0;
-                ctx.cached_scope_depth = 0;
-                let frame = rt.frames.get_unchecked_mut(top);
-                if (frame.flags & FLAG_OWNS_SCOPE) != 0
-                    && frame.escaped_scopes == 0
-                    && let Some(scope) = frame.scope.take()
-                {
-                    free_owned_scope_outline(heap, scope);
-                }
-            } else if (frame.flags & FLAG_OWNS_SCOPE) != 0 {
-                let popped_raw = scope_raw(&frame.scope);
-                if popped_raw != 0 && ctx.cached_scope_raw == popped_raw {
-                    let depth = ctx.cached_scope_depth as usize;
-                    let parent_raw = if depth >= 2 {
-                        frame
-                            .scope
-                            .as_ref()
-                            .and_then(|s| heap.scope_at_ref(s, 0).map(|sc| scope_raw(&sc.parent)))
-                            .unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    if parent_raw != 0 {
-                        for i in 0..(depth - 1) {
-                            *ctx.scope_ptrs.get_unchecked_mut(i) =
-                                *ctx.scope_ptrs.get_unchecked(i + 1);
-                            *ctx.scope_lens.get_unchecked_mut(i) =
-                                *ctx.scope_lens.get_unchecked(i + 1);
-                        }
-                        ctx.cached_scope_raw = parent_raw;
-                        ctx.cached_scope_depth = (depth - 1) as u8;
-                    } else {
-                        ctx.cached_scope_raw = 0;
-                        ctx.cached_scope_depth = 0;
-                    }
-                }
-                if frame.escaped_scopes == 0
-                    && let Some(scope) = frame.scope.take()
-                {
-                    free_owned_scope_outline(heap, scope);
-                }
+                | (frame.scopes > 0)
+                | ((frame.flags & FLAG_OWNS_SCOPE) != 0);
+            if needs_cleanup {
+                clean_return_slow(ctx, rt, heap, top, chain_base, pending_base, iter_base);
             }
             let frame_ptr = rt.frames.as_mut_ptr().add(top);
             rt.frames.set_len(top);
@@ -2883,18 +3337,19 @@ extern "sysv64" fn helper_return(run: *mut JitRun, next_pc: usize) -> u32 {
             let reg_base = caller.reg_base;
             let max_scope_depth = caller.code.max_scope_depth;
             let caller_scope_raw = scope_raw(&caller.scope);
-            let cap_slots =
-                (ctx.stack_end as usize - ctx.stack_ptr as usize) / std::mem::size_of::<Value>();
-            if new_len + max_pushes > cap_slots {
+            if (ctx.stack_end as usize - stack_ptr as usize)
+                < (new_len + max_pushes) * std::mem::size_of::<Value>()
+            {
                 grow_stack_for_jit(ctx, rt, new_len, max_pushes, max_pushes);
             } else {
                 ctx.stack_safe_limit = ctx.stack_end.sub(max_pushes);
             }
+            let base_ptr = ctx.stack_ptr;
             ctx.top = new_top;
             ctx.reg_base = reg_base;
             ctx.max_pushes = max_pushes;
-            ctx.sp = ctx.stack_ptr.add(new_len);
-            ctx.regs = ctx.stack_ptr.add(reg_base);
+            ctx.sp = base_ptr.add(new_len);
+            ctx.regs = base_ptr.add(reg_base);
             ctx.this_ptr = &rt.frames.get_unchecked(new_top).this as *const Value;
             ctx.next_target = return_target;
             if max_scope_depth > 0
@@ -5713,6 +6168,441 @@ pub(super) fn run_jit_frame(
     }
 }
 
+// reusable JIT invocation session for native higher-order loops (Array.prototype.map/filter/sort/etc)
+pub(super) struct JitCallbackSession<'a> {
+    rt: &'a mut ScriptRuntime,
+    _heap_guard: super::heap::HeapGuard,
+    entry: extern "sysv64" fn(*mut JitRun, *const u8) -> u32,
+    target: *const u8,
+    code: Rc<Code>,
+    closure: Rc<Closure>,
+    callee: Value,
+    this: Value,
+    reg_count: usize,
+    param_count: usize,
+    max_pushes: usize,
+    max_scope_depth: u8,
+    scope_raw: u64,
+    mirror_base: usize,
+    frame_floor: usize,
+    stack_floor: usize,
+    handler_floor: usize,
+    chain_floor: usize,
+    pending_floor: usize,
+    iter_floor: usize,
+    sampling: bool,
+    run: JitRun,
+}
+
+impl<'a> JitCallbackSession<'a> {
+    pub(super) fn try_new(
+        rt: &'a mut ScriptRuntime,
+        closure: &Rc<Closure>,
+        callee: Value,
+        receiver: Value,
+        expected_calls: usize,
+    ) -> Option<Self> {
+        let code = &closure.code;
+        if code.fast_call != 1 {
+            return None;
+        }
+        let marker = 0u8;
+        let here = std::hint::black_box(&marker) as *const u8 as usize;
+        let heap_guard = super::heap::enter(rt.heap_id);
+        let heap_ptr = super::heap::heap_ptr(rt.heap_id);
+        let jit = if let Some(cached) = code.jit_code.get() {
+            cached.as_ref()?
+        } else {
+            let bump = (expected_calls.min(JIT_THRESHOLD as usize) as u32).max(1);
+            let hits = code.jit_hits.get().saturating_add(bump);
+            code.jit_hits.set(hits);
+            if expected_calls >= 4 || hits >= JIT_THRESHOLD {
+                let compiled = compile(unsafe { &*heap_ptr }, code);
+                let _ = code.jit_code.set(compiled);
+                code.jit_code.get().and_then(Option::as_ref)?
+            } else {
+                return None;
+            }
+        };
+        if !rt.jit_callback_enter(here) {
+            return None;
+        }
+        let entry = jit.entry();
+        let target = jit.target(code.entry);
+        let this = if code.uses_lexical_this {
+            closure.lexical_this().unwrap_or(Value::Undefined)
+        } else if code.strict_or_arrow || !matches!(receiver, Value::Undefined | Value::Null) {
+            receiver
+        } else {
+            Value::Window
+        };
+        let reg_count = code.registers as usize;
+        let param_count = code.param_slots.len();
+        let max_pushes = code.max_pushes as usize;
+        let max_scope_depth = code.max_scope_depth;
+        let scope_raw = scope_raw(&closure.scope);
+        let mirror_base = rt.debugger.mirror.len();
+        let frame_floor = rt.frames.len();
+        let stack_floor = rt.vm_stack.len();
+        let handler_floor = rt.vm_handlers.len();
+        let chain_floor = rt.vm_chains.len();
+        let pending_floor = rt.vm_pending.len();
+        let iter_floor = rt.vm_iters.len();
+        let sampling = crate::profile::enabled();
+        let safepoint_at = rt.jit_callback_safepoint(sampling);
+        let needed_stack = 1 + reg_count + max_pushes;
+        if rt.vm_stack.capacity() - stack_floor < needed_stack {
+            rt.vm_stack.reserve(needed_stack);
+        }
+        if rt.frames.capacity() <= frame_floor {
+            reserve_frame_slot(&mut rt.frames);
+        }
+        let stack_ptr = rt.vm_stack.as_mut_ptr();
+        let cap = rt.vm_stack.capacity();
+        let mut run = JitRun {
+            ctx: JitCtx {
+                rt: std::ptr::null_mut(),
+                heap: heap_ptr,
+                stack_ptr,
+                stack_end: unsafe { stack_ptr.add(cap) },
+                stack_safe_limit: unsafe { stack_ptr.add(cap.saturating_sub(max_pushes)) },
+                sp: unsafe { stack_ptr.add(stack_floor) },
+                regs: unsafe { stack_ptr.add(stack_floor + 1) },
+                this_ptr: std::ptr::null(),
+                next_target: std::ptr::null(),
+                array_proto: rt.intrinsics.array_prototype.id() as u64,
+                string_proto: rt.intrinsics.string_prototype.id() as u64,
+                scope_ptrs: [std::ptr::null_mut(); SCOPE_CACHE_DEPTH],
+                scope_lens: [0; SCOPE_CACHE_DEPTH],
+                cached_scope_raw: 0,
+                steps: rt.steps,
+                safepoint_at,
+                reg_base: stack_floor + 1,
+                top: frame_floor,
+                frame_floor,
+                max_pushes,
+                cached_scope_depth: 0,
+                sampling: u8::from(sampling),
+            },
+            error: None,
+            result: None,
+            prev_code: None,
+        };
+        if max_scope_depth > 0 && scope_raw != 0 {
+            let heap = unsafe { &*heap_ptr };
+            let limit = (max_scope_depth as usize).min(SCOPE_CACHE_DEPTH);
+            unsafe {
+                let mut cur = closure.scope.clone();
+                let mut i = 0usize;
+                while i < limit {
+                    let Some(sr) = cur.as_ref() else {
+                        break;
+                    };
+                    let Some((ptr, len, parent)) = heap.scope_slots_fast(sr) else {
+                        break;
+                    };
+                    *run.ctx.scope_ptrs.get_unchecked_mut(i) = ptr;
+                    *run.ctx.scope_lens.get_unchecked_mut(i) = len;
+                    cur = parent;
+                    i += 1;
+                }
+                if i == limit {
+                    run.ctx.cached_scope_raw = scope_raw;
+                    run.ctx.cached_scope_depth = limit as u8;
+                }
+            }
+        }
+        Some(Self {
+            rt,
+            _heap_guard: heap_guard,
+            entry,
+            target,
+            code: code.clone(),
+            closure: closure.clone(),
+            callee,
+            this,
+            reg_count,
+            param_count,
+            max_pushes,
+            max_scope_depth,
+            scope_raw,
+            mirror_base,
+            frame_floor,
+            stack_floor,
+            handler_floor,
+            chain_floor,
+            pending_floor,
+            iter_floor,
+            sampling,
+            run,
+        })
+    }
+
+    #[inline(always)]
+    pub(super) fn param_count(&self) -> usize {
+        self.param_count
+    }
+
+    #[inline(always)]
+    pub(super) fn heap_ptr(&self) -> *const Heap {
+        self.run.ctx.heap
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn resync_after_external(&mut self) {
+        let needed = 1 + self.reg_count + self.max_pushes;
+        if self.rt.vm_stack.capacity() - self.stack_floor < needed {
+            self.rt.vm_stack.reserve(needed);
+        }
+        let stack_ptr = self.rt.vm_stack.as_mut_ptr();
+        let cap = self.rt.vm_stack.capacity();
+        self.run.ctx.stack_ptr = stack_ptr;
+        self.run.ctx.stack_end = unsafe { stack_ptr.add(cap) };
+        self.run.ctx.stack_safe_limit =
+            unsafe { stack_ptr.add(cap.saturating_sub(self.max_pushes)) };
+        self.run.ctx.steps = self.rt.steps;
+        self.run.ctx.safepoint_at = self.rt.jit_callback_safepoint(self.sampling);
+        self.run.ctx.cached_scope_raw = 0;
+        self.run.ctx.cached_scope_depth = 0;
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn with_runtime<R>(&mut self, f: impl FnOnce(&mut ScriptRuntime) -> R) -> R {
+        self.rt.steps = self.run.ctx.steps;
+        let out = f(self.rt);
+        self.resync_after_external();
+        out
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn hit_safepoint_cold(&mut self) -> Result<(), ScriptError> {
+        self.rt.steps = self.run.ctx.steps;
+        match self.rt.jit_hit_safepoint(self.sampling, self.code.entry) {
+            Ok(next) => {
+                self.run.ctx.safepoint_at = next;
+                Ok(())
+            }
+            Err(err) => {
+                self.run.ctx.steps = self.rt.steps;
+                Err(err)
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn finish_slow_call(&mut self, status: u32) -> Result<Value, ScriptError> {
+        self.rt.steps = self.run.ctx.steps;
+        let err = match status {
+            STATUS_FRAME_CHANGED => None,
+            STATUS_ERR => Some(self.run.error.take().expect("jit error")),
+            _ => unreachable!("unexpected jit exit status"),
+        };
+        let res = self.rt.jit_callback_finish_slow(
+            self.frame_floor,
+            self.stack_floor,
+            self.handler_floor,
+            self.chain_floor,
+            self.pending_floor,
+            self.iter_floor,
+            err,
+        );
+        self.resync_after_external();
+        res
+    }
+
+    #[inline(always)]
+    unsafe fn enter_and_run(&mut self, keep: usize) -> Result<Value, ScriptError> {
+        unsafe {
+            let new_len = self.stack_floor + 1 + self.reg_count;
+            let base = self.run.ctx.stack_ptr.add(self.stack_floor);
+            base.write(self.callee.clone());
+            fill_undefined_fast(base.add(1 + keep), self.reg_count - keep);
+            if self.rt.frames.capacity() <= self.frame_floor {
+                reserve_frame_slot(&mut self.rt.frames);
+            }
+            let frame_slot = self.rt.frames.as_mut_ptr().add(self.frame_floor);
+            frame_slot.write(Frame {
+                code: self.code.clone(),
+                closure: Some(self.closure.clone()),
+                pc: self.code.entry,
+                reg_base: self.stack_floor + 1,
+                stack_base: new_len,
+                return_base: self.stack_floor,
+                return_target: std::ptr::null(),
+                handler_base: self.handler_floor as u32,
+                chain_base: self.chain_floor as u32,
+                pending_base: self.pending_floor as u32,
+                iter_base: self.iter_floor as u32,
+                scope: self.closure.scope.clone(),
+                this: self.this.clone(),
+                function: Value::Undefined,
+                scopes: 0,
+                escaped_scopes: 0,
+                flags: FLAG_USES_REGS | FLAG_CALLEE_ON_STACK,
+                extra: None,
+            });
+            self.rt.frames.set_len(self.frame_floor + 1);
+            let ctx = &mut self.run.ctx;
+            ctx.rt = self.rt as *mut ScriptRuntime;
+            ctx.top = self.frame_floor;
+            ctx.reg_base = self.stack_floor + 1;
+            ctx.max_pushes = self.max_pushes;
+            ctx.stack_safe_limit = ctx.stack_end.sub(self.max_pushes);
+            ctx.sp = ctx.stack_ptr.add(new_len);
+            ctx.regs = ctx.stack_ptr.add(self.stack_floor + 1);
+            ctx.this_ptr = &(*frame_slot).this as *const Value;
+            ctx.next_target = std::ptr::null();
+            if self.max_scope_depth > 0
+                && (self.scope_raw == 0
+                    || ctx.cached_scope_raw != self.scope_raw
+                    || ctx.cached_scope_depth < self.max_scope_depth)
+            {
+                let heap = &*ctx.heap;
+                fill_scope_cache_fast(
+                    ctx,
+                    self.rt,
+                    heap,
+                    &self.closure.scope,
+                    self.max_scope_depth,
+                );
+            }
+            let status = (self.entry)(&mut self.run, self.target);
+            if status == STATUS_DONE {
+                return match self.run.result.take().expect("jit done result") {
+                    RunResult::Return(value) => Ok(value),
+                    _ => Err(runtime_error("a plain call cannot suspend")),
+                };
+            }
+            self.finish_slow_call(status)
+        }
+    }
+
+    #[inline(always)]
+    fn ensure_ready(&mut self) -> Result<(), ScriptError> {
+        if self.run.ctx.steps >= self.run.ctx.safepoint_at {
+            self.hit_safepoint_cold()?;
+        }
+        let need_bytes = (self.stack_floor + 1 + self.reg_count + self.max_pushes)
+            * std::mem::size_of::<Value>();
+        if (self.run.ctx.stack_end as usize - self.run.ctx.stack_ptr as usize) < need_bytes {
+            self.resync_after_external();
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub(super) fn call0(&mut self) -> Result<Value, ScriptError> {
+        self.ensure_ready()?;
+        unsafe { self.enter_and_run(0) }
+    }
+
+    #[inline(always)]
+    pub(super) fn call1(&mut self, a0: Value) -> Result<Value, ScriptError> {
+        self.ensure_ready()?;
+        unsafe {
+            let keep = self.param_count.min(1);
+            if keep == 1 {
+                self.run.ctx.stack_ptr.add(self.stack_floor + 1).write(a0);
+            } else {
+                a0.fast_drop();
+            }
+            self.enter_and_run(keep)
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn call2(&mut self, a0: Value, a1: Value) -> Result<Value, ScriptError> {
+        self.ensure_ready()?;
+        unsafe {
+            let keep = self.param_count.min(2);
+            let args = self.run.ctx.stack_ptr.add(self.stack_floor + 1);
+            if keep >= 1 {
+                args.write(a0);
+            } else {
+                a0.fast_drop();
+            }
+            if keep >= 2 {
+                args.add(1).write(a1);
+            } else {
+                a1.fast_drop();
+            }
+            self.enter_and_run(keep)
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn call3(&mut self, a0: Value, a1: Value, a2: Value) -> Result<Value, ScriptError> {
+        self.ensure_ready()?;
+        unsafe {
+            let keep = self.param_count.min(3);
+            let args = self.run.ctx.stack_ptr.add(self.stack_floor + 1);
+            if keep >= 1 {
+                args.write(a0);
+            } else {
+                a0.fast_drop();
+            }
+            if keep >= 2 {
+                args.add(1).write(a1);
+            } else {
+                a1.fast_drop();
+            }
+            if keep >= 3 {
+                args.add(2).write(a2);
+            } else {
+                a2.fast_drop();
+            }
+            self.enter_and_run(keep)
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn call4(
+        &mut self,
+        a0: Value,
+        a1: Value,
+        a2: Value,
+        a3: Value,
+    ) -> Result<Value, ScriptError> {
+        self.ensure_ready()?;
+        unsafe {
+            let keep = self.param_count.min(4);
+            let args = self.run.ctx.stack_ptr.add(self.stack_floor + 1);
+            if keep >= 1 {
+                args.write(a0);
+            } else {
+                a0.fast_drop();
+            }
+            if keep >= 2 {
+                args.add(1).write(a1);
+            } else {
+                a1.fast_drop();
+            }
+            if keep >= 3 {
+                args.add(2).write(a2);
+            } else {
+                a2.fast_drop();
+            }
+            if keep >= 4 {
+                args.add(3).write(a3);
+            } else {
+                a3.fast_drop();
+            }
+            self.enter_and_run(keep)
+        }
+    }
+}
+
+impl Drop for JitCallbackSession<'_> {
+    fn drop(&mut self) {
+        self.rt.steps = self.run.ctx.steps;
+        self.rt.jit_callback_exit(self.mirror_base);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6323,5 +7213,154 @@ mod tests {
         .expect("hoist and lexical this");
         let expected_sub: i64 = (0..30).map(|i| i + 3).sum();
         assert_eq!(out, format!("{}|1|99|99|99|{expected_sub}|40", 40 * 6 + 70));
+    }
+
+    #[test]
+    fn jit_callback_session_array_methods_edges_and_exceptions() {
+        let out = run_js(
+            r#"
+            const nums = [5, 1, 8, 3, 2, 9, 4, 7, 6, 0];
+            let factor = 3;
+            const mapped = nums.map(x => x * factor);
+            const filtered = mapped.filter((v, i) => v >= 12 && i % 2 === 0);
+            const sum = filtered.reduce((acc, v, i, arr) => acc + v + i + arr.length, 0);
+            const right = [1, 2, 3, 4, 5].reduceRight((a, b) => a * 10 + b);
+            let fe = 0;
+            nums.forEach(function(v, i) { fe += v + i + this.bias; }, { bias: 2 });
+            const has8 = nums.some(x => x === 8);
+            const allPos = nums.every(x => x >= 0);
+            const found = nums.find(x => x > 6);
+            const foundIdx = nums.findIndex(x => x > 6);
+
+            // sort and toSorted with JIT comparator and valueOf fallback
+            const sorted = nums.slice().sort((a, b) => a - b);
+            const toSortedObj = [3, 1, 2, 5, 4].toSorted((a, b) => ({ valueOf() { return b - a; } }));
+
+            // in-callback try/catch recovery
+            const safe = [1, 2, 3, 4, 5, 6].map(x => {
+                try {
+                    if (x % 2 === 0) throw x * 10;
+                    return x;
+                } catch (e) {
+                    return e + 1;
+                }
+            });
+
+            // uncaught throw cleans stack/frame floors cleanly
+            let caught = "";
+            try {
+                [1, 2, 3, 4, 5, 6].forEach(x => {
+                    if (x === 4) throw new Error("boom4");
+                });
+            } catch (e) {
+                caught = e.message;
+            }
+
+            // nested array callbacks inside JIT loop
+            const nested = [1, 2, 3, 4, 5].map(x =>
+                [10, 20, 30, 40].filter(y => y >= x * 8).reduce((a, b) => a + b, x)
+            );
+
+            // sparse hole getter + shrinking mid-iteration
+            const sparse = [1, , 3, 4, 5];
+            let getterHits = 0;
+            Object.defineProperty(sparse, 1, {
+                get() { getterHits++; return 20; },
+                enumerable: true,
+                configurable: true,
+            });
+            const sparseMapped = sparse.map(x => x + 1);
+            const shrink = [10, 20, 30, 40, 50];
+            const shrunkSeen = [];
+            shrink.forEach(x => { shrunkSeen.push(x); if (shrink.length > 3) shrink.pop(); });
+
+            // callback calling uncompiled callee (STATUS_FRAME_CHANGED)
+            function coldHelper(v) { return v + 100; }
+            const mixed = [1, 2, 3, 4, 5].map(x => (x === 3 ? coldHelper(x) : x));
+
+            document.getElementById("out").textContent = [
+                sum,
+                right,
+                fe,
+                has8,
+                allPos,
+                found,
+                foundIdx,
+                sorted.join(","),
+                toSortedObj.join(","),
+                safe.join(","),
+                caught,
+                nested.join(","),
+                sparseMapped.join(","),
+                getterHits,
+                shrunkSeen.join(","),
+                mixed.join(","),
+            ].join("|");
+            "#,
+        )
+        .expect("jit callback session");
+        // mapped = [15, 3, 24, 9, 6, 27, 12, 21, 18, 0]
+        // filtered (v >= 12 && even i): i=0(15), i=2(24), i=6(12), i=8(18) -> [15, 24, 12, 18] (len 4)
+        // sum = (15+0+4) + (24+1+4) + (12+2+4) + (18+3+4) = 19 + 29 + 18 + 25 = 91
+        // fe = sum(0..10)*2 + 10*2 = 90 + 20 = 110
+        assert_eq!(
+            out,
+            "91|54321|110|true|true|8|2|0,1,2,3,4,5,6,7,8,9|5,4,3,2,1|1,21,3,41,5,61|boom4|101,92,73,44,45|2,21,4,5,6|1|10,20,30|1,2,103,4,5"
+        );
+    }
+
+    #[test]
+    fn jit_inline_empty_array_collections_and_deep_scopes() {
+        let out = run_js(
+            r#"
+            function makeDeep(a) {
+                let b = a + 1;
+                return function mid(c) {
+                    let d = c + 2;
+                    return function inner(e) {
+                        let f = e + 3;
+                        const read = () => a + b + c + d + e + f;
+                        return [1, 2, 3, 4].reduce((acc, x) => acc + x + a + b + d + f, read());
+                    };
+                };
+            }
+            const deepFn = makeDeep(1)(10);
+            let deepSum = 0;
+            const m = new Map();
+            const s = new Set();
+            let emptyScore = 0;
+            for (let i = 0; i < 40; i++) {
+                deepSum += deepFn(i);
+                m.set("k" + i, i * 2);
+                s.add(i);
+                if (m.has("k" + i) && m.get("k" + i) === i * 2 && s.has(i)) emptyScore++;
+                if (i % 2 === 0) {
+                    if (!m.delete("k" + i) || !s.delete(i)) throw new Error("del");
+                }
+                const empty = [];
+                if (empty.map(x => x).length !== 0) throw new Error("emap");
+                if (empty.filter(x => x).length !== 0) throw new Error("efilt");
+                if (empty.some(() => true) !== false) throw new Error("esome");
+                if (empty.every(() => false) !== true) throw new Error("eevery");
+                if (empty.find(() => true) !== undefined) throw new Error("efind");
+                if (empty.findIndex(() => true) !== -1) throw new Error("efidx");
+                empty.forEach(() => { throw new Error("efe"); });
+            }
+            const sizesBefore = m.size + ":" + s.size;
+            m.clear();
+            s.clear();
+            const sizesAfter = m.size + ":" + s.size;
+            let badEmptyThrew = false;
+            try { [].map(123); } catch (e) { badEmptyThrew = e instanceof TypeError; }
+            document.getElementById("out").textContent =
+                [deepSum, emptyScore, sizesBefore, sizesAfter, badEmptyThrew].join("|");
+            "#,
+        )
+        .expect("inline empty array, collections, deep scopes");
+        // a=1, b=2, c=10, d=12, f=i+3
+        // read() = 1+2+10+12+i+(i+3) = 28 + 2*i
+        // reduce adds sum(1..=4)=10 + 4*(1+2+12+i+3) = 10 + 4*(18+i) = 82 + 4*i
+        // per i: 110 + 6*i; sum over 0..40 = 40*110 + 6*780 = 4400 + 4680 = 9080
+        assert_eq!(out, "9080|40|20:20|0:0|true");
     }
 }

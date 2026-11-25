@@ -301,7 +301,7 @@ impl std::fmt::Debug for Shape {
 pub(super) const SHARED_KEYS: usize = 64;
 
 impl Shape {
-    fn root() -> Rc<Self> {
+    pub(super) fn root() -> Rc<Self> {
         thread_local! {
             static ROOT: Rc<Shape> = Rc::new(Shape {
                 id: next_shape_id(),
@@ -330,6 +330,27 @@ impl Shape {
 
     pub(super) fn len(&self) -> usize {
         self.keys.len()
+    }
+
+    #[inline]
+    pub(super) fn longest(&self) -> usize {
+        self.longest.get()
+    }
+
+    #[inline]
+    pub(super) fn key_position(&self, key: &str) -> Option<usize> {
+        self.position(key)
+    }
+
+    // advances to an existing shared data-property child shape without allocating a key
+    #[inline]
+    pub(super) fn transition_data_existing(&self, key: &str) -> Option<Rc<Self>> {
+        self.transitions.borrow().get(key).and_then(Weak::upgrade)
+    }
+
+    #[inline]
+    pub(super) fn transition_data(self: &Rc<Self>, key: &str) -> Rc<Self> {
+        self.with_key_attrs(key, ATTR_DATA)
     }
 
     fn own_copy(&self) -> Self {
@@ -1154,6 +1175,21 @@ impl JsObject {
             shape_id,
             jit_flags: JIT_FLAG_ORDINARY,
             orphan: false,
+            extensible: true,
+            class: ObjectClass::Ordinary,
+        }
+    }
+
+    pub(super) fn from_shape_orphan(shape: Rc<Shape>, slots: Vec<Slot>) -> Self {
+        debug_assert_eq!(shape.keys.len(), slots.len());
+        let shape_id = shape.id;
+        Self {
+            shape,
+            properties: Properties::from_vec(slots),
+            prototype: None,
+            shape_id,
+            jit_flags: JIT_FLAG_ORDINARY | JIT_FLAG_NO_PROTO_IC,
+            orphan: true,
             extensible: true,
             class: ObjectClass::Ordinary,
         }

@@ -1088,6 +1088,98 @@ impl ScriptRuntime {
         }
     }
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn jit_callback_enter(&mut self, here: usize) -> bool {
+        if self.debugger.active || self.frames.len() >= MAX_FRAMES {
+            return false;
+        }
+        if self.nested_runs == 0 {
+            self.stack_base = here;
+        } else if self.nested_runs >= MAX_NESTED_RUNS
+            || self.stack_base.saturating_sub(here) > NATIVE_STACK_BUDGET
+        {
+            return false;
+        }
+        self.nested_runs += 1;
+        true
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn jit_callback_exit(&mut self, mirror_base: usize) {
+        self.debugger.mirror.truncate(mirror_base);
+        self.nested_runs -= 1;
+        if self.nested_runs == 0 {
+            self.debug_task_ended();
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn jit_callback_safepoint(&self, sampling: bool) -> u64 {
+        self.safepoint_target(sampling)
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn jit_callback_finish_slow(
+        &mut self,
+        frame_floor: usize,
+        stack_floor: usize,
+        handler_floor: usize,
+        chain_floor: usize,
+        pending_floor: usize,
+        iter_floor: usize,
+        err: Option<ScriptError>,
+    ) -> Result<Value, ScriptError> {
+        let outcome = match err {
+            None => self.run_frames(frame_floor),
+            Some(error) if self.interrupted => Err(error),
+            Some(error) => {
+                let thrown = self.take_thrown(error);
+                self.note_thrown(&thrown);
+                if self.debugger.active {
+                    self.debug_thrown(&thrown);
+                }
+                match self.unwind(frame_floor, thrown) {
+                    Ok(Some(res)) => Ok(res),
+                    Ok(None) => self.run_frames(frame_floor),
+                    Err(unhandled) => Err(unhandled),
+                }
+            }
+        };
+        if outcome.is_err() {
+            self.frames.truncate(frame_floor);
+            truncate_stack(&mut self.vm_stack, stack_floor);
+            self.vm_handlers.truncate(handler_floor);
+            self.vm_chains.truncate(chain_floor);
+            self.vm_pending.truncate(pending_floor);
+            self.vm_iters.truncate(iter_floor);
+        }
+        debug_assert_eq!(self.frames.len(), frame_floor);
+        debug_assert_eq!(self.vm_stack.len(), stack_floor);
+        debug_assert_eq!(self.vm_handlers.len(), handler_floor);
+        debug_assert_eq!(self.vm_chains.len(), chain_floor);
+        debug_assert_eq!(self.vm_pending.len(), pending_floor);
+        debug_assert_eq!(self.vm_iters.len(), iter_floor);
+        match outcome? {
+            RunResult::Return(value) => Ok(value),
+            _ => Err(runtime_error("a plain call cannot suspend")),
+        }
+    }
+
     pub(super) fn construct(
         &mut self,
         callee: Value,
@@ -2490,7 +2582,9 @@ impl ScriptRuntime {
             String(super::strings::StringMethod),
             ArrayPush,
             ArrayPop,
+            ArrayCallback(super::arrays::ArrayMethod),
             ArrayIsArray,
+            JsonParse,
             FunctionCall,
             Bound,
             Collection(super::collections::CollectionMethod),
@@ -2517,12 +2611,29 @@ impl ScriptRuntime {
                         Native::Array(super::arrays::ArrayMethod::Pop) if method => {
                             HotNative::ArrayPop
                         }
+                        Native::Array(
+                            m @ (super::arrays::ArrayMethod::ForEach
+                            | super::arrays::ArrayMethod::Map
+                            | super::arrays::ArrayMethod::Filter
+                            | super::arrays::ArrayMethod::Some
+                            | super::arrays::ArrayMethod::Every
+                            | super::arrays::ArrayMethod::Find
+                            | super::arrays::ArrayMethod::FindIndex
+                            | super::arrays::ArrayMethod::Reduce
+                            | super::arrays::ArrayMethod::ReduceRight
+                            | super::arrays::ArrayMethod::Sort
+                            | super::arrays::ArrayMethod::ToSorted),
+                        ) if method && count <= 2 => HotNative::ArrayCallback(*m),
+                        Native::JsonParse if count <= 2 => HotNative::JsonParse,
                         Native::FunctionCall if method => HotNative::FunctionCall,
                         Native::Collection(
                             m @ (super::collections::CollectionMethod::Get
                             | super::collections::CollectionMethod::Has
                             | super::collections::CollectionMethod::Set
-                            | super::collections::CollectionMethod::Add),
+                            | super::collections::CollectionMethod::Add
+                            | super::collections::CollectionMethod::Delete
+                            | super::collections::CollectionMethod::Clear
+                            | super::collections::CollectionMethod::Size),
                         ) if method && count <= 2 => HotNative::Collection(*m),
                         Native::ObjectGetOwnPropertyDescriptor if count == 2 => {
                             HotNative::ObjectGetOwnPropertyDescriptor
@@ -2704,8 +2815,13 @@ impl ScriptRuntime {
                     return Ok(FastNativeCall::NotHandled);
                 };
                 let collection = match (&borrowed.class, col_method) {
-                    (ObjectClass::Map(col), M::Get | M::Has | M::Set)
-                    | (ObjectClass::Set(col), M::Has | M::Add) => col.clone(),
+                    (
+                        ObjectClass::Map(col),
+                        M::Get | M::Has | M::Set | M::Delete | M::Clear | M::Size,
+                    )
+                    | (ObjectClass::Set(col), M::Has | M::Add | M::Delete | M::Clear | M::Size) => {
+                        col.clone()
+                    }
                     _ => return Ok(FastNativeCall::NotHandled),
                 };
                 if matches!(col_method, M::Set | M::Add)
@@ -2734,6 +2850,26 @@ impl ScriptRuntime {
                         };
                         truncate_stack(&mut self.vm_stack, return_base);
                         Value::Bool(has)
+                    }
+                    M::Size => {
+                        let len = collection.borrow().len() as f64;
+                        truncate_stack(&mut self.vm_stack, return_base);
+                        Value::Number(len)
+                    }
+                    M::Delete => {
+                        let deleted = if count == 0 {
+                            collection.borrow_mut().delete(&Value::Undefined)
+                        } else {
+                            let key = unsafe { self.vm_stack.get_unchecked(arg_start) };
+                            collection.borrow_mut().delete(key)
+                        };
+                        truncate_stack(&mut self.vm_stack, return_base);
+                        Value::Bool(deleted)
+                    }
+                    M::Clear => {
+                        collection.borrow_mut().clear();
+                        truncate_stack(&mut self.vm_stack, return_base);
+                        Value::Undefined
                     }
                     M::Set | M::Add => {
                         // safety: this and callee are Copy Value::Object; move args out directly
@@ -2893,6 +3029,50 @@ impl ScriptRuntime {
                 }
                 let value = array.values.pop().unwrap_or(Value::Undefined).filled();
                 truncate_stack(&mut self.vm_stack, return_base);
+                self.vm_stack.push(value);
+                Ok(FastNativeCall::Done)
+            }
+            HotNative::ArrayCallback(array_method) => {
+                let mut args = [Value::Undefined, Value::Undefined];
+                // safety: method is true, count <= 2, callee is Copy Value::Object
+                let this = unsafe {
+                    let base = self.vm_stack.as_ptr();
+                    for (i, slot) in args.iter_mut().take(count).enumerate() {
+                        *slot = std::ptr::read(base.add(arg_start + i));
+                    }
+                    let this = std::ptr::read(base.add(return_base));
+                    self.vm_stack.set_len(return_base);
+                    this
+                };
+                let result = self.call_array_callback_slice(array_method, this, &args[..count]);
+                for slot in &mut args[..count] {
+                    std::mem::replace(slot, Value::Undefined).fast_drop();
+                }
+                std::mem::forget(args);
+                self.vm_stack.push(result?);
+                Ok(FastNativeCall::Done)
+            }
+            HotNative::JsonParse => {
+                // safety: count <= 2, callee is Copy Value::Object
+                let (text, reviver) = unsafe {
+                    let base = self.vm_stack.as_ptr();
+                    if method {
+                        std::ptr::read(base.add(return_base)).fast_drop();
+                    }
+                    let text = if count >= 1 {
+                        std::ptr::read(base.add(arg_start))
+                    } else {
+                        Value::Undefined
+                    };
+                    let reviver = if count >= 2 {
+                        std::ptr::read(base.add(arg_start + 1))
+                    } else {
+                        Value::Undefined
+                    };
+                    self.vm_stack.set_len(return_base);
+                    (text, reviver)
+                };
+                let value = self.json_parse(text, reviver)?;
                 self.vm_stack.push(value);
                 Ok(FastNativeCall::Done)
             }
