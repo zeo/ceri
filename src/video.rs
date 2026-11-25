@@ -44,7 +44,7 @@ mod platform {
     use std::os::windows::ffi::OsStrExt;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+    use std::sync::{Arc, Mutex, Once, OnceLock, PoisonError};
     use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, RECT};
     use windows::Win32::Foundation::{
         E_NOTIMPL, E_POINTER, S_FALSE, S_OK, STG_E_ACCESSDENIED, STG_E_INVALIDFUNCTION,
@@ -273,7 +273,7 @@ mod platform {
     // media foundation keeps time in units of 100 nanoseconds
     const TICKS: f64 = 10_000_000.0;
 
-    pub(super) struct Reader {
+    struct Stream {
         reader: IMFSourceReader,
         info: MediaInfo,
         // the decoded buffer's size and row stride, and the part of it that is picture
@@ -287,6 +287,14 @@ mod platform {
         pending: Option<VideoFrame>,
         // seconds the mp4 edit list moves pictures by
         shift: f64,
+    }
+
+    pub(super) struct Reader {
+        stream: Stream,
+        // source kept while opened in software during cold gpu warmup, for a seamless switch
+        upgrade: Option<MediaSource>,
+        // presentation time of the last delivered frame, so mid-stream gpu upgrade resumes after it
+        last_time: Option<f64>,
         // declared last so the reader is released before the apartment closes
         _apartment: Apartment,
     }
@@ -316,10 +324,28 @@ mod platform {
     unsafe impl Send for Gpu {}
     unsafe impl Sync for Gpu {}
 
+    static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
+    static GPU_WARMUP: Once = Once::new();
+
     pub(super) fn gpu() -> Option<&'static Gpu> {
-        static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
         // SAFETY: the out pointers refer to live locals for each call
         GPU.get_or_init(|| unsafe { Gpu::new() }).as_ref()
+    }
+
+    // starts d3d11 device initialization off the decode thread once the first software frame has
+    // landed, avoiding windows loader-lock contention with media foundation dlls on cold open
+    fn warm_gpu() {
+        if GPU.get().is_some() {
+            return;
+        }
+        GPU_WARMUP.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("ceri-video-gpu".into())
+                .stack_size(256 * 1024)
+                .spawn(|| {
+                    let _ = gpu();
+                });
+        });
     }
 
     impl Gpu {
@@ -1629,12 +1655,26 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
     }
 
     impl Reader {
-        // a hardware decoder that fails anywhere up to its first frame leaves the media to
-        // the software one
+        // opens immediately in software when d3d11 is cold so the first video frame lands without
+        // waiting on driver startup or loader lock; codecs that decode on gpu only wait for warmup
         pub(super) fn open(source: &MediaSource) -> Result<Self, String> {
-            gpu()
-                .and_then(|gpu| Self::open_on(source, Some(gpu)).ok())
-                .map_or_else(|| Self::open_on(source, None), Ok)
+            if let Some(gpu) = GPU.get().and_then(Option::as_ref) {
+                if let Ok(reader) = Self::open_on(source, Some(gpu)) {
+                    return Ok(reader);
+                }
+                return Self::open_on(source, None);
+            }
+            match Self::open_on(source, None) {
+                Ok(mut reader) => {
+                    if GPU.get().is_none() {
+                        reader.upgrade = Some(source.clone());
+                    }
+                    Ok(reader)
+                }
+                Err(error) => gpu()
+                    .and_then(|gpu| Self::open_on(source, Some(gpu)).ok())
+                    .ok_or(error),
+            }
         }
 
         pub(super) fn open_on(
@@ -1642,6 +1682,78 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
             gpu: Option<&'static Gpu>,
         ) -> Result<Self, String> {
             let apartment = apartment()?;
+            let stream = Stream::open(source, gpu, gpu.is_some())?;
+            Ok(Self {
+                stream,
+                upgrade: None,
+                last_time: None,
+                _apartment: apartment,
+            })
+        }
+
+        #[cfg(test)]
+        pub(super) fn open_upgradable(source: &MediaSource) -> Result<Self, String> {
+            let mut reader = Self::open_on(source, None)?;
+            reader.upgrade = Some(source.clone());
+            Ok(reader)
+        }
+
+        fn upgrade_for_seek(&mut self, seconds: f64) -> bool {
+            if self.upgrade.is_none() {
+                return false;
+            }
+            let Some(ready) = GPU.get() else {
+                return false;
+            };
+            let Some(source) = self.upgrade.take() else {
+                return false;
+            };
+            let Some(gpu) = ready.as_ref() else {
+                return false;
+            };
+            let Ok(mut stream) = Stream::open(&source, Some(gpu), false) else {
+                return false;
+            };
+            if seek(&stream.reader, seconds - stream.shift).is_err() {
+                return false;
+            }
+            let Ok(first) = stream.next() else {
+                return false;
+            };
+            stream.pending = first;
+            self.stream = stream;
+            true
+        }
+
+        fn upgrade_for_read(&mut self) -> Option<Option<VideoFrame>> {
+            let after = self.last_time?;
+            self.upgrade.as_ref()?;
+            let ready = GPU.get()?;
+            let source = self.upgrade.take()?;
+            let gpu = ready.as_ref()?;
+            let mut stream = Stream::open(&source, Some(gpu), false).ok()?;
+            seek(&stream.reader, (after - stream.shift).max(0.0)).ok()?;
+            // advance past already-delivered frames so mid-stream switching drops nothing
+            let next = loop {
+                match stream.next().ok()? {
+                    Some(frame) if frame.time <= after + 0.0005 => continue,
+                    other => break other,
+                }
+            };
+            self.stream = stream;
+            if let Some(frame) = &next {
+                self.last_time = Some(frame.time);
+            }
+            Some(next)
+        }
+    }
+
+    impl Stream {
+        fn open(
+            source: &MediaSource,
+            gpu: Option<&'static Gpu>,
+            probe_first: bool,
+        ) -> Result<Self, String> {
             let mf = mfplat()?;
             // SAFETY: every call below follows the source reader's documented contract, on
             // interfaces this function created and still holds
@@ -1726,10 +1838,9 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
                     converter: None,
                     pending: None,
                     shift,
-                    _apartment: apartment,
                 };
                 opened.take_format()?;
-                if gpu.is_some() {
+                if probe_first {
                     opened.pending = opened.next()?;
                 }
                 Ok(opened)
@@ -1837,19 +1948,34 @@ float4 pixels(float4 at : SV_Position) : SV_Target {
 
     impl VideoReader for Reader {
         fn info(&self) -> MediaInfo {
-            self.info
+            self.stream.info
         }
 
         fn seek(&mut self, seconds: f64) -> Result<(), String> {
-            self.pending = None;
-            seek(&self.reader, seconds - self.shift)
+            self.stream.pending = None;
+            self.last_time = None;
+            if self.upgrade_for_seek(seconds) {
+                return Ok(());
+            }
+            seek(&self.stream.reader, seconds - self.stream.shift)
         }
 
         fn read(&mut self) -> Result<Option<VideoFrame>, String> {
-            match self.pending.take() {
-                Some(frame) => Ok(Some(frame)),
-                None => self.next(),
+            if let Some(frame) = self.stream.pending.take() {
+                self.last_time = Some(frame.time);
+                return Ok(Some(frame));
             }
+            if let Some(upgraded) = self.upgrade_for_read() {
+                return Ok(upgraded);
+            }
+            let frame = self.stream.next()?;
+            if let Some(frame) = &frame {
+                self.last_time = Some(frame.time);
+                if self.upgrade.is_some() {
+                    warm_gpu();
+                }
+            }
+            Ok(frame)
         }
     }
 
@@ -2978,6 +3104,36 @@ mod tests {
                 .max()
                 .unwrap_or(u8::MAX);
             assert!(apart <= 2, "{time}: {apart}");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn software_reader_upgrades_mid_stream_to_gpu_without_dropping_frames() {
+        use super::platform::{Reader, gpu};
+        use ceri_engine::VideoReader;
+
+        if gpu().is_none() {
+            return;
+        }
+        let mut reader =
+            Reader::open_upgradable(&MediaSource::File(reel())).expect("the fixture should open");
+        let mut times = Vec::new();
+        let mut gpu_frames = 0usize;
+        let mut cpu_frames = 0usize;
+        while let Some(frame) = reader.read().expect("frames should decode") {
+            if frame.surface.is_some() {
+                gpu_frames += 1;
+            } else {
+                cpu_frames += 1;
+            }
+            times.push(frame.time);
+        }
+        assert_eq!(times.len(), 10, "{times:?}");
+        assert_eq!(cpu_frames, 1, "first frame comes immediately from software");
+        assert_eq!(gpu_frames, 9, "remaining frames upgrade seamlessly to gpu");
+        for (index, time) in times.iter().enumerate() {
+            assert!((time - index as f64 / 10.0).abs() < 0.01, "{times:?}");
         }
     }
 

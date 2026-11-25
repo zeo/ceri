@@ -160,16 +160,29 @@ struct ShownPlane {
     format: DXGI_FORMAT,
 }
 
+// heavy d3d11, dxgi and directcomposition setup built off the ui thread before hwnd attach
+pub(crate) struct PreparedPresenter(Presenter);
+
+// safety: d3d11, dxgi and directcomposition objects are free-threaded before hwnd attach,
+// and ownership moves exclusively to the ui thread before attach_to or present runs
+unsafe impl Send for PreparedPresenter {}
+
 impl Presenter {
     pub(crate) fn new(hwnd: isize, width: u32, height: u32) -> Result<Self, String> {
         Self::on_device(hwnd, width, height, true)
             .or_else(|_| Self::on_device(hwnd, width, height, false))
     }
 
-    // opens directly on the GPU when video is already present so D3D10Warp is never loaded first
-    pub(crate) fn new_for_video(hwnd: isize, width: u32, height: u32) -> Result<Self, String> {
-        Self::on_device(hwnd, width, height, false)
-            .or_else(|_| Self::on_device(hwnd, width, height, true))
+    pub(crate) fn prepare_for_video(width: u32, height: u32) -> Result<PreparedPresenter, String> {
+        Self::build_detached(width, height, false)
+            .or_else(|_| Self::build_detached(width, height, true))
+            .map(PreparedPresenter)
+    }
+
+    pub(crate) fn attach_to(mut prepared: PreparedPresenter, hwnd: isize) -> Result<Self, String> {
+        prepared.0.hwnd = hwnd;
+        prepared.0.target = Some(prepared.0.attach()?);
+        Ok(prepared.0)
     }
 
     // a decoder's frames are shared with the GPU's own device without a copy, so a window
@@ -213,6 +226,13 @@ impl Presenter {
     }
 
     fn on_device(hwnd: isize, width: u32, height: u32, warp: bool) -> Result<Self, String> {
+        let mut presenter = Self::build_detached(width, height, warp)?;
+        presenter.hwnd = hwnd;
+        presenter.target = Some(presenter.attach()?);
+        Ok(presenter)
+    }
+
+    fn build_detached(width: u32, height: u32, warp: bool) -> Result<Self, String> {
         let api = graphics_api()?;
         let (width, height) = (width.max(1), height.max(1));
         let mut raw_device: *mut c_void = std::ptr::null_mut();
@@ -276,8 +296,8 @@ impl Presenter {
                 .map_err(failed("the swapchain could not be shown"))?;
             root.AddVisual(&canvas, false, None)
                 .map_err(failed("the canvas visual could not be attached"))?;
-            let mut presenter = Self {
-                hwnd,
+            Ok(Self {
+                hwnd: 0,
                 device,
                 context,
                 factory,
@@ -298,9 +318,7 @@ impl Presenter {
                 outputs: create_dxgi_factory(api).map_err(failed("no DXGI factory"))?,
                 display: None,
                 sdr_only: false,
-            };
-            presenter.target = Some(presenter.attach()?);
-            Ok(presenter)
+            })
         }
     }
 

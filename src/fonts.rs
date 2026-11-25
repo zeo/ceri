@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
 
 const MAX_INDEXED_FONTS: usize = 2_000;
 const MAX_FONT_BYTES: u64 = 32 * 1024 * 1024;
@@ -17,88 +18,161 @@ struct IndexedFace {
     italic: bool,
 }
 
-// installed faces indexed by family name, read from each file's name table
-pub struct SystemFonts {
+struct FontIndex {
     faces: Vec<IndexedFace>,
     // families the platform font configuration prefers for a name, in priority order
     preferred: HashMap<String, Vec<String>>,
+}
+
+static FULL_INDEX: OnceLock<Arc<FontIndex>> = OnceLock::new();
+
+fn shared_index() -> &'static Arc<FontIndex> {
+    FULL_INDEX.get_or_init(|| Arc::new(scan_installed_fonts()))
+}
+
+fn scan_installed_fonts() -> FontIndex {
+    let (directories, preferred) = font_locations();
+    let mut faces = Vec::new();
+    let mut scratch = Vec::new();
+    for directory in directories {
+        index_directory(&directory, &mut faces, &mut scratch, 0);
+    }
+    sort_faces(&mut faces);
+    FontIndex { faces, preferred }
+}
+
+fn sort_faces(faces: &mut [IndexedFace]) {
+    faces.sort_by(|left, right| {
+        (&left.family, left.weight, left.italic).cmp(&(&right.family, right.weight, right.italic))
+    });
+}
+
+#[cfg(test)]
+struct CustomIndex {
+    #[cfg(target_os = "windows")]
+    allow_direct: bool,
+    index: OnceLock<Arc<FontIndex>>,
+    build: Box<dyn Fn() -> FontIndex>,
+}
+
+#[cfg(test)]
+impl CustomIndex {
+    fn inline(mut faces: Vec<IndexedFace>, preferred: HashMap<String, Vec<String>>) -> Self {
+        sort_faces(&mut faces);
+        let index = OnceLock::new();
+        let _ = index.set(Arc::new(FontIndex { faces, preferred }));
+        Self {
+            #[cfg(target_os = "windows")]
+            allow_direct: false,
+            index,
+            build: Box::new(|| FontIndex {
+                faces: Vec::new(),
+                preferred: HashMap::new(),
+            }),
+        }
+    }
+
+    fn lazy(build: impl Fn() -> FontIndex + 'static) -> Self {
+        Self {
+            #[cfg(target_os = "windows")]
+            allow_direct: true,
+            index: OnceLock::new(),
+            build: Box::new(build),
+        }
+    }
+
+    fn get(&self) -> &FontIndex {
+        self.index.get_or_init(|| Arc::new((self.build)())).as_ref()
+    }
+}
+
+// installed faces resolved on demand, backed by a single process-wide directory scan when needed
+pub struct SystemFonts {
+    #[cfg(test)]
+    custom: Option<CustomIndex>,
+    // standard windows families resolved directly from windir\fonts without scanning the directory
+    #[cfg(target_os = "windows")]
+    direct: RefCell<HashMap<&'static str, Vec<IndexedFace>>>,
     loaded: RefCell<HashMap<PathBuf, Option<Rc<FontFace>>>>,
     // what each character fell back to, so the search runs once per character
     fallbacks: RefCell<HashMap<char, Option<PathBuf>>>,
 }
 
 impl SystemFonts {
-    pub fn discover() -> Self {
-        let (directories, preferred) = font_locations();
-        let mut faces = Vec::new();
-        for directory in directories {
-            index_directory(&directory, &mut faces, 0);
-        }
-        faces.sort_by(|left, right| {
-            (&left.family, left.weight, left.italic).cmp(&(
-                &right.family,
-                right.weight,
-                right.italic,
-            ))
-        });
+    // defers full directory scanning until an unknown family or fallback miss requires it
+    pub fn lazy() -> Self {
         Self {
-            faces,
-            preferred,
+            #[cfg(test)]
+            custom: None,
+            #[cfg(target_os = "windows")]
+            direct: RefCell::new(HashMap::new()),
             loaded: RefCell::new(HashMap::new()),
             fallbacks: RefCell::new(HashMap::new()),
         }
     }
 
+    #[cfg(test)]
+    pub fn discover() -> Self {
+        let _ = shared_index();
+        Self::lazy()
+    }
+
+    #[cfg(test)]
     pub fn families(&self) -> usize {
-        self.faces.len()
+        self.index().faces.len()
     }
 
-    // an installed family first, then what the font configuration prefers for the name or its
-    // css generic, then the platform's default for the generic
-    fn lookup(&self, family: &str, style: FontStyle) -> Option<&IndexedFace> {
-        if let Some(face) = self.installed(family, style) {
-            return Some(face);
+    fn index(&self) -> &FontIndex {
+        #[cfg(test)]
+        if let Some(custom) = &self.custom {
+            return custom.get();
         }
-        // what is configured for system-ui, then for the sans-serif it is one of
-        let sans = (css_generic(family) == Some("system-ui")).then_some("sans-serif");
-        let preferred = [Some(family), css_generic(family), sans]
-            .into_iter()
-            .flatten()
-            .filter_map(|name| self.preferred.get(name))
-            .flatten()
-            .find_map(|name| self.installed(name, style));
-        if preferred.is_some() {
-            return preferred;
-        }
-        if let Some(default) = generic_family(family).or_else(|| substitute(family)) {
-            return self.installed(default, style);
-        }
-        // a width variant that is not installed, such as arial narrow, takes its base family,
-        // as edge and chrome do on windows
-        let base = WIDTH_WORDS
-            .iter()
-            .find_map(|word| family.strip_suffix(word)?.strip_suffix(' '))?;
-        self.lookup(base, style)
+        shared_index().as_ref()
     }
 
-    // the css font matching order: slant first, then the weight nearest in the direction
-    // the requested weight leans
-    fn installed(&self, family: &str, style: FontStyle) -> Option<&IndexedFace> {
-        let matching = self
-            .faces
-            .iter()
-            .filter(|face| face.family == family)
-            .collect::<Vec<_>>();
-        let slant = if matching.iter().any(|face| face.italic == style.italic) {
-            style.italic
-        } else {
-            !style.italic
-        };
-        let wanted = style.weight;
-        matching
-            .into_iter()
-            .filter(|face| face.italic == slant)
-            .min_by_key(|face| weight_distance(wanted, face.weight))
+    #[cfg(target_os = "windows")]
+    fn allow_direct(&self) -> bool {
+        #[cfg(test)]
+        if let Some(custom) = &self.custom {
+            return custom.allow_direct;
+        }
+        true
+    }
+
+    #[cfg(target_os = "windows")]
+    fn direct_lookup(&self, family: &str, style: FontStyle) -> Option<PathBuf> {
+        if !self.allow_direct() {
+            return None;
+        }
+        let (target, candidates) = windows_standard_faces(family).or_else(|| {
+            let mapped = generic_family(family).or_else(|| substitute(family))?;
+            windows_standard_faces(mapped)
+        })?;
+        let directory = windows_fonts_dir()?;
+        let mut direct = self.direct.borrow_mut();
+        let faces = direct.entry(target).or_insert_with(|| {
+            candidates
+                .iter()
+                .filter_map(|&(file, weight, italic)| {
+                    let path = directory.join(file);
+                    path.is_file().then(|| IndexedFace {
+                        family: target.to_string(),
+                        path,
+                        weight,
+                        italic,
+                    })
+                })
+                .collect()
+        });
+        best_matching_face(faces, style).map(|face| face.path.clone())
+    }
+
+    fn lookup_path(&self, family: &str, style: FontStyle) -> Option<PathBuf> {
+        #[cfg(target_os = "windows")]
+        if let Some(path) = self.direct_lookup(family, style) {
+            return Some(path);
+        }
+        lookup_in_index(self.index(), family, style).map(|face| face.path.clone())
     }
 
     fn load(&self, path: &Path) -> Option<Rc<FontFace>> {
@@ -117,10 +191,211 @@ impl SystemFonts {
     }
 }
 
+// an installed family first, then what the font configuration prefers for the name or its
+// css generic, then the platform's default for the generic
+fn lookup_in_index<'a>(
+    index: &'a FontIndex,
+    family: &str,
+    style: FontStyle,
+) -> Option<&'a IndexedFace> {
+    if let Some(face) = installed_in(index, family, style) {
+        return Some(face);
+    }
+    // what is configured for system-ui, then for the sans-serif it is one of
+    let sans = (css_generic(family) == Some("system-ui")).then_some("sans-serif");
+    let preferred = [Some(family), css_generic(family), sans]
+        .into_iter()
+        .flatten()
+        .filter_map(|name| index.preferred.get(name))
+        .flatten()
+        .find_map(|name| installed_in(index, name, style));
+    if preferred.is_some() {
+        return preferred;
+    }
+    if let Some(default) = generic_family(family).or_else(|| substitute(family)) {
+        return installed_in(index, default, style);
+    }
+    // a width variant that is not installed, such as arial narrow, takes its base family,
+    // as edge and chrome do on windows
+    let base = WIDTH_WORDS
+        .iter()
+        .find_map(|word| family.strip_suffix(word)?.strip_suffix(' '))?;
+    lookup_in_index(index, base, style)
+}
+
+fn installed_in<'a>(
+    index: &'a FontIndex,
+    family: &str,
+    style: FontStyle,
+) -> Option<&'a IndexedFace> {
+    let start = index
+        .faces
+        .partition_point(|face| face.family.as_str() < family);
+    let end = index.faces[start..].partition_point(|face| face.family.as_str() == family) + start;
+    best_matching_face(&index.faces[start..end], style)
+}
+
+// the css font matching order: slant first, then the weight nearest in the direction
+// the requested weight leans
+fn best_matching_face(matching: &[IndexedFace], style: FontStyle) -> Option<&IndexedFace> {
+    if matching.is_empty() {
+        return None;
+    }
+    let slant = if matching.iter().any(|face| face.italic == style.italic) {
+        style.italic
+    } else {
+        !style.italic
+    };
+    let wanted = style.weight;
+    matching
+        .iter()
+        .filter(|face| face.italic == slant)
+        .min_by_key(|face| weight_distance(wanted, face.weight))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_fonts_dir() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        std::env::var_os("WINDIR").map(|windows| PathBuf::from(windows).join("Fonts"))
+    })
+    .as_deref()
+}
+
+#[cfg(target_os = "windows")]
+type StandardFace = (&'static str, u16, bool);
+
+#[cfg(target_os = "windows")]
+fn windows_standard_faces(family: &str) -> Option<(&'static str, &'static [StandardFace])> {
+    Some(match family {
+        "segoe ui" => (
+            "segoe ui",
+            &[
+                ("segoeuil.ttf", 300, false),
+                ("seguili.ttf", 300, true),
+                ("segoeuisl.ttf", 350, false),
+                ("seguisli.ttf", 350, true),
+                ("segoeui.ttf", 400, false),
+                ("segoeuii.ttf", 400, true),
+                ("seguisb.ttf", 600, false),
+                ("seguisbi.ttf", 600, true),
+                ("segoeuib.ttf", 700, false),
+                ("segoeuiz.ttf", 700, true),
+                ("seguibl.ttf", 900, false),
+                ("seguibli.ttf", 900, true),
+            ],
+        ),
+        "arial" => (
+            "arial",
+            &[
+                ("arial.ttf", 400, false),
+                ("ariali.ttf", 400, true),
+                ("arialbd.ttf", 700, false),
+                ("arialbi.ttf", 700, true),
+            ],
+        ),
+        "consolas" => (
+            "consolas",
+            &[
+                ("consola.ttf", 400, false),
+                ("consolai.ttf", 400, true),
+                ("consolab.ttf", 700, false),
+                ("consolaz.ttf", 700, true),
+            ],
+        ),
+        "tahoma" => (
+            "tahoma",
+            &[("tahoma.ttf", 400, false), ("tahomabd.ttf", 700, false)],
+        ),
+        "segoe ui symbol" => ("segoe ui symbol", &[("seguisym.ttf", 400, false)]),
+        "segoe ui emoji" => ("segoe ui emoji", &[("seguiemj.ttf", 400, false)]),
+        "segoe ui historic" => ("segoe ui historic", &[("seguihis.ttf", 400, false)]),
+        "times new roman" => (
+            "times new roman",
+            &[
+                ("times.ttf", 400, false),
+                ("timesi.ttf", 400, true),
+                ("timesbd.ttf", 700, false),
+                ("timesbi.ttf", 700, true),
+            ],
+        ),
+        "courier new" => (
+            "courier new",
+            &[
+                ("cour.ttf", 400, false),
+                ("couri.ttf", 400, true),
+                ("courbd.ttf", 700, false),
+                ("courbi.ttf", 700, true),
+            ],
+        ),
+        "cambria" => (
+            "cambria",
+            &[
+                ("cambria.ttc", 400, false),
+                ("cambriai.ttf", 400, true),
+                ("cambriab.ttf", 700, false),
+                ("cambriaz.ttf", 700, true),
+            ],
+        ),
+        "cambria math" => ("cambria math", &[("cambria.ttc", 400, false)]),
+        "impact" => ("impact", &[("impact.ttf", 400, false)]),
+        "comic sans ms" => (
+            "comic sans ms",
+            &[
+                ("comic.ttf", 400, false),
+                ("comici.ttf", 400, true),
+                ("comicbd.ttf", 700, false),
+                ("comicz.ttf", 700, true),
+            ],
+        ),
+        "georgia" => (
+            "georgia",
+            &[
+                ("georgia.ttf", 400, false),
+                ("georgiai.ttf", 400, true),
+                ("georgiab.ttf", 700, false),
+                ("georgiaz.ttf", 700, true),
+            ],
+        ),
+        "verdana" => (
+            "verdana",
+            &[
+                ("verdana.ttf", 400, false),
+                ("verdanai.ttf", 400, true),
+                ("verdanab.ttf", 700, false),
+                ("verdanaz.ttf", 700, true),
+            ],
+        ),
+        "trebuchet ms" => (
+            "trebuchet ms",
+            &[
+                ("trebuc.ttf", 400, false),
+                ("trebucit.ttf", 400, true),
+                ("trebucbd.ttf", 700, false),
+                ("trebucbi.ttf", 700, true),
+            ],
+        ),
+        "calibri" => (
+            "calibri",
+            &[
+                ("calibril.ttf", 300, false),
+                ("calibrili.ttf", 300, true),
+                ("calibri.ttf", 400, false),
+                ("calibrii.ttf", 400, true),
+                ("calibrib.ttf", 700, false),
+                ("calibriz.ttf", 700, true),
+            ],
+        ),
+        "cascadia mono" => ("cascadia mono", &[("CascadiaMono.ttf", 400, false)]),
+        "cascadia code" => ("cascadia code", &[("CascadiaCode.ttf", 400, false)]),
+        _ => return None,
+    })
+}
+
 impl FontSource for SystemFonts {
     fn face(&self, family: &str, style: FontStyle) -> Option<Rc<FontFace>> {
-        let indexed = self.lookup(family, style)?;
-        self.load(&indexed.path.clone())
+        let path = self.lookup_path(family, style)?;
+        self.load(&path)
     }
 
     // the platform's broad-coverage families first, then any installed face that has it
@@ -128,28 +403,29 @@ impl FontSource for SystemFonts {
         if let Some(path) = self.fallbacks.borrow().get(&character).cloned() {
             return path.and_then(|path| self.load(&path));
         }
-        let covers = |face: &IndexedFace| {
-            self.load(&face.path)
+        let covers = |path: &Path| {
+            self.load(path)
                 .is_some_and(|loaded| loaded.has_glyph(character))
         };
         let found = FALLBACK_FAMILIES
             .iter()
-            .filter_map(|family| self.lookup(family, style))
-            .find(|face| covers(face))
+            .filter_map(|family| self.lookup_path(family, style))
+            .find(|path| covers(path))
             .or_else(|| {
-                self.faces
+                self.index()
+                    .faces
                     .iter()
                     .filter(|face| !face.italic)
                     .take(MAX_FALLBACK_PROBES)
-                    .find(|face| covers(face))
-            })
-            .map(|face| face.path.clone());
+                    .find(|face| covers(&face.path))
+                    .map(|face| face.path.clone())
+            });
         self.fallbacks.borrow_mut().insert(character, found.clone());
         found.and_then(|path| self.load(&path))
     }
 
     fn emoji(&self, style: FontStyle) -> Option<Rc<FontFace>> {
-        let path = self.lookup(EMOJI_FAMILY, style)?.path.clone();
+        let path = self.lookup_path(EMOJI_FAMILY, style)?;
         self.load(&path)
     }
 }
@@ -678,7 +954,12 @@ mod fontconfig {
     }
 }
 
-fn index_directory(directory: &Path, faces: &mut Vec<IndexedFace>, depth: u8) {
+fn index_directory(
+    directory: &Path,
+    faces: &mut Vec<IndexedFace>,
+    scratch: &mut Vec<u8>,
+    depth: u8,
+) {
     if depth > 3 || faces.len() >= MAX_INDEXED_FONTS {
         return;
     }
@@ -694,7 +975,7 @@ fn index_directory(directory: &Path, faces: &mut Vec<IndexedFace>, depth: u8) {
             continue;
         };
         if file_type.is_dir() {
-            index_directory(&path, faces, depth + 1);
+            index_directory(&path, faces, scratch, depth + 1);
             continue;
         }
         if !file_type.is_file() {
@@ -708,14 +989,14 @@ fn index_directory(directory: &Path, faces: &mut Vec<IndexedFace>, depth: u8) {
         if !matches!(extension.as_str(), "ttf" | "ttc" | "otf") {
             continue;
         }
-        if let Some(face) = read_face_names(&path) {
+        if let Some(face) = read_face_names(&path, scratch) {
             faces.push(face);
         }
     }
 }
 
 // only the table directory and name table are read, so indexing stays cheap
-fn read_face_names(path: &Path) -> Option<IndexedFace> {
+fn read_face_names(path: &Path, scratch: &mut Vec<u8>) -> Option<IndexedFace> {
     let mut file = File::open(path).ok()?;
     let mut header = [0_u8; 12];
     file.read_exact(&mut header).ok()?;
@@ -735,12 +1016,12 @@ fn read_face_names(path: &Path) -> Option<IndexedFace> {
     if table_count == 0 || table_count > 512 {
         return None;
     }
-    let mut directory = vec![0_u8; table_count * 16];
+    scratch.resize(table_count * 16, 0);
     file.seek(SeekFrom::Start(base + 12)).ok()?;
-    file.read_exact(&mut directory).ok()?;
+    file.read_exact(scratch).ok()?;
     let mut name_table = None;
     let mut os2_table = None;
-    for record in directory.as_chunks::<16>().0 {
+    for record in scratch.as_chunks::<16>().0 {
         let offset = u32::from_be_bytes([record[8], record[9], record[10], record[11]]);
         let length = u32::from_be_bytes([record[12], record[13], record[14], record[15]]);
         match &record[..4] {
@@ -759,11 +1040,11 @@ fn read_face_names(path: &Path) -> Option<IndexedFace> {
     if !(6..=1 << 20).contains(&length) {
         return None;
     }
-    let mut table = vec![0_u8; length];
+    scratch.resize(length, 0);
     file.seek(SeekFrom::Start(offset)).ok()?;
-    file.read_exact(&mut table).ok()?;
-    let family = read_name(&table, &[16, 1])?.to_ascii_lowercase();
-    let subfamily = read_name(&table, &[17, 2])
+    file.read_exact(scratch).ok()?;
+    let family = read_name(scratch, &[16, 1])?.to_ascii_lowercase();
+    let subfamily = read_name(scratch, &[17, 2])
         .unwrap_or_default()
         .to_ascii_lowercase();
     let weight = os2
@@ -820,11 +1101,42 @@ fn read_name(table: &[u8], wanted: &[u16]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexedFace, SystemFonts, generic_family, weight_distance};
+    use super::{
+        CustomIndex, FontIndex, IndexedFace, SystemFonts, generic_family, shared_index,
+        weight_distance,
+    };
     use ceri_engine::{FontSource, FontStyle};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_fonts(faces: Vec<IndexedFace>, preferred: HashMap<String, Vec<String>>) -> SystemFonts {
+        SystemFonts {
+            custom: Some(CustomIndex::inline(faces, preferred)),
+            #[cfg(target_os = "windows")]
+            direct: RefCell::new(HashMap::new()),
+            loaded: RefCell::new(HashMap::new()),
+            fallbacks: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn lazy_with_counter(scans: Arc<AtomicUsize>, fallback: Vec<IndexedFace>) -> SystemFonts {
+        SystemFonts {
+            custom: Some(CustomIndex::lazy(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                FontIndex {
+                    faces: fallback.clone(),
+                    preferred: HashMap::new(),
+                }
+            })),
+            #[cfg(target_os = "windows")]
+            direct: RefCell::new(HashMap::new()),
+            loaded: RefCell::new(HashMap::new()),
+            fallbacks: RefCell::new(HashMap::new()),
+        }
+    }
 
     #[test]
     fn generic_families_map_to_platform_faces() {
@@ -836,26 +1148,20 @@ mod tests {
 
     #[test]
     fn a_missing_width_variant_takes_its_base_family() {
-        let fonts = SystemFonts {
-            faces: vec![IndexedFace {
+        let fonts = test_fonts(
+            vec![IndexedFace {
                 family: "arial".into(),
                 path: PathBuf::from("arial.ttf"),
                 weight: 400,
                 italic: false,
             }],
-            preferred: HashMap::new(),
-            loaded: RefCell::new(HashMap::new()),
-            fallbacks: RefCell::new(HashMap::new()),
-        };
-        let found = |family| {
-            fonts
-                .lookup(family, FontStyle::NORMAL)
-                .map(|face| &face.path)
-        };
-        assert_eq!(found("arial narrow"), Some(&PathBuf::from("arial.ttf")));
+            HashMap::new(),
+        );
+        let found = |family| fonts.lookup_path(family, FontStyle::NORMAL);
+        assert_eq!(found("arial narrow"), Some(PathBuf::from("arial.ttf")));
         assert_eq!(
             found("arial semi condensed"),
-            Some(&PathBuf::from("arial.ttf"))
+            Some(PathBuf::from("arial.ttf"))
         );
         assert_eq!(found("aptos narrow"), None);
         assert_eq!(found("arial bold"), None);
@@ -870,13 +1176,13 @@ mod tests {
             italic: false,
         };
         let list = |families: &[&str]| families.iter().map(|family| family.to_string()).collect();
-        let fonts = SystemFonts {
-            faces: vec![
+        let fonts = test_fonts(
+            vec![
                 face("cantarell"),
                 face("liberation sans"),
                 face("fira mono"),
             ],
-            preferred: HashMap::from([
+            HashMap::from([
                 (
                     "sans-serif".to_string(),
                     list(&["noto sans", "liberation sans"]),
@@ -885,19 +1191,17 @@ mod tests {
                 ("monospace".to_string(), list(&["noto mono"])),
                 ("helvetica".to_string(), list(&["cantarell"])),
             ]),
-            loaded: RefCell::new(HashMap::new()),
-            fallbacks: RefCell::new(HashMap::new()),
-        };
+        );
         let found = |family| {
             fonts
-                .lookup(family, FontStyle::NORMAL)
-                .map(|face| face.family.as_str())
+                .lookup_path(family, FontStyle::NORMAL)
+                .map(|path| path.to_string_lossy().into_owned())
         };
-        assert_eq!(found("sans-serif"), Some("liberation sans"));
+        assert_eq!(found("sans-serif").as_deref(), Some("liberation sans.ttf"));
         // system-ui has its own list, then falls back to the sans-serif one
-        assert_eq!(found("system-ui"), Some("liberation sans"));
-        assert_eq!(found("helvetica"), Some("cantarell"));
-        assert_eq!(found("fira mono"), Some("fira mono"));
+        assert_eq!(found("system-ui").as_deref(), Some("liberation sans.ttf"));
+        assert_eq!(found("helvetica").as_deref(), Some("cantarell.ttf"));
+        assert_eq!(found("fira mono").as_deref(), Some("fira mono.ttf"));
         // neither a preferred family nor the platform default is installed
         assert_eq!(found("monospace"), None);
     }
@@ -915,6 +1219,125 @@ mod tests {
         assert_eq!(nearest(700, &[400, 600, 900]), 900);
         assert_eq!(nearest(300, &[200, 400]), 200);
         assert_eq!(nearest(600, &[400, 500]), 500);
+    }
+
+    #[test]
+    fn lazy_fonts_defer_and_cache_the_full_directory_scan() {
+        let scans = Arc::new(AtomicUsize::new(0));
+        let fonts = lazy_with_counter(scans.clone(), Vec::new());
+        assert_eq!(scans.load(Ordering::SeqCst), 0);
+
+        // repeated unknown-family misses scan at most once
+        assert!(
+            fonts
+                .face("ceri-nonexistent-family-a", FontStyle::NORMAL)
+                .is_none()
+        );
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        assert!(
+            fonts
+                .face("ceri-nonexistent-family-b", FontStyle::NORMAL)
+                .is_none()
+        );
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+
+        // process-wide shared instances reuse the same cached index
+        let first = SystemFonts::lazy();
+        let second = SystemFonts::lazy();
+        assert!(Arc::ptr_eq(shared_index(), shared_index()));
+        assert_eq!(first.families(), second.families());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_standard_families_resolve_directly_without_directory_scan() {
+        let scans = Arc::new(AtomicUsize::new(0));
+        let fonts = lazy_with_counter(scans.clone(), Vec::new());
+
+        for family in [
+            "segoe ui",
+            "arial",
+            "consolas",
+            "tahoma",
+            "segoe ui symbol",
+            "segoe ui emoji",
+            "times new roman",
+            "courier new",
+            "cambria math",
+            "impact",
+            "comic sans ms",
+            "georgia",
+            "verdana",
+            "trebuchet ms",
+            "calibri",
+            "sans-serif",
+            "system-ui",
+            "serif",
+            "monospace",
+            "cursive",
+            "fantasy",
+            "math",
+            "helvetica",
+            "courier",
+            "times",
+        ] {
+            assert!(
+                fonts.face(family, FontStyle::NORMAL).is_some(),
+                "standard family {family} should resolve directly from WINDIR\\Fonts"
+            );
+        }
+        assert!(fonts.emoji(FontStyle::NORMAL).is_some());
+        assert!(fonts.fallback('\u{2192}', FontStyle::NORMAL).is_some());
+
+        // verify weight and italic matching on the direct path
+        let regular = fonts
+            .lookup_path("segoe ui", FontStyle::NORMAL)
+            .expect("segoe ui regular");
+        let bold = fonts
+            .lookup_path(
+                "segoe ui",
+                FontStyle {
+                    weight: 700,
+                    ..FontStyle::NORMAL
+                },
+            )
+            .expect("segoe ui bold");
+        let semibold = fonts
+            .lookup_path(
+                "segoe ui",
+                FontStyle {
+                    weight: 600,
+                    ..FontStyle::NORMAL
+                },
+            )
+            .expect("segoe ui semibold");
+        let italic = fonts
+            .lookup_path(
+                "segoe ui",
+                FontStyle {
+                    italic: true,
+                    ..FontStyle::NORMAL
+                },
+            )
+            .expect("segoe ui italic");
+        assert!(regular.ends_with("segoeui.ttf"), "{regular:?}");
+        assert!(bold.ends_with("segoeuib.ttf"), "{bold:?}");
+        assert!(semibold.ends_with("seguisb.ttf"), "{semibold:?}");
+        assert!(italic.ends_with("segoeuii.ttf"), "{italic:?}");
+
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            0,
+            "standard windows families must not trigger a full directory scan"
+        );
+
+        // only an unknown family falls back to the cached full scan
+        assert!(
+            fonts
+                .face("ceri-nonexistent-family", FontStyle::NORMAL)
+                .is_none()
+        );
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -942,7 +1365,7 @@ mod tests {
         }
         // windows always ships these scripts, a linux install only has what its packages added
         let installed = |character| {
-            fonts.faces.iter().any(|face| {
+            fonts.index().faces.iter().any(|face| {
                 fonts
                     .load(&face.path)
                     .is_some_and(|loaded| loaded.has_glyph(character))

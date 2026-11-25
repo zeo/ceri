@@ -137,10 +137,7 @@ pub struct Frame {
     // size is made
     pub background: [u8; 3],
     // video frames to show under the canvas where it leaves them transparent
-    #[cfg_attr(
-        not(all(feature = "windowed", target_os = "windows")),
-        expect(dead_code)
-    )]
+    #[cfg_attr(not(feature = "windowed"), expect(dead_code))]
     pub(crate) planes: Vec<crate::paint::PlaneFrame>,
 }
 
@@ -3958,30 +3955,31 @@ mod tests {
         let (outgoing, messages) = std::sync::mpsc::channel();
         host.browser.attach_inspector(1, outgoing);
 
-        let mut dispatch = |id: u64, kind: &str, x: f32, y: f32, click_count: u64| {
-            let text = json!({
-                "id": id,
-                "method": "Input.dispatchMouseEvent",
-                "params": {
-                    "type": kind,
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "clickCount": click_count,
-                }
-            })
-            .to_string();
-            let event = answer(
-                &mut host,
-                EngineWorkerCommand::Inspector(Inbound::Message { session: 1, text }),
-            );
-            let reply = messages.try_recv().expect("cdp should receive a reply");
-            assert!(reply.contains(&format!(r#""id":{id}"#)), "{reply}");
-            assert!(reply.contains(r#""result":{}"#), "{reply}");
-            event
-        };
+        let dispatch =
+            |host: &mut EngineHost, id: u64, kind: &str, x: f32, y: f32, click_count: u64| {
+                let text = json!({
+                    "id": id,
+                    "method": "Input.dispatchMouseEvent",
+                    "params": {
+                        "type": kind,
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "clickCount": click_count,
+                    }
+                })
+                .to_string();
+                let event = answer(
+                    host,
+                    EngineWorkerCommand::Inspector(Inbound::Message { session: 1, text }),
+                );
+                let reply = messages.try_recv().expect("cdp should receive a reply");
+                assert!(reply.contains(&format!(r#""id":{id}"#)), "{reply}");
+                assert!(reply.contains(r#""result":{}"#), "{reply}");
+                event
+            };
 
-        let first = dispatch(1, "mousePressed", 40.0, 16.0, 1);
+        let first = dispatch(&mut host, 1, "mousePressed", 40.0, 16.0, 1);
         assert!(
             matches!(
                 first,
@@ -3995,9 +3993,9 @@ mod tests {
             ),
             "{first:?}"
         );
-        assert!(dispatch(2, "mouseReleased", 40.0, 16.0, 1).is_none());
+        assert!(dispatch(&mut host, 2, "mouseReleased", 40.0, 16.0, 1).is_none());
 
-        let second = dispatch(3, "mousePressed", 40.0, 16.0, 2);
+        let second = dispatch(&mut host, 3, "mousePressed", 40.0, 16.0, 2);
         assert!(
             matches!(
                 second,
@@ -4011,9 +4009,46 @@ mod tests {
             ),
             "{second:?}"
         );
-        assert!(dispatch(4, "mouseReleased", 40.0, 16.0, 2).is_none());
+        assert!(dispatch(&mut host, 4, "mouseReleased", 40.0, 16.0, 2).is_none());
 
         // a no-drag control inside the strip does not emit a window region press
-        assert!(dispatch(5, "mousePressed", 160.0, 16.0, 2).is_none());
+        assert!(dispatch(&mut host, 5, "mousePressed", 160.0, 16.0, 2).is_none());
+
+        // after maximizing resizes the viewport, a second double-click on the drag strip restores
+        host.input(InputEvent::Resize(Size {
+            width: 400.0,
+            height: 200.0,
+        }))
+        .expect("resize should apply");
+        let restore_first = dispatch(&mut host, 6, "mousePressed", 40.0, 16.0, 1);
+        assert!(
+            matches!(
+                restore_first,
+                Some(EngineWorkerEvent::Input {
+                    request_id: 0,
+                    result: Ok(InputResult {
+                        region: Some(RegionPress::Move),
+                        ..
+                    }),
+                })
+            ),
+            "{restore_first:?}"
+        );
+        assert!(dispatch(&mut host, 7, "mouseReleased", 40.0, 16.0, 1).is_none());
+        let restore_second = dispatch(&mut host, 8, "mousePressed", 40.0, 16.0, 2);
+        assert!(
+            matches!(
+                restore_second,
+                Some(EngineWorkerEvent::Input {
+                    request_id: 0,
+                    result: Ok(InputResult {
+                        region: Some(RegionPress::ToggleMaximize),
+                        ..
+                    }),
+                })
+            ),
+            "{restore_second:?}"
+        );
+        assert!(dispatch(&mut host, 9, "mouseReleased", 40.0, 16.0, 2).is_none());
     }
 }

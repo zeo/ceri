@@ -921,12 +921,7 @@ fn app_icon_source(assets: &AssetOrigin) -> Option<Vec<u8>> {
 }
 
 fn system_font_set() -> FontSet {
-    let fonts = SystemFonts::discover();
-    if fonts.families() == 0 {
-        eprintln!("ceri: no installed fonts were found, falling back to the builtin face");
-        return FontSet::builtin();
-    }
-    FontSet::from_source(Rc::new(fonts))
+    FontSet::from_source(Rc::new(SystemFonts::lazy()))
 }
 
 fn runtime_info() -> HostRuntimeInfo {

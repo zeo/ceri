@@ -61,7 +61,7 @@ impl Output {
                     Err(error) => eprintln!("ceri: falling back to composition, {error}"),
                 }
             }
-            match Self::compose(window, false) {
+            match Self::compose(window) {
                 Ok(output) => return Ok(output),
                 Err(error) => eprintln!("ceri: drawing in software, {error}"),
             }
@@ -71,29 +71,30 @@ impl Output {
             .map_err(|error| format!("window surface creation failed: {error}"))
     }
 
-    // a composition swapchain on the window, used directly for decorated transparency or when
-    // any window receives its first video frame
+    // a composition swapchain on the window, used directly for decorated transparency
     #[cfg(target_os = "windows")]
-    fn compose(window: &Rc<Window>, for_video: bool) -> Result<Self, String> {
+    fn compose(window: &Rc<Window>) -> Result<Self, String> {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let size = window.inner_size();
         window
             .window_handle()
             .map_err(|error| error.to_string())
             .and_then(|handle| match handle.as_raw() {
-                RawWindowHandle::Win32(handle) if for_video => {
-                    crate::presenter::Presenter::new_for_video(
-                        handle.hwnd.get(),
-                        size.width,
-                        size.height,
-                    )
-                }
                 RawWindowHandle::Win32(handle) => {
                     crate::presenter::Presenter::new(handle.hwnd.get(), size.width, size.height)
                 }
                 _ => Err("the window has no Win32 handle".to_string()),
             })
             .map(Self::Composition)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn last_frame(&self) -> Option<Frame> {
+        match self {
+            Self::Composition(_) => None,
+            Self::Layered(layered) => layered.last.clone(),
+            Self::Software(_, _, last) => last.clone(),
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -130,7 +131,8 @@ impl Output {
             Self::Software(surface, shown, last) => {
                 let revision = frame.canvas.revision();
                 let size = (width.get(), height.get());
-                if *shown == Some((revision.id, size)) {
+                let has_planes = !frame.planes.is_empty();
+                if !has_planes && *shown == Some((revision.id, size)) {
                     return Ok(());
                 }
                 surface
@@ -139,7 +141,11 @@ impl Output {
                 let mut buffer = surface
                     .buffer_mut()
                     .map_err(|error| format!("window surface buffer failed: {error}"))?;
-                let boxes = damage_boxes(revision, *shown, buffer.age() == 1, size);
+                let boxes = if has_planes {
+                    vec![[0, 0, size.0, size.1]]
+                } else {
+                    damage_boxes(revision, *shown, buffer.age() == 1, size)
+                };
                 *shown = None;
                 let mut rects = Vec::with_capacity(boxes.len());
                 for changed in boxes {
@@ -156,12 +162,15 @@ impl Output {
                         });
                     }
                 }
+                if has_planes {
+                    composite_planes_software(frame, size, &mut buffer);
+                }
                 if !rects.is_empty() {
                     buffer
                         .present_with_damage(&rects)
                         .map_err(|error| format!("window surface present failed: {error}"))?;
                 }
-                *shown = Some((revision.id, size));
+                *shown = (!has_planes).then_some((revision.id, size));
                 *last = Some(frame.clone());
                 Ok(())
             }
@@ -497,12 +506,20 @@ impl LayeredSurface {
     ) -> Result<(), String> {
         let size = (width.get(), height.get());
         let revision = frame.canvas.revision();
-        if self.shown == Some((revision.id, size)) && self.presented && has_layered_style(self.hwnd)
+        let has_planes = !frame.planes.is_empty();
+        if !has_planes
+            && self.shown == Some((revision.id, size))
+            && self.presented
+            && has_layered_style(self.hwnd)
         {
             return Ok(());
         }
         let resized = self.resize(size.0, size.1)?;
-        let boxes = damage_boxes(revision, self.shown, !resized, size);
+        let boxes = if has_planes {
+            vec![[0, 0, size.0, size.1]]
+        } else {
+            damage_boxes(revision, self.shown, !resized, size)
+        };
         let mut dirty: Option<[u32; 4]> = None;
         for changed in boxes {
             pack_layered_frame(frame, size, changed, self.pixels_mut());
@@ -516,13 +533,16 @@ impl LayeredSurface {
                 None => changed,
             });
         }
-        if let Some(changed) = dirty {
+        if has_planes {
+            composite_planes_layered(frame, size, self.pixels_mut());
+            self.commit(None)?;
+        } else if let Some(changed) = dirty {
             let whole = changed == [0, 0, size.0, size.1];
             self.commit((!whole).then_some(changed))?;
         } else if !self.presented {
             self.commit(None)?;
         }
-        self.shown = Some((revision.id, size));
+        self.shown = (!has_planes).then_some((revision.id, size));
         self.last = Some(frame.clone());
         Ok(())
     }
@@ -862,6 +882,12 @@ enum Request {
     Wake,
     // a closed window's worker has finished exiting, so main-thread caches can trim if idle
     Trim,
+    // a background thread finished preparing directcomposition for a window's first video
+    #[cfg(target_os = "windows")]
+    Composed(
+        WindowId,
+        Result<crate::presenter::PreparedPresenter, String>,
+    ),
     Open(Box<WindowConfig>),
     Close(String),
     Act(String, WindowAction),
@@ -1111,6 +1137,12 @@ struct AppWindow {
     intercept_close: bool,
     #[cfg(target_os = "windows")]
     click_through: bool,
+    #[cfg(target_os = "windows")]
+    proxy: EventLoopProxy<Request>,
+    #[cfg(target_os = "windows")]
+    composing: bool,
+    #[cfg(target_os = "windows")]
+    compose_failed: bool,
 }
 
 impl<F> App<F>
@@ -1214,6 +1246,12 @@ where
             intercept_close: false,
             #[cfg(target_os = "windows")]
             click_through,
+            #[cfg(target_os = "windows")]
+            proxy: self.control.proxy.clone(),
+            #[cfg(target_os = "windows")]
+            composing: false,
+            #[cfg(target_os = "windows")]
+            compose_failed: false,
         };
         let monitors = self.control.monitors();
         let Some(id) = this.create(event_loop, &mut self.context, &monitors) else {
@@ -2104,10 +2142,13 @@ impl AppWindow {
             return;
         };
         match region {
-            // the press may already be over when the engine answers, and the platform then ends
-            // the move at once
+            // only start a native move while the primary button is physically held on this
+            // window; synthetic automation presses and quick taps skip the modal drag loop
             RegionPress::Move => {
-                let _ = window.drag_window();
+                if should_drag_window(&self.pressed, button_held(PointerButton::Primary)) {
+                    let _ = window.drag_window();
+                    self.release_lost_buttons();
+                }
             }
             // as on a native caption, a window that keeps its size does not maximize
             RegionPress::ToggleMaximize if self.config.resizable => {
@@ -2205,26 +2246,85 @@ impl AppWindow {
         let Some(output) = &mut self.output else {
             return;
         };
-        // a video shows under the canvas through the compositor, so the window moves there
+        // a video shows under the canvas through directcomposition; prepare the d3d11/dcomp
+        // objects off the ui thread while presenting the first frame immediately in software
         #[cfg(target_os = "windows")]
         if !frame.planes.is_empty()
             && !output.composed()
+            && !self.composing
+            && !self.compose_failed
             && let Some(window) = &self.window
         {
-            if let Output::Layered(layered) = &*output {
-                layered.release_for_composition(self.click_through);
-            }
-            match Output::compose(window, true) {
-                Ok(composed) => *output = composed,
-                Err(error) => {
-                    eprintln!("ceri: the video stays unshown, {error}");
-                    let _ = output.sync_layered();
-                }
+            self.composing = true;
+            let id = window.id();
+            let proxy = self.proxy.clone();
+            let (w, h) = (width.get(), height.get());
+            if std::thread::Builder::new()
+                .name("ceri-compose".to_string())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    let prepared = crate::presenter::Presenter::prepare_for_video(w, h);
+                    let _ = proxy.send_event(Request::Composed(id, prepared));
+                })
+                .is_err()
+            {
+                self.composing = false;
+                self.compose_failed = true;
             }
         }
         if let Err(error) = output.present(&frame, width, height) {
             eprintln!("ceri: {error}");
             self.closing = true;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn finish_composition(
+        &mut self,
+        prepared: Result<crate::presenter::PreparedPresenter, String>,
+    ) {
+        self.composing = false;
+        let (Some(window), Some(output)) = (&self.window, &mut self.output) else {
+            return;
+        };
+        if output.composed() {
+            return;
+        }
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.compose_failed = true;
+                eprintln!("ceri: video stays painted in software, {error}");
+                return;
+            }
+        };
+        let Some(NativeHandle::Win32 { hwnd }) = self.handle else {
+            self.compose_failed = true;
+            return;
+        };
+        let last = output.last_frame();
+        if let Output::Layered(layered) = &*output {
+            layered.release_for_composition(self.click_through);
+        }
+        match crate::presenter::Presenter::attach_to(prepared, hwnd) {
+            Ok(presenter) => {
+                *output = Output::Composition(presenter);
+                if let (Some(frame), Some(width), Some(height)) = (
+                    last,
+                    NonZeroU32::new(window.inner_size().width),
+                    NonZeroU32::new(window.inner_size().height),
+                ) && let Err(error) = output.present(&frame, width, height)
+                {
+                    eprintln!("ceri: {error}");
+                    self.closing = true;
+                }
+                self.request_redraw();
+            }
+            Err(error) => {
+                self.compose_failed = true;
+                eprintln!("ceri: video stays painted in software, {error}");
+                let _ = output.sync_layered();
+            }
         }
     }
 
@@ -2405,6 +2505,12 @@ where
             Request::Trim => {
                 self.trim_if_idle();
                 return;
+            }
+            #[cfg(target_os = "windows")]
+            Request::Composed(id, prepared) => {
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.finish_composition(prepared);
+                }
             }
             Request::Open(config) => {
                 self.refresh_monitors(event_loop);
@@ -2860,6 +2966,95 @@ fn pack_layered_frame(
     }
 }
 
+// a native window move only starts while the primary button is physically held on this window
+fn should_drag_window(pressed: &[PointerButton], held: bool) -> bool {
+    pressed.contains(&PointerButton::Primary) && held
+}
+
+// composites video planes beneath the premultiplied software canvas while directcomposition warms up
+fn composite_planes_software(frame: &Frame, (width, height): (u32, u32), buffer: &mut [u32]) {
+    composite_planes(frame, (width, height), |x, y, [r, g, b]| {
+        buffer[y * width as usize + x] = u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b);
+    });
+}
+
+// composites video planes beneath the premultiplied layered dib while directcomposition warms up
+#[cfg(any(target_os = "windows", test))]
+fn composite_planes_layered(frame: &Frame, (width, height): (u32, u32), dst: &mut [u8]) {
+    composite_planes(frame, (width, height), |x, y, [r, g, b]| {
+        let offset = (y * width as usize + x) * 4;
+        dst[offset..offset + 4].copy_from_slice(&[b, g, r, 255]);
+    });
+}
+
+fn composite_planes(
+    frame: &Frame,
+    (width, height): (u32, u32),
+    mut put: impl FnMut(usize, usize, [u8; 3]),
+) {
+    let canvas = &frame.canvas;
+    let pixels = canvas.rgba_pixels();
+    let stride = canvas.bytes_per_row();
+    let (canvas_width, canvas_height) = (canvas.width() as usize, canvas.height() as usize);
+    let (width, height) = (width as usize, height as usize);
+    for (plane, image, surface) in &frame.planes {
+        if plane.scale.0 <= 0.0 || plane.scale.1 <= 0.0 {
+            continue;
+        }
+        let (img_width, img_height) = (plane.size.0 as usize, plane.size.1 as usize);
+        if img_width == 0 || img_height == 0 {
+            continue;
+        }
+        let readback = (image.pixels.len() < img_width * img_height)
+            .then(|| surface.as_ref().and_then(|surface| surface.read().ok()))
+            .flatten()
+            .filter(|bgra| bgra.len() >= img_width * img_height * 4);
+        if image.pixels.len() < img_width * img_height && readback.is_none() {
+            continue;
+        }
+        let left = (plane.bounds[0] as usize).min(width);
+        let top = (plane.bounds[1] as usize).min(height);
+        let right = (plane.bounds[2] as usize).min(width);
+        let bottom = (plane.bounds[3] as usize).min(height);
+        if left >= right || top >= bottom {
+            continue;
+        }
+        let max_x = (img_width - 1) as f32;
+        let max_y = (img_height - 1) as f32;
+        for dy in top..bottom {
+            let sy = (((dy as f32 + 0.5) - plane.origin.1) / plane.scale.1)
+                .floor()
+                .clamp(0.0, max_y) as usize;
+            let row_offset = sy * img_width;
+            for dx in left..right {
+                let sx = (((dx as f32 + 0.5) - plane.origin.0) / plane.scale.0)
+                    .floor()
+                    .clamp(0.0, max_x) as usize;
+                let (vr, vg, vb) = if let Some(bgra) = &readback {
+                    let at = (row_offset + sx) * 4;
+                    (bgra[at + 2], bgra[at + 1], bgra[at])
+                } else {
+                    let color = image.pixels[row_offset + sx];
+                    (color.red, color.green, color.blue)
+                };
+                let [cr, cg, cb, ca] = if dy < canvas_height && dx < canvas_width {
+                    let at = dy * stride + dx * 4;
+                    [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]]
+                } else {
+                    [0, 0, 0, 0]
+                };
+                let inv = u16::from(255 - ca);
+                let out = [
+                    cr.saturating_add(((u16::from(vr) * inv + 127) / 255) as u8),
+                    cg.saturating_add(((u16::from(vg) * inv + 127) / 255) as u8),
+                    cb.saturating_add(((u16::from(vb) * inv + 127) / 255) as u8),
+                ];
+                put(dx, dy, out);
+            }
+        }
+    }
+}
+
 fn drop_payload(paths: &[PathBuf]) -> String {
     let quoted: Vec<_> = paths
         .iter()
@@ -2928,9 +3123,87 @@ fn forced_palette() -> Option<crate::css::SystemColors> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Monitor, ResizeDirection, centred, damage_boxes, layout_viewport, pack_layered_frame,
-        present_frame, present_stale_software, resize_direction,
+        Monitor, PointerButton, ResizeDirection, centred, composite_planes_layered,
+        composite_planes_software, damage_boxes, layout_viewport, pack_layered_frame,
+        present_frame, present_stale_software, resize_direction, should_drag_window,
     };
+
+    #[test]
+    fn drag_window_requires_a_held_primary_press_on_the_window() {
+        assert!(should_drag_window(&[PointerButton::Primary], true));
+        assert!(!should_drag_window(&[PointerButton::Primary], false));
+        assert!(!should_drag_window(&[], true));
+        assert!(!should_drag_window(&[PointerButton::Secondary], true));
+    }
+
+    #[test]
+    fn software_and_layered_present_composite_video_planes_under_canvas_overlays() {
+        struct MockSurface(Vec<u8>);
+        impl crate::video::VideoSurface for MockSurface {
+            fn shared_handle(&self) -> isize {
+                0
+            }
+            fn read(&self) -> Result<Vec<u8>, String> {
+                Ok(self.0.clone())
+            }
+        }
+
+        // 4x2 canvas: left 2x2 is a clear video hole, top-right has a translucent white overlay
+        let canvas = crate::paint::Canvas::new(4, 2, crate::css::Color::transparent()).overlaid(&[
+            ([2.0, 0.0, 4.0, 2.0], crate::css::Color::opaque(10, 20, 30)),
+            (
+                [1.0, 0.0, 2.0, 2.0],
+                crate::css::Color::rgba(255, 255, 255, 128),
+            ),
+        ]);
+        let mut video = crate::image::Image::new(2, 2);
+        video.pixels.fill(crate::css::Color::opaque(100, 150, 200));
+        let plane = crate::paint::Plane {
+            node: crate::dom::Document::new().root(),
+            size: (2, 2),
+            bounds: [0, 0, 2, 2],
+            origin: (0.0, 0.0),
+            scale: (1.0, 1.0),
+        };
+        let frame = crate::host::Frame {
+            sequence: 1,
+            viewport: crate::layout::Size {
+                width: 4.0,
+                height: 2.0,
+            },
+            scale: 1.0,
+            title: None,
+            fullscreen: false,
+            background: [0, 0, 0],
+            canvas: std::sync::Arc::new(canvas.clone()),
+            planes: vec![(plane.clone(), std::sync::Arc::new(video), None)],
+        };
+        let mut buffer = vec![0u32; 4 * 2];
+        present_frame(&frame, (4, 2), [0, 0, 4, 2], &mut buffer);
+        composite_planes_software(&frame, (4, 2), &mut buffer);
+        assert_eq!(buffer[0], (100 << 16) | (150 << 8) | 200);
+        assert_eq!(buffer[2], (10 << 16) | (20 << 8) | 30);
+        // translucent white over (100, 150, 200) blends brighter than the raw video pixel
+        assert!((buffer[1] >> 16) > 100 && ((buffer[1] >> 8) & 0xff) > 150);
+
+        // unread gpu surface falls back to surface.read() bgra pixels for both software and layered
+        let mut empty = crate::image::Image::new(2, 2);
+        empty.pixels.clear();
+        let bgra = [200u8, 150, 100, 255].repeat(4);
+        let surface_frame = crate::host::Frame {
+            planes: vec![(
+                plane,
+                std::sync::Arc::new(empty),
+                Some(std::sync::Arc::new(MockSurface(bgra))),
+            )],
+            ..frame
+        };
+        let mut layered = vec![0u8; 4 * 2 * 4];
+        pack_layered_frame(&surface_frame, (4, 2), [0, 0, 4, 2], &mut layered);
+        composite_planes_layered(&surface_frame, (4, 2), &mut layered);
+        assert_eq!(&layered[0..4], &[200, 150, 100, 255]);
+        assert_eq!(&layered[8..12], &[30, 20, 10, 255]);
+    }
 
     #[test]
     fn a_software_present_copies_only_the_box_it_is_given() {
