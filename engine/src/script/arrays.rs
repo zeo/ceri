@@ -173,8 +173,15 @@ impl ScriptRuntime {
         values: Vec<Value>,
         set_length: bool,
     ) -> Result<Value, ScriptError> {
-        if !matches!(original, Value::Array(_)) {
-            return Ok(Self::new_array(values));
+        let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
+        let Value::Array(array) = original else {
+            return Ok(Value::Array(heap.alloc_array_fast(ArrayData::from(values))));
+        };
+        if unsafe { heap.array_ref(array) }.is_some_and(|a| a.extra.is_none())
+            && unsafe { heap.object_ref(&self.intrinsics.array_prototype) }
+                .is_some_and(|p| p.array_constructor_intact(heap))
+        {
+            return Ok(Value::Array(heap.alloc_array_fast(ArrayData::from(values))));
         }
         let mut constructor = self.get_property(original, "constructor")?;
         if let Value::Object(object) = &constructor {
@@ -493,17 +500,53 @@ impl ScriptRuntime {
         }
         match method {
             M::ForEach | M::Map | M::Filter | M::Some | M::Every | M::Find | M::FindIndex => {
-                let (values, object) = self.callback_receiver(&this, name)?;
+                let (values, object, length) = if let Value::Array(array) = &this {
+                    let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
+                    let len = unsafe { heap.array_ref(array) }
+                        .map_or_else(|| array.borrow().len(), |a| a.len());
+                    (Vec::new(), this.clone(), len)
+                } else {
+                    let (values, object) = self.callback_receiver(&this, name)?;
+                    let len = values.len();
+                    (values, object, len)
+                };
                 let callback = self.callback(&arguments, name)?;
+                if length == 0 {
+                    return Ok(match method {
+                        M::Map | M::Filter => self.array_species(&this, Vec::new(), false)?,
+                        M::Some => Value::Bool(false),
+                        M::Every => Value::Bool(true),
+                        M::FindIndex => Value::Number(-1.0),
+                        _ => Value::Undefined,
+                    });
+                }
                 let fast = Self::simple_closure(&callback);
                 let receiver = argument(&arguments, 1);
-                let length = values.len();
+                let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
                 let mut mapped = Vec::new();
                 for index in 0..length {
-                    if index >= Self::element_count(&this, &values) {
-                        break;
-                    }
-                    let value = Self::element(&this, &values, index).unwrap_or(Value::Undefined);
+                    let value = if let Value::Array(array) = &this {
+                        match unsafe { heap.array_ref(array) } {
+                            Some(data) => {
+                                if index >= data.len() {
+                                    break;
+                                }
+                                data.values[index].clone()
+                            }
+                            None => {
+                                let borrowed = array.borrow();
+                                if index >= borrowed.len() {
+                                    break;
+                                }
+                                borrowed[index].clone()
+                            }
+                        }
+                    } else {
+                        if index >= Self::element_count(&this, &values) {
+                            break;
+                        }
+                        Self::element(&this, &values, index).unwrap_or(Value::Undefined)
+                    };
                     // an index nothing was put at is passed over, kept as it is by map, and
                     // seen as undefined by the finds
                     let value = match value {
@@ -553,10 +596,16 @@ impl ScriptRuntime {
                 })
             }
             M::FindLast | M::FindLastIndex => {
-                let (values, object) = self.callback_receiver(&this, name)?;
+                let (values, object, length) = if let Value::Array(array) = &this {
+                    (Vec::new(), this.clone(), array.borrow().len())
+                } else {
+                    let (values, object) = self.callback_receiver(&this, name)?;
+                    let len = values.len();
+                    (values, object, len)
+                };
                 let callback = self.callback(&arguments, name)?;
                 let receiver = argument(&arguments, 1);
-                for index in (0..values.len()).rev() {
+                for index in (0..length).rev() {
                     let value = Self::element(&this, &values, index)
                         .unwrap_or(Value::Undefined)
                         .filled();
@@ -578,14 +627,20 @@ impl ScriptRuntime {
                 })
             }
             M::Reduce | M::ReduceRight => {
-                let (values, object) = self.callback_receiver(&this, name)?;
+                let (values, object, length) = if let Value::Array(array) = &this {
+                    (Vec::new(), this.clone(), array.borrow().len())
+                } else {
+                    let (values, object) = self.callback_receiver(&this, name)?;
+                    let len = values.len();
+                    (values, object, len)
+                };
                 let callback = self.callback(&arguments, name)?;
                 // each index is looked at when its turn comes, since the callback may fill or
                 // delete what was there when the method began
                 let indices: Vec<usize> = if matches!(method, M::Reduce) {
-                    (0..values.len()).collect()
+                    (0..length).collect()
                 } else {
-                    (0..values.len()).rev().collect()
+                    (0..length).rev().collect()
                 };
                 let mut indices = indices.into_iter();
                 let mut accumulator = if arguments.len() >= 2 {

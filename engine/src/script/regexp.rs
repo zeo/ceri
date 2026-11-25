@@ -535,69 +535,38 @@ impl ScriptRuntime {
         text: &JsStr,
         limit: usize,
     ) -> Result<Value, ScriptError> {
-        let mut parts = Vec::new();
+        let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
+        self.regexp_split_str_fast(heap, data, text, limit)
+    }
+
+    pub(super) fn regexp_split_str_fast(
+        &mut self,
+        heap: &super::heap::Heap,
+        data: &RegExpData,
+        text: &JsStr,
+        limit: usize,
+    ) -> Result<Value, ScriptError> {
         if limit == 0 {
-            return Ok(Self::new_array(parts));
+            return Ok(Value::Array(heap.alloc_array_fast(ArrayData::default())));
         }
-        // fast ASCII byte scan for single-character and character-class split patterns
-        if let Some(ascii) = data.regex.ascii_units()
+        // fast ASCII byte scan for single-unit/class and greedy `+` split patterns
+        if let Some((split_kind, repeat)) = data.regex.ascii_split()
             && text.is_ascii()
         {
             if text.is_empty() {
-                parts.push(Value::String(text.clone()));
-                return Ok(Self::new_array(parts));
+                return Ok(Value::Array(heap.alloc_array_fast(ArrayData::from(vec![
+                    Value::String(text.clone()),
+                ]))));
             }
             let bytes = text.as_bytes();
-            let mut previous = 0;
-            for (position, &byte) in bytes.iter().enumerate() {
-                if (ascii >> byte) & 1 == 1 {
-                    parts.push(Value::String(JsStr::new(&text[previous..position])));
-                    if parts.len() == limit {
-                        return Ok(Self::new_array(parts));
-                    }
-                    previous = position + 1;
-                }
-            }
-            if previous == 0 {
-                parts.push(Value::String(text.clone()));
+            let parts = if !repeat {
+                Self::split_ascii_single(text, bytes, split_kind, limit)
             } else {
-                parts.push(Value::String(JsStr::new(&text[previous..])));
-            }
-            return Ok(Self::new_array(parts));
+                Self::split_ascii_repeat(text, bytes, split_kind, limit)
+            };
+            return Ok(Value::Array(heap.alloc_array_fast(ArrayData::from(parts))));
         }
-        // fast ASCII byte scan for greedy `+` char/class split patterns (such as /\s+/)
-        if let Some(ascii) = data.regex.ascii_repeat_units()
-            && text.is_ascii()
-        {
-            if text.is_empty() {
-                parts.push(Value::String(text.clone()));
-                return Ok(Self::new_array(parts));
-            }
-            let bytes = text.as_bytes();
-            let mut previous = 0;
-            let mut position = 0;
-            while position < bytes.len() {
-                if (ascii >> bytes[position]) & 1 == 1 {
-                    parts.push(Value::String(JsStr::new(&text[previous..position])));
-                    if parts.len() == limit {
-                        return Ok(Self::new_array(parts));
-                    }
-                    position += 1;
-                    while position < bytes.len() && (ascii >> bytes[position]) & 1 == 1 {
-                        position += 1;
-                    }
-                    previous = position;
-                } else {
-                    position += 1;
-                }
-            }
-            if previous == 0 {
-                parts.push(Value::String(text.clone()));
-            } else {
-                parts.push(Value::String(JsStr::new(&text[previous..])));
-            }
-            return Ok(Self::new_array(parts));
-        }
+        let mut parts = Vec::new();
         let subject = units(text);
         let unicode = data.regex.flags.unicode || data.regex.flags.unicode_sets;
         if subject.is_empty() {
@@ -670,5 +639,115 @@ impl ScriptRuntime {
         }
         parts.push(Value::String(from_units(&subject[previous..]).into()));
         Ok(Self::new_array(parts))
+    }
+
+    #[inline]
+    fn split_ascii_single(
+        text: &JsStr,
+        bytes: &[u8],
+        kind: super::pattern::AsciiSplit,
+        limit: usize,
+    ) -> Vec<Value> {
+        use super::pattern::AsciiSplit;
+        let mut cuts = [0usize; 32];
+        let mut n = 0usize;
+        let mut overflow_parts: Option<Vec<Value>> = None;
+        let mut previous = 0usize;
+        for (position, &byte) in bytes.iter().enumerate() {
+            let hit = match kind {
+                AsciiSplit::One(b0) => byte == b0,
+                AsciiSplit::Two(b0, b1) => byte == b0 || byte == b1,
+                AsciiSplit::Mask(ascii) => (ascii >> byte) & 1 == 1,
+            };
+            if !hit {
+                continue;
+            }
+            if let Some(parts) = overflow_parts.as_mut() {
+                parts.push(Value::String(JsStr::new(&text[previous..position])));
+                if parts.len() == limit {
+                    return overflow_parts.unwrap();
+                }
+                previous = position + 1;
+            } else if n < cuts.len() {
+                cuts[n] = position;
+                n += 1;
+                if n == limit {
+                    let mut parts = Vec::with_capacity(n);
+                    let mut start = 0;
+                    for &cut in &cuts[..n] {
+                        parts.push(Value::String(JsStr::new(&text[start..cut])));
+                        start = cut + 1;
+                    }
+                    return parts;
+                }
+            } else {
+                let mut parts = Vec::with_capacity(64.min(limit));
+                let mut start = 0;
+                for &cut in &cuts {
+                    parts.push(Value::String(JsStr::new(&text[start..cut])));
+                    start = cut + 1;
+                }
+                parts.push(Value::String(JsStr::new(&text[start..position])));
+                if parts.len() == limit {
+                    return parts;
+                }
+                previous = position + 1;
+                overflow_parts = Some(parts);
+            }
+        }
+        if let Some(mut parts) = overflow_parts {
+            parts.push(Value::String(JsStr::new(&text[previous..])));
+            return parts;
+        }
+        if n == 0 {
+            return vec![Value::String(text.clone())];
+        }
+        let mut parts = Vec::with_capacity(n + 1);
+        let mut start = 0;
+        for &cut in &cuts[..n] {
+            parts.push(Value::String(JsStr::new(&text[start..cut])));
+            start = cut + 1;
+        }
+        parts.push(Value::String(JsStr::new(&text[start..])));
+        parts
+    }
+
+    #[inline]
+    fn split_ascii_repeat(
+        text: &JsStr,
+        bytes: &[u8],
+        kind: super::pattern::AsciiSplit,
+        limit: usize,
+    ) -> Vec<Value> {
+        use super::pattern::AsciiSplit;
+        let matches = |byte: u8| match kind {
+            AsciiSplit::One(b0) => byte == b0,
+            AsciiSplit::Two(b0, b1) => byte == b0 || byte == b1,
+            AsciiSplit::Mask(ascii) => (ascii >> byte) & 1 == 1,
+        };
+        let mut parts = Vec::with_capacity(8.min(limit));
+        let mut previous = 0usize;
+        let mut position = 0usize;
+        while position < bytes.len() {
+            if matches(bytes[position]) {
+                parts.push(Value::String(JsStr::new(&text[previous..position])));
+                if parts.len() == limit {
+                    return parts;
+                }
+                position += 1;
+                while position < bytes.len() && matches(bytes[position]) {
+                    position += 1;
+                }
+                previous = position;
+            } else {
+                position += 1;
+            }
+        }
+        if previous == 0 && parts.is_empty() {
+            parts.push(Value::String(text.clone()));
+        } else {
+            parts.push(Value::String(JsStr::new(&text[previous..])));
+        }
+        parts
     }
 }

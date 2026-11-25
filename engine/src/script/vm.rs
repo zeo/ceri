@@ -27,6 +27,11 @@ pub(super) struct Scope {
 pub(super) struct Grown(Option<Box<Vec<Name>>>);
 
 impl Grown {
+    #[inline(always)]
+    pub(super) fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+
     pub(super) fn push(&mut self, name: Name) {
         self.0.get_or_insert_with(Box::default).push(name);
     }
@@ -118,6 +123,8 @@ pub(super) struct ClosureMeta {
     pub(super) home: Option<ObjectHandle>,
     // instance fields and private methods a class constructor installs on each instance
     pub(super) class: Option<ClassFields>,
+    // lexical this captured directly by arrows inside non-derived functions
+    pub(super) lexical_this: Option<Value>,
 }
 
 pub(super) struct Closure {
@@ -167,6 +174,20 @@ impl Closure {
 
     pub(super) fn set_home_object(&self, home: ObjectHandle) {
         self.with_meta_mut(|meta| meta.home = Some(home));
+    }
+
+    #[inline(always)]
+    pub(super) fn lexical_this(&self) -> Option<Value> {
+        let ptr = self.meta.get();
+        if ptr.is_null() {
+            return None;
+        }
+        // safety: non-null meta pointer is valid for self's lifetime
+        unsafe { (*ptr).lexical_this.clone() }
+    }
+
+    pub(super) fn set_lexical_this(&self, this: Value) {
+        self.with_meta_mut(|meta| meta.lexical_this = Some(this));
     }
 
     pub(super) fn class_fields(&self) -> Vec<FieldDefinition> {
@@ -226,6 +247,9 @@ impl Closure {
         let meta = unsafe { &*ptr };
         if let Some(home) = &meta.home {
             tracer.mark_object(home.clone());
+        }
+        if let Some(this) = &meta.lexical_this {
+            tracer.trace_value(this);
         }
         if let Some(class) = &meta.class {
             if !tracer.visit_rc(self) {
@@ -327,14 +351,14 @@ impl Pending {
     }
 }
 
-const FLAG_USES_REGS: u8 = 1 << 0;
-const FLAG_OWNS_SCOPE: u8 = 1 << 1;
-const FLAG_CONSTRUCT: u8 = 1 << 2;
+pub(super) const FLAG_USES_REGS: u8 = 1 << 0;
+pub(super) const FLAG_OWNS_SCOPE: u8 = 1 << 1;
+pub(super) const FLAG_CONSTRUCT: u8 = 1 << 2;
 const FLAG_EVAL: u8 = 1 << 3;
-const FLAG_CALLEE_ON_STACK: u8 = 1 << 4;
+pub(super) const FLAG_CALLEE_ON_STACK: u8 = 1 << 4;
 
 // rare per-frame state kept out of line so ordinary calls push zero heap allocations
-struct FrameExtra {
+pub(super) struct FrameExtra {
     new_target: Value,
     arguments: Vec<Value>,
     handlers: Vec<Handler>,
@@ -386,23 +410,25 @@ impl FrameExtra {
 
 pub(super) struct Frame {
     pub(super) code: Rc<Code>,
-    closure: Option<Rc<Closure>>,
+    pub(super) closure: Option<Rc<Closure>>,
     pub(super) pc: usize,
     pub(super) reg_base: usize,
-    stack_base: usize,
-    return_base: usize,
+    pub(super) stack_base: usize,
+    pub(super) return_base: usize,
+    // native JIT resume address in the caller frame when called from JIT, null otherwise
+    pub(super) return_target: *const u8,
     pub(super) handler_base: u32,
-    chain_base: u32,
-    pending_base: u32,
-    iter_base: u32,
+    pub(super) chain_base: u32,
+    pub(super) pending_base: u32,
+    pub(super) iter_base: u32,
     pub(super) scope: Option<ScopeRef>,
     pub(super) this: Value,
-    function: Value,
-    scopes: u16,
+    pub(super) function: Value,
+    pub(super) scopes: u16,
     // number of nested scopes from depth 0 that may have escaped to a closure or eval
-    escaped_scopes: u16,
-    flags: u8,
-    extra: Option<Box<FrameExtra>>,
+    pub(super) escaped_scopes: u16,
+    pub(super) flags: u8,
+    pub(super) extra: Option<Box<FrameExtra>>,
 }
 
 impl Frame {
@@ -419,7 +445,7 @@ impl Frame {
     }
 
     #[inline(always)]
-    fn construct(&self) -> bool {
+    pub(super) fn construct(&self) -> bool {
         self.flags & FLAG_CONSTRUCT != 0
     }
 
@@ -506,6 +532,37 @@ impl Frame {
             std::ptr::drop_in_place(&md.scope as *const _ as *mut Option<ScopeRef>);
             std::ptr::drop_in_place(&md.extra as *const _ as *mut Option<Box<FrameExtra>>);
             let code = std::ptr::read(&md.code);
+            if Rc::strong_count(&code) == 1 {
+                Some(code)
+            } else {
+                drop(code);
+                None
+            }
+        }
+    }
+
+    // drops a frame directly in place inside the Vec slot before shrinking frames.len()
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline(always)]
+    pub(super) unsafe fn drop_in_place_keep_unique_code(slot: *mut Self) -> Option<Rc<Code>> {
+        unsafe {
+            let this_ptr = std::ptr::addr_of_mut!((*slot).this);
+            if !(*this_ptr).is_copy() {
+                drop_value_slow(std::ptr::read(this_ptr));
+            }
+            let fn_ptr = std::ptr::addr_of_mut!((*slot).function);
+            if !(*fn_ptr).is_copy() {
+                drop_value_slow(std::ptr::read(fn_ptr));
+            }
+            std::ptr::drop_in_place(std::ptr::addr_of_mut!((*slot).closure));
+            let extra_ptr = std::ptr::addr_of_mut!((*slot).extra);
+            if (*extra_ptr).is_some() {
+                std::ptr::drop_in_place(extra_ptr);
+            }
+            let code = std::ptr::read(std::ptr::addr_of!((*slot).code));
             if Rc::strong_count(&code) == 1 {
                 Some(code)
             } else {
@@ -638,7 +695,7 @@ pub(super) enum RunResult {
     Await(Value, Box<Frame>),
 }
 
-const MAX_FRAMES: usize = 10_000;
+pub(super) const MAX_FRAMES: usize = 10_000;
 // the parent constructor of a derived class, in a slot scripts cannot name
 const SUPER_KEY: &str = "\u{10ffff}#super";
 const MAX_NESTED_RUNS: usize = 400;
@@ -906,7 +963,9 @@ impl ScriptRuntime {
             return Err(self.range_error("Maximum call stack size exceeded"));
         }
         let code = &closure.code;
-        let this = if code.strict || code.kind == FunctionKind::Arrow {
+        let this = if code.uses_lexical_this {
+            closure.lexical_this().unwrap_or(Value::Undefined)
+        } else if code.strict || code.kind == FunctionKind::Arrow {
             this
         } else if matches!(this, Value::Undefined | Value::Null) {
             Value::Window
@@ -921,19 +980,24 @@ impl ScriptRuntime {
         let chain_floor = self.vm_chains.len();
         let pending_floor = self.vm_pending.len();
         let iter_floor = self.vm_iters.len();
+        let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
         if code.uses_regs {
             let reg_count = code.registers as usize;
             let param_count = code.param_slots.len();
             reserve_headroom(&mut self.vm_stack, 1 + reg_count + code.max_pushes as usize);
-            self.vm_stack.push(callee.clone());
-            let arg_start = self.vm_stack.len();
             let keep = args.len().min(param_count);
-            for value in &args[..keep] {
-                self.vm_stack.push(value.clone());
-            }
-            if keep < reg_count {
-                self.vm_stack
-                    .resize(arg_start + reg_count, Value::Undefined);
+            let arg_start = stack_floor + 1;
+            // safety: headroom for 1 + reg_count slots was reserved above
+            unsafe {
+                let ptr = self.vm_stack.as_mut_ptr().add(stack_floor);
+                ptr.write(callee.clone());
+                for (i, value) in args.iter().take(keep).enumerate() {
+                    ptr.add(1 + i).write(value.clone());
+                }
+                for i in keep..reg_count {
+                    ptr.add(1 + i).write(Value::Undefined);
+                }
+                self.vm_stack.set_len(arg_start + reg_count);
             }
             self.frames.push(Frame {
                 code: code.clone(),
@@ -942,6 +1006,7 @@ impl ScriptRuntime {
                 reg_base: arg_start,
                 stack_base: arg_start + reg_count,
                 return_base: stack_floor,
+                return_target: std::ptr::null(),
                 handler_base: handler_floor as u32,
                 chain_base: chain_floor as u32,
                 pending_base: pending_floor as u32,
@@ -955,15 +1020,26 @@ impl ScriptRuntime {
                 extra: None,
             });
         } else {
-            let mut slots = vec![Value::Undefined; code.layout.names.len()];
+            let mut slots = heap.alloc_scope_slots(code.layout.names.len(), false);
             for (position, slot) in code.param_slots.iter().enumerate() {
-                if let Some(slot) = slot {
-                    slots[*slot as usize] = args.get(position).cloned().unwrap_or(Value::Undefined);
+                if let Some(slot) = slot
+                    && let Some(value) = args.get(position)
+                {
+                    let old = std::mem::replace(
+                        unsafe { slots.get_unchecked_mut(*slot as usize) },
+                        value.clone(),
+                    );
+                    old.fast_drop();
                 }
             }
-            let scope = Scope::new_with_slots(code.layout.clone(), closure.scope.clone(), slots);
+            let scope = heap.alloc_scope_fast(Scope {
+                slots,
+                parent: closure.scope.clone(),
+                layout: code.layout.clone(),
+                extra: Grown::default(),
+            });
             reserve_headroom(&mut self.vm_stack, 1 + code.max_pushes as usize);
-            self.vm_stack.push(callee.clone());
+            unsafe { push_unchecked(&mut self.vm_stack, callee.clone()) };
             let arg_start = self.vm_stack.len();
             self.frames.push(Frame {
                 code: code.clone(),
@@ -972,6 +1048,7 @@ impl ScriptRuntime {
                 reg_base: arg_start,
                 stack_base: arg_start,
                 return_base: stack_floor,
+                return_target: std::ptr::null(),
                 handler_base: handler_floor as u32,
                 chain_base: chain_floor as u32,
                 pending_base: pending_floor as u32,
@@ -1076,7 +1153,9 @@ impl ScriptRuntime {
                             closure.code.name
                         )));
                     }
-                    let this = if closure.code.strict || closure.code.kind == FunctionKind::Arrow {
+                    let this = if closure.code.uses_lexical_this {
+                        closure.lexical_this().unwrap_or(Value::Undefined)
+                    } else if closure.code.strict || closure.code.kind == FunctionKind::Arrow {
                         this
                     } else if matches!(this, Value::Undefined | Value::Null) {
                         Value::Window
@@ -2099,7 +2178,11 @@ impl ScriptRuntime {
         let caller_url = frame.code.url.get().cloned();
         let (this, new_target) = if frame.code.kind == FunctionKind::Arrow {
             (
-                Self::lexical_value(frame, "%this").unwrap_or(Value::Window),
+                if frame.code.uses_lexical_this {
+                    frame.this.clone()
+                } else {
+                    Self::lexical_value(frame, "%this").unwrap_or(Value::Window)
+                },
                 Self::lexical_value(frame, "%newtarget").unwrap_or(Value::Undefined),
             )
         } else {
@@ -2248,7 +2331,9 @@ impl ScriptRuntime {
         } else {
             Value::Undefined
         };
-        let this = if code.strict || code.kind == FunctionKind::Arrow {
+        let this = if code.uses_lexical_this {
+            closure.lexical_this().unwrap_or(Value::Undefined)
+        } else if code.strict || code.kind == FunctionKind::Arrow {
             this
         } else if matches!(this, Value::Undefined | Value::Null) {
             Value::Window
@@ -2308,6 +2393,7 @@ impl ScriptRuntime {
                 reg_base: arg_start,
                 stack_base: arg_start + reg_count,
                 return_base,
+                return_target: std::ptr::null(),
                 handler_base,
                 chain_base,
                 pending_base,
@@ -2368,6 +2454,7 @@ impl ScriptRuntime {
             reg_base: arg_start,
             stack_base: arg_start,
             return_base,
+            return_target: std::ptr::null(),
             handler_base,
             chain_base,
             pending_base,
@@ -2493,20 +2580,57 @@ impl ScriptRuntime {
                 else {
                     return Ok(FastNativeCall::NotHandled);
                 };
-                let (target, bound_this, bound_len, mut bound_args) = {
+                let (target, bound_this, bound_len) = {
                     let Some(borrowed) = (unsafe { heap.object_ref(&bound_handle) }) else {
                         return Ok(FastNativeCall::NotHandled);
                     };
                     let ObjectClass::Bound(bound) = &borrowed.class else {
                         return Ok(FastNativeCall::NotHandled);
                     };
-                    let mut buf: [Value; 16] = [const { Value::Undefined }; 16];
-                    let blen = bound.arguments.len();
-                    for (dst, src) in buf.iter_mut().take(blen).zip(bound.arguments.iter()) {
+                    (
+                        bound.target.clone(),
+                        bound.this.clone(),
+                        bound.arguments.len(),
+                    )
+                };
+                if bound_len == 0 {
+                    // common zero-bound-arg case avoids initializing a 256-byte argument buffer
+                    let extra_slots = usize::from(!method);
+                    if extra_slots > 0 {
+                        reserve_headroom(&mut self.vm_stack, extra_slots);
+                    }
+                    unsafe {
+                        let ptr = self.vm_stack.as_mut_ptr();
+                        if method {
+                            std::ptr::read(ptr.add(return_base)).fast_drop();
+                        } else if count > 0 {
+                            std::ptr::copy(ptr.add(arg_start), ptr.add(return_base + 2), count);
+                        }
+                        ptr.add(return_base).write(bound_this);
+                        ptr.add(return_base + 1).write(target);
+                        self.vm_stack.set_len(return_base + 2 + count);
+                    }
+                    if self.call_plain(heap, count, true) {
+                        return Ok(FastNativeCall::FramePushed);
+                    }
+                    return Ok(FastNativeCall::FallbackMethod(count));
+                }
+                let mut bound_args: [Value; 16] = [const { Value::Undefined }; 16];
+                {
+                    let Some(borrowed) = (unsafe { heap.object_ref(&bound_handle) }) else {
+                        return Ok(FastNativeCall::NotHandled);
+                    };
+                    let ObjectClass::Bound(bound) = &borrowed.class else {
+                        return Ok(FastNativeCall::NotHandled);
+                    };
+                    for (dst, src) in bound_args
+                        .iter_mut()
+                        .take(bound_len)
+                        .zip(bound.arguments.iter())
+                    {
                         *dst = src.clone();
                     }
-                    (bound.target.clone(), bound.this.clone(), blen, buf)
-                };
+                }
                 let new_count = bound_len + count;
                 // rewrite [..., (orig_this?), bound_fn, a0..aN] -> [..., bound_this, target, b0..bM, a0..aN]
                 let extra_slots = bound_len + usize::from(!method);
@@ -2815,6 +2939,32 @@ impl ScriptRuntime {
         }
     }
 
+    #[inline]
+    fn call_ic_getter(&mut self, heap: &super::heap::Heap) -> Result<bool, ScriptError> {
+        if self.call_plain(heap, 0, true) {
+            return Ok(true);
+        }
+        match self.call_fast_native(heap, 0, true)? {
+            FastNativeCall::Done => Ok(false),
+            FastNativeCall::FramePushed => Ok(true),
+            FastNativeCall::FallbackMethod(new_count) => {
+                let arguments = self.pop_arguments(new_count);
+                let callee = pop_fast(&mut self.vm_stack);
+                let this = pop_fast(&mut self.vm_stack);
+                let before = self.frames.len();
+                self.call_in_loop(callee, this, arguments)?;
+                Ok(self.frames.len() != before)
+            }
+            FastNativeCall::NotHandled => {
+                let callee = pop_fast(&mut self.vm_stack);
+                let this = pop_fast(&mut self.vm_stack);
+                let before = self.frames.len();
+                self.call_in_loop(callee, this, Vec::new())?;
+                Ok(self.frames.len() != before)
+            }
+        }
+    }
+
     #[inline(always)]
     fn ic_get_value(
         &self,
@@ -3019,7 +3169,7 @@ impl ScriptRuntime {
                         let hits = code_ref.jit_hits.get().wrapping_add(1);
                         code_ref.jit_hits.set(hits);
                         if hits >= super::jit::JIT_THRESHOLD {
-                            let compiled = super::jit::compile(code_ref);
+                            let compiled = super::jit::compile(unsafe { &*heap_ptr }, code_ref);
                             let _ = code_ref.jit_code.set(compiled);
                             code_ref.jit_code.get().and_then(Option::as_ref)
                         } else {
@@ -3951,9 +4101,13 @@ impl ScriptRuntime {
                     } else {
                         None
                     };
+                    let lexical_this = child.uses_lexical_this.then(|| frame.this.clone());
                     let closure = Rc::new(Closure::new(child, scope));
                     if let Some(home) = home {
                         closure.set_home_object(home);
+                    }
+                    if let Some(this) = lexical_this {
+                        closure.set_lexical_this(this);
                     }
                     let function = self.function_object(closure);
                     unsafe { push_unchecked(&mut self.vm_stack, function) };
@@ -3990,21 +4144,12 @@ impl ScriptRuntime {
                                 safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                             }
                             unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
-                            let heap = unsafe { &*heap_ptr };
-                            if self.call_plain(heap, 0, true) {
+                            if self.call_ic_getter(unsafe { &*heap_ptr })? {
                                 reload_frame!();
-                            } else if matches!(
-                                self.call_fast_native(heap, 0, true)?,
-                                FastNativeCall::Done
-                            ) {
+                            } else {
                                 reserve_headroom(&mut self.vm_stack, unsafe {
                                     (&*code).max_pushes as usize
                                 });
-                            } else {
-                                let callee = pop_fast(&mut self.vm_stack);
-                                let this = pop_fast(&mut self.vm_stack);
-                                self.call_in_loop(callee, this, Vec::new())?;
-                                reload_frame!();
                             }
                         }
                         None => {
@@ -4048,21 +4193,12 @@ impl ScriptRuntime {
                                 safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                             }
                             unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
-                            let heap = unsafe { &*heap_ptr };
-                            if self.call_plain(heap, 0, true) {
+                            if self.call_ic_getter(unsafe { &*heap_ptr })? {
                                 reload_frame!();
-                            } else if matches!(
-                                self.call_fast_native(heap, 0, true)?,
-                                FastNativeCall::Done
-                            ) {
+                            } else {
                                 reserve_headroom(&mut self.vm_stack, unsafe {
                                     (&*code).max_pushes as usize
                                 });
-                            } else {
-                                let callee = pop_fast(&mut self.vm_stack);
-                                let this = pop_fast(&mut self.vm_stack);
-                                self.call_in_loop(callee, this, Vec::new())?;
-                                reload_frame!();
                             }
                         }
                         None => {
@@ -4137,21 +4273,12 @@ impl ScriptRuntime {
                                 safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                             }
                             unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
-                            let heap = unsafe { &*heap_ptr };
-                            if self.call_plain(heap, 0, true) {
+                            if self.call_ic_getter(unsafe { &*heap_ptr })? {
                                 reload_frame!();
-                            } else if matches!(
-                                self.call_fast_native(heap, 0, true)?,
-                                FastNativeCall::Done
-                            ) {
+                            } else {
                                 reserve_headroom(&mut self.vm_stack, unsafe {
                                     (&*code).max_pushes as usize
                                 });
-                            } else {
-                                let callee = pop_fast(&mut self.vm_stack);
-                                let this = pop_fast(&mut self.vm_stack);
-                                self.call_in_loop(callee, this, Vec::new())?;
-                                reload_frame!();
                             }
                         }
                         Some(Err((recv, None))) => {
@@ -4214,21 +4341,12 @@ impl ScriptRuntime {
                                 safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                             }
                             unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
-                            let heap = unsafe { &*heap_ptr };
-                            if self.call_plain(heap, 0, true) {
+                            if self.call_ic_getter(unsafe { &*heap_ptr })? {
                                 reload_frame!();
-                            } else if matches!(
-                                self.call_fast_native(heap, 0, true)?,
-                                FastNativeCall::Done
-                            ) {
+                            } else {
                                 reserve_headroom(&mut self.vm_stack, unsafe {
                                     (&*code).max_pushes as usize
                                 });
-                            } else {
-                                let callee = pop_fast(&mut self.vm_stack);
-                                let this = pop_fast(&mut self.vm_stack);
-                                self.call_in_loop(callee, this, Vec::new())?;
-                                reload_frame!();
                             }
                         }
                         None => {
@@ -4300,21 +4418,12 @@ impl ScriptRuntime {
                                 safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                             }
                             unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
-                            let heap = unsafe { &*heap_ptr };
-                            if self.call_plain(heap, 0, true) {
+                            if self.call_ic_getter(unsafe { &*heap_ptr })? {
                                 reload_frame!();
-                            } else if matches!(
-                                self.call_fast_native(heap, 0, true)?,
-                                FastNativeCall::Done
-                            ) {
+                            } else {
                                 reserve_headroom(&mut self.vm_stack, unsafe {
                                     (&*code).max_pushes as usize
                                 });
-                            } else {
-                                let callee = pop_fast(&mut self.vm_stack);
-                                let this = pop_fast(&mut self.vm_stack);
-                                self.call_in_loop(callee, this, Vec::new())?;
-                                reload_frame!();
                             }
                         }
                         None => {
@@ -5075,6 +5184,15 @@ impl ScriptRuntime {
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
+    #[inline(always)]
+    pub(super) fn jit_restore_scopes(heap: &super::heap::Heap, frame: &mut Frame) {
+        Self::restore_scopes_fast(heap, frame, 0);
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     pub(super) fn jit_return(
         &mut self,
         heap: &super::heap::Heap,
@@ -5205,12 +5323,73 @@ impl ScriptRuntime {
         Value::Object(object)
     }
 
+    #[inline]
+    pub(super) fn try_split_regex_pop(
+        &self,
+        heap: &super::heap::Heap,
+        code: &Code,
+        pattern: u32,
+        flags: u32,
+        cache: u16,
+        slot: &mut Value,
+    ) -> bool {
+        let Value::String(text) = &*slot else {
+            return false;
+        };
+        if !text.is_ascii() {
+            return false;
+        }
+        let intact = unsafe { heap.object_ref(&self.intrinsics.string_prototype) }
+            .is_some_and(|o| o.string_split_intact(heap))
+            && unsafe { heap.object_ref(&self.intrinsics.regexp_prototype) }
+                .is_some_and(|o| o.regexp_split_intact(heap))
+            && unsafe { heap.object_ref(&self.intrinsics.array_prototype) }
+                .is_some_and(|o| o.array_pop_intact(heap));
+        if !intact {
+            return false;
+        }
+        let Some(cell) = code.split_regex_cache.get(cache as usize) else {
+            return false;
+        };
+        let split_kind = *cell.get_or_init(|| {
+            let pat = code.names.get(pattern as usize)?;
+            let flg = code.names.get(flags as usize)?;
+            let parsed = super::pattern::Flags::parse(flg).ok()?;
+            let regex = super::pattern::Regex::new(pat, parsed).ok()?;
+            regex.ascii_split().map(|(kind, _)| kind)
+        });
+        let Some(kind) = split_kind else {
+            return false;
+        };
+        let bytes = text.as_bytes();
+        let last_cut = match kind {
+            super::pattern::AsciiSplit::One(b0) => bytes.iter().rposition(|&b| b == b0),
+            super::pattern::AsciiSplit::Two(b0, b1) => {
+                bytes.iter().rposition(|&b| b == b0 || b == b1)
+            }
+            super::pattern::AsciiSplit::Mask(mask) => {
+                bytes.iter().rposition(|&b| (mask >> b) & 1 == 1)
+            }
+        };
+        if let Some(pos) = last_cut {
+            let tail = JsStr::new(&text[pos + 1..]);
+            let old = std::mem::replace(slot, Value::String(tail));
+            old.fast_drop();
+        }
+        true
+    }
+
     #[cfg(all(
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
     #[inline]
-    pub(super) fn jit_make_closure(&mut self, top: usize, index: u32) -> Value {
+    pub(super) fn jit_make_closure(
+        &mut self,
+        heap: &super::heap::Heap,
+        top: usize,
+        index: u32,
+    ) -> Value {
         let frame = unsafe { self.frames.get_unchecked_mut(top) };
         let child = unsafe { frame.code.children.get_unchecked(index as usize).clone() };
         let scope = if child.captures_nothing {
@@ -5224,9 +5403,25 @@ impl ScriptRuntime {
         } else {
             None
         };
-        let closure = Rc::new(Closure::new(child, scope));
+        let fast_template = (!child.is_generator
+            && !child.is_async
+            && matches!(child.kind, FunctionKind::Arrow | FunctionKind::Method))
+        .then(|| child.function_template.get())
+        .flatten();
+        let lexical_this = child.uses_lexical_this.then(|| frame.this.clone());
+        let closure = Rc::new(Closure::new(child.clone(), scope));
         if let Some(home) = home {
             closure.set_home_object(home);
+        }
+        if let Some(this) = lexical_this {
+            closure.set_lexical_this(this);
+        }
+        if let Some(template) = fast_template {
+            return Value::Object(heap.alloc_object_fast(JsObject::from_template(
+                template,
+                Some(self.intrinsics.function_prototype.clone()),
+                ObjectClass::Function(closure),
+            )));
         }
         self.function_object(closure)
     }
@@ -5711,13 +5906,7 @@ impl ScriptRuntime {
                     *safepoint_at = self.hit_safepoint(sampling, op_pc)?;
                 }
                 unsafe { self.frames.get_unchecked_mut(top) }.pc = next_pc;
-                if !self.call_plain(heap, 0, true)
-                    && !matches!(self.call_fast_native(heap, 0, true)?, FastNativeCall::Done)
-                {
-                    let callee = pop_fast(&mut self.vm_stack);
-                    let this = pop_fast(&mut self.vm_stack);
-                    self.call_in_loop(callee, this, Vec::new())?;
-                }
+                let _ = self.call_ic_getter(heap)?;
                 Ok(())
             }
             None => {
@@ -6285,9 +6474,13 @@ impl ScriptRuntime {
                 } else {
                     None
                 };
+                let lexical_this = child.uses_lexical_this.then(|| frame.this.clone());
                 let closure = Rc::new(Closure::new(child, scope));
                 if let Some(home) = home {
                     closure.set_home_object(home);
+                }
+                if let Some(this) = lexical_this {
+                    closure.set_lexical_this(this);
                 }
                 let function = self.function_object(closure);
                 self.vm_stack.push(function);
@@ -8560,6 +8753,34 @@ impl ScriptRuntime {
                     }
                 }
             }
+            Op::SplitRegexPop {
+                pattern,
+                flags,
+                cache,
+            } => {
+                let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
+                let code = self.frames[top].code.clone();
+                let handled = if let Some(slot) = self.vm_stack.last_mut() {
+                    let slot_ptr: *mut Value = slot;
+                    // safety: try_split_regex_pop only reads self.intrinsics and mutates *slot_ptr
+                    self.try_split_regex_pop(heap, &code, pattern, flags, cache, unsafe {
+                        &mut *slot_ptr
+                    })
+                } else {
+                    false
+                };
+                if !handled {
+                    let recv = self.pop();
+                    let split_fn = self.get_property(&recv, "split")?;
+                    let pat = code.names[pattern as usize].clone();
+                    let flg = code.names[flags as usize].clone();
+                    let re = self.new_regexp(&pat, &flg)?;
+                    let arr = self.call_function(split_fn, recv, vec![re])?;
+                    let pop_fn = self.get_property(&arr, "pop")?;
+                    let res = self.call_function(pop_fn, arr, Vec::new())?;
+                    self.vm_stack.push(res);
+                }
+            }
         }
         Ok(None)
     }
@@ -9123,6 +9344,7 @@ impl Frame {
             reg_base: 0,
             stack_base: 0,
             return_base: 0,
+            return_target: std::ptr::null(),
             handler_base: 0,
             chain_base: 0,
             pending_base: 0,

@@ -368,11 +368,15 @@ impl ScriptRuntime {
     }
 
     // checks whether pattern is an unmodified RegExp whose @@split resolves to the intrinsic
-    fn intrinsic_regexp_split(&self, pattern: &Value) -> Option<Rc<super::pattern::RegExpData>> {
+    fn intrinsic_regexp_split(
+        &self,
+        heap: &super::heap::Heap,
+        pattern: &Value,
+    ) -> Option<Rc<super::pattern::RegExpData>> {
         let Value::Object(object) = pattern else {
             return None;
         };
-        let borrowed = object.try_borrow().ok()?;
+        let borrowed = unsafe { heap.object_ref(object)? };
         let object::ObjectClass::RegExp(data) = &borrowed.class else {
             return None;
         };
@@ -383,19 +387,10 @@ impl ScriptRuntime {
         if !object::ObjectHandle::ptr_eq(proto, &self.intrinsics.regexp_prototype) {
             return None;
         }
-        let proto_borrowed = proto.try_borrow().ok()?;
-        let Value::Object(method_obj) = proto_borrowed.property("@@split")?.value()? else {
-            return None;
-        };
-        let method_borrowed = method_obj.try_borrow().ok()?;
-        match &method_borrowed.class {
-            object::ObjectClass::Native(native)
-                if matches!(**native, Native::RegExp(super::regexp::RegExpMethod::Split)) =>
-            {
-                Some(data.clone())
-            }
-            _ => None,
-        }
+        let proto_borrowed = unsafe { heap.object_ref(proto)? };
+        proto_borrowed
+            .regexp_split_intact(heap)
+            .then(|| data.clone())
     }
 
     pub(super) fn template_replacement(
@@ -473,15 +468,16 @@ impl ScriptRuntime {
             && !matches!(pattern, Value::Undefined | Value::Null | Value::String(_))
             && !super::operations::is_primitive(pattern)
         {
-            if matches!(method, M::Split)
-                && let Some(data) = self.intrinsic_regexp_split(pattern)
-            {
-                let subject = self.this_js_str(this, method)?;
-                let limit = match arguments.get(1) {
-                    None | Some(Value::Undefined) => u32::MAX as usize,
-                    Some(limit) => self.coerce_uint32(limit.clone())? as usize,
-                };
-                return self.regexp_split_str(&data, &subject, limit);
+            if matches!(method, M::Split) {
+                let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
+                if let Some(data) = self.intrinsic_regexp_split(heap, pattern) {
+                    let subject = self.this_js_str(this, method)?;
+                    let limit = match arguments.get(1) {
+                        None | Some(Value::Undefined) => u32::MAX as usize,
+                        Some(limit) => self.coerce_uint32(limit.clone())? as usize,
+                    };
+                    return self.regexp_split_str_fast(heap, &data, &subject, limit);
+                }
             }
             let pattern = pattern.clone();
             let symbol = match method {

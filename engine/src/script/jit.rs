@@ -6,11 +6,17 @@ use super::ast::BinaryOperator;
 use super::compiler::{Code, Op};
 use super::heap::{Entry, Heap};
 use super::object::{
-    JIT_FLAG_NO_PROTO_IC, JIT_FLAG_ORDINARY, JIT_FLAG_PROXY, JsObject, MONO_MISSING, MONO_OWN_DATA,
-    MONO_PROTO_DATA, MonoEntry, PropIc, Properties, SHARED_CAP,
+    JIT_FLAG_NO_PROTO_IC, JIT_FLAG_ORDINARY, JIT_FLAG_PROXY, JsObject, MONO_ARRAY_LENGTH,
+    MONO_ARRAY_METHOD, MONO_COUNT, MONO_MISSING, MONO_OWN_DATA, MONO_OWN_GETTER, MONO_PROTO_DATA,
+    MONO_PROTO_GETTER, MONO_STRING_LENGTH, MONO_STRING_METHOD, MonoEntry, PropIc, Properties,
+    SHARED_CAP,
 };
-use super::vm::{FastNativeCall, RunResult};
+use super::vm::{
+    Closure, FLAG_CALLEE_ON_STACK, FLAG_OWNS_SCOPE, FLAG_USES_REGS, FastNativeCall, Frame, Grown,
+    MAX_FRAMES, RunResult, Scope,
+};
 use super::*;
+use std::cell::Cell;
 use std::mem::offset_of;
 
 pub(super) const JIT_THRESHOLD: u32 = 16;
@@ -23,6 +29,7 @@ const STATUS_FRAME_CHANGED: u32 = 1;
 const STATUS_DONE: u32 = 2;
 const STATUS_ERR: u32 = 3;
 const STATUS_DISPATCH_NEXT: u32 = 4;
+const STATUS_FALLBACK: u32 = u32::MAX;
 
 // x86-64 register numbers
 const RAX: u8 = 0;
@@ -84,15 +91,18 @@ const OFF_MONO_WRITABLE: i32 = offset_of!(MonoEntry, writable) as i32;
 
 const OFF_HEAP_ID: i32 = Heap::OFF_ID as i32;
 const OFF_HEAP_OBJ_CHUNKS: i32 = Heap::OFF_OBJECTS_CHUNKS as i32;
+const OFF_HEAP_ARR_CHUNKS: i32 = Heap::OFF_ARRAYS_CHUNKS as i32;
+const ENTRY_ARR_SIZE: usize = std::mem::size_of::<Entry<ArrayData>>();
+const OFF_ARR_ENTRY_BORROW: i32 = offset_of!(Entry<ArrayData>, borrow) as i32;
+const OFF_ARR_ENTRY_VAL: i32 = offset_of!(Entry<ArrayData>, value) as i32;
+const OFF_ARR_EXTRA: i32 = OFF_ARR_ENTRY_VAL + offset_of!(ArrayData, extra) as i32;
 
 // stack-allocated scratch area inside the JIT prologue (RSP+0..RSP+32)
 const SCRATCH_VAL: i32 = 0;
 const SCRATCH_TMP: i32 = 16;
 
-struct ExecBuf {
-    ptr: *mut u8,
-    len: usize,
-}
+const SLAB_SIZE: usize = 65_536;
+const PAGE_SIZE: usize = 4_096;
 
 #[cfg(target_os = "windows")]
 mod os_mem {
@@ -113,8 +123,8 @@ mod os_mem {
         fn VirtualFree(addr: *mut u8, size: usize, free_type: u32) -> i32;
     }
 
-    pub(super) fn alloc_exec(code: &[u8]) -> Option<(*mut u8, usize)> {
-        let len = code.len().max(1);
+    pub(super) fn alloc_rw(len: usize) -> Option<*mut u8> {
+        let len = len.max(super::PAGE_SIZE);
         // safety: requesting a fresh anonymous RW allocation from the OS
         let ptr = unsafe {
             VirtualAlloc(
@@ -124,18 +134,17 @@ mod os_mem {
                 PAGE_READWRITE,
             )
         };
-        if ptr.is_null() {
-            return None;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
-            let mut old = 0u32;
-            if VirtualProtect(ptr, len, PAGE_EXECUTE_READ, &mut old) == 0 {
-                VirtualFree(ptr, 0, MEM_RELEASE);
-                return None;
-            }
-        }
-        Some((ptr, len))
+        if ptr.is_null() { None } else { Some(ptr) }
+    }
+
+    pub(super) unsafe fn protect_rw(ptr: *mut u8, len: usize) -> bool {
+        let mut old = 0u32;
+        unsafe { VirtualProtect(ptr, len, PAGE_READWRITE, &mut old) != 0 }
+    }
+
+    pub(super) unsafe fn protect_rx(ptr: *mut u8, len: usize) -> bool {
+        let mut old = 0u32;
+        unsafe { VirtualProtect(ptr, len, PAGE_EXECUTE_READ, &mut old) != 0 }
     }
 
     pub(super) unsafe fn free_exec(ptr: *mut u8, _len: usize) {
@@ -166,8 +175,8 @@ mod os_mem {
         fn munmap(addr: *mut u8, len: usize) -> i32;
     }
 
-    pub(super) fn alloc_exec(code: &[u8]) -> Option<(*mut u8, usize)> {
-        let len = code.len().max(1);
+    pub(super) fn alloc_rw(len: usize) -> Option<*mut u8> {
+        let len = len.max(super::PAGE_SIZE);
         // safety: requesting a fresh anonymous RW mapping from the OS
         let ptr = unsafe {
             mmap(
@@ -180,16 +189,18 @@ mod os_mem {
             )
         };
         if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-            return None;
+            None
+        } else {
+            Some(ptr)
         }
-        unsafe {
-            std::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
-            if mprotect(ptr, len, PROT_READ | PROT_EXEC) != 0 {
-                munmap(ptr, len);
-                return None;
-            }
-        }
-        Some((ptr, len))
+    }
+
+    pub(super) unsafe fn protect_rw(ptr: *mut u8, len: usize) -> bool {
+        unsafe { mprotect(ptr, len, PROT_READ | PROT_WRITE) == 0 }
+    }
+
+    pub(super) unsafe fn protect_rx(ptr: *mut u8, len: usize) -> bool {
+        unsafe { mprotect(ptr, len, PROT_READ | PROT_EXEC) == 0 }
     }
 
     pub(super) unsafe fn free_exec(ptr: *mut u8, len: usize) {
@@ -199,22 +210,92 @@ mod os_mem {
     }
 }
 
-impl ExecBuf {
-    fn from_bytes(code: &[u8]) -> Option<Self> {
-        let (ptr, len) = os_mem::alloc_exec(code)?;
-        Some(Self { ptr, len })
+struct ExecSlab {
+    base: *mut u8,
+    cap: usize,
+    used: Cell<usize>,
+    rx_end: Cell<usize>,
+}
+
+impl ExecSlab {
+    fn new(cap: usize) -> Option<Self> {
+        let base = os_mem::alloc_rw(cap)?;
+        Some(Self {
+            base,
+            cap,
+            used: Cell::new(0),
+            rx_end: Cell::new(0),
+        })
+    }
+
+    // carves a 16-byte-aligned code slice with strict W^X transitions on touched pages only
+    fn alloc_slice(&self, code: &[u8]) -> Option<*const u8> {
+        let start = (self.used.get() + 15) & !15;
+        let end = start.checked_add(code.len().max(1))?;
+        if end > self.cap {
+            return None;
+        }
+        let page_start = start & !(PAGE_SIZE - 1);
+        let page_end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let prev_rx = self.rx_end.get();
+        unsafe {
+            if page_start < prev_rx {
+                let rw_len = prev_rx.min(page_end) - page_start;
+                if !os_mem::protect_rw(self.base.add(page_start), rw_len) {
+                    return None;
+                }
+            }
+            let dst = self.base.add(start);
+            std::ptr::copy_nonoverlapping(code.as_ptr(), dst, code.len());
+            if !os_mem::protect_rx(self.base.add(page_start), page_end - page_start) {
+                return None;
+            }
+            self.used.set(end);
+            if page_end > prev_rx {
+                self.rx_end.set(page_end);
+            }
+            Some(dst)
+        }
     }
 }
 
-impl Drop for ExecBuf {
+impl Drop for ExecSlab {
     fn drop(&mut self) {
-        // safety: ptr/len came from os_mem::alloc_exec and no JIT code is executing on drop
-        unsafe { os_mem::free_exec(self.ptr, self.len) };
+        // safety: base/cap came from os_mem::alloc_rw and every JitCode referencing it has dropped
+        unsafe { os_mem::free_exec(self.base, self.cap) };
+    }
+}
+
+#[derive(Default)]
+pub(super) struct JitPool {
+    active: Option<Rc<ExecSlab>>,
+    slab_count: usize,
+}
+
+impl JitPool {
+    fn alloc(&mut self, code: &[u8]) -> Option<(Rc<ExecSlab>, *const u8)> {
+        if let Some(slab) = self.active.as_ref()
+            && let Some(ptr) = slab.alloc_slice(code)
+        {
+            return Some((slab.clone(), ptr));
+        }
+        let need = (code.len().max(1) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let slab = Rc::new(ExecSlab::new(SLAB_SIZE.max(need))?);
+        let ptr = slab.alloc_slice(code)?;
+        self.active = Some(slab.clone());
+        self.slab_count += 1;
+        Some((slab, ptr))
+    }
+
+    #[cfg(test)]
+    pub(super) fn slab_count(&self) -> usize {
+        self.slab_count
     }
 }
 
 pub(super) struct JitCode {
-    buf: ExecBuf,
+    _slab: Rc<ExecSlab>,
+    ptr: *const u8,
     pc_offsets: Box<[u32]>,
 }
 
@@ -227,17 +308,13 @@ impl std::fmt::Debug for JitCode {
 impl JitCode {
     #[inline(always)]
     pub(super) fn entry(&self) -> extern "sysv64" fn(*mut JitRun, *const u8) -> u32 {
-        // safety: buf.ptr starts with our sysv64 prologue and has RX permissions
-        unsafe { std::mem::transmute(self.buf.ptr) }
+        // safety: ptr starts with our sysv64 prologue inside an RX ExecSlab
+        unsafe { std::mem::transmute(self.ptr) }
     }
 
     #[inline(always)]
     pub(super) fn target(&self, pc: usize) -> *const u8 {
-        unsafe {
-            self.buf
-                .ptr
-                .add(*self.pc_offsets.get_unchecked(pc) as usize)
-        }
+        unsafe { self.ptr.add(*self.pc_offsets.get_unchecked(pc) as usize) }
     }
 }
 
@@ -246,18 +323,25 @@ pub(super) struct JitCtx {
     pub(super) rt: *mut ScriptRuntime,
     pub(super) heap: *const Heap,
     pub(super) stack_ptr: *mut Value,
+    pub(super) stack_end: *mut Value,
     pub(super) stack_safe_limit: *mut Value,
     pub(super) sp: *mut Value,
     pub(super) regs: *mut Value,
+    pub(super) this_ptr: *const Value,
     pub(super) next_target: *const u8,
+    pub(super) array_proto: u64,
+    pub(super) string_proto: u64,
     pub(super) scope_ptrs: [*mut Value; SCOPE_CACHE_DEPTH],
     pub(super) scope_lens: [usize; SCOPE_CACHE_DEPTH],
+    // head ScopeRef raw bits and valid depth currently cached in scope_ptrs/scope_lens
+    pub(super) cached_scope_raw: u64,
     pub(super) steps: u64,
     pub(super) safepoint_at: u64,
     pub(super) reg_base: usize,
     pub(super) top: usize,
     pub(super) frame_floor: usize,
     pub(super) max_pushes: usize,
+    pub(super) cached_scope_depth: u8,
     pub(super) sampling: u8,
 }
 
@@ -275,7 +359,10 @@ const OFF_CTX_HEAP: i32 = offset_of!(JitCtx, heap) as i32;
 const OFF_CTX_STACK_SAFE_LIMIT: i32 = offset_of!(JitCtx, stack_safe_limit) as i32;
 const OFF_CTX_SP: i32 = offset_of!(JitCtx, sp) as i32;
 const OFF_CTX_REGS: i32 = offset_of!(JitCtx, regs) as i32;
+const OFF_CTX_THIS_PTR: i32 = offset_of!(JitCtx, this_ptr) as i32;
 const OFF_CTX_NEXT_TARGET: i32 = offset_of!(JitCtx, next_target) as i32;
+const OFF_CTX_ARRAY_PROTO: i32 = offset_of!(JitCtx, array_proto) as i32;
+const OFF_CTX_STRING_PROTO: i32 = offset_of!(JitCtx, string_proto) as i32;
 const OFF_CTX_SCOPE_PTRS: i32 = offset_of!(JitCtx, scope_ptrs) as i32;
 const OFF_CTX_SCOPE_LENS: i32 = offset_of!(JitCtx, scope_lens) as i32;
 const OFF_CTX_STEPS: i32 = offset_of!(JitCtx, steps) as i32;
@@ -494,6 +581,21 @@ impl Asm {
         self.rex(1, dst, 0, base);
         self.emit(0x8D);
         self.emit_mem(dst, base, disp);
+    }
+
+    fn lea_sib(&mut self, dst: u8, base: u8, index: u8, scale_shift: u8, disp: i32) {
+        self.rex(1, dst, index, base);
+        self.emit(0x8D);
+        self.emit_mem_sib(dst, base, index, scale_shift, disp);
+    }
+
+    fn lea_rip_label(&mut self, dst: u8, label: usize) {
+        self.rex(1, dst, 0, 0);
+        self.emit(0x8D);
+        self.modrm(0, dst, 5);
+        let at = self.code.len();
+        self.emit_i32(0);
+        self.fixups.push((at, label));
     }
 
     fn alu_ri(&mut self, ext: u8, r: u8, imm: i32) {
@@ -857,6 +959,11 @@ unsafe fn sync_from_jit(run: *mut JitRun) -> &'static mut ScriptRuntime {
 }
 
 #[inline(always)]
+fn scope_raw(scope: &Option<super::heap::ScopeRef>) -> u64 {
+    scope.as_ref().map_or(0, super::heap::ScopeRef::raw_bits)
+}
+
+#[inline(always)]
 unsafe fn sync_to_jit(run: *mut JitRun, rt: &mut ScriptRuntime, refresh_scopes: bool) {
     unsafe {
         let ctx = &mut (*run).ctx;
@@ -868,24 +975,39 @@ unsafe fn sync_to_jit(run: *mut JitRun, rt: &mut ScriptRuntime, refresh_scopes: 
         let base = rt.vm_stack.as_mut_ptr();
         let cap = rt.vm_stack.capacity();
         ctx.stack_ptr = base;
+        ctx.stack_end = base.add(cap);
         ctx.stack_safe_limit = base.add(cap.saturating_sub(ctx.max_pushes));
         ctx.sp = base.add(rt.vm_stack.len());
         ctx.regs = base.add(ctx.reg_base);
+        ctx.this_ptr = &rt.frames.get_unchecked(ctx.top).this as *const Value;
         ctx.steps = rt.steps;
         if refresh_scopes {
-            refresh_scope_cache(ctx, rt);
+            let max_depth = rt.frames.get_unchecked(ctx.top).code.max_scope_depth;
+            if max_depth > 0 {
+                refresh_scope_cache(ctx, rt);
+            } else {
+                ctx.cached_scope_raw = 0;
+                ctx.cached_scope_depth = 0;
+            }
+        } else if ctx.cached_scope_raw != scope_raw(&rt.frames.get_unchecked(ctx.top).scope) {
+            ctx.cached_scope_raw = 0;
+            ctx.cached_scope_depth = 0;
         }
     }
 }
 
-#[inline(always)]
+#[cold]
+#[inline(never)]
 pub(super) unsafe fn refresh_scope_cache(ctx: &mut JitCtx, rt: &ScriptRuntime) {
     let frame = unsafe { rt.frames.get_unchecked(ctx.top) };
     let limit = (frame.code.max_scope_depth as usize).min(SCOPE_CACHE_DEPTH);
     if limit == 0 {
+        ctx.cached_scope_raw = 0;
+        ctx.cached_scope_depth = 0;
         return;
     }
     let heap = unsafe { &*ctx.heap };
+    let head_raw = scope_raw(&frame.scope);
     let mut cur = frame.scope.as_ref();
     let mut depth = 0;
     while depth < limit {
@@ -917,6 +1039,44 @@ pub(super) unsafe fn refresh_scope_cache(ctx: &mut JitCtx, rt: &ScriptRuntime) {
         }
         depth += 1;
     }
+    ctx.cached_scope_raw = head_raw;
+    ctx.cached_scope_depth = if head_raw != 0 { limit as u8 } else { 0 };
+}
+
+#[inline(always)]
+unsafe fn fill_scope_cache_fast(
+    ctx: &mut JitCtx,
+    rt: &ScriptRuntime,
+    heap: &Heap,
+    head: &Option<super::heap::ScopeRef>,
+    max_scope_depth: u8,
+) {
+    unsafe {
+        if let Some(s0) = head.as_ref() {
+            if max_scope_depth == 1 {
+                if let Some((p0, l0, _)) = heap.scope_slots_fast(s0) {
+                    ctx.scope_ptrs[0] = p0;
+                    ctx.scope_lens[0] = l0;
+                    ctx.cached_scope_raw = s0.raw_bits();
+                    ctx.cached_scope_depth = 1;
+                    return;
+                }
+            } else if max_scope_depth == 2
+                && let Some((p0, l0, parent)) = heap.scope_slots_fast(s0)
+                && let Some(s1) = parent.as_ref()
+                && let Some((p1, l1, _)) = heap.scope_slots_fast(s1)
+            {
+                ctx.scope_ptrs[0] = p0;
+                ctx.scope_lens[0] = l0;
+                ctx.scope_ptrs[1] = p1;
+                ctx.scope_lens[1] = l1;
+                ctx.cached_scope_raw = s0.raw_bits();
+                ctx.cached_scope_depth = 2;
+                return;
+            }
+        }
+        refresh_scope_cache(ctx, rt);
+    }
 }
 
 // transitions ctx to the current top frame and returns STATUS_DISPATCH_NEXT if compiled
@@ -932,7 +1092,8 @@ unsafe fn try_dispatch_top(run: *mut JitRun, rt: &mut ScriptRuntime) -> u32 {
             let hits = code_ref.jit_hits.get().wrapping_add(1);
             code_ref.jit_hits.set(hits);
             if hits >= JIT_THRESHOLD {
-                let compiled = compile(code_ref);
+                let heap = &*(*run).ctx.heap;
+                let compiled = compile(heap, code_ref);
                 let _ = code_ref.jit_code.set(compiled);
                 code_ref.jit_code.get().and_then(Option::as_ref)
             } else {
@@ -1076,24 +1237,122 @@ extern "sysv64" fn helper_ic_set_leaf(
     }
 }
 
-extern "sysv64" fn helper_get_index_leaf(
+extern "sysv64" fn helper_array_len_leaf(
+    heap: *const Heap,
+    recv: *const Value,
+    out: *mut Value,
+) -> u32 {
+    unsafe {
+        let Value::Array(array) = &*recv else {
+            return 0;
+        };
+        let Some(data) = (*heap).array_ref(array) else {
+            return 0;
+        };
+        // Value::Array is Copy so overwriting recv in place needs no drop
+        std::ptr::write(out, Value::Number(data.len() as f64));
+        1
+    }
+}
+
+extern "sysv64" fn helper_str_len_leaf(recv: *const Value, out: *mut Value, replace: u32) -> u32 {
+    unsafe {
+        let Value::String(text) = &*recv else {
+            return 0;
+        };
+        let len = if text.is_ascii() {
+            text.len()
+        } else {
+            super::strings::utf16_length(text)
+        };
+        if replace != 0 {
+            let old = std::mem::replace(&mut *out, Value::Number(len as f64));
+            old.fast_drop();
+        } else {
+            std::ptr::write(out, Value::Number(len as f64));
+        }
+        1
+    }
+}
+
+extern "sysv64" fn helper_split_regex_pop_leaf(
+    rt: *const ScriptRuntime,
+    heap: *const Heap,
+    code: *const Code,
+    slot: *mut Value,
+    pat_flags: u64,
+    cache: u32,
+) -> u32 {
+    unsafe {
+        let pattern = pat_flags as u32;
+        let flags = (pat_flags >> 32) as u32;
+        u32::from((*rt).try_split_regex_pop(
+            &*heap,
+            &*code,
+            pattern,
+            flags,
+            cache as u16,
+            &mut *slot,
+        ))
+    }
+}
+
+extern "sysv64" fn helper_get_index_push(
     heap: *const Heap,
     arr_ptr: *const Value,
     idx_ptr: *const Value,
     out_ptr: *mut Value,
-    replace_two: u32,
 ) -> u32 {
     unsafe {
+        if let (Value::Array(array), Value::Number(number)) = (&*arr_ptr, &*idx_ptr) {
+            let num = *number;
+            if num >= 0.0 && num.fract() == 0.0 {
+                let idx = num as usize;
+                if let Some(data) = (*heap).array_ref(array)
+                    && let Some(val) = data.values.get(idx)
+                    && !matches!(val, Value::Uninitialized)
+                {
+                    std::ptr::write(out_ptr, val.clone());
+                    return 1;
+                }
+            }
+            return 0;
+        }
         let Some(val) = ScriptRuntime::jit_try_fast_get_index(&*heap, &*arr_ptr, &*idx_ptr) else {
             return 0;
         };
-        if replace_two != 0 {
-            std::ptr::read(idx_ptr).fast_drop();
-            let old = std::mem::replace(&mut *out_ptr, val);
-            old.fast_drop();
-        } else {
-            std::ptr::write(out_ptr, val);
+        std::ptr::write(out_ptr, val);
+        1
+    }
+}
+
+extern "sysv64" fn helper_get_index_replace(
+    heap: *const Heap,
+    arr_ptr: *mut Value,
+    idx_ptr: *mut Value,
+) -> u32 {
+    unsafe {
+        if let (Value::Array(array), Value::Number(number)) = (&*arr_ptr, &*idx_ptr) {
+            let num = *number;
+            if num >= 0.0 && num.fract() == 0.0 {
+                let idx = num as usize;
+                if let Some(data) = (*heap).array_ref(array)
+                    && let Some(val) = data.values.get(idx)
+                    && !matches!(val, Value::Uninitialized)
+                {
+                    // Value::Array and Value::Number are both Copy
+                    std::ptr::write(arr_ptr, val.clone());
+                    return 1;
+                }
+            }
+            return 0;
         }
+        let Some(val) = ScriptRuntime::jit_try_fast_get_index(&*heap, &*arr_ptr, &*idx_ptr) else {
+            return 0;
+        };
+        std::ptr::read(idx_ptr).fast_drop();
+        let old = std::mem::replace(&mut *arr_ptr, val);
+        old.fast_drop();
         1
     }
 }
@@ -1223,12 +1482,13 @@ extern "sysv64" fn helper_define_field(
 
 extern "sysv64" fn helper_closure(
     rt: *mut ScriptRuntime,
+    heap: *const Heap,
     top: usize,
     child_idx: u32,
     out: *mut Value,
 ) {
     unsafe {
-        let val = (*rt).jit_make_closure(top, child_idx);
+        let val = (*rt).jit_make_closure(&*heap, top, child_idx);
         std::ptr::write(out, val);
     }
 }
@@ -1249,13 +1509,21 @@ extern "sysv64" fn helper_get_global_leaf(
     }
 }
 
-extern "sysv64" fn helper_this_leaf(rt: *const ScriptRuntime, top: usize, out: *mut Value) -> u32 {
+extern "sysv64" fn helper_init_this_slot(
+    rt: *const ScriptRuntime,
+    ctx: *const JitCtx,
+    slot: u32,
+) -> u32 {
     unsafe {
-        let frame = (&*rt).frames.get_unchecked(top);
-        if matches!(frame.this, Value::Uninitialized) {
+        let ptr = (*ctx).scope_ptrs[0];
+        let idx = slot as usize;
+        if ptr.is_null() || idx >= (*ctx).scope_lens[0] {
             return 0;
         }
-        std::ptr::write(out, frame.this.clone());
+        let this_val = (&*rt).frames.get_unchecked((*ctx).top).this.clone();
+        let dst = ptr.add(idx);
+        let old = std::ptr::replace(dst, this_val);
+        old.fast_drop();
         1
     }
 }
@@ -1404,10 +1672,7 @@ extern "sysv64" fn helper_str_concat(
         } else if sr.is_empty() {
             sl.clone()
         } else {
-            let mut combined = String::with_capacity(sl.len() + sr.len());
-            combined.push_str(sl);
-            combined.push_str(sr);
-            JsStr::from(combined)
+            JsStr::concat(sl, sr)
         };
         if drop_inputs != 0 {
             std::ptr::read(r).fast_drop();
@@ -1415,6 +1680,42 @@ extern "sysv64" fn helper_str_concat(
         }
         std::ptr::write(out, Value::String(res));
     }
+}
+
+#[inline(always)]
+fn push_stack_bytes(buf: &mut [u8; 256], pos: &mut usize, bytes: &[u8]) -> bool {
+    let end = *pos + bytes.len();
+    if end > buf.len() {
+        return false;
+    }
+    buf[*pos..end].copy_from_slice(bytes);
+    *pos = end;
+    true
+}
+
+#[inline(always)]
+fn push_stack_i64(buf: &mut [u8; 256], pos: &mut usize, n: i64) -> bool {
+    let mut tmp = [0u8; 24];
+    let mut idx = tmp.len();
+    let neg = n < 0;
+    let mut u = if neg {
+        n.wrapping_neg() as u64
+    } else {
+        n as u64
+    };
+    loop {
+        idx -= 1;
+        tmp[idx] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    if neg {
+        idx -= 1;
+        tmp[idx] = b'-';
+    }
+    push_stack_bytes(buf, pos, &tmp[idx..])
 }
 
 extern "sysv64" fn helper_template_concat(src: *mut Value, count: u32, out: *mut Value) -> u32 {
@@ -1432,24 +1733,60 @@ extern "sysv64" fn helper_template_concat(src: *mut Value, count: u32, out: *mut
                 _ => return 0,
             }
         }
-        let mut text = String::with_capacity(cap);
+        let mut buf = [0u8; 256];
+        let mut pos = 0usize;
+        let mut fit = true;
         for v in slice {
-            match v {
-                Value::String(s) => text.push_str(s),
-                Value::Number(num) => text.push_str(&number_to_string(*num)),
-                Value::Bool(b) => text.push_str(if *b { "true" } else { "false" }),
-                Value::Null => text.push_str("null"),
-                Value::Undefined => text.push_str("undefined"),
+            fit = match v {
+                Value::String(s) => push_stack_bytes(&mut buf, &mut pos, s.as_bytes()),
+                Value::Number(num) => {
+                    let n_val = *num;
+                    let int = n_val as i64;
+                    if n_val.is_finite()
+                        && (int as f64) == n_val
+                        && (-999_999_999_999..=999_999_999_999).contains(&int)
+                    {
+                        push_stack_i64(&mut buf, &mut pos, int)
+                    } else {
+                        let s = number_to_string(n_val);
+                        push_stack_bytes(&mut buf, &mut pos, s.as_bytes())
+                    }
+                }
+                Value::Bool(b) => {
+                    push_stack_bytes(&mut buf, &mut pos, if *b { b"true" } else { b"false" })
+                }
+                Value::Null => push_stack_bytes(&mut buf, &mut pos, b"null"),
+                Value::Undefined => push_stack_bytes(&mut buf, &mut pos, b"undefined"),
                 _ => unreachable!(),
+            };
+            if !fit {
+                break;
             }
         }
+        let res = if fit {
+            // safety: every appended piece is valid utf-8
+            JsStr::new(std::str::from_utf8_unchecked(&buf[..pos]))
+        } else {
+            let mut text = String::with_capacity(cap);
+            for v in slice {
+                match v {
+                    Value::String(s) => text.push_str(s),
+                    Value::Number(num) => text.push_str(&number_to_string(*num)),
+                    Value::Bool(b) => text.push_str(if *b { "true" } else { "false" }),
+                    Value::Null => text.push_str("null"),
+                    Value::Undefined => text.push_str("undefined"),
+                    _ => unreachable!(),
+                }
+            }
+            JsStr::from(text)
+        };
         for i in 0..n {
             let p = src.add(i);
             if !(*p).is_copy() {
                 drop_value_slow(std::ptr::read(p));
             }
         }
-        std::ptr::write(out, Value::String(JsStr::from(text)));
+        std::ptr::write(out, Value::String(res));
         1
     }
 }
@@ -1459,13 +1796,30 @@ extern "sysv64" fn helper_push_scope(run: *mut JitRun, block: u32, is_var: u32) 
         let ctx = &mut (*run).ctx;
         let rt = &mut *ctx.rt;
         let heap = &*ctx.heap;
+        let prev_raw = scope_raw(&rt.frames.get_unchecked(ctx.top).scope);
         let (ptr, len) = rt.jit_push_scope(heap, ctx.top, block, is_var != 0);
-        for i in (1..SCOPE_CACHE_DEPTH).rev() {
-            ctx.scope_ptrs[i] = ctx.scope_ptrs[i - 1];
-            ctx.scope_lens[i] = ctx.scope_lens[i - 1];
+        let new_raw = scope_raw(&rt.frames.get_unchecked(ctx.top).scope);
+        if prev_raw != 0 && ctx.cached_scope_raw == prev_raw && ctx.cached_scope_depth > 0 {
+            let new_depth = (ctx.cached_scope_depth as usize + 1).min(SCOPE_CACHE_DEPTH);
+            for i in (1..new_depth).rev() {
+                *ctx.scope_ptrs.get_unchecked_mut(i) = *ctx.scope_ptrs.get_unchecked(i - 1);
+                *ctx.scope_lens.get_unchecked_mut(i) = *ctx.scope_lens.get_unchecked(i - 1);
+            }
+            ctx.scope_ptrs[0] = ptr;
+            ctx.scope_lens[0] = len;
+            ctx.cached_scope_raw = new_raw;
+            ctx.cached_scope_depth = new_depth as u8;
+        } else {
+            let needed = rt.frames.get_unchecked(ctx.top).code.max_scope_depth;
+            if needed <= 1 {
+                ctx.scope_ptrs[0] = ptr;
+                ctx.scope_lens[0] = len;
+                ctx.cached_scope_raw = new_raw;
+                ctx.cached_scope_depth = u8::from(new_raw != 0);
+            } else {
+                refresh_scope_cache(ctx, rt);
+            }
         }
-        ctx.scope_ptrs[0] = ptr;
-        ctx.scope_lens[0] = len;
     }
 }
 
@@ -1474,24 +1828,30 @@ extern "sysv64" fn helper_pop_scope(run: *mut JitRun) {
         let ctx = &mut (*run).ctx;
         let rt = &mut *ctx.rt;
         let heap = &*ctx.heap;
+        let prev_raw = scope_raw(&rt.frames.get_unchecked(ctx.top).scope);
         rt.jit_pop_scope(heap, ctx.top);
-        for i in 0..SCOPE_CACHE_DEPTH - 1 {
-            ctx.scope_ptrs[i] = ctx.scope_ptrs[i + 1];
-            ctx.scope_lens[i] = ctx.scope_lens[i + 1];
-        }
-        if !ctx.scope_ptrs[SCOPE_CACHE_DEPTH - 2].is_null() {
-            let frame = rt.frames.get_unchecked(ctx.top);
-            if let Some(start) = frame.scope.as_ref()
-                && let Some(scope) = heap.scope_at_mut(start, (SCOPE_CACHE_DEPTH - 1) as u16)
-                && !scope.layout.grows
-            {
-                ctx.scope_ptrs[SCOPE_CACHE_DEPTH - 1] = scope.slots.as_mut_ptr();
-                ctx.scope_lens[SCOPE_CACHE_DEPTH - 1] = scope.slots.len();
-                return;
+        let frame = rt.frames.get_unchecked(ctx.top);
+        let new_raw = scope_raw(&frame.scope);
+        let needed = frame.code.max_scope_depth;
+        if prev_raw != 0
+            && new_raw != 0
+            && ctx.cached_scope_raw == prev_raw
+            && ctx.cached_scope_depth > 1
+            && ctx.cached_scope_depth > needed
+        {
+            let new_depth = (ctx.cached_scope_depth - 1) as usize;
+            for i in 0..new_depth {
+                *ctx.scope_ptrs.get_unchecked_mut(i) = *ctx.scope_ptrs.get_unchecked(i + 1);
+                *ctx.scope_lens.get_unchecked_mut(i) = *ctx.scope_lens.get_unchecked(i + 1);
             }
+            ctx.cached_scope_raw = new_raw;
+            ctx.cached_scope_depth = new_depth as u8;
+        } else if needed > 0 {
+            refresh_scope_cache(ctx, rt);
+        } else {
+            ctx.cached_scope_raw = 0;
+            ctx.cached_scope_depth = 0;
         }
-        ctx.scope_ptrs[SCOPE_CACHE_DEPTH - 1] = std::ptr::null_mut();
-        ctx.scope_lens[SCOPE_CACHE_DEPTH - 1] = 0;
     }
 }
 
@@ -1500,9 +1860,17 @@ extern "sysv64" fn helper_clone_scope(run: *mut JitRun) {
         let ctx = &mut (*run).ctx;
         let rt = &mut *ctx.rt;
         let heap = &*ctx.heap;
+        let prev_raw = scope_raw(&rt.frames.get_unchecked(ctx.top).scope);
         let (ptr, len) = rt.jit_clone_scope(heap, ctx.top);
         ctx.scope_ptrs[0] = ptr;
         ctx.scope_lens[0] = len;
+        let new_raw = scope_raw(&rt.frames.get_unchecked(ctx.top).scope);
+        ctx.cached_scope_depth = if ctx.cached_scope_raw == prev_raw {
+            ctx.cached_scope_depth.max(1)
+        } else {
+            1
+        };
+        ctx.cached_scope_raw = new_raw;
     }
 }
 
@@ -1630,30 +1998,300 @@ extern "sysv64" fn helper_step_op(run: *mut JitRun, op_pc: usize, refresh_scopes
     }
 }
 
-extern "sysv64" fn helper_call(run: *mut JitRun, count: u32, method: u32, next_pc: usize) -> u32 {
+#[cold]
+#[inline(never)]
+unsafe fn grow_stack_for_jit(
+    ctx: &mut JitCtx,
+    rt: &mut ScriptRuntime,
+    cur_len: usize,
+    need: usize,
+    max_pushes: usize,
+) {
     unsafe {
+        rt.vm_stack.set_len(cur_len);
+        rt.vm_stack.reserve(need);
+        let base = rt.vm_stack.as_mut_ptr();
+        let cap = rt.vm_stack.capacity();
+        ctx.stack_ptr = base;
+        ctx.stack_end = base.add(cap);
+        ctx.stack_safe_limit = base.add(cap.saturating_sub(max_pushes));
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn push_frame_grow(frames: &mut Vec<Frame>, frame: Frame) {
+    frames.reserve(64);
+    frames.push(frame);
+}
+
+#[inline(always)]
+fn push_frame_fast(frames: &mut Vec<Frame>, frame: Frame) {
+    let len = frames.len();
+    if len < frames.capacity() {
+        unsafe {
+            frames.as_mut_ptr().add(len).write(frame);
+            frames.set_len(len + 1);
+        }
+    } else {
+        push_frame_grow(frames, frame);
+    }
+}
+
+#[inline(always)]
+unsafe fn fill_undefined_fast(ptr: *mut Value, count: usize) {
+    unsafe {
+        // unroll common register counts so llvm avoids memset plt overhead
+        match count {
+            0 => {}
+            1 => std::ptr::write(ptr, Value::Undefined),
+            2 => {
+                std::ptr::write(ptr, Value::Undefined);
+                std::ptr::write(ptr.add(1), Value::Undefined);
+            }
+            3 => {
+                std::ptr::write(ptr, Value::Undefined);
+                std::ptr::write(ptr.add(1), Value::Undefined);
+                std::ptr::write(ptr.add(2), Value::Undefined);
+            }
+            4 => {
+                std::ptr::write(ptr, Value::Undefined);
+                std::ptr::write(ptr.add(1), Value::Undefined);
+                std::ptr::write(ptr.add(2), Value::Undefined);
+                std::ptr::write(ptr.add(3), Value::Undefined);
+            }
+            _ => {
+                for i in 0..count {
+                    std::ptr::write(ptr.add(i), Value::Undefined);
+                }
+            }
+        }
+    }
+}
+
+#[inline(never)]
+unsafe fn helper_call_native(
+    run: *mut JitRun,
+    count: u32,
+    method: u32,
+    next_pc: usize,
+    return_target: *const u8,
+) -> u32 {
+    unsafe {
+        let ctx = &mut (*run).ctx;
+        let heap = &*ctx.heap;
+        let count_usize = count as usize;
+        let is_method = method != 0;
+        let sp_len = (ctx.sp as usize - ctx.stack_ptr as usize) / std::mem::size_of::<Value>();
+        if sp_len >= count_usize + 1 + usize::from(is_method) {
+            let arg_start = sp_len - count_usize;
+            let callee_at = arg_start - 1;
+            let return_base = callee_at - usize::from(is_method);
+            let stack_ptr = ctx.stack_ptr;
+            match &*stack_ptr.add(callee_at) {
+                Value::Builtin(b) if matches!(b.as_ref(), Builtin::ArrayIsArray) => {
+                    let is_arr = if count_usize == 0 {
+                        Some(false)
+                    } else {
+                        match &*stack_ptr.add(arg_start) {
+                            Value::Array(_) => Some(true),
+                            Value::Object(obj) => heap
+                                .object_ref(obj)
+                                .is_some_and(|o| !matches!(o.class, ObjectClass::Proxy(_)))
+                                .then_some(false),
+                            other
+                                if other.is_copy()
+                                    || matches!(other, Value::String(_) | Value::Element(_)) =>
+                            {
+                                Some(false)
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(is_arr) = is_arr {
+                        for i in return_base..sp_len {
+                            let slot = stack_ptr.add(i);
+                            if !(*slot).is_copy() {
+                                drop_value_slow(std::ptr::read(slot));
+                            }
+                        }
+                        std::ptr::write(stack_ptr.add(return_base), Value::Bool(is_arr));
+                        ctx.sp = stack_ptr.add(return_base + 1);
+                        return STATUS_OK;
+                    }
+                }
+                Value::Object(obj) if is_method => {
+                    if let Some(borrowed) = heap.object_ref(obj)
+                        && let ObjectClass::Native(native) = &borrowed.class
+                    {
+                        match native.as_ref() {
+                            Native::Array(super::arrays::ArrayMethod::Pop) => {
+                                if let Value::Array(arr_h) = &*stack_ptr.add(return_base)
+                                    && let Some(array) = heap.array_mut(arr_h)
+                                    && array.extra.is_none()
+                                {
+                                    let value =
+                                        array.values.pop().unwrap_or(Value::Undefined).filled();
+                                    for i in arg_start..sp_len {
+                                        let slot = stack_ptr.add(i);
+                                        if !(*slot).is_copy() {
+                                            drop_value_slow(std::ptr::read(slot));
+                                        }
+                                    }
+                                    std::ptr::write(stack_ptr.add(return_base), value);
+                                    ctx.sp = stack_ptr.add(return_base + 1);
+                                    return STATUS_OK;
+                                }
+                            }
+                            Native::Array(super::arrays::ArrayMethod::Push) => {
+                                if let Value::Array(arr_h) = &*stack_ptr.add(return_base)
+                                    && let Some(array) = heap.array_mut(arr_h)
+                                    && array.extra.is_none()
+                                    && array.values.len().saturating_add(count_usize)
+                                        <= MAX_RUNTIME_ARRAY_LENGTH
+                                {
+                                    let needed = array.values.len() + count_usize;
+                                    if needed <= 2 && array.values.capacity() < needed {
+                                        array.values.reserve_exact(count_usize);
+                                    } else if count_usize > 0 {
+                                        array.values.reserve(count_usize);
+                                    }
+                                    for i in 0..count_usize {
+                                        array
+                                            .values
+                                            .push(std::ptr::read(stack_ptr.add(arg_start + i)));
+                                    }
+                                    let new_len = array.values.len();
+                                    std::ptr::write(
+                                        stack_ptr.add(return_base),
+                                        Value::Number(new_len as f64),
+                                    );
+                                    ctx.sp = stack_ptr.add(return_base + 1);
+                                    return STATUS_OK;
+                                }
+                            }
+                            Native::String(super::strings::StringMethod::LocaleCompare) => {
+                                if let Value::String(text) = &*stack_ptr.add(return_base) {
+                                    let other_opt = if count_usize == 0 {
+                                        Some("undefined")
+                                    } else if let Value::String(other) = &*stack_ptr.add(arg_start)
+                                    {
+                                        Some(other.as_str())
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(other) = other_opt {
+                                        let num = match super::strings::locale_compare(text, other)
+                                        {
+                                            std::cmp::Ordering::Less => -1.0,
+                                            std::cmp::Ordering::Equal => 0.0,
+                                            std::cmp::Ordering::Greater => 1.0,
+                                        };
+                                        for i in return_base..sp_len {
+                                            let slot = stack_ptr.add(i);
+                                            if !(*slot).is_copy() {
+                                                drop_value_slow(std::ptr::read(slot));
+                                            }
+                                        }
+                                        std::ptr::write(
+                                            stack_ptr.add(return_base),
+                                            Value::Number(num),
+                                        );
+                                        ctx.sp = stack_ptr.add(return_base + 1);
+                                        return STATUS_OK;
+                                    }
+                                }
+                            }
+                            Native::String(super::strings::StringMethod::ToLowerCase) => {
+                                if let Value::String(text) = &*stack_ptr.add(return_base)
+                                    && text.is_ascii()
+                                {
+                                    let bytes = text.as_bytes();
+                                    if !bytes.iter().any(u8::is_ascii_uppercase) {
+                                        for i in callee_at..sp_len {
+                                            let slot = stack_ptr.add(i);
+                                            if !(*slot).is_copy() {
+                                                drop_value_slow(std::ptr::read(slot));
+                                            }
+                                        }
+                                        ctx.sp = stack_ptr.add(return_base + 1);
+                                        return STATUS_OK;
+                                    } else if bytes.len() <= 256 {
+                                        let mut buf = [0u8; 256];
+                                        for (dst, &b) in buf.iter_mut().zip(bytes.iter()) {
+                                            *dst = b.to_ascii_lowercase();
+                                        }
+                                        let lowered = JsStr::new(std::str::from_utf8_unchecked(
+                                            &buf[..bytes.len()],
+                                        ));
+                                        for i in return_base..sp_len {
+                                            let slot = stack_ptr.add(i);
+                                            if !(*slot).is_copy() {
+                                                drop_value_slow(std::ptr::read(slot));
+                                            }
+                                        }
+                                        std::ptr::write(
+                                            stack_ptr.add(return_base),
+                                            Value::String(lowered),
+                                        );
+                                        ctx.sp = stack_ptr.add(return_base + 1);
+                                        return STATUS_OK;
+                                    }
+                                }
+                            }
+                            Native::String(super::strings::StringMethod::Includes)
+                                if count_usize == 1 =>
+                            {
+                                if let Value::String(text) = &*stack_ptr.add(return_base)
+                                    && let Value::String(needle) = &*stack_ptr.add(arg_start)
+                                {
+                                    let found = text.contains(needle.as_str());
+                                    for i in return_base..sp_len {
+                                        let slot = stack_ptr.add(i);
+                                        if !(*slot).is_copy() {
+                                            drop_value_slow(std::ptr::read(slot));
+                                        }
+                                    }
+                                    std::ptr::write(stack_ptr.add(return_base), Value::Bool(found));
+                                    ctx.sp = stack_ptr.add(return_base + 1);
+                                    return STATUS_OK;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         let rt = sync_from_jit(run);
         let top = (*run).ctx.top;
         rt.frames.get_unchecked_mut(top).pc = next_pc;
         let heap = &*(*run).ctx.heap;
-        let method = method != 0;
-        if rt.jit_call_plain(heap, count as usize, method) {
-            return try_dispatch_top(run, rt);
-        }
-        match rt.jit_call_fast_native(heap, count as usize, method) {
+        let before = rt.frames.len();
+        match rt.jit_call_fast_native(heap, count_usize, is_method) {
             Ok(FastNativeCall::Done) => {
                 sync_to_jit(run, rt, false);
                 STATUS_OK
             }
-            Ok(FastNativeCall::FramePushed) => try_dispatch_top(run, rt),
+            Ok(FastNativeCall::FramePushed) => {
+                if rt.frames.len() > before {
+                    rt.frames.get_unchecked_mut(before).return_target = return_target;
+                }
+                try_dispatch_top(run, rt)
+            }
             Ok(FastNativeCall::FallbackMethod(new_count)) => {
-                let before = rt.frames.len();
                 match rt.jit_call_in_loop_stack(new_count, true) {
                     Ok(()) if rt.frames.len() == before => {
                         sync_to_jit(run, rt, false);
                         STATUS_OK
                     }
-                    Ok(()) => try_dispatch_top(run, rt),
+                    Ok(()) => {
+                        if rt.frames.len() > before {
+                            rt.frames.get_unchecked_mut(before).return_target = return_target;
+                        }
+                        try_dispatch_top(run, rt)
+                    }
                     Err(err) => {
                         (*run).error = Some(err);
                         STATUS_ERR
@@ -1661,13 +2299,17 @@ extern "sysv64" fn helper_call(run: *mut JitRun, count: u32, method: u32, next_p
                 }
             }
             Ok(FastNativeCall::NotHandled) => {
-                let before = rt.frames.len();
-                match rt.jit_call_in_loop_stack(count as usize, method) {
+                match rt.jit_call_in_loop_stack(count_usize, is_method) {
                     Ok(()) if rt.frames.len() == before => {
                         sync_to_jit(run, rt, false);
                         STATUS_OK
                     }
-                    Ok(()) => try_dispatch_top(run, rt),
+                    Ok(()) => {
+                        if rt.frames.len() > before {
+                            rt.frames.get_unchecked_mut(before).return_target = return_target;
+                        }
+                        try_dispatch_top(run, rt)
+                    }
                     Err(err) => {
                         (*run).error = Some(err);
                         STATUS_ERR
@@ -1682,7 +2324,443 @@ extern "sysv64" fn helper_call(run: *mut JitRun, count: u32, method: u32, next_p
     }
 }
 
-extern "sysv64" fn helper_return(run: *mut JitRun, next_pc: usize) -> u32 {
+#[cold]
+#[inline(never)]
+unsafe fn helper_call_slow(
+    run: *mut JitRun,
+    count: u32,
+    method: u32,
+    next_pc: usize,
+    return_target: *const u8,
+) -> u32 {
+    unsafe {
+        let rt = sync_from_jit(run);
+        let top = (*run).ctx.top;
+        rt.frames.get_unchecked_mut(top).pc = next_pc;
+        let heap = &*(*run).ctx.heap;
+        let method = method != 0;
+        let before = rt.frames.len();
+        if rt.jit_call_plain(heap, count as usize, method) {
+            rt.frames.get_unchecked_mut(before).return_target = return_target;
+            return try_dispatch_top(run, rt);
+        }
+        match rt.jit_call_fast_native(heap, count as usize, method) {
+            Ok(FastNativeCall::Done) => {
+                sync_to_jit(run, rt, false);
+                STATUS_OK
+            }
+            Ok(FastNativeCall::FramePushed) => {
+                if rt.frames.len() > before {
+                    rt.frames.get_unchecked_mut(before).return_target = return_target;
+                }
+                try_dispatch_top(run, rt)
+            }
+            Ok(FastNativeCall::FallbackMethod(new_count)) => {
+                match rt.jit_call_in_loop_stack(new_count, true) {
+                    Ok(()) if rt.frames.len() == before => {
+                        sync_to_jit(run, rt, false);
+                        STATUS_OK
+                    }
+                    Ok(()) => {
+                        if rt.frames.len() > before {
+                            rt.frames.get_unchecked_mut(before).return_target = return_target;
+                        }
+                        try_dispatch_top(run, rt)
+                    }
+                    Err(err) => {
+                        (*run).error = Some(err);
+                        STATUS_ERR
+                    }
+                }
+            }
+            Ok(FastNativeCall::NotHandled) => {
+                match rt.jit_call_in_loop_stack(count as usize, method) {
+                    Ok(()) if rt.frames.len() == before => {
+                        sync_to_jit(run, rt, false);
+                        STATUS_OK
+                    }
+                    Ok(()) => {
+                        if rt.frames.len() > before {
+                            rt.frames.get_unchecked_mut(before).return_target = return_target;
+                        }
+                        try_dispatch_top(run, rt)
+                    }
+                    Err(err) => {
+                        (*run).error = Some(err);
+                        STATUS_ERR
+                    }
+                }
+            }
+            Err(err) => {
+                (*run).error = Some(err);
+                STATUS_ERR
+            }
+        }
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn helper_call_scoped(
+    ctx: &mut JitCtx,
+    rt: &mut ScriptRuntime,
+    heap: &Heap,
+    code: Rc<Code>,
+    closure: Rc<Closure>,
+    entry_target: *const u8,
+    this: Value,
+    arg_start: usize,
+    return_base: usize,
+    count_usize: usize,
+    return_target: *const u8,
+    handler_base: u32,
+    chain_base: u32,
+    pending_base: u32,
+    iter_base: u32,
+) -> u32 {
+    unsafe {
+        let mut slots = heap.alloc_scope_slots(code.layout.names.len(), false);
+        if count_usize > 0 {
+            let stack_ptr = ctx.stack_ptr;
+            for (position, slot) in code.param_slots.iter().enumerate() {
+                if let Some(slot) = slot {
+                    let arg = if position < count_usize {
+                        std::ptr::replace(stack_ptr.add(arg_start + position), Value::Undefined)
+                    } else {
+                        Value::Undefined
+                    };
+                    let old = std::mem::replace(slots.get_unchecked_mut(*slot as usize), arg);
+                    old.fast_drop();
+                }
+            }
+            for i in arg_start..(arg_start + count_usize) {
+                let slot = stack_ptr.add(i);
+                if !(*slot).is_copy() {
+                    drop_value_slow(std::ptr::read(slot));
+                }
+            }
+        }
+        let max_pushes = code.max_pushes as usize;
+        let max_scope_depth = code.max_scope_depth;
+        let cap_slots =
+            (ctx.stack_end as usize - ctx.stack_ptr as usize) / std::mem::size_of::<Value>();
+        if arg_start + max_pushes > cap_slots {
+            grow_stack_for_jit(ctx, rt, arg_start, max_pushes, max_pushes);
+        } else {
+            ctx.stack_safe_limit = ctx.stack_end.sub(max_pushes);
+        }
+        let grows = code.layout.grows;
+        let (slot_ptr, slot_len) = if grows {
+            (std::ptr::null_mut(), 0usize)
+        } else {
+            (slots.as_mut_ptr(), slots.len())
+        };
+        let parent_raw = scope_raw(&closure.scope);
+        let scope = heap.alloc_scope_fast(Scope {
+            slots,
+            parent: closure.scope.clone(),
+            layout: code.layout.clone(),
+            extra: Grown::default(),
+        });
+        let new_scope_raw = scope.raw_bits();
+        let pc = code.entry;
+        let new_top = rt.frames.len();
+        push_frame_fast(
+            &mut rt.frames,
+            Frame {
+                code,
+                closure: Some(closure),
+                pc,
+                reg_base: arg_start,
+                stack_base: arg_start,
+                return_base,
+                return_target,
+                handler_base,
+                chain_base,
+                pending_base,
+                iter_base,
+                scope: Some(scope),
+                this,
+                function: Value::Undefined,
+                scopes: 0,
+                escaped_scopes: 0,
+                flags: FLAG_OWNS_SCOPE | FLAG_CALLEE_ON_STACK,
+                extra: None,
+            },
+        );
+        ctx.top = new_top;
+        ctx.reg_base = arg_start;
+        ctx.max_pushes = max_pushes;
+        ctx.sp = ctx.stack_ptr.add(arg_start);
+        ctx.regs = ctx.stack_ptr.add(arg_start);
+        ctx.this_ptr = &rt.frames.get_unchecked(new_top).this as *const Value;
+        ctx.next_target = entry_target;
+        if max_scope_depth > 0 {
+            let needed = (max_scope_depth as usize).min(SCOPE_CACHE_DEPTH);
+            if parent_raw != 0
+                && ctx.cached_scope_raw == parent_raw
+                && ctx.cached_scope_depth as usize + 1 >= needed
+            {
+                let new_depth = (ctx.cached_scope_depth as usize + 1).min(SCOPE_CACHE_DEPTH);
+                for i in (1..new_depth).rev() {
+                    *ctx.scope_ptrs.get_unchecked_mut(i) = *ctx.scope_ptrs.get_unchecked(i - 1);
+                    *ctx.scope_lens.get_unchecked_mut(i) = *ctx.scope_lens.get_unchecked(i - 1);
+                }
+                ctx.scope_ptrs[0] = slot_ptr;
+                ctx.scope_lens[0] = slot_len;
+                ctx.cached_scope_raw = new_scope_raw;
+                ctx.cached_scope_depth = new_depth as u8;
+            } else if max_scope_depth == 1 {
+                ctx.scope_ptrs[0] = slot_ptr;
+                ctx.scope_lens[0] = slot_len;
+                ctx.cached_scope_raw = new_scope_raw;
+                ctx.cached_scope_depth = 1;
+            } else {
+                fill_scope_cache_fast(
+                    ctx,
+                    rt,
+                    heap,
+                    &rt.frames.get_unchecked(new_top).scope,
+                    max_scope_depth,
+                );
+            }
+        }
+        STATUS_DISPATCH_NEXT
+    }
+}
+
+extern "sysv64" fn helper_call(
+    run: *mut JitRun,
+    count: u32,
+    method: u32,
+    next_pc: usize,
+    return_target: *const u8,
+) -> u32 {
+    unsafe {
+        let ctx = &mut (*run).ctx;
+        let rt = &mut *ctx.rt;
+        let heap = &*ctx.heap;
+        let count_usize = count as usize;
+        let is_method = method != 0;
+        let sp_len = (ctx.sp as usize - ctx.stack_ptr as usize) / std::mem::size_of::<Value>();
+        // fused zero-sync fast path for plain JIT-to-JIT JS calls (and 0-arg bound functions)
+        if rt.frames.len() < MAX_FRAMES && sp_len >= count_usize + 1 + usize::from(is_method) {
+            let arg_start = sp_len - count_usize;
+            let callee_at = arg_start - 1;
+            let return_base = callee_at - usize::from(is_method);
+            enum FastCallee {
+                Js(Rc<Closure>, Option<(Value, Value)>),
+                Native,
+                Slow,
+            }
+            let callee_kind = match &*ctx.stack_ptr.add(callee_at) {
+                Value::Object(obj) => match heap.object_ref(obj) {
+                    Some(borrowed) => match &borrowed.class {
+                        ObjectClass::Function(closure) => FastCallee::Js(closure.clone(), None),
+                        ObjectClass::Native(_) => FastCallee::Native,
+                        ObjectClass::Bound(bound) if bound.arguments.is_empty() => {
+                            if let Value::Object(target_h) = &bound.target
+                                && let Some(target_obj) = heap.object_ref(target_h)
+                                && let ObjectClass::Function(closure) = &target_obj.class
+                            {
+                                FastCallee::Js(
+                                    closure.clone(),
+                                    Some((bound.target.clone(), bound.this.clone())),
+                                )
+                            } else {
+                                FastCallee::Slow
+                            }
+                        }
+                        _ => FastCallee::Slow,
+                    },
+                    None => FastCallee::Slow,
+                },
+                Value::Builtin(_) => FastCallee::Native,
+                _ => FastCallee::Slow,
+            };
+            match callee_kind {
+                FastCallee::Native => {
+                    return helper_call_native(run, count, method, next_pc, return_target);
+                }
+                FastCallee::Slow => {
+                    return helper_call_slow(run, count, method, next_pc, return_target);
+                }
+                FastCallee::Js(closure, bound_opt) => {
+                    let fast_call = closure.code.fast_call;
+                    if fast_call != 0
+                        && let Some(jit) = closure.code.jit_code.get().and_then(Option::as_ref)
+                    {
+                        let code = closure.code.clone();
+                        let entry_target = jit.target(code.entry);
+                        rt.frames.get_unchecked_mut(ctx.top).pc = next_pc;
+                        let raw_this = if let Some((target_val, bound_this)) = bound_opt {
+                            std::ptr::write(ctx.stack_ptr.add(callee_at), target_val);
+                            if is_method {
+                                let old = std::ptr::replace(
+                                    ctx.stack_ptr.add(return_base),
+                                    Value::Undefined,
+                                );
+                                old.fast_drop();
+                            }
+                            bound_this
+                        } else if is_method {
+                            std::ptr::replace(ctx.stack_ptr.add(return_base), Value::Undefined)
+                        } else {
+                            Value::Undefined
+                        };
+                        let this = if code.uses_lexical_this {
+                            raw_this.fast_drop();
+                            closure.lexical_this().unwrap_or(Value::Undefined)
+                        } else if code.strict_or_arrow
+                            || !matches!(raw_this, Value::Undefined | Value::Null)
+                        {
+                            raw_this
+                        } else {
+                            Value::Window
+                        };
+                        let handler_base = rt.vm_handlers.len() as u32;
+                        let chain_base = rt.vm_chains.len() as u32;
+                        let pending_base = rt.vm_pending.len() as u32;
+                        let iter_base = rt.vm_iters.len() as u32;
+                        if fast_call == 1 {
+                            let max_pushes = code.max_pushes as usize;
+                            let max_scope_depth = code.max_scope_depth;
+                            let new_top = rt.frames.len();
+                            let reg_count = code.registers as usize;
+                            let keep = count_usize.min(code.param_slots.len());
+                            if count_usize > keep {
+                                for i in (arg_start + keep)..(arg_start + count_usize) {
+                                    let slot = ctx.stack_ptr.add(i);
+                                    if !(*slot).is_copy() {
+                                        drop_value_slow(std::ptr::read(slot));
+                                    }
+                                }
+                            }
+                            let new_len = arg_start + reg_count;
+                            let cap_slots = (ctx.stack_end as usize - ctx.stack_ptr as usize)
+                                / std::mem::size_of::<Value>();
+                            if new_len + max_pushes > cap_slots {
+                                grow_stack_for_jit(
+                                    ctx,
+                                    rt,
+                                    arg_start + keep,
+                                    reg_count.saturating_sub(keep) + max_pushes,
+                                    max_pushes,
+                                );
+                            } else {
+                                ctx.stack_safe_limit = ctx.stack_end.sub(max_pushes);
+                            }
+                            fill_undefined_fast(
+                                ctx.stack_ptr.add(arg_start + keep),
+                                new_len - (arg_start + keep),
+                            );
+                            let pc = code.entry;
+                            let new_scope_raw = scope_raw(&closure.scope);
+                            let scope = closure.scope.clone();
+                            push_frame_fast(
+                                &mut rt.frames,
+                                Frame {
+                                    code,
+                                    closure: Some(closure),
+                                    pc,
+                                    reg_base: arg_start,
+                                    stack_base: new_len,
+                                    return_base,
+                                    return_target,
+                                    handler_base,
+                                    chain_base,
+                                    pending_base,
+                                    iter_base,
+                                    scope,
+                                    this,
+                                    function: Value::Undefined,
+                                    scopes: 0,
+                                    escaped_scopes: 0,
+                                    flags: FLAG_USES_REGS | FLAG_CALLEE_ON_STACK,
+                                    extra: None,
+                                },
+                            );
+                            ctx.top = new_top;
+                            ctx.reg_base = arg_start;
+                            ctx.max_pushes = max_pushes;
+                            ctx.sp = ctx.stack_ptr.add(new_len);
+                            ctx.regs = ctx.stack_ptr.add(arg_start);
+                            ctx.this_ptr = &rt.frames.get_unchecked(new_top).this as *const Value;
+                            ctx.next_target = entry_target;
+                            if max_scope_depth > 0
+                                && (new_scope_raw == 0
+                                    || ctx.cached_scope_raw != new_scope_raw
+                                    || ctx.cached_scope_depth < max_scope_depth)
+                            {
+                                fill_scope_cache_fast(
+                                    ctx,
+                                    rt,
+                                    heap,
+                                    &rt.frames.get_unchecked(new_top).scope,
+                                    max_scope_depth,
+                                );
+                            }
+                            return STATUS_DISPATCH_NEXT;
+                        } else {
+                            return helper_call_scoped(
+                                ctx,
+                                rt,
+                                heap,
+                                code,
+                                closure,
+                                entry_target,
+                                this,
+                                arg_start,
+                                return_base,
+                                count_usize,
+                                return_target,
+                                handler_base,
+                                chain_base,
+                                pending_base,
+                                iter_base,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        helper_call_slow(run, count, method, next_pc, return_target)
+    }
+}
+
+#[inline(never)]
+unsafe fn free_owned_scope_outline(heap: &Heap, scope: super::heap::ScopeRef) {
+    heap.free_scope_fast(scope);
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn clean_return_extras(
+    rt: &mut ScriptRuntime,
+    heap: &Heap,
+    top: usize,
+    chain_base: usize,
+    pending_base: usize,
+    iter_base: usize,
+) {
+    if rt.vm_chains.len() > chain_base {
+        rt.vm_chains.truncate(chain_base);
+    }
+    if rt.vm_pending.len() > pending_base {
+        rt.vm_pending.truncate(pending_base);
+    }
+    if rt.vm_iters.len() > iter_base {
+        rt.vm_iters.truncate(iter_base);
+    }
+    let frame = unsafe { rt.frames.get_unchecked_mut(top) };
+    if frame.scopes > 0 {
+        ScriptRuntime::jit_restore_scopes(heap, frame);
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn helper_return_slow(run: *mut JitRun, next_pc: usize) -> u32 {
     unsafe {
         let rt = sync_from_jit(run);
         let top = (*run).ctx.top;
@@ -1712,12 +2790,332 @@ extern "sysv64" fn helper_return(run: *mut JitRun, next_pc: usize) -> u32 {
     }
 }
 
+extern "sysv64" fn helper_return(run: *mut JitRun, next_pc: usize) -> u32 {
+    unsafe {
+        let ctx = &mut (*run).ctx;
+        let rt = &mut *ctx.rt;
+        let top = ctx.top;
+        let heap = &*ctx.heap;
+        let frame = rt.frames.get_unchecked_mut(top);
+        let return_target = frame.return_target;
+        let at_floor = top == ctx.frame_floor;
+        if (at_floor || !return_target.is_null())
+            && rt.vm_handlers.len() == frame.handler_base as usize
+            && !frame.construct()
+        {
+            let return_base = frame.return_base;
+            let chain_base = frame.chain_base as usize;
+            let pending_base = frame.pending_base as usize;
+            let iter_base = frame.iter_base as usize;
+            let drop_end = ctx.sp.sub(1);
+            let ret_val = std::ptr::read(drop_end);
+            let stack_ptr = ctx.stack_ptr;
+            let mut cur = stack_ptr.add(return_base);
+            while cur < drop_end {
+                if !(*cur).is_copy() {
+                    drop_value_slow(std::ptr::read(cur));
+                }
+                cur = cur.add(1);
+            }
+            let has_extras = (rt.vm_chains.len() > chain_base)
+                | (rt.vm_pending.len() > pending_base)
+                | (rt.vm_iters.len() > iter_base)
+                | (frame.scopes > 0);
+            if has_extras {
+                clean_return_extras(rt, heap, top, chain_base, pending_base, iter_base);
+                ctx.cached_scope_raw = 0;
+                ctx.cached_scope_depth = 0;
+                let frame = rt.frames.get_unchecked_mut(top);
+                if (frame.flags & FLAG_OWNS_SCOPE) != 0
+                    && frame.escaped_scopes == 0
+                    && let Some(scope) = frame.scope.take()
+                {
+                    free_owned_scope_outline(heap, scope);
+                }
+            } else if (frame.flags & FLAG_OWNS_SCOPE) != 0 {
+                let popped_raw = scope_raw(&frame.scope);
+                if popped_raw != 0 && ctx.cached_scope_raw == popped_raw {
+                    let depth = ctx.cached_scope_depth as usize;
+                    let parent_raw = if depth >= 2 {
+                        frame
+                            .scope
+                            .as_ref()
+                            .and_then(|s| heap.scope_at_ref(s, 0).map(|sc| scope_raw(&sc.parent)))
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if parent_raw != 0 {
+                        for i in 0..(depth - 1) {
+                            *ctx.scope_ptrs.get_unchecked_mut(i) =
+                                *ctx.scope_ptrs.get_unchecked(i + 1);
+                            *ctx.scope_lens.get_unchecked_mut(i) =
+                                *ctx.scope_lens.get_unchecked(i + 1);
+                        }
+                        ctx.cached_scope_raw = parent_raw;
+                        ctx.cached_scope_depth = (depth - 1) as u8;
+                    } else {
+                        ctx.cached_scope_raw = 0;
+                        ctx.cached_scope_depth = 0;
+                    }
+                }
+                if frame.escaped_scopes == 0
+                    && let Some(scope) = frame.scope.take()
+                {
+                    free_owned_scope_outline(heap, scope);
+                }
+            }
+            let frame_ptr = rt.frames.as_mut_ptr().add(top);
+            rt.frames.set_len(top);
+            if let Some(keep_code) = Frame::drop_in_place_keep_unique_code(frame_ptr) {
+                (*run).prev_code = Some(keep_code);
+            }
+            if at_floor {
+                rt.vm_stack.set_len(return_base);
+                (*run).result = Some(RunResult::Return(ret_val));
+                return STATUS_DONE;
+            }
+            std::ptr::write(stack_ptr.add(return_base), ret_val);
+            let new_top = top - 1;
+            let new_len = return_base + 1;
+            let caller = rt.frames.get_unchecked(new_top);
+            let max_pushes = caller.code.max_pushes as usize;
+            let reg_base = caller.reg_base;
+            let max_scope_depth = caller.code.max_scope_depth;
+            let caller_scope_raw = scope_raw(&caller.scope);
+            let cap_slots =
+                (ctx.stack_end as usize - ctx.stack_ptr as usize) / std::mem::size_of::<Value>();
+            if new_len + max_pushes > cap_slots {
+                grow_stack_for_jit(ctx, rt, new_len, max_pushes, max_pushes);
+            } else {
+                ctx.stack_safe_limit = ctx.stack_end.sub(max_pushes);
+            }
+            ctx.top = new_top;
+            ctx.reg_base = reg_base;
+            ctx.max_pushes = max_pushes;
+            ctx.sp = ctx.stack_ptr.add(new_len);
+            ctx.regs = ctx.stack_ptr.add(reg_base);
+            ctx.this_ptr = &rt.frames.get_unchecked(new_top).this as *const Value;
+            ctx.next_target = return_target;
+            if max_scope_depth > 0
+                && (caller_scope_raw == 0
+                    || ctx.cached_scope_raw != caller_scope_raw
+                    || ctx.cached_scope_depth < max_scope_depth)
+            {
+                fill_scope_cache_fast(
+                    ctx,
+                    rt,
+                    heap,
+                    &rt.frames.get_unchecked(new_top).scope,
+                    max_scope_depth,
+                );
+            }
+            return STATUS_DISPATCH_NEXT;
+        }
+        helper_return_slow(run, next_pc)
+    }
+}
+
+extern "sysv64" fn helper_ic_getter(
+    run: *mut JitRun,
+    entry: *const MonoEntry,
+    recv_ptr: *const Value,
+    mode: u32,
+    next_pc: usize,
+    return_target: *const u8,
+) -> u32 {
+    unsafe {
+        let ctx = &mut (*run).ctx;
+        let next_steps = ctx.steps + 1;
+        if next_steps >= ctx.safepoint_at {
+            return STATUS_FALLBACK;
+        }
+        let rt = &mut *ctx.rt;
+        if rt.frames.len() >= MAX_FRAMES {
+            return STATUS_FALLBACK;
+        }
+        let Value::Object(recv_handle) = &*recv_ptr else {
+            return STATUS_FALLBACK;
+        };
+        let recv_handle = recv_handle.clone();
+        let heap = &*ctx.heap;
+        let Some(recv_obj) = heap.object_ref(&recv_handle) else {
+            return STATUS_FALLBACK;
+        };
+        let entry = &*entry;
+        let slot = if entry.kind == MONO_OWN_GETTER {
+            recv_obj.properties.get(entry.index as usize)
+        } else if entry.kind == MONO_PROTO_GETTER {
+            let Some(proto_h) = recv_obj.prototype.as_ref() else {
+                return STATUS_FALLBACK;
+            };
+            let Some(proto_obj) = heap.object_ref(proto_h) else {
+                return STATUS_FALLBACK;
+            };
+            if proto_obj.shape_id != entry.proto_shape_id
+                || (proto_obj.jit_flags & JIT_FLAG_PROXY) != 0
+            {
+                return STATUS_FALLBACK;
+            }
+            proto_obj.properties.get(entry.index as usize)
+        } else {
+            return STATUS_FALLBACK;
+        };
+        let Some(super::object::Slot::Accessor(accessors)) = slot else {
+            return STATUS_FALLBACK;
+        };
+        let Some(getter_val @ Value::Object(fn_handle)) = &accessors.get else {
+            return STATUS_FALLBACK;
+        };
+        let getter_val = getter_val.clone();
+        let Some(fn_obj) = heap.object_ref(fn_handle) else {
+            return STATUS_FALLBACK;
+        };
+        let ObjectClass::Function(closure) = &fn_obj.class else {
+            return STATUS_FALLBACK;
+        };
+        let fast_call = closure.code.fast_call;
+        if fast_call == 0 {
+            return STATUS_FALLBACK;
+        }
+        let Some(jit) = closure.code.jit_code.get().and_then(Option::as_ref) else {
+            return STATUS_FALLBACK;
+        };
+        let closure = closure.clone();
+        let code = closure.code.clone();
+        let entry_target = jit.target(code.entry);
+        let max_pushes = code.max_pushes as usize;
+        let max_scope_depth = code.max_scope_depth;
+        ctx.steps = next_steps;
+        rt.frames.get_unchecked_mut(ctx.top).pc = next_pc;
+        let sp_len = (ctx.sp as usize - ctx.stack_ptr as usize) / std::mem::size_of::<Value>();
+        let is_method = matches!(mode, 2 | 4);
+        let callee_at = if mode == 0 {
+            sp_len - 1
+        } else if is_method {
+            sp_len + 1
+        } else {
+            sp_len
+        };
+        let arg_start = callee_at + 1;
+        let handler_base = rt.vm_handlers.len() as u32;
+        let chain_base = rt.vm_chains.len() as u32;
+        let pending_base = rt.vm_pending.len() as u32;
+        let iter_base = rt.vm_iters.len() as u32;
+        let this_val = if code.uses_lexical_this {
+            closure.lexical_this().unwrap_or(Value::Undefined)
+        } else {
+            Value::Object(recv_handle.clone())
+        };
+        if fast_call == 1 {
+            let new_top = rt.frames.len();
+            let reg_count = code.registers as usize;
+            let new_len = arg_start + reg_count;
+            let cap_slots =
+                (ctx.stack_end as usize - ctx.stack_ptr as usize) / std::mem::size_of::<Value>();
+            if new_len + max_pushes > cap_slots {
+                grow_stack_for_jit(ctx, rt, sp_len, (new_len - sp_len) + max_pushes, max_pushes);
+            } else {
+                ctx.stack_safe_limit = ctx.stack_end.sub(max_pushes);
+            }
+            if is_method {
+                std::ptr::write(ctx.stack_ptr.add(sp_len), Value::Object(recv_handle));
+            }
+            std::ptr::write(ctx.stack_ptr.add(callee_at), getter_val);
+            fill_undefined_fast(ctx.stack_ptr.add(arg_start), reg_count);
+            let pc = code.entry;
+            let new_scope_raw = scope_raw(&closure.scope);
+            let scope = closure.scope.clone();
+            push_frame_fast(
+                &mut rt.frames,
+                Frame {
+                    code,
+                    closure: Some(closure),
+                    pc,
+                    reg_base: arg_start,
+                    stack_base: new_len,
+                    return_base: callee_at,
+                    return_target,
+                    handler_base,
+                    chain_base,
+                    pending_base,
+                    iter_base,
+                    scope,
+                    this: this_val,
+                    function: Value::Undefined,
+                    scopes: 0,
+                    escaped_scopes: 0,
+                    flags: FLAG_USES_REGS | FLAG_CALLEE_ON_STACK,
+                    extra: None,
+                },
+            );
+            ctx.top = new_top;
+            ctx.reg_base = arg_start;
+            ctx.max_pushes = max_pushes;
+            ctx.sp = ctx.stack_ptr.add(new_len);
+            ctx.regs = ctx.stack_ptr.add(arg_start);
+            ctx.this_ptr = &rt.frames.get_unchecked(new_top).this as *const Value;
+            ctx.next_target = entry_target;
+            if max_scope_depth > 0
+                && (new_scope_raw == 0
+                    || ctx.cached_scope_raw != new_scope_raw
+                    || ctx.cached_scope_depth < max_scope_depth)
+            {
+                fill_scope_cache_fast(
+                    ctx,
+                    rt,
+                    heap,
+                    &rt.frames.get_unchecked(new_top).scope,
+                    max_scope_depth,
+                );
+            }
+            STATUS_DISPATCH_NEXT
+        } else {
+            let cap_slots =
+                (ctx.stack_end as usize - ctx.stack_ptr as usize) / std::mem::size_of::<Value>();
+            if arg_start + max_pushes > cap_slots {
+                grow_stack_for_jit(
+                    ctx,
+                    rt,
+                    sp_len,
+                    (arg_start - sp_len) + max_pushes,
+                    max_pushes,
+                );
+            } else {
+                ctx.stack_safe_limit = ctx.stack_end.sub(max_pushes);
+            }
+            if is_method {
+                std::ptr::write(ctx.stack_ptr.add(sp_len), Value::Object(recv_handle));
+            }
+            std::ptr::write(ctx.stack_ptr.add(callee_at), getter_val);
+            helper_call_scoped(
+                ctx,
+                rt,
+                heap,
+                code,
+                closure,
+                entry_target,
+                this_val,
+                arg_start,
+                callee_at,
+                0,
+                return_target,
+                handler_base,
+                chain_base,
+                pending_base,
+                iter_base,
+            )
+        }
+    }
+}
+
 extern "sysv64" fn helper_get_prop_slow(
     run: *mut JitRun,
     op_pc: usize,
     name: u32,
     ic: u32,
     mode: u32,
+    return_target: *const u8,
 ) -> u32 {
     unsafe {
         let rt = sync_from_jit(run);
@@ -1747,6 +3145,9 @@ extern "sysv64" fn helper_get_prop_slow(
         match res {
             Ok(()) => {
                 if rt.frames.len() != frames_before {
+                    if rt.frames.len() > frames_before {
+                        rt.frames.get_unchecked_mut(frames_before).return_target = return_target;
+                    }
                     try_dispatch_top(run, rt)
                 } else {
                     sync_to_jit(run, rt, false);
@@ -1801,13 +3202,13 @@ pub(super) fn can_compile(code: &Code) -> bool {
         && code.ops.len() <= MAX_JIT_OPS
 }
 
-pub(super) fn compile(code: &Code) -> Option<JitCode> {
+pub(super) fn compile(heap: &Heap, code: &Code) -> Option<JitCode> {
     if !can_compile(code) {
         return None;
     }
     let mut c = Compiler::new(code);
     c.emit_all();
-    c.finish()
+    c.finish(heap)
 }
 
 struct Compiler<'a> {
@@ -1848,6 +3249,8 @@ enum Stub {
     },
     GetPropSlow {
         label: usize,
+        getter_slow: usize,
+        full_slow: usize,
         op_pc: usize,
         name: u32,
         ic: u32,
@@ -2092,6 +3495,28 @@ impl<'a> Compiler<'a> {
         self.asm.bind(done);
     }
 
+    fn emit_array_entry_lookup(&mut self, miss: usize) {
+        self.asm.mov_rr(RAX, RCX);
+        self.asm.shr_ri(RAX, 48);
+        self.asm.cmp_r16_mem(RAX, R_HEAP, OFF_HEAP_ID);
+        self.asm.jcc(CC_NE, miss);
+        self.asm.mov_rr(RAX, RCX);
+        self.asm.and_r32_imm(RAX, 0x00FF_FFFF);
+        self.asm.mov_rr(RDX, RAX);
+        self.asm.shr_r32_ri(RDX, 10);
+        self.asm.and_r32_imm(RAX, 0x3FF);
+        self.asm.mov_r_mem(R8, R_HEAP, OFF_HEAP_ARR_CHUNKS);
+        self.asm.mov_r_sib(R8, R8, RDX, 3, 0);
+        const { assert!(ENTRY_ARR_SIZE == 40) };
+        const { assert!(std::mem::size_of::<Option<Box<ArrayExtra>>>() == 8) };
+        self.asm.lea_sib(RAX, RAX, RAX, 2, 0);
+        self.asm.shl_ri(RAX, 3);
+        self.asm.add_rr(R8, RAX);
+        self.asm.cmp_m32_imm(R8, OFF_ARR_ENTRY_BORROW, 0);
+        self.asm.jcc(CC_L, miss);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn emit_mono_ic_get(
         &mut self,
         ic_ptr: *const PropIc,
@@ -2100,28 +3525,45 @@ impl<'a> Compiler<'a> {
         out_base: u8,
         out_disp: i32,
         miss: usize,
+        getter_slow: usize,
     ) {
+        let replace_in_place = recv_base == out_base && recv_disp == out_disp;
         let matched = self.asm.label();
         let check_proto = self.asm.label();
         let check_missing = self.asm.label();
+        let check_getter = self.asm.label();
         let missing_proto = self.asm.label();
         let emit_undef = self.asm.label();
+        let check_array = self.asm.label();
+        let check_string = self.asm.label();
+        let array_matched = self.asm.label();
+        let array_len = self.asm.label();
+        let string_matched = self.asm.label();
+        let string_len = self.asm.label();
+        let load_proto_method = self.asm.label();
         let done = self.asm.label();
 
-        self.asm.cmp_m8_imm(recv_base, recv_disp, VALUE_TAG_OBJECT);
-        self.asm.jcc(CC_NE, miss);
+        self.asm.movzx_r_m8(RAX, recv_base, recv_disp);
+        self.asm.cmp_r8_imm(RAX, VALUE_TAG_OBJECT);
+        self.asm.jcc(CC_NE, check_array);
         self.asm.mov_r_mem(RCX, recv_base, recv_disp + 8);
         self.emit_object_entry_lookup(false, miss);
         self.asm.mov_r32_mem(RAX, R8, OFF_OBJ_SHAPE_ID);
         self.asm.test_r32(RAX, RAX);
         self.asm.jcc(CC_E, miss);
         self.asm.mov_ri64(R9, ic_ptr as u64);
-        // check e0 then e1
-        self.asm.cmp_r32_mem(RAX, R9, OFF_MONO_SHAPE_ID);
-        self.asm.jcc(CC_E, matched);
-        self.asm.add_ri(R9, MONO_ENTRY_SIZE);
-        self.asm.cmp_r32_mem(RAX, R9, OFF_MONO_SHAPE_ID);
-        self.asm.jcc(CC_NE, miss);
+        // check mono entries[0..MONO_COUNT]
+        for i in 0..MONO_COUNT {
+            if i > 0 {
+                self.asm.add_ri(R9, MONO_ENTRY_SIZE);
+            }
+            self.asm.cmp_r32_mem(RAX, R9, OFF_MONO_SHAPE_ID);
+            if i + 1 < MONO_COUNT {
+                self.asm.jcc(CC_E, matched);
+            } else {
+                self.asm.jcc(CC_NE, miss);
+            }
+        }
 
         self.asm.bind(matched);
         self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_OWN_DATA);
@@ -2179,7 +3621,7 @@ impl<'a> Compiler<'a> {
         // 0-level or 1-level missing property hit -> Value::Undefined
         self.asm.bind(check_missing);
         self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_MISSING);
-        self.asm.jcc(CC_NE, miss);
+        self.asm.jcc(CC_NE, check_getter);
         self.asm.mov_r32_mem(RAX, R9, OFF_MONO_PROTO_SHAPE_ID);
         self.asm.mov_r_mem(RCX, R8, OFF_OBJ_PROTOTYPE);
         self.asm.test_r32(RAX, RAX);
@@ -2203,6 +3645,103 @@ impl<'a> Compiler<'a> {
 
         self.asm.bind(emit_undef);
         self.asm.mov_m8_imm(out_base, out_disp, VALUE_TAG_UNDEFINED);
+        self.asm.jmp(done);
+
+        // dispatch matched getter directly via zero-sync helper_ic_getter (R9 = MonoEntry)
+        self.asm.bind(check_getter);
+        self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_OWN_GETTER);
+        self.asm.jcc(CC_E, getter_slow);
+        self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_PROTO_GETTER);
+        self.asm.jcc(CC_E, getter_slow);
+        self.asm.jmp(miss);
+
+        // inline Array.prototype method and .length IC for arrays
+        self.asm.bind(check_array);
+        self.asm.cmp_r8_imm(RAX, VALUE_TAG_ARRAY);
+        self.asm.jcc(CC_NE, check_string);
+        self.asm.mov_ri64(R9, ic_ptr as u64);
+        self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_ARRAY_METHOD);
+        self.asm.jcc(CC_E, array_matched);
+        self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_ARRAY_LENGTH);
+        self.asm.jcc(CC_E, array_len);
+        self.asm.add_ri(R9, MONO_ENTRY_SIZE);
+        self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_ARRAY_METHOD);
+        self.asm.jcc(CC_E, array_matched);
+        self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_ARRAY_LENGTH);
+        self.asm.jcc(CC_NE, miss);
+
+        self.asm.bind(array_len);
+        self.asm.mov_rr(RDI, R_HEAP);
+        self.asm.lea_mem(RSI, recv_base, recv_disp);
+        self.asm.lea_mem(RDX, out_base, out_disp);
+        self.asm
+            .call_abs(helper_array_len_leaf as *const () as usize);
+        self.asm.test_r32(RAX, RAX);
+        self.asm.jcc(CC_E, miss);
+        self.asm.jmp(done);
+
+        self.asm.bind(array_matched);
+        self.asm.mov_r_mem(RCX, recv_base, recv_disp + 8);
+        self.emit_array_entry_lookup(miss);
+        self.asm.cmp_m64_imm(R8, OFF_ARR_EXTRA, 0);
+        self.asm.jcc(CC_NE, miss);
+        self.asm.mov_r_mem(RCX, R_CTX, OFF_CTX_ARRAY_PROTO);
+        self.asm.jmp(load_proto_method);
+
+        // inline String.prototype method and .length IC
+        self.asm.bind(check_string);
+        self.asm.cmp_r8_imm(RAX, VALUE_TAG_STRING);
+        self.asm.jcc(CC_NE, miss);
+        self.asm.mov_ri64(R9, ic_ptr as u64);
+        self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_STRING_METHOD);
+        self.asm.jcc(CC_E, string_matched);
+        self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_STRING_LENGTH);
+        self.asm.jcc(CC_E, string_len);
+        self.asm.add_ri(R9, MONO_ENTRY_SIZE);
+        self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_STRING_METHOD);
+        self.asm.jcc(CC_E, string_matched);
+        self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_STRING_LENGTH);
+        self.asm.jcc(CC_NE, miss);
+
+        self.asm.bind(string_len);
+        self.asm.lea_mem(RDI, recv_base, recv_disp);
+        self.asm.lea_mem(RSI, out_base, out_disp);
+        self.asm.mov_ri32(RDX, u32::from(replace_in_place));
+        self.asm.call_abs(helper_str_len_leaf as *const () as usize);
+        self.asm.test_r32(RAX, RAX);
+        self.asm.jcc(CC_E, miss);
+        self.asm.jmp(done);
+
+        self.asm.bind(string_matched);
+        self.asm.mov_r_mem(RCX, R_CTX, OFF_CTX_STRING_PROTO);
+
+        self.asm.bind(load_proto_method);
+        self.emit_object_entry_lookup(false, miss);
+        self.asm.mov_r32_mem(RAX, R9, OFF_MONO_PROTO_SHAPE_ID);
+        self.asm.cmp_r32_mem(RAX, R8, OFF_OBJ_SHAPE_ID);
+        self.asm.jcc(CC_NE, miss);
+        self.asm.test_m8_imm(R8, OFF_OBJ_JIT_FLAGS, JIT_FLAG_PROXY);
+        self.asm.jcc(CC_NE, miss);
+        self.asm.movzx_r_m16(RDX, R9, OFF_MONO_INDEX);
+        self.asm.shl_ri(RDX, 4);
+        self.asm.mov_r_mem(R10, R8, OFF_OBJ_PROPS_PTR);
+        self.asm.add_rr(R10, RDX);
+        self.asm.movzx_r_m8(RAX, R10, 0);
+        self.asm.cmp_r8_imm(RAX, VALUE_TAG_BINDING);
+        self.asm.jcc(CC_E, miss);
+        self.asm.cmp_r8_imm(RAX, VALUE_TAG_CONST_BINDING);
+        self.asm.jcc(CC_E, miss);
+        self.asm.cmp_r8_imm(RAX, VALUE_TAG_COUNT);
+        self.asm.jcc(CC_AE, miss);
+        if replace_in_place {
+            // drop non-Copy String receiver when replacing in place on vm_stack
+            self.asm.movzx_r_m8(RAX, recv_base, recv_disp);
+            self.emit_overwrite_slot(out_base, out_disp, R10, 0, true);
+        } else {
+            self.asm.movdqu_load(XMM0, R10, 0);
+            self.asm.movdqu_store(out_base, out_disp, XMM0);
+            self.emit_clone_value(out_base, out_disp);
+        }
         self.asm.bind(done);
     }
 
@@ -2232,11 +3771,17 @@ impl<'a> Compiler<'a> {
         self.asm.test_r32(RAX, RAX);
         self.asm.jcc(CC_E, miss);
         self.asm.mov_ri64(R9, ic_ptr as u64);
-        self.asm.cmp_r32_mem(RAX, R9, OFF_MONO_SHAPE_ID);
-        self.asm.jcc(CC_E, matched);
-        self.asm.add_ri(R9, MONO_ENTRY_SIZE);
-        self.asm.cmp_r32_mem(RAX, R9, OFF_MONO_SHAPE_ID);
-        self.asm.jcc(CC_NE, miss);
+        for i in 0..MONO_COUNT {
+            if i > 0 {
+                self.asm.add_ri(R9, MONO_ENTRY_SIZE);
+            }
+            self.asm.cmp_r32_mem(RAX, R9, OFF_MONO_SHAPE_ID);
+            if i + 1 < MONO_COUNT {
+                self.asm.jcc(CC_E, matched);
+            } else {
+                self.asm.jcc(CC_NE, miss);
+            }
+        }
 
         self.asm.bind(matched);
         self.asm.cmp_m8_imm(R9, OFF_MONO_KIND, MONO_OWN_DATA);
@@ -2861,11 +4406,13 @@ impl<'a> Compiler<'a> {
             }
             Op::InitThisSlot(slot) => {
                 let slow = self.defer_step_op(op_pc, false, next_label);
-                let off = slot as i32 * VAL_SIZE;
-                self.emit_load_scope_ptr(0, slot, R10, slow);
-                self.asm.movzx_r_m8(RAX, R10, off);
-                self.asm.sub_ri(R_SP, VAL_SIZE);
-                self.emit_overwrite_slot(R10, off, R_SP, 0, false);
+                self.asm.mov_rr(RDI, R_RT);
+                self.asm.mov_rr(RSI, R_CTX);
+                self.asm.mov_ri32(RDX, slot as u32);
+                self.asm
+                    .call_abs(helper_init_this_slot as *const () as usize);
+                self.asm.test_r32(RAX, RAX);
+                self.asm.jcc(CC_E, slow);
             }
             Op::UpdateLocal {
                 depth,
@@ -2927,13 +4474,14 @@ impl<'a> Compiler<'a> {
             }
             Op::This => {
                 let slow = self.defer_step_op(op_pc, false, next_label);
-                self.asm.mov_rr(RDI, R_RT);
-                self.asm.mov_r_mem(RSI, R_CTX, OFF_CTX_TOP);
-                self.asm.mov_rr(RDX, R_SP);
-                self.asm.call_abs(helper_this_leaf as *const () as usize);
-                self.asm.test_r32(RAX, RAX);
+                self.asm.mov_r_mem(R10, R_CTX, OFF_CTX_THIS_PTR);
+                self.asm.movzx_r_m8(RAX, R10, 0);
+                self.asm.cmp_r8_imm(RAX, VALUE_TAG_UNINITIALIZED);
                 self.asm.jcc(CC_E, slow);
+                self.asm.movdqu_load(XMM0, R10, 0);
+                self.asm.movdqu_store(R_SP, 0, XMM0);
                 self.asm.add_ri(R_SP, VAL_SIZE);
+                self.emit_clone_value(R_SP, -VAL_SIZE);
             }
             Op::TypeOf => {
                 self.asm.mov_rr(RDI, R_RT);
@@ -2996,21 +4544,40 @@ impl<'a> Compiler<'a> {
             }
             Op::Closure(index) => {
                 self.asm.mov_rr(RDI, R_RT);
-                self.asm.mov_r_mem(RSI, R_CTX, OFF_CTX_TOP);
-                self.asm.mov_ri32(RDX, index);
-                self.asm.mov_rr(RCX, R_SP);
+                self.asm.mov_rr(RSI, R_HEAP);
+                self.asm.mov_r_mem(RDX, R_CTX, OFF_CTX_TOP);
+                self.asm.mov_ri32(RCX, index);
+                self.asm.mov_rr(R8, R_SP);
                 self.asm.call_abs(helper_closure as *const () as usize);
                 self.asm.add_ri(R_SP, VAL_SIZE);
+            }
+            Op::SplitRegexPop {
+                pattern,
+                flags,
+                cache,
+            } => {
+                let slow = self.defer_step_op(op_pc, false, next_label);
+                self.asm.cmp_m8_imm(R_SP, -VAL_SIZE, VALUE_TAG_STRING);
+                self.asm.jcc(CC_NE, slow);
+                let pat_flags = u64::from(pattern) | (u64::from(flags) << 32);
+                self.asm.mov_rr(RDI, R_RT);
+                self.asm.mov_rr(RSI, R_HEAP);
+                self.asm.mov_ri64(RDX, code_ptr);
+                self.asm.lea_mem(RCX, R_SP, -VAL_SIZE);
+                self.asm.mov_ri64(R8, pat_flags);
+                self.asm.mov_ri32(R9, cache as u32);
+                self.asm
+                    .call_abs(helper_split_regex_pop_leaf as *const () as usize);
+                self.asm.test_r32(RAX, RAX);
+                self.asm.jcc(CC_E, slow);
             }
             Op::GetIndex => {
                 let slow = self.defer_step_op(op_pc, false, next_label);
                 self.asm.mov_rr(RDI, R_HEAP);
                 self.asm.lea_mem(RSI, R_SP, -2 * VAL_SIZE);
                 self.asm.lea_mem(RDX, R_SP, -VAL_SIZE);
-                self.asm.lea_mem(RCX, R_SP, -2 * VAL_SIZE);
-                self.asm.mov_ri32(R8, 1);
                 self.asm
-                    .call_abs(helper_get_index_leaf as *const () as usize);
+                    .call_abs(helper_get_index_replace as *const () as usize);
                 self.asm.test_r32(RAX, RAX);
                 self.asm.jcc(CC_E, slow);
                 self.asm.sub_ri(R_SP, VAL_SIZE);
@@ -3027,9 +4594,8 @@ impl<'a> Compiler<'a> {
                 self.asm.lea_mem(RSI, R_REGS, aoff);
                 self.asm.lea_mem(RDX, R_REGS, ioff);
                 self.asm.mov_rr(RCX, R_SP);
-                self.asm.mov_ri32(R8, 0);
                 self.asm
-                    .call_abs(helper_get_index_leaf as *const () as usize);
+                    .call_abs(helper_get_index_push as *const () as usize);
                 self.asm.test_r32(RAX, RAX);
                 self.asm.jcc(CC_E, slow);
                 self.asm.add_ri(R_SP, VAL_SIZE);
@@ -3666,8 +5232,12 @@ impl<'a> Compiler<'a> {
             Op::GetProp { name, ic } => {
                 let ic_ptr = &self.code.ics[ic as usize] as *const PropIc;
                 let miss = self.asm.label();
+                let getter_slow = self.asm.label();
+                let full_slow = self.asm.label();
                 self.stubs.push(Stub::GetPropSlow {
                     label: miss,
+                    getter_slow,
+                    full_slow,
                     op_pc,
                     name,
                     ic,
@@ -3676,14 +5246,18 @@ impl<'a> Compiler<'a> {
                     recv_reg_or_local: None,
                     cont: next_label,
                 });
-                self.emit_mono_ic_get(ic_ptr, R_SP, -VAL_SIZE, R_SP, -VAL_SIZE, miss);
+                self.emit_mono_ic_get(ic_ptr, R_SP, -VAL_SIZE, R_SP, -VAL_SIZE, miss, getter_slow);
             }
             Op::GetRegProp { reg, name, ic } => {
                 let off = reg as i32 * VAL_SIZE;
                 let ic_ptr = &self.code.ics[ic as usize] as *const PropIc;
                 let miss = self.asm.label();
+                let getter_slow = self.asm.label();
+                let full_slow = self.asm.label();
                 self.stubs.push(Stub::GetPropSlow {
                     label: miss,
+                    getter_slow,
+                    full_slow,
                     op_pc,
                     name,
                     ic,
@@ -3692,15 +5266,19 @@ impl<'a> Compiler<'a> {
                     recv_reg_or_local: Some((true, 0, reg)),
                     cont: next_label,
                 });
-                self.emit_mono_ic_get(ic_ptr, R_REGS, off, R_SP, 0, miss);
+                self.emit_mono_ic_get(ic_ptr, R_REGS, off, R_SP, 0, miss, getter_slow);
                 self.asm.add_ri(R_SP, VAL_SIZE);
             }
             Op::GetRegMethod { reg, name, ic } => {
                 let off = reg as i32 * VAL_SIZE;
                 let ic_ptr = &self.code.ics[ic as usize] as *const PropIc;
                 let miss = self.asm.label();
+                let getter_slow = self.asm.label();
+                let full_slow = self.asm.label();
                 self.stubs.push(Stub::GetPropSlow {
                     label: miss,
+                    getter_slow,
+                    full_slow,
                     op_pc,
                     name,
                     ic,
@@ -3709,9 +5287,11 @@ impl<'a> Compiler<'a> {
                     recv_reg_or_local: Some((true, 0, reg)),
                     cont: next_label,
                 });
-                self.emit_mono_ic_get(ic_ptr, R_REGS, off, R_SP, VAL_SIZE, miss);
+                self.emit_mono_ic_get(ic_ptr, R_REGS, off, R_SP, VAL_SIZE, miss, getter_slow);
                 self.asm.movdqu_load(XMM0, R_REGS, off);
                 self.asm.movdqu_store(R_SP, 0, XMM0);
+                self.asm.movzx_r_m8(RAX, R_SP, 0);
+                self.emit_clone_value(R_SP, 0);
                 self.asm.add_ri(R_SP, 2 * VAL_SIZE);
             }
             Op::GetLocalProp {
@@ -3722,8 +5302,12 @@ impl<'a> Compiler<'a> {
             } if (depth as usize) < SCOPE_CACHE_DEPTH => {
                 let ic_ptr = &self.code.ics[ic as usize] as *const PropIc;
                 let miss = self.asm.label();
+                let getter_slow = self.asm.label();
+                let full_slow = self.asm.label();
                 self.stubs.push(Stub::GetPropSlow {
                     label: miss,
+                    getter_slow,
+                    full_slow,
                     op_pc,
                     name,
                     ic,
@@ -3734,7 +5318,7 @@ impl<'a> Compiler<'a> {
                 });
                 let off = index as i32 * VAL_SIZE;
                 self.emit_load_scope_ptr(depth, index, R11, miss);
-                self.emit_mono_ic_get(ic_ptr, R11, off, R_SP, 0, miss);
+                self.emit_mono_ic_get(ic_ptr, R11, off, R_SP, 0, miss, getter_slow);
                 self.asm.add_ri(R_SP, VAL_SIZE);
             }
             Op::GetLocalMethod {
@@ -3745,8 +5329,12 @@ impl<'a> Compiler<'a> {
             } if (depth as usize) < SCOPE_CACHE_DEPTH => {
                 let ic_ptr = &self.code.ics[ic as usize] as *const PropIc;
                 let miss = self.asm.label();
+                let getter_slow = self.asm.label();
+                let full_slow = self.asm.label();
                 self.stubs.push(Stub::GetPropSlow {
                     label: miss,
+                    getter_slow,
+                    full_slow,
                     op_pc,
                     name,
                     ic,
@@ -3757,11 +5345,13 @@ impl<'a> Compiler<'a> {
                 });
                 let off = index as i32 * VAL_SIZE;
                 self.emit_load_scope_ptr(depth, index, R11, miss);
-                self.emit_mono_ic_get(ic_ptr, R11, off, R_SP, VAL_SIZE, miss);
+                self.emit_mono_ic_get(ic_ptr, R11, off, R_SP, VAL_SIZE, miss, getter_slow);
                 let ptr_off = OFF_CTX_SCOPE_PTRS + (depth as i32) * 8;
                 self.asm.mov_r_mem(R11, R_CTX, ptr_off);
                 self.asm.movdqu_load(XMM0, R11, off);
                 self.asm.movdqu_store(R_SP, 0, XMM0);
+                self.asm.movzx_r_m8(RAX, R_SP, 0);
+                self.emit_clone_value(R_SP, 0);
                 self.asm.add_ri(R_SP, 2 * VAL_SIZE);
             }
             Op::SetProp { name, ic } => {
@@ -3800,6 +5390,7 @@ impl<'a> Compiler<'a> {
                 self.asm
                     .mov_ri32(RDX, u32::from(matches!(op, Op::CallMethod(_))));
                 self.asm.mov_ri32(RCX, next_pc as u32);
+                self.asm.lea_rip_label(R8, next_label);
                 self.asm.call_abs(helper_call as *const () as usize);
                 self.emit_check_helper_status();
                 self.block_start = next_pc;
@@ -3881,6 +5472,8 @@ impl<'a> Compiler<'a> {
                 }
                 Stub::GetPropSlow {
                     label,
+                    getter_slow,
+                    full_slow,
                     op_pc,
                     name,
                     ic,
@@ -3890,7 +5483,6 @@ impl<'a> Compiler<'a> {
                     cont,
                 } => {
                     self.asm.bind(label);
-                    let full_slow = self.asm.label();
                     // try zero-sync PIC leaf first (covers polymorphic OwnData, ProtoData,
                     // DeepProto, Missing, DeepMissing, Array.length, String.length)
                     match (mode, recv_reg_or_local) {
@@ -3903,6 +5495,7 @@ impl<'a> Compiler<'a> {
                                 .call_abs(helper_ic_get_leaf_replace as *const () as usize);
                             self.asm.test_r32(RAX, RAX);
                             self.asm.jcc(CC_NE, cont);
+                            self.asm.jmp(full_slow);
                         }
                         (1 | 2, Some((true, _, reg))) => {
                             let off = reg as i32 * VAL_SIZE;
@@ -3954,6 +5547,31 @@ impl<'a> Compiler<'a> {
                         }
                         _ => {}
                     }
+                    // direct zero-sync getter dispatch when MonoIc matched an own or proto getter
+                    self.asm.bind(getter_slow);
+                    self.asm.mov_mem_r(R_CTX, OFF_CTX_SP, R_SP);
+                    self.asm.mov_rr(RSI, R9);
+                    match (mode, recv_reg_or_local) {
+                        (0, None) => {
+                            self.asm.lea_mem(RDX, R_SP, -VAL_SIZE);
+                        }
+                        (1 | 2, Some((true, _, reg))) => {
+                            self.asm.lea_mem(RDX, R_REGS, reg as i32 * VAL_SIZE);
+                        }
+                        (3 | 4, Some((false, depth, index))) => {
+                            self.emit_load_scope_ptr(depth, index, R10, full_slow);
+                            self.asm.lea_mem(RDX, R10, index as i32 * VAL_SIZE);
+                        }
+                        _ => unreachable!(),
+                    }
+                    self.asm.mov_rr(RDI, R_CTX);
+                    self.asm.mov_ri32(RCX, mode);
+                    self.asm.mov_ri32(R8, (op_pc + 1) as u32);
+                    self.asm.lea_rip_label(R9, cont);
+                    self.asm.call_abs(helper_ic_getter as *const () as usize);
+                    self.asm.cmp_r32_imm(RAX, STATUS_DISPATCH_NEXT as i32);
+                    self.asm.jcc(CC_E, self.dispatch_next);
+
                     self.asm.bind(full_slow);
                     self.asm.mov_mem_r(R_CTX, OFF_CTX_SP, R_SP);
                     self.asm.mov_rr(RDI, R_CTX);
@@ -3961,6 +5579,7 @@ impl<'a> Compiler<'a> {
                     self.asm.mov_ri32(RDX, name);
                     self.asm.mov_ri32(RCX, ic);
                     self.asm.mov_ri32(R8, mode);
+                    self.asm.lea_rip_label(R9, cont);
                     self.asm
                         .call_abs(helper_get_prop_slow as *const () as usize);
                     self.emit_check_helper_status();
@@ -4006,15 +5625,19 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn finish(mut self) -> Option<JitCode> {
+    fn finish(mut self, heap: &Heap) -> Option<JitCode> {
         self.asm.patch_labels();
         let pc_offsets: Box<[u32]> = self
             .pc_labels
             .iter()
             .map(|&lbl| self.asm.labels[lbl].expect("pc label bound") as u32)
             .collect();
-        let buf = ExecBuf::from_bytes(&self.asm.code)?;
-        Some(JitCode { buf, pc_offsets })
+        let (slab, ptr) = unsafe { (&mut *heap.jit_pool_ptr()).alloc(&self.asm.code)? };
+        Some(JitCode {
+            _slab: slab,
+            ptr,
+            pc_offsets,
+        })
     }
 }
 
@@ -4029,9 +5652,13 @@ pub(super) fn run_jit_frame(
     sampling: bool,
     safepoint_at: &mut u64,
 ) -> JitOutcome {
-    let (reg_base, max_pushes) = {
+    let (reg_base, max_pushes, max_scope_depth) = {
         let frame = unsafe { rt.frames.get_unchecked(top) };
-        (frame.reg_base, frame.code.max_pushes as usize)
+        (
+            frame.reg_base,
+            frame.code.max_pushes as usize,
+            frame.code.max_scope_depth,
+        )
     };
     let cap = rt.vm_stack.capacity();
     let len = rt.vm_stack.len();
@@ -4040,30 +5667,39 @@ pub(super) fn run_jit_frame(
     }
     let stack_ptr = rt.vm_stack.as_mut_ptr();
     let cap = rt.vm_stack.capacity();
+    let this_ptr = unsafe { &rt.frames.get_unchecked(top).this as *const Value };
     let mut run = JitRun {
         ctx: JitCtx {
             rt: rt as *mut ScriptRuntime,
             heap: heap_ptr,
             stack_ptr,
+            stack_end: unsafe { stack_ptr.add(cap) },
             stack_safe_limit: unsafe { stack_ptr.add(cap.saturating_sub(max_pushes)) },
             sp: unsafe { stack_ptr.add(rt.vm_stack.len()) },
             regs: unsafe { stack_ptr.add(reg_base) },
+            this_ptr,
             next_target: std::ptr::null(),
+            array_proto: rt.intrinsics.array_prototype.id() as u64,
+            string_proto: rt.intrinsics.string_prototype.id() as u64,
             scope_ptrs: [std::ptr::null_mut(); SCOPE_CACHE_DEPTH],
             scope_lens: [0; SCOPE_CACHE_DEPTH],
+            cached_scope_raw: 0,
             steps: rt.steps,
             safepoint_at: *safepoint_at,
             reg_base,
             top,
             frame_floor,
             max_pushes,
+            cached_scope_depth: 0,
             sampling: u8::from(sampling),
         },
         error: None,
         result: None,
         prev_code: None,
     };
-    unsafe { refresh_scope_cache(&mut run.ctx, rt) };
+    if max_scope_depth > 0 {
+        unsafe { refresh_scope_cache(&mut run.ctx, rt) };
+    }
     let entry = jit.entry();
     let target = jit.target(pc);
     let status = entry(&mut run, target);
@@ -4194,5 +5830,498 @@ mod tests {
         )
         .expect("jit stack and split");
         assert_eq!(out, "RangeError:|alpha|beta|gamma|:a|b:1");
+    }
+
+    #[test]
+    fn jit_preserves_this_slot_and_bound_getters() {
+        let out = run_js(
+            r#"
+            class Q {
+                constructor(e) {
+                    this.anchor = e;
+                }
+                getA() {
+                    return (() => this.anchor)();
+                }
+            }
+            let sum = 0;
+            for (let i = 0; i < 50; i++) {
+                const v = new Q(i).getA();
+                if (v !== i) throw new Error(i + ":" + v);
+                sum += v;
+            }
+            // exercise InitArgumentsSlot, InitNewTargetSlot, and InitHomeSlot under JIT
+            function argCapture() {
+                return (() => arguments.length + arguments[0])();
+            }
+            function NewTargetBox(x) {
+                this.ok = (() => new.target === NewTargetBox ? x : -1)();
+            }
+            const superBase = { tag() { return 5; } };
+            const superChild = {
+                __proto__: superBase,
+                read() {
+                    return (() => super.tag())();
+                }
+            };
+            let initSum = 0;
+            for (let i = 0; i < 30; i++) {
+                initSum += argCapture(i, 9) + new NewTargetBox(i).ok + superChild.read();
+            }
+            class Boxed {
+                constructor(n) {
+                    this.n = n;
+                    this.read = () => this.n;
+                }
+                nested(a, b) {
+                    const f = () => () => this.n + a + b;
+                    return f()();
+                }
+                withEval(k) {
+                    eval("");
+                    return (() => this.n + k)();
+                }
+            }
+            let dsum = 0;
+            for (let i = 0; i < 30; i++) {
+                const b = new Boxed(i);
+                dsum += b.read() + b.nested(1, 2) + b.withEval(1);
+            }
+            function readBound(bias) {
+                return this.base + bias;
+            }
+            function readBound0() {
+                return this.base;
+            }
+            const ctx = { base: 7 };
+            const b0 = readBound0.bind(ctx);
+            const host = {};
+            Object.defineProperty(host, "v", { get: readBound.bind(ctx, 3) });
+            Object.defineProperty(host, "s", { get: String.prototype.toUpperCase.bind("ok") });
+            function readHost(o) {
+                return o.v + (o.s === "OK" ? 1 : 0) + b0();
+            }
+            let gsum = 0;
+            for (let i = 0; i < 40; i++) {
+                gsum += readHost(host) + host.v;
+            }
+            // exercise 4-shape polymorphic ICs, Array/String method ICs, and ASCII char-class splits
+            function read4(o) { return o.k; }
+            const shapes = [
+                { k: 1 },
+                { a: 0, k: 2 },
+                { a: 0, b: 0, k: 3 },
+                { a: 0, b: 0, c: 0, k: 4 },
+            ];
+            let psum = 0;
+            function splitLast(p) { return p.split(/[\\/]/).pop(); }
+            function splitCollapse(p) { return p.split(/[\\/]+/).join("|"); }
+            for (let i = 0; i < 40; i++) {
+                psum += read4(shapes[i & 3]);
+                if (splitLast("C:\\Users\\demo/app.exe") !== "app.exe") throw new Error("split");
+                if (splitCollapse("a///b\\\\c") !== "a|b|c") throw new Error("split+");
+            }
+            document.getElementById("out").textContent =
+                sum + ":" + initSum + ":" + dsum + ":" + gsum + ":" + psum;
+            "#,
+        )
+        .expect("jit this slot and bound getters");
+        let sum: i64 = (0..50).sum();
+        let init_sum: i64 = (0..30).map(|i| (2 + i) + i + 5).sum();
+        let dsum: i64 = (0..30).map(|i| i + (i + 3) + (i + 1)).sum();
+        let gsum: i64 = 40 * ((10 + 1 + 7) + 10);
+        let psum: i64 = (0..40).map(|i| (i & 3) + 1).sum();
+        assert_eq!(out, format!("{sum}:{init_sum}:{dsum}:{gsum}:{psum}"));
+    }
+
+    #[test]
+    fn jit_pool_shares_wx_slabs_across_many_functions() {
+        let document = crate::dom::Document::parse("<p id='out'></p>").expect("doc");
+        let document = Rc::new(RefCell::new(document));
+        let mut rt = ScriptRuntime::new(document.clone());
+        let mut src = String::from("let acc = 0;\n");
+        for i in 0..24 {
+            src.push_str(&format!("function f{i}(x) {{ return x + {i}; }}\n"));
+        }
+        src.push_str("for (let r = 0; r < 24; r++) {");
+        for i in 0..24 {
+            src.push_str(&format!(" acc += f{i}(r);"));
+        }
+        src.push_str(" }\ndocument.getElementById('out').textContent = String(acc);");
+        rt.execute(&src).expect("pool script");
+        let slabs =
+            unsafe { (*(*super::super::heap::heap_ptr(rt.heap_id)).jit_pool_ptr()).slab_count() };
+        assert_eq!(
+            slabs, 1,
+            "24 small functions should share one 64 KiB W^X slab"
+        );
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        let text = document.borrow().element_text_content(out).unwrap();
+        let expected: i64 = (0..24).flat_map(|r| (0..24).map(move |i| r + i)).sum();
+        assert_eq!(text, expected.to_string());
+    }
+
+    #[test]
+    fn jit_uses_regs_with_grandparent_capturing_closures() {
+        let out = run_js(
+            r#"
+            function makeSuite(seed) {
+                let factor = seed;
+                function scale(v) { return v * factor; }
+                function middle(a, b) {
+                    const pick = o => scale(o.v);
+                    const bump = o => o.v + 1;
+                    return pick(a) + bump(b);
+                }
+                function mutateThroughNested(x) {
+                    const run = () => () => { factor += 1; return scale(x); };
+                    return run()();
+                }
+                function realCapture(k) {
+                    let local = k * 2;
+                    const read = () => local + factor;
+                    local += 3;
+                    return read();
+                }
+                let total = 0;
+                for (let i = 0; i < 40; i++) {
+                    total += middle({ v: i }, { v: i + 1 }) + realCapture(i);
+                }
+                total += mutateThroughNested(5);
+                return total;
+            }
+            document.getElementById("out").textContent = String(makeSuite(3));
+            "#,
+        )
+        .expect("grandparent capture script");
+        let mut expected: i64 = 0;
+        let factor = 3i64;
+        for i in 0..40i64 {
+            expected += (i * factor + (i + 1 + 1)) + ((i * 2 + 3) + factor);
+        }
+        expected += 5 * (factor + 1);
+        assert_eq!(out, expected.to_string());
+
+        // confirm the middle function kept uses_regs = true despite its child capturing x
+        let src = "function outer() { let x = 1; function mid(a) { const f = y => x + y; return f(a); } return mid; }";
+        let parsed = super::super::parser::parse_script(src).expect("parse");
+        let compiled = super::super::compiler::Compiler::new(src)
+            .compile_script(&parsed)
+            .expect("compile");
+        let outer = &compiled.children[0];
+        let mid = &outer.children[0];
+        assert!(mid.uses_regs, "mid should stay register-only");
+        assert_eq!(mid.fast_call, 1);
+
+        // confirm `split(/[\\/]/).pop()` actually fused into Op::SplitRegexPop
+        let split_src = "function leaf(e) { return e.split(/[\\\\/]/).pop(); }";
+        let split_parsed = super::super::parser::parse_script(split_src).expect("parse");
+        let split_compiled = super::super::compiler::Compiler::new(split_src)
+            .compile_script(&split_parsed)
+            .expect("compile");
+        assert!(
+            split_compiled.children[0]
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::SplitRegexPop { .. })),
+            "e.split(/[\\\\/]/).pop() should fuse into Op::SplitRegexPop"
+        );
+    }
+
+    #[test]
+    fn jit_split_regex_pop_fast_path_and_fallbacks() {
+        let out = run_js(
+            r#"
+            function leaf1(s) { return s.split(/[\\/]/).pop(); }
+            function leaf2(s) { return s.split(/[\\/]+/).pop(); }
+            let checks = 0;
+            for (let i = 0; i < 40; i++) {
+                if (leaf1("C:\\Users\\demo/app.exe") !== "app.exe") throw new Error("p1");
+                if (leaf1("plain") !== "plain") throw new Error("p2");
+                if (leaf1("") !== "") throw new Error("p3");
+                if (leaf1("a/b/") !== "") throw new Error("p4");
+                if (leaf2("a///b\\\\c") !== "c") throw new Error("p5");
+                if (leaf2("///") !== "") throw new Error("p6");
+                if (leaf1("caf\u00e9/na\u00efve") !== "na\u00efve") throw new Error("unicode");
+                if (leaf1({ split() { return ["a", "obj"]; } }) !== "obj") throw new Error("obj");
+                checks++;
+            }
+            let threw = "";
+            try { leaf1(null); } catch (e) { threw = e.name; }
+
+            const origPop = Array.prototype.pop;
+            Array.prototype.pop = function() { return "pop:" + this.length; };
+            const rPop = leaf1("a/b/c");
+            Array.prototype.pop = origPop;
+
+            const origSplit = String.prototype.split;
+            String.prototype.split = function() { return ["s", "custom"]; };
+            const rSplit = leaf1("a/b/c");
+            String.prototype.split = origSplit;
+
+            const origSym = RegExp.prototype[Symbol.split];
+            RegExp.prototype[Symbol.split] = function() { return ["sym", "ok"]; };
+            const rSym = leaf1("a/b/c");
+            RegExp.prototype[Symbol.split] = origSym;
+
+            const rAfter = leaf1("x/y/z");
+            document.getElementById("out").textContent =
+                [checks, threw, rPop, rSplit, rSym, rAfter].join("|");
+            "#,
+        )
+        .expect("split regex pop");
+        assert_eq!(out, "40|TypeError|pop:3|custom|ok|z");
+    }
+
+    #[test]
+    fn jit_direct_getters_length_ics_and_array_callbacks() {
+        let out = run_js(
+            r#"
+            const proto = {
+                get regGet() { return this.x * 2; },
+                get scopeGet() {
+                    if (this.x >= 0) { let b = 1; return this.x + b; }
+                    return 0;
+                },
+                get fnGet() { return k => this.x + k; }
+            };
+            function make(x) {
+                const o = Object.create(proto);
+                o.x = x;
+                Object.defineProperty(o, "own", { get() { return this.x + 10; } });
+                return o;
+            }
+            function readGetters(o) {
+                let local = o;
+                const keep = () => local;
+                return o.regGet + o.scopeGet + o.own + o.fnGet(5) + local.regGet + (keep() === o ? 0 : 1);
+            }
+            function readLengths(a, s) {
+                a.push(s.length);
+                const popped = a.pop();
+                return a.length + popped + (Array.isArray(a) ? 1 : 0) + (Array.isArray(s) ? 10 : 0);
+            }
+            let sum = 0;
+            const arr = [1, 2, 3];
+            for (let i = 0; i < 40; i++) {
+                const o = make(i);
+                sum += readGetters(o) + readLengths(arr, i & 1 ? "a\u{1F600}b" : "abcd");
+            }
+            const emptyMap = [].map(x => x + 1).length;
+            const emptySome = [].some(() => true);
+            const emptyEvery = [].every(() => false);
+            const shrink = [1, 2, 3, 4];
+            const seen = [];
+            shrink.forEach(v => { seen.push(v); shrink.pop(); });
+            const reduced = [10, 20, 30].reduce((a, b) => a + b, 0);
+            document.getElementById("out").textContent =
+                [sum, emptyMap, emptySome, emptyEvery, seen.join(","), reduced].join("|");
+            "#,
+        )
+        .expect("getters, lengths, callbacks");
+        let expected_sum: i64 = (0..40)
+            .map(|i| (2 * i + (i + 1) + (i + 10) + (i + 5) + 2 * i) + (3 + 4 + 1))
+            .sum();
+        assert_eq!(out, format!("{expected_sum}|0|false|true|1,2|60"));
+    }
+
+    #[test]
+    fn jit_scope_cache_and_this_ptr_across_nested_calls() {
+        let out = run_js(
+            r#"
+            function makeEnv(base) {
+                let outerVal = base;
+                function scopedLeaf(x) {
+                    let y = x + 1;
+                    const c = () => y;
+                    return c() + outerVal;
+                }
+                function earlyReturn(flag, x) {
+                    let local = x + 2;
+                    const keep = () => local;
+                    if (flag) {
+                        let inner = keep() + outerVal;
+                        return inner;
+                    }
+                    return outerVal;
+                }
+                function withBlockClobber(otherFn, k) {
+                    let sum = 0;
+                    if (k >= 0) {
+                        let blk = k * 3;
+                        const readBlk = () => blk;
+                        sum += otherFn(k) + readBlk() + outerVal;
+                    }
+                    // outerVal read after PopScope must still hit the refreshed scope chain
+                    sum += outerVal + scopedLeaf(k) + earlyReturn(k % 2 === 0, k);
+                    return sum;
+                }
+                return { scopedLeaf, withBlockClobber };
+            }
+            const envA = makeEnv(100);
+            const envB = makeEnv(200);
+            let total = 0;
+            for (let i = 0; i < 40; i++) {
+                total += envA.withBlockClobber(envB.scopedLeaf, i);
+            }
+            // exercise this_ptr across deep recursion that reallocates rt.frames
+            const box = {
+                tag: 7,
+                walk(n) {
+                    if (n === 0) return this.tag;
+                    return this.tag + this.walk(n - 1);
+                },
+            };
+            const boxB = { tag: 3, walk: box.walk };
+            const boundWalk = box.walk.bind(boxB);
+            let deep = 0;
+            for (let i = 0; i < 20; i++) {
+                deep += box.walk(80) + boundWalk(40);
+            }
+            document.getElementById("out").textContent = total + "|" + deep;
+            "#,
+        )
+        .expect("scope cache and this_ptr");
+        let expected_total: i64 = (0..40i64)
+            .map(|i| {
+                let other = (i + 1) + 200;
+                let blk = i * 3;
+                let leaf = (i + 1) + 100;
+                let early = if i % 2 == 0 { (i + 2) + 100 } else { 100 };
+                other + blk + 100 + 100 + leaf + early
+            })
+            .sum();
+        let expected_deep: i64 = 20 * (81 * 7 + 41 * 3);
+        assert_eq!(out, format!("{expected_total}|{expected_deep}"));
+    }
+
+    #[test]
+    fn jit_hoists_non_capturing_blocks_and_lexical_this_arrows() {
+        // verify a SolidJS-like signal getter with blocks and a cold `() => ge(this)` stays register-only
+        let se_src = r#"
+            function mod() {
+                let g = 0, h = 0;
+                function ge(x) { return x.v; }
+                function P(fn) { return fn(); }
+                function se() {
+                    let e = g;
+                    if (this.flag) {
+                        let e = g;
+                        g = 1;
+                        let r = P(() => ge(this));
+                        g = e;
+                        return r;
+                    }
+                    if (h) {
+                        let e = this.obs;
+                        if (e) { let t = e.length; return t; }
+                    }
+                    return this.v;
+                }
+                return se;
+            }
+        "#;
+        let parsed = super::super::parser::parse_script(se_src).expect("parse se");
+        let compiled = super::super::compiler::Compiler::new(se_src)
+            .compile_script(&parsed)
+            .expect("compile se");
+        let mod_code = &compiled.children[0];
+        let se_code = mod_code
+            .children
+            .iter()
+            .find(|c| &*c.name == "se")
+            .expect("se code");
+        assert!(se_code.uses_regs, "se should stay register-only");
+        assert_eq!(se_code.fast_call, 1);
+        assert_eq!(se_code.max_scope_depth, 1);
+
+        // derived constructors must keep this_slot rather than capturing pre-super lexical this
+        let derived_src = "class B {} class D extends B { constructor() { const f = () => this; super(); return f; } }";
+        let derived_parsed =
+            super::super::parser::parse_script(derived_src).expect("parse derived");
+        let derived_compiled = super::super::compiler::Compiler::new(derived_src)
+            .compile_script(&derived_parsed)
+            .expect("compile derived");
+        let derived_ctor = &derived_compiled.classes[1].constructor;
+        assert!(
+            !derived_ctor.children[0].uses_lexical_this,
+            "arrow inside derived constructor must not use lexical_this"
+        );
+
+        let out = run_js(
+            r#"
+            function makeSignal() {
+                let ran = 0;
+                function ge(x) { ran++; return x.v * 10; }
+                function P(fn) { return fn(); }
+                function se() {
+                    let e = ran;
+                    if (this.flag) {
+                        let e = ran;
+                        let r = P(() => ge(this));
+                        ran = e + 1;
+                        return r;
+                    }
+                    if (this.v > 0) {
+                        let t = this.v + 1;
+                        return t + e * 0;
+                    }
+                    return this.v;
+                }
+                const objA = { flag: false, v: 5 };
+                const objB = { flag: true, v: 7 };
+                const readA = se.bind(objA);
+                const readB = se.bind(objB);
+                let total = 0;
+                for (let i = 0; i < 40; i++) {
+                    total += readA() + (i === 35 ? readB() : 0);
+                }
+                // arrow bound to lexical this ignores call/bind receiver and works as getter
+                const holder = {
+                    tag: 99,
+                    makeArrow() { return () => () => this.tag; },
+                    makeEvalArrow() { return () => eval("this.tag"); },
+                };
+                const arr = holder.makeArrow();
+                const inner = arr.call({ tag: 1 });
+                const gObj = {};
+                Object.defineProperty(gObj, "k", { get: inner });
+                const evalRes = holder.makeEvalArrow().call({ tag: 2 });
+
+                // non-derived constructor arrows capture lexical this cleanly
+                class Box {
+                    constructor(x) {
+                        this.x = x + 3;
+                        const getX = () => this.x;
+                        this.captured = getX();
+                    }
+                }
+                let subSum = 0;
+                for (let i = 0; i < 30; i++) subSum += new Box(i).captured;
+
+                // exercise fast string methods and template concat (including -0 and >256 bytes)
+                const longStr = "x".repeat(300);
+                let strScore = 0;
+                for (let i = 0; i < 40; i++) {
+                    const a = "AppName";
+                    const b = "appname";
+                    if (a.toLowerCase() !== b) throw new Error("lower");
+                    if (b.toLowerCase() !== b) throw new Error("lower2");
+                    if (!b.includes("name") || b.includes("zzz")) throw new Error("inc");
+                    if (a.localeCompare("Beta") >= 0) throw new Error("loc");
+                    const t1 = `${-0}:${i}:${1.5}:${true}:${null}:${undefined}`;
+                    if (t1 !== "0:" + i + ":1.5:true:null:undefined") throw new Error("t1");
+                    const t2 = `p:${longStr}:${i}`;
+                    if (t2.length !== 303 + String(i).length) throw new Error("t2");
+                    strScore++;
+                }
+                return [total, ran, inner.call({ tag: 0 }), gObj.k, evalRes, subSum, strScore].join("|");
+            }
+            document.getElementById("out").textContent = makeSignal();
+            "#,
+        )
+        .expect("hoist and lexical this");
+        let expected_sub: i64 = (0..30).map(|i| i + 3).sum();
+        assert_eq!(out, format!("{}|1|99|99|99|{expected_sub}|40", 40 * 6 + 70));
     }
 }

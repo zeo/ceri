@@ -506,8 +506,16 @@ pub(super) const MONO_EMPTY: u8 = 0;
 pub(super) const MONO_OWN_DATA: u8 = 1;
 pub(super) const MONO_PROTO_DATA: u8 = 2;
 pub(super) const MONO_MISSING: u8 = 3;
+pub(super) const MONO_ARRAY_METHOD: u8 = 4;
+pub(super) const MONO_STRING_METHOD: u8 = 5;
+pub(super) const MONO_OWN_GETTER: u8 = 6;
+pub(super) const MONO_PROTO_GETTER: u8 = 7;
+pub(super) const MONO_ARRAY_LENGTH: u8 = 8;
+pub(super) const MONO_STRING_LENGTH: u8 = 9;
 
-// compact inline fast-path entry mirrored from entries[0..2] for direct JIT checks
+pub(super) const MONO_COUNT: usize = 4;
+
+// compact inline fast-path entry mirrored from entries[0..MONO_COUNT] for direct JIT checks
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct MonoEntry {
@@ -544,6 +552,14 @@ impl MonoEntry {
                 writable: u8::from(*writable),
                 _pad: 0,
             },
+            IcEntry::OwnAccessor { shape, index } if shape.id != 0 => Self {
+                shape_id: shape.id,
+                proto_shape_id: 0,
+                index: *index,
+                kind: MONO_OWN_GETTER,
+                writable: 0,
+                _pad: 0,
+            },
             IcEntry::ProtoData {
                 receiver: Some(recv),
                 holder_shape,
@@ -554,6 +570,44 @@ impl MonoEntry {
                 proto_shape_id: holder_shape.id,
                 index: *index,
                 kind: MONO_PROTO_DATA,
+                writable: 0,
+                _pad: 0,
+            },
+            IcEntry::ProtoData {
+                receiver: None,
+                holder_shape,
+                index,
+                ..
+            } if holder_shape.id != 0 => Self {
+                shape_id: 0,
+                proto_shape_id: holder_shape.id,
+                index: *index,
+                kind: MONO_ARRAY_METHOD,
+                writable: 0,
+                _pad: 0,
+            },
+            IcEntry::ProtoAccessor {
+                receiver,
+                holder_shape,
+                index,
+                ..
+            } if receiver.id != 0 && holder_shape.id != 0 => Self {
+                shape_id: receiver.id,
+                proto_shape_id: holder_shape.id,
+                index: *index,
+                kind: MONO_PROTO_GETTER,
+                writable: 0,
+                _pad: 0,
+            },
+            IcEntry::StringMethod {
+                holder_shape,
+                index,
+                ..
+            } if holder_shape.id != 0 => Self {
+                shape_id: 0,
+                proto_shape_id: holder_shape.id,
+                index: *index,
+                kind: MONO_STRING_METHOD,
                 writable: 0,
                 _pad: 0,
             },
@@ -576,6 +630,22 @@ impl MonoEntry {
                 },
                 _ => Self::EMPTY,
             },
+            IcEntry::ArrayLength => Self {
+                shape_id: 0,
+                proto_shape_id: 0,
+                index: 0,
+                kind: MONO_ARRAY_LENGTH,
+                writable: 0,
+                _pad: 0,
+            },
+            IcEntry::StringLength => Self {
+                shape_id: 0,
+                proto_shape_id: 0,
+                index: 0,
+                kind: MONO_STRING_LENGTH,
+                writable: 0,
+                _pad: 0,
+            },
             _ => Self::EMPTY,
         }
     }
@@ -584,14 +654,12 @@ impl MonoEntry {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct MonoIc {
-    pub(super) e0: MonoEntry,
-    pub(super) e1: MonoEntry,
+    pub(super) entries: [MonoEntry; MONO_COUNT],
 }
 
 impl MonoIc {
     const EMPTY: Self = Self {
-        e0: MonoEntry::EMPTY,
-        e1: MonoEntry::EMPTY,
+        entries: [MonoEntry::EMPTY; MONO_COUNT],
     };
 }
 
@@ -693,8 +761,9 @@ enum IcEntry {
 impl PropIc {
     #[inline]
     fn sync_mono(inner: &mut PropIcInner) {
-        inner.mono.e0 = MonoEntry::from_ic_entry(&inner.entries[0]);
-        inner.mono.e1 = MonoEntry::from_ic_entry(&inner.entries[1]);
+        for i in 0..MONO_COUNT {
+            inner.mono.entries[i] = MonoEntry::from_ic_entry(&inner.entries[i]);
+        }
     }
 
     fn replace_or_insert(&self, matches_existing: impl Fn(&IcEntry) -> bool, entry: IcEntry) {
@@ -703,7 +772,7 @@ impl PropIc {
         for (i, slot) in inner.entries.iter_mut().enumerate() {
             if matches_existing(slot) {
                 *slot = entry;
-                if i <= 1 {
+                if i < MONO_COUNT {
                     Self::sync_mono(inner);
                 }
                 return;
@@ -712,7 +781,7 @@ impl PropIc {
         for (i, slot) in inner.entries.iter_mut().enumerate() {
             if matches!(slot, IcEntry::Empty) {
                 *slot = entry;
-                if i <= 1 {
+                if i < MONO_COUNT {
                     Self::sync_mono(inner);
                 }
                 return;
@@ -721,7 +790,7 @@ impl PropIc {
         let slot = inner.next as usize % PIC_SIZE;
         inner.next = inner.next.wrapping_add(1);
         inner.entries[slot] = entry;
-        if slot <= 1 {
+        if slot < MONO_COUNT {
             Self::sync_mono(inner);
         }
     }
@@ -729,6 +798,9 @@ impl PropIc {
     #[inline]
     pub(super) fn is_array_length(&self) -> bool {
         let inner = unsafe { &*self.0.get() };
+        if inner.mono.entries[0].kind == MONO_ARRAY_LENGTH {
+            return true;
+        }
         inner
             .entries
             .iter()
@@ -738,6 +810,9 @@ impl PropIc {
     #[inline]
     pub(super) fn is_string_length(&self) -> bool {
         let inner = unsafe { &*self.0.get() };
+        if inner.mono.entries[0].kind == MONO_STRING_LENGTH {
+            return true;
+        }
         inner
             .entries
             .iter()
@@ -1183,6 +1258,101 @@ impl JsObject {
         matches!(
             self.properties.get(index),
             Some(Slot::Data(Value::Object(actual))) if ObjectHandle::ptr_eq(actual, expected_obj)
+        )
+    }
+
+    #[inline]
+    pub(super) fn regexp_split_intact(&self, heap: &super::heap::Heap) -> bool {
+        // realm installs REGEXP_METHODS in order, placing "@@split" at slot 7
+        let index = if self.shape.keys.get(7).is_some_and(|k| &**k == "@@split") {
+            7
+        } else {
+            let Some(pos) = self.shape.position("@@split") else {
+                return false;
+            };
+            pos
+        };
+        let Some(Slot::Data(Value::Object(method_obj))) = self.properties.get(index) else {
+            return false;
+        };
+        let Some(borrowed) = (unsafe { heap.object_ref(method_obj) }) else {
+            return false;
+        };
+        matches!(
+            &borrowed.class,
+            ObjectClass::Native(native)
+                if matches!(**native, super::realm::Native::RegExp(super::regexp::RegExpMethod::Split))
+        )
+    }
+
+    #[inline]
+    pub(super) fn string_split_intact(&self, heap: &super::heap::Heap) -> bool {
+        // realm installs toString, valueOf, then STRING_METHODS, placing "split" at slot 23
+        let index = if self.shape.keys.get(23).is_some_and(|k| &**k == "split") {
+            23
+        } else {
+            let Some(pos) = self.shape.position("split") else {
+                return false;
+            };
+            pos
+        };
+        let Some(Slot::Data(Value::Object(method_obj))) = self.properties.get(index) else {
+            return false;
+        };
+        let Some(borrowed) = (unsafe { heap.object_ref(method_obj) }) else {
+            return false;
+        };
+        matches!(
+            &borrowed.class,
+            ObjectClass::Native(native)
+                if matches!(**native, super::realm::Native::String(super::strings::StringMethod::Split))
+        )
+    }
+
+    #[inline]
+    pub(super) fn array_pop_intact(&self, heap: &super::heap::Heap) -> bool {
+        // realm installs values, @@iterator, keys, entries, then ARRAY_METHODS, placing "pop" at slot 22
+        let index = if self.shape.keys.get(22).is_some_and(|k| &**k == "pop") {
+            22
+        } else {
+            let Some(pos) = self.shape.position("pop") else {
+                return false;
+            };
+            pos
+        };
+        let Some(Slot::Data(Value::Object(method_obj))) = self.properties.get(index) else {
+            return false;
+        };
+        let Some(borrowed) = (unsafe { heap.object_ref(method_obj) }) else {
+            return false;
+        };
+        matches!(
+            &borrowed.class,
+            ObjectClass::Native(native)
+                if matches!(**native, super::realm::Native::Array(super::arrays::ArrayMethod::Pop))
+        )
+    }
+
+    #[inline]
+    pub(super) fn array_constructor_intact(&self, heap: &super::heap::Heap) -> bool {
+        let index = match self.shape.keys.len().checked_sub(1) {
+            Some(last) if &*self.shape.keys[last] == "constructor" => last,
+            _ => {
+                let Some(pos) = self.shape.position("constructor") else {
+                    return false;
+                };
+                pos
+            }
+        };
+        let Some(Slot::Data(Value::Object(ctor_obj))) = self.properties.get(index) else {
+            return false;
+        };
+        let Some(borrowed) = (unsafe { heap.object_ref(ctor_obj) }) else {
+            return false;
+        };
+        matches!(
+            &borrowed.class,
+            ObjectClass::Native(native) if matches!(**native, super::realm::Native::ArrayConstructor)
         )
     }
 

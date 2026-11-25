@@ -136,7 +136,7 @@ impl<T> Drop for Slab<T> {
 }
 
 impl<T> Slab<T> {
-    #[inline]
+    #[inline(always)]
     fn alloc(&self, value: T) -> (u32, u32) {
         let index = match unsafe { (&mut *self.free_list.get()).pop() } {
             Some(index) => index,
@@ -165,7 +165,7 @@ impl<T> Slab<T> {
         self.take_free_slot(index, expected_gen).is_some()
     }
 
-    #[inline]
+    #[inline(always)]
     fn take_free_slot(&self, index: u32, expected_gen: u32) -> Option<T> {
         let entry = self.entry_if_alive(index, expected_gen)?;
         let entry = unsafe { &*entry };
@@ -446,6 +446,11 @@ pub(super) struct Heap {
     gc_threshold: Cell<usize>,
     // recycled small scope slot vectors avoiding malloc/free on short-lived scopes
     slot_pool: UnsafeCell<Vec<Vec<Value>>>,
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    jit_pool: UnsafeCell<super::jit::JitPool>,
 }
 
 #[cfg(all(
@@ -456,6 +461,13 @@ impl Heap {
     pub(super) const OFF_ID: usize = std::mem::offset_of!(Self, id);
     pub(super) const OFF_OBJECTS_CHUNKS: usize =
         std::mem::offset_of!(Self, objects) + std::mem::offset_of!(Slab<JsObject>, chunks_ptr);
+    pub(super) const OFF_ARRAYS_CHUNKS: usize =
+        std::mem::offset_of!(Self, arrays) + std::mem::offset_of!(Slab<ArrayData>, chunks_ptr);
+
+    #[inline]
+    pub(super) fn jit_pool_ptr(&self) -> *mut super::jit::JitPool {
+        self.jit_pool.get()
+    }
 }
 
 impl Heap {
@@ -468,10 +480,15 @@ impl Heap {
             allocs_since_gc: Cell::new(0),
             gc_threshold: Cell::new(MINIMUM_THRESHOLD),
             slot_pool: UnsafeCell::new(Vec::new()),
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            jit_pool: UnsafeCell::new(super::jit::JitPool::default()),
         })
     }
 
-    #[inline]
+    #[inline(always)]
     pub(super) fn alloc_scope_slots(&self, len: usize, uninit: bool) -> Vec<Value> {
         if len == 0 {
             return Vec::new();
@@ -493,8 +510,29 @@ impl Heap {
                     std::ptr::write(ptr.add(i), Value::Uninitialized);
                 }
             } else {
-                for i in 0..len {
-                    std::ptr::write(ptr.add(i), Value::Undefined);
+                // unroll small scope slot fills so llvm emits inline stores instead of memset
+                match len {
+                    1 => std::ptr::write(ptr, Value::Undefined),
+                    2 => {
+                        std::ptr::write(ptr, Value::Undefined);
+                        std::ptr::write(ptr.add(1), Value::Undefined);
+                    }
+                    3 => {
+                        std::ptr::write(ptr, Value::Undefined);
+                        std::ptr::write(ptr.add(1), Value::Undefined);
+                        std::ptr::write(ptr.add(2), Value::Undefined);
+                    }
+                    4 => {
+                        std::ptr::write(ptr, Value::Undefined);
+                        std::ptr::write(ptr.add(1), Value::Undefined);
+                        std::ptr::write(ptr.add(2), Value::Undefined);
+                        std::ptr::write(ptr.add(3), Value::Undefined);
+                    }
+                    _ => {
+                        for i in 0..len {
+                            std::ptr::write(ptr.add(i), Value::Undefined);
+                        }
+                    }
                 }
             }
             buf.set_len(len);
@@ -534,7 +572,7 @@ impl Heap {
         buf
     }
 
-    #[inline]
+    #[inline(always)]
     pub(super) fn recycle_scope_slots(&self, mut slots: Vec<Value>) {
         let len = slots.len();
         let ptr = slots.as_mut_ptr();
@@ -620,6 +658,30 @@ impl Heap {
     }
 
     #[inline(always)]
+    pub(super) unsafe fn scope_slots_fast(
+        &self,
+        scope_ref: &ScopeRef,
+    ) -> Option<(*mut Value, usize, Option<ScopeRef>)> {
+        let (heap_id, epoch, index) = unpack_handle(scope_ref.0);
+        if heap_id != self.id {
+            return None;
+        }
+        let entry = self.scopes.entry_live(index, epoch);
+        if unsafe { (*entry).borrow.get() } != 0 {
+            return None;
+        }
+        let scope = unsafe { (*(*entry).value.get()).as_mut().unwrap_unchecked() };
+        if scope.layout.grows {
+            return None;
+        }
+        Some((
+            scope.slots.as_mut_ptr(),
+            scope.slots.len(),
+            scope.parent.clone(),
+        ))
+    }
+
+    #[inline(always)]
     pub(super) unsafe fn object_ref(&self, handle: &ObjectHandle) -> Option<&JsObject> {
         let (heap_id, epoch, index) = unpack_handle(handle.0);
         if heap_id != self.id {
@@ -701,7 +763,17 @@ impl Heap {
             if let Some(mut freed) = self.scopes.take_free_slot(index, epoch) {
                 let slots = std::mem::take(&mut freed.slots);
                 self.recycle_scope_slots(slots);
-                drop(freed);
+                if freed.extra.is_none() {
+                    // slots was taken and extra is None; drop only Rc<Layout> without drop_glue
+                    let md = std::mem::ManuallyDrop::new(freed);
+                    unsafe {
+                        std::ptr::drop_in_place(
+                            &md.layout as *const _ as *mut Rc<super::compiler::Layout>,
+                        );
+                    }
+                } else {
+                    drop(freed);
+                }
                 let count = self.allocs_since_gc.get();
                 if count > 0 {
                     self.allocs_since_gc.set(count - 1);
@@ -1042,6 +1114,11 @@ impl ArrayHandle {
 pub(super) struct ScopeRef(NonZeroU64);
 
 impl ScopeRef {
+    #[inline(always)]
+    pub(super) fn raw_bits(&self) -> u64 {
+        self.0.get()
+    }
+
     #[inline(always)]
     pub(super) fn borrow(&self) -> GcRef<'_, Scope> {
         let (heap_id, epoch, index) = unpack_handle(self.0);
@@ -2024,12 +2101,33 @@ mod tests {
             obj_addr - entry_base,
             std::mem::offset_of!(Entry<JsObject>, value)
         );
-        // verify Option<ObjectHandle> niche-packs None as 0u64 and MonoIc fits two 16-byte entries
+        // verify Option<ObjectHandle> niche-packs None as 0u64 and MonoIc fits four 16-byte entries
         assert_eq!(std::mem::size_of::<Option<ObjectHandle>>(), 8);
         let none_bits: u64 = unsafe { std::mem::transmute(Option::<ObjectHandle>::None) };
         assert_eq!(none_bits, 0);
         assert_eq!(std::mem::size_of::<super::object::MonoEntry>(), 16);
-        assert_eq!(std::mem::size_of::<super::object::MonoIc>(), 32);
+        assert_eq!(
+            std::mem::size_of::<super::object::MonoIc>(),
+            16 * super::object::MONO_COUNT
+        );
+        // verify Entry<ArrayData> niche layout and ArrayData::extra None == 0u64 for JIT array ICs
+        assert_eq!(std::mem::size_of::<Entry<ArrayData>>(), 40);
+        let arr_entry = Entry {
+            meta: Cell::new(1),
+            borrow: Cell::new(0),
+            value: UnsafeCell::new(Some(ArrayData::default())),
+        };
+        let arr_base = &arr_entry as *const Entry<ArrayData> as usize;
+        let arr_addr =
+            unsafe { (*arr_entry.value.get()).as_ref().unwrap() as *const ArrayData as usize };
+        assert_eq!(
+            arr_addr - arr_base,
+            std::mem::offset_of!(Entry<ArrayData>, value)
+        );
+        let extra_off =
+            std::mem::offset_of!(Entry<ArrayData>, value) + std::mem::offset_of!(ArrayData, extra);
+        let extra_none = unsafe { *((arr_base + extra_off) as *const u64) };
+        assert_eq!(extra_none, 0);
     }
 
     #[test]

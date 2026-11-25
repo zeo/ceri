@@ -359,6 +359,12 @@ pub(super) enum Op {
         array: u16,
         index: u16,
     },
+    // fused `str.split(/re/).pop()` skipping temporary regexp, array, and dead segment strings
+    SplitRegexPop {
+        pattern: u32,
+        flags: u32,
+        cache: u16,
+    },
 }
 
 pub(super) const NO_TARGET: u32 = u32::MAX;
@@ -409,6 +415,8 @@ pub(super) struct Code {
     pub(super) eval_context: EvalContext,
     // per-site polymorphic inline caches for GetProp and SetProp
     pub(super) ics: Box<[super::object::PropIc]>,
+    // lazily classified ascii splitters for fused SplitRegexPop sites
+    pub(super) split_regex_cache: Box<[std::cell::OnceCell<Option<super::pattern::AsciiSplit>>]>,
     // static key lists for MakeObject literals, lazily materialized into shared Shapes
     pub(super) object_shapes: Box<[ObjectShapeEntry]>,
     // what each closure of this code starts as, when it has no prototype of its own
@@ -426,6 +434,12 @@ pub(super) struct Code {
     pub(super) captures_nothing: bool,
     // max lexical scope depth read by ops in this code (0 when no scope-chain ops exist)
     pub(super) max_scope_depth: u8,
+    // 1 = register-only linear-param fast call, 2 = pooled-scope simple-param fast call, 0 = slow
+    pub(super) fast_call: u8,
+    // true when strict mode or arrow function (no sloppy null/undefined this -> window coercion)
+    pub(super) strict_or_arrow: bool,
+    // true when this arrow captures lexical this on its Closure rather than via a parent scope slot
+    pub(super) uses_lexical_this: bool,
     // true for top-level script and module bodies
     pub(super) is_script: bool,
     // the module URL this code was compiled in, shared by every closure of this code
@@ -639,6 +653,10 @@ struct FunctionState {
     pending_labels: Vec<Name>,
     // async generators await yielded and returned values
     async_generator: bool,
+    // derived constructors initialize this via super(), so inner arrows must read a mutable slot
+    is_derived_constructor: bool,
+    // arrow captures lexical this directly on its Closure from the enclosing frame
+    uses_lexical_this: bool,
     // a scope or the block list outgrew its u16 indexes
     overflowed: bool,
 }
@@ -652,19 +670,33 @@ impl FunctionState {
         if self.is_global || block.kind != ScopeKind::Block || block.overflowed {
             return false;
         }
-        let captures = self.ops[block.start..].iter().any(|op| match op {
-            Op::Closure(index) => !self.children[*index as usize].captures_nothing,
-            Op::Class { .. }
-            | Op::CallEval(_)
-            | Op::CallEvalSpread
-            | Op::CloneScope
-            | Op::GetName { .. }
-            | Op::SetName { .. }
-            | Op::DeleteName { .. }
-            | Op::TypeofName { .. }
-            | Op::CalleeName { .. } => true,
-            _ => false,
-        });
+        let mut captures = false;
+        let mut scan_nested = 0u16;
+        for op in &self.ops[block.start + 1..] {
+            match op {
+                Op::PushScope(_) | Op::PushVarScope(_) => scan_nested += 1,
+                Op::PopScope => scan_nested = scan_nested.saturating_sub(1),
+                Op::Closure(index) => {
+                    if captures_scope_at(&self.children[*index as usize], scan_nested) {
+                        captures = true;
+                        break;
+                    }
+                }
+                Op::Class { .. }
+                | Op::CallEval(_)
+                | Op::CallEvalSpread
+                | Op::CloneScope
+                | Op::GetName { .. }
+                | Op::SetName { .. }
+                | Op::DeleteName { .. }
+                | Op::TypeofName { .. }
+                | Op::CalleeName { .. } => {
+                    captures = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
         let Some(host) = self
             .scopes
             .iter_mut()
@@ -701,6 +733,13 @@ impl FunctionState {
                         *index = moved(*index);
                     } else if *depth > nested && *depth != GLOBAL {
                         *depth -= 1;
+                    }
+                }
+                Op::Closure(index) => {
+                    let child = &mut self.children[*index as usize];
+                    if !child.captures_nothing {
+                        let child_mut = Rc::get_mut(child).expect("compiled child code is unique");
+                        shift_captured_depths(child_mut, nested);
                     }
                 }
                 // an inner block hoisted here already clears its slots in this one
@@ -745,6 +784,8 @@ impl FunctionState {
             strict,
             pending_labels: Vec::new(),
             async_generator: false,
+            is_derived_constructor: false,
+            uses_lexical_this: false,
             overflowed: false,
         }
     }
@@ -1706,7 +1747,7 @@ impl Compiler {
                     | Op::InitNewTargetSlot(_)
                     | Op::InitHomeSlot(_) => true,
                     Op::Exit { scopes, .. } if *scopes != 0 => true,
-                    Op::Closure(index) => !state.children[*index as usize].captures_nothing,
+                    Op::Closure(index) => captures_scope_at(&state.children[*index as usize], 0),
                     _ => false,
                 };
                 if forbids {
@@ -1725,6 +1766,7 @@ impl Compiler {
                 .iter()
                 .enumerate()
                 .all(|(position, slot)| *slot == Some(position as u16));
+        let mut children = state.children;
         if uses_regs {
             for op in &mut ops {
                 match *op {
@@ -1794,10 +1836,17 @@ impl Compiler {
                     _ => {}
                 }
             }
+            for child in &mut children {
+                if !child.captures_nothing {
+                    let child_mut = Rc::get_mut(child).expect("compiled child code is unique");
+                    shift_captured_depths(child_mut, 0);
+                }
+            }
         }
         let mut positions = state.positions;
-        fuse_ops(&mut ops, entry, &mut positions);
+        fuse_ops(&mut ops, entry, &mut positions, &state.names);
         let mut ic_count = 0u32;
+        let mut split_cache_count = 0u16;
         for op in &mut ops {
             match op {
                 Op::GetProp { ic, .. }
@@ -1810,43 +1859,40 @@ impl Compiler {
                     *ic = ic_count;
                     ic_count += 1;
                 }
+                Op::SplitRegexPop { cache, .. } => {
+                    *cache = split_cache_count;
+                    split_cache_count = split_cache_count.saturating_add(1);
+                }
                 _ => {}
             }
         }
         let ics = (0..ic_count)
             .map(|_| super::object::PropIc::default())
             .collect();
+        let split_regex_cache = (0..split_cache_count)
+            .map(|_| std::cell::OnceCell::new())
+            .collect();
         let max_pushes = compute_max_pushes(&ops);
-        let mut max_scope_depth = 0u8;
-        let mut has_pop_scope = false;
-        for &op in &ops {
-            match op {
-                Op::GetLocal { depth, .. }
-                | Op::SetLocal { depth, .. }
-                | Op::SetLocalPop { depth, .. }
-                | Op::InitLocal { depth, .. }
-                | Op::UpdateLocal { depth, .. }
-                | Op::UpdateLocalPop { depth, .. }
-                | Op::GetLocalProp { depth, .. }
-                | Op::GetLocalMethod { depth, .. } => {
-                    max_scope_depth = max_scope_depth.max(depth.saturating_add(1).min(6) as u8);
-                }
-                Op::InitThisSlot(_)
-                | Op::Uninitialize { .. }
-                | Op::PushScope(_)
-                | Op::PushVarScope(_)
-                | Op::CloneScope => {
-                    max_scope_depth = max_scope_depth.max(1);
-                }
-                Op::PopScope => {
-                    has_pop_scope = true;
-                }
-                _ => {}
-            }
-        }
-        if has_pop_scope && max_scope_depth > 0 {
-            max_scope_depth = 6;
-        }
+        let max_scope_depth = compute_max_scope_depth(&ops);
+        let plain_callable = state.arguments_slot.is_none()
+            && self_scope.is_none()
+            && !is_generator
+            && !is_async
+            && !matches!(
+                kind,
+                FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor
+            );
+        let fast_call = if !plain_callable {
+            0
+        } else if uses_regs && linear_params {
+            1
+        } else if !uses_regs && simple_params {
+            2
+        } else {
+            0
+        };
+        let strict_or_arrow = state.strict || kind == FunctionKind::Arrow;
+        let uses_lexical_this = state.uses_lexical_this;
         Code {
             ops,
             entry,
@@ -1856,6 +1902,9 @@ impl Compiler {
             linear_params,
             captures_nothing,
             max_scope_depth,
+            fast_call,
+            strict_or_arrow,
+            uses_lexical_this,
             is_script: state.is_global,
             url: std::cell::OnceCell::new(),
             #[cfg(all(
@@ -1869,7 +1918,7 @@ impl Compiler {
             ))]
             jit_code: std::cell::OnceCell::new(),
             names: state.names,
-            children: state.children,
+            children,
             classes: state.classes,
             templates: state.templates,
             layout,
@@ -1890,6 +1939,7 @@ impl Compiler {
             reads_arguments: state.arguments_slot.is_some(),
             eval_context: EvalContext::default(),
             ics,
+            split_regex_cache,
             object_shapes,
             function_template: std::cell::OnceCell::new(),
         }
@@ -2231,12 +2281,27 @@ impl Compiler {
     }
 
     fn compile_lexical(&mut self, which: Lexical, direct: Op) {
-        if self.in_arrow()
-            && let Some((depth, index)) = self.lexical_slot(which)
-        {
-            let name = self.name("this");
-            self.emit(Op::GetLocal { depth, index, name });
-            return;
+        if self.in_arrow() {
+            if which == Lexical::This
+                && let Some(owner) = (0..self.functions.len())
+                    .rev()
+                    .find(|index| !self.functions[*index].is_arrow)
+                && !self.functions[owner].is_global
+                && !self.functions[owner].is_derived_constructor
+                && !self.functions[owner].eval_code
+            {
+                // capture immutable this on the arrow closure so the owner can stay register-only
+                for func in &mut self.functions[owner + 1..] {
+                    func.uses_lexical_this = true;
+                }
+                self.emit(Op::This);
+                return;
+            }
+            if let Some((depth, index)) = self.lexical_slot(which) {
+                let name = self.name("this");
+                self.emit(Op::GetLocal { depth, index, name });
+                return;
+            }
         }
         let top_level_arrow = self.in_arrow();
         if top_level_arrow && which == Lexical::This {
@@ -2732,11 +2797,26 @@ impl Compiler {
         // so a loop with neither keeps one scope and spares a copy per iteration
         if let Some(clone) = clone {
             let state = self.state();
-            let captures = state.ops[head as usize..].iter().any(|op| match op {
-                Op::Closure(index) => !state.children[*index as usize].captures_nothing,
-                Op::Class { .. } | Op::CallEval(_) | Op::CallEvalSpread => true,
-                _ => false,
-            });
+            let mut captures = false;
+            let mut scan_nested = 0u16;
+            // skip the loop's own PushScope at head so nested depth starts at 0 for loop bindings
+            for op in &state.ops[head as usize + 1..] {
+                match op {
+                    Op::PushScope(_) | Op::PushVarScope(_) => scan_nested += 1,
+                    Op::PopScope => scan_nested = scan_nested.saturating_sub(1),
+                    Op::Closure(index) => {
+                        if captures_scope_at(&state.children[*index as usize], scan_nested) {
+                            captures = true;
+                            break;
+                        }
+                    }
+                    Op::Class { .. } | Op::CallEval(_) | Op::CallEvalSpread => {
+                        captures = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
             if !captures {
                 state.ops[clone] = Op::Nop;
             }
@@ -3263,6 +3343,7 @@ impl Compiler {
         let parent_strict = self.functions.last().is_some_and(|state| state.strict);
         let mut state = FunctionState::new(is_arrow, false, function.strict || parent_strict);
         state.async_generator = function.is_async && function.is_generator;
+        state.is_derived_constructor = function.kind == FunctionKind::DerivedConstructor;
         let mut self_scope = None;
         if named_expression && let Some(name) = &function.name {
             // the self-name lives in a one-slot scope between the closure and its parent
@@ -4957,8 +5038,160 @@ fn remap_op_targets(op: &mut Op, remap: &[u32]) {
     }
 }
 
+// checks whether a compiled child (or any descendant) touches the scope at target_depth
+// relative to the closure.scope it receives, or uses dynamic/block scope ops that could
+fn captures_scope_at(code: &Code, target_depth: u16) -> bool {
+    if code.captures_nothing {
+        return false;
+    }
+    if code.is_script || code.self_scope.is_some() {
+        return true;
+    }
+    let check_depth = if code.uses_regs {
+        target_depth
+    } else {
+        target_depth.saturating_add(1)
+    };
+    for &op in &code.ops {
+        match op {
+            Op::PushScope(_)
+            | Op::PushVarScope(_)
+            | Op::PopScope
+            | Op::CloneScope
+            | Op::Class { .. }
+            | Op::CallEval(_)
+            | Op::CallEvalSpread
+            | Op::GetName { .. }
+            | Op::SetName { .. }
+            | Op::TypeofName { .. }
+            | Op::DeleteName { .. }
+            | Op::CalleeName { .. } => return true,
+            Op::GetLocal { depth, .. }
+            | Op::SetLocal { depth, .. }
+            | Op::InitLocal { depth, .. }
+            | Op::UpdateLocal { depth, .. }
+            | Op::GetLocalProp { depth, .. }
+            | Op::GetLocalMethod { depth, .. }
+            | Op::SetLocalPop { depth, .. }
+            | Op::UpdateLocalPop { depth, .. }
+                if depth == check_depth =>
+            {
+                return true;
+            }
+            Op::Closure(index)
+                if captures_scope_at(&code.children[index as usize], check_depth) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn compute_max_scope_depth(ops: &[Op]) -> u8 {
+    let mut max_depth = 0u8;
+    for &op in ops {
+        match op {
+            Op::GetLocal { depth, .. }
+            | Op::SetLocal { depth, .. }
+            | Op::SetLocalPop { depth, .. }
+            | Op::InitLocal { depth, .. }
+            | Op::UpdateLocal { depth, .. }
+            | Op::UpdateLocalPop { depth, .. }
+            | Op::GetLocalProp { depth, .. }
+            | Op::GetLocalMethod { depth, .. }
+                if depth != GLOBAL =>
+            {
+                let d = depth.saturating_add(1).min(6) as u8;
+                max_depth = max_depth.max(d);
+            }
+            Op::InitThisSlot(_)
+            | Op::Uninitialize { .. }
+            | Op::CloneScope
+            | Op::PushScope(_)
+            | Op::PushVarScope(_) => {
+                max_depth = max_depth.max(1);
+            }
+            _ => {}
+        }
+    }
+    max_depth
+}
+
+// decrements captured ancestor scope depths past an elided register-only parent scope
+fn shift_captured_depths(code: &mut Code, above_depth: u16) {
+    if code.captures_nothing {
+        return;
+    }
+    let threshold = if code.uses_regs {
+        above_depth
+    } else {
+        above_depth.saturating_add(1)
+    };
+    for op in &mut code.ops {
+        match op {
+            Op::GetLocal { depth, .. }
+            | Op::SetLocal { depth, .. }
+            | Op::InitLocal { depth, .. }
+            | Op::UpdateLocal { depth, .. }
+            | Op::GetLocalProp { depth, .. }
+            | Op::GetLocalMethod { depth, .. }
+            | Op::SetLocalPop { depth, .. }
+            | Op::UpdateLocalPop { depth, .. }
+                if *depth > threshold && *depth != GLOBAL =>
+            {
+                *depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    code.max_scope_depth = compute_max_scope_depth(&code.ops);
+    for child in &mut code.children {
+        if !child.captures_nothing {
+            let child_mut = Rc::get_mut(child).expect("compiled child code is unique");
+            shift_captured_depths(child_mut, threshold);
+        }
+    }
+}
+
+fn is_split_regex_pop(
+    ops: &[Op],
+    barrier: &[bool],
+    names: &[Name],
+    at: usize,
+) -> Option<(u32, u32)> {
+    if at + 7 > ops.len() || (at + 1..at + 7).any(|k| barrier[k]) {
+        return None;
+    }
+    match (
+        ops[at],
+        ops[at + 1],
+        ops[at + 2],
+        ops[at + 3],
+        ops[at + 4],
+        ops[at + 5],
+        ops[at + 6],
+    ) {
+        (
+            Op::Dup,
+            Op::GetProp {
+                name: split_name, ..
+            },
+            Op::Regex { pattern, flags },
+            Op::CallMethod(1),
+            Op::Dup,
+            Op::GetProp { name: pop_name, .. },
+            Op::CallMethod(0),
+        ) if &*names[split_name as usize] == "split" && &*names[pop_name as usize] == "pop" => {
+            Some((pattern, flags))
+        }
+        _ => None,
+    }
+}
+
 // fuses common straight-line instruction pairs/triples without crossing jump or breakpoint targets
-fn fuse_ops(ops: &mut Vec<Op>, entry: usize, positions: &mut [(u32, u32)]) {
+fn fuse_ops(ops: &mut Vec<Op>, entry: usize, positions: &mut [(u32, u32)], names: &[Name]) {
     let len = ops.len();
     if len <= entry + 1 {
         return;
@@ -4986,6 +5219,18 @@ fn fuse_ops(ops: &mut Vec<Op>, entry: usize, positions: &mut [(u32, u32)]) {
     }
     while i < len {
         remap[i] = out.len() as u32;
+        if let Some((pattern, flags)) = is_split_regex_pop(ops, &barrier, names, i) {
+            out.push(Op::SplitRegexPop {
+                pattern,
+                flags,
+                cache: 0,
+            });
+            for k in 1..7 {
+                remap[i + k] = out.len() as u32;
+            }
+            i += 7;
+            continue;
+        }
         let can2 = i + 2 <= len && !barrier[i + 1];
         let can3 = can2 && i + 3 <= len && !barrier[i + 2];
         let can4 = can3 && i + 4 <= len && !barrier[i + 3];
@@ -5016,10 +5261,14 @@ fn fuse_ops(ops: &mut Vec<Op>, entry: usize, positions: &mut [(u32, u32)]) {
         // 3-op fusions
         if can3 {
             let fused3 = match (ops[i], ops[i + 1], ops[i + 2]) {
-                (Op::GetReg { reg, .. }, Op::Dup, Op::GetProp { name, ic }) => {
+                (Op::GetReg { reg, .. }, Op::Dup, Op::GetProp { name, ic })
+                    if is_split_regex_pop(ops, &barrier, names, i + 1).is_none() =>
+                {
                     Some(Op::GetRegMethod { reg, name, ic })
                 }
-                (Op::GetLocal { depth, index, .. }, Op::Dup, Op::GetProp { name, ic }) => {
+                (Op::GetLocal { depth, index, .. }, Op::Dup, Op::GetProp { name, ic })
+                    if is_split_regex_pop(ops, &barrier, names, i + 1).is_none() =>
+                {
                     Some(Op::GetLocalMethod {
                         depth,
                         index,
@@ -5156,6 +5405,7 @@ fn op_max_push(op: Op) -> u32 {
         | Op::GetProp { .. }
         | Op::GetRegIndex { .. }
         | Op::BinaryRegs { .. }
+        | Op::SplitRegexPop { .. }
         | Op::Closure(_)
         | Op::NewPrivateName(_)
         | Op::IterValue

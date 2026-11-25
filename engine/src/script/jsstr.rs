@@ -2,7 +2,7 @@
 // allocation, so a value holding it stays two words wide where an Rc<str> would make it three
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -14,13 +14,60 @@ struct Header {
 
 pub(crate) struct JsStr(NonNull<Header>);
 
+const DATA_OFFSET: usize = std::mem::size_of::<Header>();
+const HEADER_ALIGN: usize = std::mem::align_of::<Header>();
+const SMALL32_CAP: usize = 32;
+const SMALL64_CAP: usize = 64;
+const POOL_LIMIT: usize = 128;
+
+#[inline(always)]
 fn layout_for(len: usize) -> (Layout, usize) {
-    Layout::new::<Header>()
-        .extend(Layout::array::<u8>(len).expect("a string fits in memory"))
-        .expect("a string fits in memory")
+    let bucket = if len <= SMALL32_CAP {
+        SMALL32_CAP
+    } else if len <= SMALL64_CAP {
+        SMALL64_CAP
+    } else {
+        len
+    };
+    let size = DATA_OFFSET
+        .checked_add(bucket)
+        .expect("a string fits in memory");
+    let layout = Layout::from_size_align(size, HEADER_ALIGN).expect("a string fits in memory");
+    (layout, DATA_OFFSET)
+}
+
+struct StrPool {
+    s32: Vec<*mut u8>,
+    s64: Vec<*mut u8>,
+}
+
+impl StrPool {
+    const fn new() -> Self {
+        Self {
+            s32: Vec::new(),
+            s64: Vec::new(),
+        }
+    }
+}
+
+impl Drop for StrPool {
+    fn drop(&mut self) {
+        let l32 = layout_for(SMALL32_CAP).0;
+        let l64 = layout_for(SMALL64_CAP).0;
+        // safety: every cached pointer was allocated with the bucket's layout
+        unsafe {
+            for ptr in self.s32.drain(..) {
+                dealloc(ptr, l32);
+            }
+            for ptr in self.s64.drain(..) {
+                dealloc(ptr, l64);
+            }
+        }
+    }
 }
 
 thread_local! {
+    static STR_POOL: UnsafeCell<StrPool> = const { UnsafeCell::new(StrPool::new()) };
     static EMPTY: JsStr = JsStr::alloc_bytes("");
 }
 
@@ -33,20 +80,65 @@ impl JsStr {
         Self::alloc_bytes(text)
     }
 
+    fn alloc_raw(len: usize) -> *mut u8 {
+        let pooled = if len <= SMALL32_CAP {
+            STR_POOL
+                .try_with(|cell| unsafe { (&mut *cell.get()).s32.pop() })
+                .ok()
+                .flatten()
+        } else if len <= SMALL64_CAP {
+            STR_POOL
+                .try_with(|cell| unsafe { (&mut *cell.get()).s64.pop() })
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        match pooled {
+            Some(ptr) => ptr,
+            None => unsafe {
+                let (layout, _) = layout_for(len);
+                let raw = alloc(layout);
+                if raw.is_null() {
+                    handle_alloc_error(layout);
+                }
+                raw
+            },
+        }
+    }
+
     fn alloc_bytes(text: &str) -> Self {
-        let (layout, offset) = layout_for(text.len());
-        // SAFETY: the layout is never zero-sized, as it holds the header; the header and the
+        let len = text.len();
+        // safety: the layout is never zero-sized, as it holds the header; the header and the
         // bytes are written before anything reads them
         unsafe {
-            let raw = alloc(layout);
-            let Some(header) = NonNull::new(raw.cast::<Header>()) else {
-                handle_alloc_error(layout);
-            };
+            let raw = Self::alloc_raw(len);
+            let header = NonNull::new_unchecked(raw.cast::<Header>());
             header.as_ptr().write(Header {
                 count: Cell::new(1),
-                len: text.len(),
+                len,
             });
-            std::ptr::copy_nonoverlapping(text.as_ptr(), raw.add(offset), text.len());
+            std::ptr::copy_nonoverlapping(text.as_ptr(), raw.add(DATA_OFFSET), len);
+            Self(header)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn concat(a: &str, b: &str) -> Self {
+        let len = a.len() + b.len();
+        if len == 0 {
+            return EMPTY.with(JsStr::clone);
+        }
+        // safety: raw has DATA_OFFSET + len bytes and both slices are valid utf-8
+        unsafe {
+            let raw = Self::alloc_raw(len);
+            let header = NonNull::new_unchecked(raw.cast::<Header>());
+            header.as_ptr().write(Header {
+                count: Cell::new(1),
+                len,
+            });
+            std::ptr::copy_nonoverlapping(a.as_ptr(), raw.add(DATA_OFFSET), a.len());
+            std::ptr::copy_nonoverlapping(b.as_ptr(), raw.add(DATA_OFFSET + a.len()), b.len());
             Self(header)
         }
     }
@@ -59,7 +151,6 @@ impl JsStr {
 
     #[inline(always)]
     pub(crate) fn as_str(&self) -> &str {
-        const DATA_OFFSET: usize = std::mem::size_of::<Header>();
         let len = self.header().len;
         // SAFETY: Header is repr(C) with align >= 1 so u8 bytes immediately follow it
         unsafe {
@@ -85,9 +176,42 @@ impl JsStr {
     #[cold]
     #[inline(never)]
     fn dealloc_slow(&mut self) {
-        let (layout, _) = layout_for(self.header().len);
-        // SAFETY: this was the last handle, and the layout is the one it was made with
-        unsafe { dealloc(self.0.as_ptr().cast(), layout) }
+        let len = self.header().len;
+        let ptr = self.0.as_ptr().cast::<u8>();
+        if len <= SMALL32_CAP {
+            let recycled = STR_POOL
+                .try_with(|cell| {
+                    let pool = unsafe { &mut *cell.get() };
+                    if pool.s32.len() < POOL_LIMIT {
+                        pool.s32.push(ptr);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if recycled {
+                return;
+            }
+        } else if len <= SMALL64_CAP {
+            let recycled = STR_POOL
+                .try_with(|cell| {
+                    let pool = unsafe { &mut *cell.get() };
+                    if pool.s64.len() < POOL_LIMIT {
+                        pool.s64.push(ptr);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if recycled {
+                return;
+            }
+        }
+        let (layout, _) = layout_for(len);
+        // safety: this was the last handle, and the layout matches allocation
+        unsafe { dealloc(ptr, layout) }
     }
 }
 

@@ -86,7 +86,7 @@ enum Property {
     Emoji,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Class {
     ranges: Vec<(u32, u32)>,
     properties: Vec<(Property, bool)>,
@@ -146,6 +146,27 @@ enum Inst {
     Match,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum AsciiSplit {
+    One(u8),
+    Two(u8, u8),
+    Mask(u128),
+}
+
+impl AsciiSplit {
+    fn from_mask(mask: u128) -> Self {
+        match mask.count_ones() {
+            1 => Self::One(mask.trailing_zeros() as u8),
+            2 => {
+                let first = mask.trailing_zeros() as u8;
+                let rest = mask & !(1u128 << first);
+                Self::Two(first, rest.trailing_zeros() as u8)
+            }
+            _ => Self::Mask(mask),
+        }
+    }
+}
+
 pub(super) struct Regex {
     program: Vec<Inst>,
     classes: Vec<Class>,
@@ -156,8 +177,8 @@ pub(super) struct Regex {
     pub(super) flags: Flags,
     // which ascii units a one-character pattern matches, worked out on the first split by it
     ascii_units: std::cell::OnceCell<Option<u128>>,
-    // which ascii units a greedy one-or-more (+) char/class pattern matches
-    ascii_repeat_units: std::cell::OnceCell<Option<u128>>,
+    // pre-classified ascii fast split pattern (single unit or greedy `+` repeat)
+    ascii_split: std::cell::OnceCell<Option<(AsciiSplit, bool)>>,
 }
 
 // the start and end of each group, group 0 first
@@ -1191,7 +1212,7 @@ impl Regex {
             marks,
             flags,
             ascii_units: std::cell::OnceCell::new(),
-            ascii_repeat_units: std::cell::OnceCell::new(),
+            ascii_split: std::cell::OnceCell::new(),
         })
     }
 
@@ -1206,13 +1227,16 @@ impl Regex {
         })
     }
 
-    // the ascii units a greedy `+` repeat of one character or one class matches (such as /\s+/)
-    pub(super) fn ascii_repeat_units(&self) -> Option<u128> {
-        *self.ascii_repeat_units.get_or_init(|| {
+    // fast ascii split classifier for single unit/class or greedy `+` repeat (such as /[\/]/ or /\s+/)
+    pub(super) fn ascii_split(&self) -> Option<(AsciiSplit, bool)> {
+        *self.ascii_split.get_or_init(|| {
+            if let Some(mask) = self.ascii_units() {
+                return Some((AsciiSplit::from_mask(mask), false));
+            }
             if self.flags.full_unicode() || self.groups != 1 {
                 return None;
             }
-            match self.program.as_slice() {
+            let mask = match self.program.as_slice() {
                 [
                     Inst::Save(0),
                     Inst::Char(c1),
@@ -1223,11 +1247,11 @@ impl Regex {
                     Inst::Match,
                 ] if c1 == c2 => {
                     let expected = *c1;
-                    Some((0..128u32).fold(0u128, |bits, unit| {
+                    (0..128u32).fold(0u128, |bits, unit| {
                         let ok =
                             unit == expected || self.canonical(unit) == self.canonical(expected);
                         bits | (u128::from(ok) << unit)
-                    }))
+                    })
                 }
                 [
                     Inst::Save(0),
@@ -1237,15 +1261,16 @@ impl Regex {
                     Inst::Jump(2),
                     Inst::Save(1),
                     Inst::Match,
-                ] if i1 == i2 => {
+                ] if self.classes[*i1] == self.classes[*i2] => {
                     let class = &self.classes[*i1];
-                    Some((0..128u32).fold(0u128, |bits, unit| {
+                    (0..128u32).fold(0u128, |bits, unit| {
                         let ok = self.class_matches(class, unit);
                         bits | (u128::from(ok) << unit)
-                    }))
+                    })
                 }
-                _ => None,
-            }
+                _ => return None,
+            };
+            Some((AsciiSplit::from_mask(mask), true))
         })
     }
 
