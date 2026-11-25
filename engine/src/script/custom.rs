@@ -24,6 +24,15 @@ pub(super) struct Definition {
     attribute_changed: Value,
 }
 
+impl Definition {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        tracer.trace_value(&self.constructor);
+        tracer.trace_value(&self.connected);
+        tracer.trace_value(&self.disconnected);
+        tracer.trace_value(&self.attribute_changed);
+    }
+}
+
 // names the HTML standard reserves even though they contain a hyphen
 const RESERVED: &[&str] = &[
     "annotation-xml",

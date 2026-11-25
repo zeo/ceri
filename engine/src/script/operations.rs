@@ -40,6 +40,26 @@ pub(super) enum VmIterator {
     Done,
 }
 
+impl VmIterator {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        match self {
+            Self::Array { array, .. } => tracer.mark_array(array.clone()),
+            Self::List { values, .. } => {
+                for value in values {
+                    tracer.trace_value(value);
+                }
+            }
+            Self::Keys { object, .. } => tracer.trace_value(object),
+            Self::Object { iterator, next } => {
+                tracer.trace_value(iterator);
+                tracer.trace_value(next);
+            }
+            Self::AsyncFromSync(inner) => inner.trace(tracer),
+            Self::Done => {}
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Hint {
     Default,
@@ -434,7 +454,7 @@ impl ScriptRuntime {
         if self
             .joining
             .iter()
-            .any(|joining| Rc::ptr_eq(joining, array))
+            .any(|joining| ArrayHandle::ptr_eq(joining, array))
         {
             return Ok(String::new());
         }
@@ -916,7 +936,7 @@ impl ScriptRuntime {
         };
         let mut current = self.prototype_of_value(value)?;
         while let Some(object) = current {
-            if Rc::ptr_eq(&object, &prototype) {
+            if ObjectHandle::ptr_eq(&object, &prototype) {
                 return Ok(true);
             }
             current = self.prototype_of_value(&Value::Object(object))?;
@@ -967,7 +987,7 @@ impl ScriptRuntime {
             Value::String(_) => intrinsics.string_prototype.clone(),
             Value::Symbol(_) => intrinsics.symbol_prototype.clone(),
             Value::BigInt(_) => intrinsics.bigint_prototype.clone(),
-            Value::Array(array) => match &array.borrow().prototype {
+            Value::Array(array) => match array.borrow().prototype() {
                 None => intrinsics.array_prototype.clone(),
                 Some(prototype) => return prototype.clone(),
             },
@@ -1104,6 +1124,58 @@ impl ScriptRuntime {
             Err(error) => Err(error),
         }
     }
+}
+
+// result of a property read whose getter or proxy trap can run as a tail call on the VM frame stack
+pub(super) enum GetOutcome {
+    Value(Value),
+    Call {
+        callee: Value,
+        this: Value,
+        arguments: Vec<Value>,
+    },
+}
+
+impl ScriptRuntime {
+    pub(super) fn get_property_tail(
+        &mut self,
+        value: &Value,
+        key: &str,
+    ) -> Result<GetOutcome, ScriptError> {
+        match value {
+            Value::Object(object) => self.ordinary_get_tail(object.clone(), key, value),
+            Value::Element(_)
+            | Value::Event(_)
+            | Value::Range(_)
+            | Value::Selection(_)
+            | Value::Promise(_) => {
+                let object = self
+                    .wrapper_object(value)
+                    .expect("nodes and events have wrappers");
+                self.ordinary_get_tail(object, key, value)
+            }
+            Value::Binding(cell) | Value::ConstBinding(cell) => {
+                let inner = cell.borrow().clone();
+                self.get_property_tail(&inner, key)
+            }
+            Value::Bool(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_) => {
+                if let Value::Symbol(symbol) = value
+                    && key == "description"
+                {
+                    return Ok(GetOutcome::Value(
+                        symbol_description(symbol)
+                            .map(|text| Value::String(text.into()))
+                            .unwrap_or(Value::Undefined),
+                    ));
+                }
+                let prototype = self
+                    .prototype_of(value)
+                    .expect("primitives have prototypes");
+                self.ordinary_get_tail(prototype, key, value)
+            }
+            _ => self.get_property(value, key).map(GetOutcome::Value),
+        }
+    }
 
     pub(super) fn ordinary_get(
         &mut self,
@@ -1111,6 +1183,22 @@ impl ScriptRuntime {
         key: &str,
         receiver: &Value,
     ) -> Result<Value, ScriptError> {
+        match self.ordinary_get_tail(object, key, receiver)? {
+            GetOutcome::Value(value) => Ok(value),
+            GetOutcome::Call {
+                callee,
+                this,
+                arguments,
+            } => self.call_function(callee, this, arguments),
+        }
+    }
+
+    pub(super) fn ordinary_get_tail(
+        &mut self,
+        object: ObjectHandle,
+        key: &str,
+        receiver: &Value,
+    ) -> Result<GetOutcome, ScriptError> {
         enum Found {
             Data(Value),
             Getter(Option<Value>),
@@ -1119,7 +1207,7 @@ impl ScriptRuntime {
         let mut current = object;
         loop {
             if let Some(proxy) = super::reflect::proxy_of(&current) {
-                return self.proxy_get(&proxy, key, receiver);
+                return self.proxy_get_tail(&proxy, key, receiver);
             }
             let found = {
                 let borrowed = current.borrow();
@@ -1135,13 +1223,17 @@ impl ScriptRuntime {
                 }
             };
             match found {
-                Found::Data(value) => return Ok(value),
+                Found::Data(value) => return Ok(GetOutcome::Value(value)),
                 Found::Getter(Some(getter)) => {
-                    return self.call_function(getter, receiver.clone(), Vec::new());
+                    return Ok(GetOutcome::Call {
+                        callee: getter,
+                        this: receiver.clone(),
+                        arguments: Vec::new(),
+                    });
                 }
-                Found::Getter(None) => return Ok(Value::Undefined),
+                Found::Getter(None) => return Ok(GetOutcome::Value(Value::Undefined)),
                 Found::Next(Some(next)) => current = next,
-                Found::Next(None) => return Ok(Value::Undefined),
+                Found::Next(None) => return Ok(GetOutcome::Value(Value::Undefined)),
             }
         }
     }
@@ -1210,7 +1302,7 @@ impl ScriptRuntime {
                     }
                     return set_array_element(array, index as usize, value);
                 }
-                if array.borrow().integrity != super::Integrity::Open {
+                if array.borrow().integrity() != super::Integrity::Open {
                     return if strict {
                         Err(self.type_error(format!(
                             "Cannot add property {}, object is not extensible",
@@ -1229,11 +1321,10 @@ impl ScriptRuntime {
 
     pub(super) fn set_array_expando(&mut self, array: &ArrayHandle, key: &str, value: Value) {
         let mut array = array.borrow_mut();
-        match array.properties.iter_mut().find(|(name, _)| name == key) {
+        let properties = &mut array.extra_mut().properties;
+        match properties.iter_mut().find(|(name, _)| name == key) {
             Some((_, property)) => property.slot = Slot::Data(value),
-            None => array
-                .properties
-                .push((key.to_string(), Property::data(value))),
+            None => properties.push((key.to_string(), Property::data(value))),
         }
     }
 
@@ -1286,7 +1377,9 @@ impl ScriptRuntime {
                 }
                 None => {}
             },
-            Slot::Data(_) if !writable || array.borrow().integrity == super::Integrity::Frozen => {
+            Slot::Data(_)
+                if !writable || array.borrow().integrity() == super::Integrity::Frozen =>
+            {
                 if strict {
                     return Err(self.type_error(format!(
                         "Cannot assign to read only property '{}' of object '[object Array]'",
@@ -1426,6 +1519,21 @@ impl ScriptRuntime {
     }
 
     pub(super) fn get_index(&mut self, object: &Value, key: Value) -> Result<Value, ScriptError> {
+        match self.get_index_tail(object, key)? {
+            GetOutcome::Value(value) => Ok(value),
+            GetOutcome::Call {
+                callee,
+                this,
+                arguments,
+            } => self.call_function(callee, this, arguments),
+        }
+    }
+
+    pub(super) fn get_index_tail(
+        &mut self,
+        object: &Value,
+        key: Value,
+    ) -> Result<GetOutcome, ScriptError> {
         if let Value::Number(number) = key {
             match object {
                 Value::Array(array) => {
@@ -1435,21 +1543,21 @@ impl ScriptRuntime {
                         if let Some(value) = own
                             && !matches!(value, Value::Uninitialized)
                         {
-                            return Ok(value);
+                            return Ok(GetOutcome::Value(value));
                         }
                         // an index the array does not have is read from its prototypes
                         if (index as f64) == number {
                             let key = index.to_string();
                             if let Some(found) = self.array_property_get(array, &key, object)? {
-                                return Ok(found);
+                                return Ok(GetOutcome::Value(found));
                             }
                             if !self.inherits(object, &key) {
-                                return Ok(Value::Undefined);
+                                return Ok(GetOutcome::Value(Value::Undefined));
                             }
                             let Some(prototype) = self.prototype_of(object) else {
-                                return Ok(Value::Undefined);
+                                return Ok(GetOutcome::Value(Value::Undefined));
                             };
-                            return self.ordinary_get(prototype, &key, object);
+                            return self.ordinary_get_tail(prototype, &key, object);
                         }
                     }
                 }
@@ -1460,18 +1568,20 @@ impl ScriptRuntime {
                 | Value::IndexedDbNameList(_)
                 | Value::Bytes(_) => {
                     if number >= 0.0 && number.fract() == 0.0 {
-                        return self.index(object.clone(), Value::Number(number));
+                        return self
+                            .index(object.clone(), Value::Number(number))
+                            .map(GetOutcome::Value);
                     }
                 }
                 Value::TypedArray(array) if number >= 0.0 && number.fract() == 0.0 => {
                     let value = super::typed::read_element(&array.borrow(), number as usize);
-                    return Ok(value.unwrap_or(Value::Undefined));
+                    return Ok(GetOutcome::Value(value.unwrap_or(Value::Undefined)));
                 }
                 _ => {}
             }
         }
         let key = self.coerce_key(key)?;
-        self.get_property(object, &key)
+        self.get_property_tail(object, &key)
     }
 
     pub(super) fn set_index(
@@ -1489,7 +1599,7 @@ impl ScriptRuntime {
                 Value::Array(array) => {
                     let index = runtime_array_index(&Value::Number(number))?;
                     // an index only needs the named-property path when the array has some
-                    if !array.borrow().properties.is_empty()
+                    if !array.borrow().properties().is_empty()
                         && self.array_property_set(
                             array,
                             &index.to_string(),
@@ -1575,10 +1685,9 @@ impl ScriptRuntime {
                     .map(|property| property.configurable);
                 match configurable {
                     Some(true) => {
-                        array
-                            .borrow_mut()
-                            .properties
-                            .retain(|(name, _)| name != key);
+                        if let Some(extra) = array.borrow_mut().extra.as_mut() {
+                            extra.properties.retain(|(name, _)| name != key);
+                        }
                         return Ok(true);
                     }
                     Some(false) if strict => {
@@ -1595,7 +1704,7 @@ impl ScriptRuntime {
                         .borrow()
                         .get(index as usize)
                         .is_some_and(|value| !matches!(value, Value::Uninitialized));
-                    if present && array.borrow().integrity >= super::Integrity::Sealed {
+                    if present && array.borrow().integrity() >= super::Integrity::Sealed {
                         return if strict {
                             Err(self.type_error(format!(
                                 "Cannot delete property '{key}' of [object Array]"
@@ -1828,9 +1937,7 @@ impl ScriptRuntime {
     }
 
     pub(super) fn new_array(values: Vec<Value>) -> Value {
-        let array = Rc::new(RefCell::new(values.into()));
-        super::heap::register_array(&array);
-        Value::Array(array)
+        Value::Array(super::heap::alloc_array(values.into()))
     }
 
     // own enumerable properties, string and symbol keyed, as object spread copies them
@@ -1900,7 +2007,7 @@ impl ScriptRuntime {
             }
             // an array with named properties or set-apart elements answers through its keys
             // and descriptors; a plain list of elements takes the quick path below
-            Value::Array(array) if !array.borrow().properties.is_empty() => {
+            Value::Array(array) if !array.borrow().properties().is_empty() => {
                 let mut entries = Vec::new();
                 for key in self.own_property_keys(source, false)? {
                     if !self
@@ -1990,7 +2097,8 @@ impl ScriptRuntime {
                 let mut walk = object.borrow().prototype_or(&self.intrinsics);
                 while let Some(proto) = walk {
                     let borrowed = proto.borrow();
-                    if borrowed.has_enumerable() || matches!(borrowed.class, ObjectClass::String(_)) {
+                    if borrowed.has_enumerable() || matches!(borrowed.class, ObjectClass::String(_))
+                    {
                         proto_has_enumerable = true;
                         break;
                     }
@@ -2742,7 +2850,7 @@ fn host_instance_of(value: &Value, constructor: &Value) -> bool {
 // the values a host collection yields when iterated
 fn host_iterable_values(value: &Value) -> Option<Vec<Value>> {
     let pair = |first: Value, second: Value| {
-        Value::Array(Rc::new(RefCell::new(vec![first, second].into())))
+        Value::Array(super::heap::alloc_array(vec![first, second].into()))
     };
     Some(match value {
         Value::Array(values) => values.borrow().iter().cloned().map(Value::filled).collect(),

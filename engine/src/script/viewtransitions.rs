@@ -27,6 +27,18 @@ pub(super) struct ViewTransition {
     skipped: Cell<bool>,
 }
 
+impl ViewTransition {
+    pub(super) fn trace(self: &Rc<Self>, tracer: &mut super::heap::Tracer) {
+        if !tracer.visit_rc(self) {
+            return;
+        }
+        tracer.trace_value(&self.callback);
+        tracer.trace_promise(&self.update_done);
+        tracer.trace_promise(&self.ready);
+        tracer.trace_promise(&self.finished);
+    }
+}
+
 fn step(transition: &Rc<ViewTransition>, step: TransitionStep) -> Native {
     Native::ViewTransition(transition.clone(), step)
 }

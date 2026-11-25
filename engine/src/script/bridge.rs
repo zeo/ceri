@@ -46,6 +46,18 @@ pub(super) struct BridgeState {
 }
 
 impl BridgeState {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        for promise in self.pending.values() {
+            tracer.trace_promise(promise);
+        }
+        for (_, _, listener) in &self.listeners {
+            tracer.trace_value(listener);
+        }
+        if let Some(object) = &*self.object.borrow() {
+            tracer.trace_value(object);
+        }
+    }
+
     pub(super) fn permits(&self, command: &str) -> bool {
         self.bridge
             .capabilities
@@ -293,6 +305,7 @@ impl ScriptRuntime {
 
     // an event from the host reaches the page's listeners for its name as { event, payload }
     pub fn dispatch_host_event(&mut self, name: &str, payload: &str) -> Result<usize, ScriptError> {
+        let _heap = super::heap::enter(self.heap_id);
         let _profile = crate::profile::scope("script: host event");
         if name == super::broadcast::RELAYED {
             return self.receive_broadcast(payload);

@@ -115,7 +115,7 @@ impl ScriptRuntime {
                 self.inspect(&inner, depth, seen)
             }
             Value::Array(array) => {
-                let address = Rc::as_ptr(array) as usize;
+                let address = array.id();
                 if seen.contains(&address) {
                     return "[Circular]".to_string();
                 }
@@ -140,7 +140,7 @@ impl ScriptRuntime {
                 }
             }
             Value::Object(object) => {
-                let address = Rc::as_ptr(object) as usize;
+                let address = object.id();
                 if seen.contains(&address) {
                     return "[Circular]".to_string();
                 }

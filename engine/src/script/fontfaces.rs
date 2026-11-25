@@ -70,6 +70,15 @@ pub(super) struct FaceState {
     face: RefCell<Option<Rc<crate::font::FontFace>>>,
 }
 
+impl FaceState {
+    pub(super) fn trace(self: &Rc<Self>, tracer: &mut super::heap::Tracer) {
+        if !tracer.visit_rc(self) {
+            return;
+        }
+        tracer.trace_promise(&self.loaded);
+    }
+}
+
 pub(super) struct FontInterfaces {
     face: ObjectHandle,
     set: ObjectHandle,
@@ -378,7 +387,9 @@ impl ScriptRuntime {
                     }
                     M::SetDescriptor(index) => {
                         state.descriptors.borrow_mut()[index] = self.coerce_string(first)?;
-                        if self.font_set_faces.borrow().iter().any(|face| matches!(&this, Value::Object(object) if Rc::ptr_eq(object, face))) {
+                        if self.font_set_faces.borrow().iter().any(|face| {
+                            matches!(&this, Value::Object(object) if ObjectHandle::ptr_eq(object, face))
+                        }) {
                             self.publish_fonts();
                         }
                         Value::Undefined
@@ -395,7 +406,9 @@ impl ScriptRuntime {
                     M::Loaded => Value::Promise(state.loaded.clone()),
                     _ => {
                         self.load_face(&state);
-                        if self.font_set_faces.borrow().iter().any(|face| matches!(&this, Value::Object(object) if Rc::ptr_eq(object, face))) {
+                        if self.font_set_faces.borrow().iter().any(|face| {
+                            matches!(&this, Value::Object(object) if ObjectHandle::ptr_eq(object, face))
+                        }) {
                             self.publish_fonts();
                         }
                         let face = this.clone();
@@ -414,9 +427,9 @@ impl ScriptRuntime {
         }
         let faces = self.font_set_faces.borrow().clone();
         let position = |faces: &[ObjectHandle], value: &Value| {
-            faces
-                .iter()
-                .position(|face| matches!(value, Value::Object(object) if Rc::ptr_eq(object, face)))
+            faces.iter().position(
+                |face| matches!(value, Value::Object(object) if ObjectHandle::ptr_eq(object, face)),
+            )
         };
         match member {
             M::Add => {

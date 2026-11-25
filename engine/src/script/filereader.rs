@@ -111,6 +111,19 @@ pub(super) struct Readers {
     states: HashMap<u32, ReaderState>,
 }
 
+impl Readers {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        for state in self.states.values() {
+            if let Some(value) = &state.result {
+                tracer.trace_value(value);
+            }
+            if let Some(value) = &state.error {
+                tracer.trace_value(value);
+            }
+        }
+    }
+}
+
 // the text of bytes under an encoding label: a byte order mark wins, then the label, then utf-8
 fn decode(bytes: &[u8], label: Option<&str>) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
@@ -244,7 +257,11 @@ impl ScriptRuntime {
         state.pending = Some((format, bytes, mime_type, label));
         let generation = state.generation;
         // a reader at work stays alive for its listeners
-        if let Some(object) = self.event_targets.get(&id).and_then(Weak::upgrade) {
+        if let Some(object) = self
+            .event_targets
+            .get(&id)
+            .and_then(super::object::ObjectWeak::upgrade)
+        {
             self.held_targets.insert(id, object);
         }
         self.schedule_native_task(Native::ReaderDeliver(id, generation));

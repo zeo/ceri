@@ -54,11 +54,45 @@ pub(super) struct LockRequest {
     granted: Cell<bool>,
 }
 
+impl LockRequest {
+    pub(super) fn trace(self: &Rc<Self>, tracer: &mut super::heap::Tracer) {
+        if !tracer.visit_rc(self) {
+            return;
+        }
+        tracer.trace_value(&self.callback);
+        tracer.trace_promise(&self.result);
+    }
+}
+
 pub(super) struct PostedTask {
     callback: Value,
     result: PromiseHandle,
     done: Cell<bool>,
     signal: Option<AbortSignalHandle>,
+}
+
+impl PostedTask {
+    pub(super) fn trace(self: &Rc<Self>, tracer: &mut super::heap::Tracer) {
+        if !tracer.visit_rc(self) {
+            return;
+        }
+        tracer.trace_value(&self.callback);
+        tracer.trace_promise(&self.result);
+        if let Some(signal) = &self.signal {
+            tracer.trace_abort_signal(signal);
+        }
+    }
+}
+
+impl NavFunction {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        match self {
+            Self::GrantLock(req) | Self::LockSettled(req, _) => req.trace(tracer),
+            Self::RunTask(task) | Self::Aborted(task) => task.trace(tracer),
+            Self::Resume(promise) => tracer.trace_promise(promise),
+            _ => {}
+        }
+    }
 }
 
 pub(super) struct NavigatorInterfaces {
@@ -256,6 +290,7 @@ impl ScriptRuntime {
 
     // leaves fullscreen and tells the element that held it
     pub(crate) fn leave_fullscreen(&mut self) -> Result<bool, ScriptError> {
+        let _heap = super::heap::enter(self.heap_id);
         let Some(node) = self.fullscreen_element.take() else {
             return Ok(false);
         };

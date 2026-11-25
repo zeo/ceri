@@ -136,13 +136,11 @@ type ResponseBodyHandle = Rc<RefCell<ResponseBodyData>>;
 type ReadableStreamHandle = Rc<RefCell<ReadableStreamData>>;
 type HeadersHandle = Rc<RefCell<HeadersData>>;
 type PromiseHandle = Rc<RefCell<PromiseData>>;
-type ArrayHandle = Rc<RefCell<ArrayData>>;
+type ArrayHandle = heap::ArrayHandle;
 
-// an array's elements, with what makes it more than a list: the prototype a subclass or
-// setPrototypeOf gave it, and how far preventExtensions, seal or freeze have closed it
+// rare array metadata boxed out of line so ordinary arrays stay 32 bytes in the slab
 #[derive(Clone, Default)]
-struct ArrayData {
-    values: Vec<Value>,
+struct ArrayExtra {
     // none for Array.prototype, Some(None) for no prototype at all
     prototype: Option<Option<object::ObjectHandle>>,
     integrity: Integrity,
@@ -153,9 +151,46 @@ struct ArrayData {
     fixed_length: bool,
 }
 
+// an array's elements, with rare prototype, integrity and named properties boxed out of line
+#[derive(Clone, Default)]
+struct ArrayData {
+    values: Vec<Value>,
+    extra: Option<Box<ArrayExtra>>,
+}
+
 impl ArrayData {
+    #[inline]
+    fn integrity(&self) -> Integrity {
+        self.extra
+            .as_ref()
+            .map_or(Integrity::Open, |extra| extra.integrity)
+    }
+
+    #[inline]
+    fn fixed_length(&self) -> bool {
+        self.extra.as_ref().is_some_and(|extra| extra.fixed_length)
+    }
+
+    #[inline]
+    fn prototype(&self) -> Option<&Option<object::ObjectHandle>> {
+        self.extra
+            .as_ref()
+            .and_then(|extra| extra.prototype.as_ref())
+    }
+
+    #[inline]
+    fn properties(&self) -> &[(String, object::Property)] {
+        self.extra
+            .as_ref()
+            .map_or(&[], |extra| extra.properties.as_slice())
+    }
+
+    fn extra_mut(&mut self) -> &mut ArrayExtra {
+        self.extra.get_or_insert_with(Box::default)
+    }
+
     fn own(&self, key: &str) -> Option<&object::Property> {
-        self.properties
+        self.properties()
             .iter()
             .find(|(name, _)| name == key)
             .map(|(_, property)| property)
@@ -178,10 +213,7 @@ impl From<Vec<Value>> for ArrayData {
     fn from(values: Vec<Value>) -> Self {
         ArrayData {
             values,
-            prototype: None,
-            integrity: Integrity::Open,
-            properties: Vec::new(),
-            fixed_length: false,
+            extra: None,
         }
     }
 }
@@ -776,10 +808,14 @@ pub struct ScriptRuntime {
     computed_styles: Option<geometry::KeptComputed>,
     // the last getComputedStyle object, whose keys the next one takes when they match
     computed_style_template: Option<JsObject>,
-    // the heap generation its nodes are made in, cleared together once its page is gone
-    generation: u32,
-    // scopes of returned calls nothing else held, emptied for the next call to take
-    spare_scopes: Vec<vm::ScopeRef>,
+    // managed arena heap id for this runtime, destroyed cleanly when the runtime drops
+    heap_id: u16,
+    has_weak_refs: Cell<bool>,
+    gc_safepoint_allowed: bool,
+    gc_inhibit: usize,
+    temp_roots: Vec<Value>,
+    active_microtasks: Vec<MicrotaskKind>,
+    active_module_scopes: Vec<vm::ScopeRef>,
     // active call frames across all nested runs, outermost first
     frames: Vec<vm::Frame>,
     // shared runtime value stack holding registers and operands of active frames
@@ -805,7 +841,7 @@ pub struct ScriptRuntime {
     performance_entries: Vec<geometry::PerformanceEntry>,
     // PerformanceObservers that observe, kept alive while they do
     perf_observers: Vec<(ObjectHandle, Rc<perf_observers::PerfObserver>)>,
-    event_targets: HashMap<u32, Weak<RefCell<JsObject>>>,
+    event_targets: HashMap<u32, object::ObjectWeak>,
     next_event_target: u32,
     // event target objects with listeners stay alive for as long as the listeners do
     held_targets: HashMap<u32, ObjectHandle>,
@@ -862,7 +898,7 @@ pub struct ScriptRuntime {
     // each canvas's WebGL context, with the object script holds
     webgl_contexts: HashMap<NodeId, webgl::WebGlHandle>,
     // the OffscreenCanvas objects standing in front of canvas elements no document holds
-    offscreen_canvases: HashMap<NodeId, std::rc::Weak<RefCell<object::JsObject>>>,
+    offscreen_canvases: HashMap<NodeId, object::ObjectWeak>,
     logs: Vec<String>,
     clock: u64,
     next_task_id: u64,
@@ -1804,10 +1840,8 @@ impl ScriptRuntime {
         session_storage: Option<StorageHandle>,
         host_runtime_info: Option<HostRuntimeInfo>,
     ) -> Self {
-        // a runtime dropped before this one may have left cycles behind
-        heap::collect_if_due();
-        // every node made from here on is this runtime's, until a newer one starts
-        let generation = heap::begin_generation();
+        let heap_id = heap::create_heap();
+        let _heap = heap::enter(heap_id);
         let global = Rc::new(RefCell::new(Environment::default()));
         let (intrinsics, intrinsic_globals) = create_intrinsics();
         let selection = ranges::new_selection(&intrinsics);
@@ -2003,8 +2037,13 @@ impl ScriptRuntime {
             checked_version: 0,
             computed_styles: None,
             computed_style_template: None,
-            generation,
-            spare_scopes: Vec::new(),
+            heap_id,
+            has_weak_refs: Cell::new(false),
+            gc_safepoint_allowed: false,
+            gc_inhibit: 0,
+            temp_roots: Vec::new(),
+            active_microtasks: Vec::new(),
+            active_module_scopes: Vec::new(),
             frames: Vec::new(),
             vm_stack: Vec::new(),
             bound_templates: HashMap::default(),
@@ -2139,6 +2178,7 @@ impl ScriptRuntime {
         );
         runtime.service_workers = Some(service_workers);
         runtime.custom_registry = runtime.custom_element_registry();
+        heap::pin_current(heap_id);
         runtime
     }
 
@@ -2257,6 +2297,7 @@ impl ScriptRuntime {
             .borrow_mut()
             .entry(id)
             .or_insert_with(|| {
+                let _heap = heap::enter(self.heap_id);
                 Rc::new(NodeHandle {
                     id,
                     object: self.new_node_wrapper(id),
@@ -2289,48 +2330,67 @@ impl ScriptRuntime {
         }
         candidates.sort_unstable();
         candidates.dedup();
+        let mut gc_retried = false;
         let mut freed = Vec::new();
-        {
-            let mut document = self.document.borrow_mut();
-            let handles = self.node_handles.borrow();
-            let mut busy = document.range_nodes().into_iter().collect::<HashSet<_>>();
-            // keep detached nodes alive while a scheduled task still targets them
-            for task in &self.tasks {
-                if let Value::Builtin(Builtin::Native(native)) = &task.callback {
-                    match &**native {
-                        Native::ImageDeliver(node, _)
-                        | Native::MediaLoad(node, _)
-                        | Native::DialogClose(node)
-                        | Native::PopoverToggle(node)
-                        | Native::ScriptElement(node) => {
-                            busy.insert(*node);
+        loop {
+            let mut still_retained = Vec::new();
+            {
+                let mut document = self.document.borrow_mut();
+                let handles = self.node_handles.borrow();
+                let mut busy = document.range_nodes().into_iter().collect::<HashSet<_>>();
+                // keep detached nodes alive while a scheduled task still targets them
+                for task in &self.tasks {
+                    if let Value::Builtin(Builtin::Native(native)) = &task.callback {
+                        match &**native {
+                            Native::ImageDeliver(node, _)
+                            | Native::MediaLoad(node, _)
+                            | Native::DialogClose(node)
+                            | Native::PopoverToggle(node)
+                            | Native::ScriptElement(node) => {
+                                busy.insert(*node);
+                            }
+                            Native::MediaCue(cue) => {
+                                busy.insert(cue.0);
+                            }
+                            _ => {}
                         }
-                        Native::MediaCue(cue) => {
-                            busy.insert(cue.0);
-                        }
-                        _ => {}
+                    }
+                }
+                for root in candidates.drain(..) {
+                    if !document.contains(root)
+                        || root == document.root()
+                        || document.parent(root).is_some()
+                    {
+                        continue;
+                    }
+                    let reachable = document.subtree(root).into_iter().any(|node| {
+                        busy.contains(&node)
+                            || handles
+                                .get(&node)
+                                .is_some_and(|handle| Rc::strong_count(handle) > 1)
+                    });
+                    if reachable {
+                        still_retained.push(root);
+                    } else {
+                        freed.extend(document.free_tree(root));
                     }
                 }
             }
-            for root in candidates {
-                if !document.contains(root)
-                    || root == document.root()
-                    || document.parent(root).is_some()
-                {
-                    continue;
-                }
-                let reachable = document.subtree(root).into_iter().any(|node| {
-                    busy.contains(&node)
-                        || handles
-                            .get(&node)
-                            .is_some_and(|handle| Rc::strong_count(handle) > 1)
-                });
-                if reachable {
-                    self.retained_orphans.push(root);
-                } else {
-                    freed.extend(document.free_tree(root));
-                }
+            if !still_retained.is_empty()
+                && !gc_retried
+                && self.nested_runs == 0
+                && self.gc_inhibit == 0
+                && (heap::gc_due(self.heap_id)
+                    || (heap::live_count(self.heap_id) < 16_384
+                        && heap::allocs_since_gc(self.heap_id) > 0))
+            {
+                gc_retried = true;
+                self.collect_garbage();
+                candidates = still_retained;
+                continue;
             }
+            self.retained_orphans.extend(still_retained);
+            break;
         }
         self.orphan_recheck_at = (self.retained_orphans.len() * 2).max(64);
         if !freed.is_empty() {
@@ -2538,6 +2598,7 @@ impl ScriptRuntime {
     }
 
     pub fn execute(&mut self, source: &str) -> Result<(), ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let script = parser::parse_script(source)?;
         let code = compiler::Compiler::new(source).compile_script(&script)?;
         self.register_script(&code, "", false);
@@ -2586,6 +2647,7 @@ impl ScriptRuntime {
     // a page script that throws or fails to parse is reported as uncaught, as browsers do,
     // and the scripts after it still run
     pub(crate) fn execute_reporting(&mut self, source: &str) -> Result<(), ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let outcome = parser::parse_script(source)
             .and_then(|script| compiler::Compiler::new(source).compile_script(&script))
             .and_then(|code| {
@@ -2606,6 +2668,7 @@ impl ScriptRuntime {
         url: AppUrl,
         loader: &mut L,
     ) -> Result<(), ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let outcome = self.execute_module_graph(source, url, loader);
         self.clear_script_origin();
         if let Err(error) = outcome {
@@ -2620,6 +2683,7 @@ impl ScriptRuntime {
         url: AppUrl,
         loader: &mut L,
     ) -> Result<ModuleNamespace, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let namespace = self.execute_module_graph(source, url, loader)?;
         self.drain_microtasks()?;
         Ok(namespace)
@@ -2704,6 +2768,7 @@ impl ScriptRuntime {
     }
 
     pub fn click_node(&mut self, node: NodeId) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         self.click(node, true)
     }
 
@@ -2773,12 +2838,14 @@ impl ScriptRuntime {
     }
 
     pub fn dispatch_node_event(&mut self, node: NodeId, event: &str) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let dispatch = self.dispatch_event(node, event)?;
         self.drain_microtasks()?;
         Ok(dispatch.handled)
     }
 
     pub(crate) fn focus_node(&mut self, node: NodeId) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         if !self.is_focusable(node) {
             return Ok(false);
         }
@@ -2814,6 +2881,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn blur_focused(&mut self) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let composition_changed = self.composition_cancel()?;
         let Some(node) = self.focused_element.take() else {
             return Ok(composition_changed);
@@ -2823,6 +2891,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn apply_autofocus(&mut self) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         if self.focused_element.is_some() {
             return Ok(false);
         }
@@ -2983,6 +3052,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn insert_text(&mut self, text: &str) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         if self.composition.is_some() {
             return self.composition_commit(text);
         }
@@ -3089,6 +3159,7 @@ impl ScriptRuntime {
         text: &str,
         _cursor: Option<(usize, usize)>,
     ) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let Some(control) = self.begin_composition()? else {
             return Ok(false);
         };
@@ -3132,6 +3203,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn composition_commit(&mut self, text: &str) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let Some(composition) = self.composition.clone() else {
             return self.insert_text(text);
         };
@@ -3178,6 +3250,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn composition_cancel(&mut self) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let Some(composition) = self.composition.clone() else {
             return Ok(false);
         };
@@ -3220,6 +3293,7 @@ impl ScriptRuntime {
         key: &str,
         modifiers: KeyModifiers,
     ) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         // escape takes the page out of fullscreen before anything else sees it, as browsers do
         if key == "Escape" && self.fullscreen_requested() {
             return self.leave_fullscreen();
@@ -3497,6 +3571,7 @@ impl ScriptRuntime {
         focus: usize,
         fresh: bool,
     ) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let boundary = |position: usize| -> Option<Boundary> {
             let (node, offset) = self.document.borrow().text_point(position)?;
             Some(Boundary { node, offset })
@@ -3513,6 +3588,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn clear_document_selection(&mut self) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let changed = self.selection.range().is_some();
         self.selection.state.borrow_mut().range = None;
         self.drain_microtasks()?;
@@ -3527,6 +3603,7 @@ impl ScriptRuntime {
         name: &str,
         elapsed: f64,
     ) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         if self.document.borrow().element(node).is_none() {
             return Ok(false);
         }
@@ -4259,6 +4336,7 @@ impl ScriptRuntime {
 
     // the page's window was shown, or hidden or minimised
     pub(crate) fn set_visible(&mut self, visible: bool) -> Result<(), ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         if self.visible == visible {
             return Ok(());
         }
@@ -4297,6 +4375,7 @@ impl ScriptRuntime {
         &mut self,
         serialized: &str,
     ) -> Result<(), ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let state = self.parse_json(serialized)?;
         self.history.borrow_mut().state = state;
         Ok(())
@@ -4337,6 +4416,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn dispatch_window_event(&mut self, event_type: &str) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let dispatch = self.fire(
             ListenerTarget::Window,
             event_type,
@@ -4363,6 +4443,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn dispatch_popstate(&mut self, serialized: &str) -> Result<bool, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let state = self.parse_json(serialized)?;
         let fields = HostEventFields {
             state: Some(state),
@@ -4394,6 +4475,7 @@ impl ScriptRuntime {
     // runs every task due by the new time in order, each at its own due time, with a
     // microtask checkpoint after each; an uncaught error is reported and the clock moves on
     pub fn advance_time(&mut self, milliseconds: u64) -> Result<usize, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let _profile = crate::profile::scope("script: tick");
         let target = self.clock.saturating_add(milliseconds);
         let mut executed = 0;
@@ -4416,7 +4498,11 @@ impl ScriptRuntime {
                 });
             }
             let _profile = crate::profile::scope("script: callback");
-            if let Err(error) = self.call(callback, arguments) {
+            let prev_gc = self.gc_safepoint_allowed;
+            self.gc_safepoint_allowed = self.nested_runs == 0 && self.gc_inhibit == 0;
+            let outcome = self.call(callback, arguments);
+            self.gc_safepoint_allowed = prev_gc;
+            if let Err(error) = outcome {
                 self.report_exception(error);
             }
             self.drain_microtasks()?;
@@ -4425,7 +4511,7 @@ impl ScriptRuntime {
         self.clock = target;
         {
             let _profile = crate::profile::scope("script: cycles");
-            heap::collect_if_due();
+            self.collect_if_due();
         }
         {
             let _profile = crate::profile::scope("script: audio");
@@ -4600,9 +4686,9 @@ impl ScriptRuntime {
             Value::Navigator => match property {
                 "clipboard" => Ok(Value::Clipboard),
                 "language" => Ok(Value::String(self.locale.as_str().into())),
-                "languages" => Ok(Value::Array(Rc::new(RefCell::new(
-                    vec![Value::String(self.locale.as_str().into())].into(),
-                )))),
+                "languages" => Ok(Self::new_array(vec![Value::String(
+                    self.locale.as_str().into(),
+                )])),
                 "userAgent" => Ok(Value::String(crate::devtools::user_agent().into())),
                 "appVersion" => Ok(Value::String(
                     crate::devtools::user_agent()
@@ -5881,6 +5967,7 @@ impl ScriptRuntime {
     }
 
     pub fn pump(&mut self) -> Result<usize, ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let processed = self.pump_workers()?
             + self.settle_command_replies()?
             + self.pump_audio()?
@@ -8917,7 +9004,7 @@ impl ScriptRuntime {
                     .first()
                     .map(Value::string_value)
                     .unwrap_or_default();
-                Ok(Value::Array(Rc::new(RefCell::new(
+                Ok(Self::new_array(
                     form_data
                         .borrow()
                         .pairs
@@ -8925,7 +9012,7 @@ impl ScriptRuntime {
                         .filter(|(entry_name, _)| entry_name == &name)
                         .map(|(_, value)| form_data_entry_value(value))
                         .collect(),
-                ))))
+                ))
             }
             Builtin::FormDataHas(form_data) => {
                 let name = arguments
@@ -8991,10 +9078,10 @@ impl ScriptRuntime {
                     .pairs
                     .iter()
                     .map(|(name, value)| {
-                        Value::Array(Rc::new(RefCell::new(vec![
+                        Self::new_array(vec![
                             Value::String(name.clone().into()),
                             form_data_entry_value(value),
-                        ].into())))
+                        ])
                     })
                     .collect(),
             )),
@@ -9127,10 +9214,10 @@ impl ScriptRuntime {
                     .iter()
                     .enumerate()
                     .map(|(index, node)| {
-                        Value::Array(Rc::new(RefCell::new(vec![
+                        Self::new_array(vec![
                             Value::Number(index as f64),
                             Value::Element(node.clone()),
-                        ].into())))
+                        ])
                     })
                     .collect(),
             )),
@@ -9426,10 +9513,10 @@ impl ScriptRuntime {
                     .values
                     .iter()
                     .map(|(name, value)| {
-                        Value::Array(Rc::new(RefCell::new(vec![
+                        Self::new_array(vec![
                             Value::String(name.clone().into()),
                             Value::String(value.clone().into()),
-                        ].into())))
+                        ])
                     })
                     .collect(),
             )),
@@ -10141,10 +10228,7 @@ impl ScriptRuntime {
                     .map(|(index, token)| match kind {
                         "keys" => Value::Number(index as f64),
                         "values" => token,
-                        _ => Value::Array(Rc::new(RefCell::new(vec![
-                            Value::Number(index as f64),
-                            token,
-                        ].into()))),
+                        _ => Self::new_array(vec![Value::Number(index as f64), token]),
                     })
                     .collect(),
             ))
@@ -10400,6 +10484,7 @@ impl ScriptRuntime {
     }
 
     fn drain_microtasks(&mut self) -> Result<(), ScriptError> {
+        let _heap = heap::enter(self.heap_id);
         let mut executed = 0;
         loop {
             // mutation observers are notified from the microtask queue, ahead of what follows
@@ -10415,8 +10500,13 @@ impl ScriptRuntime {
                     "microtask queue exceeded the deterministic limit",
                 ));
             }
+            self.active_microtasks.push(task.kind);
+            let prev_gc = self.gc_safepoint_allowed;
+            self.gc_safepoint_allowed = self.nested_runs == 0 && self.gc_inhibit == 0;
             let outcome = self.call_function(task.callback, task.this, task.arguments);
-            match (task.kind, outcome) {
+            self.gc_safepoint_allowed = prev_gc;
+            let kind = self.active_microtasks.pop().expect("active microtask");
+            match (kind, outcome) {
                 (MicrotaskKind::Reaction(next), Ok(value)) => self.resolve_promise(&next, value)?,
                 (MicrotaskKind::Reaction(next), Err(error)) => {
                     let reason = self.take_thrown(error);
@@ -10430,12 +10520,26 @@ impl ScriptRuntime {
                 (MicrotaskKind::Adopt(_) | MicrotaskKind::Plain, Ok(_)) => {}
             }
             executed += 1;
+            if self.nested_runs == 0 && self.gc_inhibit == 0 && heap::gc_due(self.heap_id) {
+                self.collect_garbage();
+            }
             if self.microtasks.is_empty() {
                 self.report_unhandled_rejections();
             }
         }
         self.report_unhandled_rejections();
         self.sync_selection_change()?;
+        if self.nested_runs == 0
+            && self.gc_inhibit == 0
+            && (heap::gc_due(self.heap_id)
+                || heap::allocs_since_gc(self.heap_id) >= 131_072
+                || (self.has_weak_refs.get() && heap::allocs_since_gc(self.heap_id) > 0))
+        {
+            let cleared = self.collect_garbage();
+            if cleared >= 32_768 {
+                crate::release_memory();
+            }
+        }
         self.prune_event_targets();
         self.collect_detached_nodes();
         self.sweep_registries();
@@ -10694,9 +10798,9 @@ impl ScriptRuntime {
             .cloned()
             .map(|text| Value::String(text.into()))
             .collect();
-        Ok(Value::Promise(self.fulfilled_promise(Value::Array(
-            Rc::new(RefCell::new(names)),
-        ))))
+        Ok(Value::Promise(
+            self.fulfilled_promise(Value::Array(heap::alloc_array(names))),
+        ))
     }
 
     fn cache_storage_match(
@@ -10822,9 +10926,9 @@ impl ScriptRuntime {
             Ok(requests) => requests,
             Err(error) => return Ok(Value::Promise(self.rejected_promise(error.message))),
         };
-        Ok(Value::Promise(self.fulfilled_promise(Value::Array(
-            Rc::new(RefCell::new(requests.into())),
-        ))))
+        Ok(Value::Promise(
+            self.fulfilled_promise(Self::new_array(requests)),
+        ))
     }
 
     fn cache_request_parts(
@@ -11190,7 +11294,7 @@ impl ScriptRuntime {
             })
             .collect();
         Ok(Value::Promise(self.fulfilled_promise(Value::Array(
-            Rc::new(RefCell::new(databases)),
+            heap::alloc_array(databases),
         ))))
     }
 
@@ -11791,7 +11895,7 @@ impl ScriptRuntime {
             });
         }
         Ok(self.indexed_db_request(
-            Value::Array(Rc::new(RefCell::new(values.into()))),
+            Self::new_array(values),
             None,
             Some(transaction),
             None,
@@ -11928,7 +12032,9 @@ impl Value {
             | Self::Uninitialized
             | Self::Null
             | Self::Bool(_)
-            | Self::Number(_) => {
+            | Self::Number(_)
+            | Self::Object(_)
+            | Self::Array(_) => {
                 std::mem::forget(self);
             }
             other => drop_value_slow(other),
@@ -12222,7 +12328,7 @@ fn clone_value(
         Value::Number(value) => Ok(CloneValue::Number(*value)),
         Value::String(value) => Ok(CloneValue::String(clone_text(value, context, "string")?)),
         Value::Object(object) => {
-            let pointer = Rc::as_ptr(object) as usize;
+            let pointer = object.id();
             let (callable, error) = {
                 let object = object.borrow();
                 (
@@ -12299,7 +12405,7 @@ fn clone_value(
             result.map(CloneValue::Object)
         }
         Value::Array(array) => {
-            let pointer = Rc::as_ptr(array) as usize;
+            let pointer = array.id();
             context.enter(pointer)?;
             let values = array.borrow().clone();
             let result = values
@@ -12402,13 +12508,13 @@ impl CloneValue {
             Self::Bool(value) => Value::Bool(value),
             Self::Number(value) => Value::Number(value),
             Self::String(value) => Value::String(value.into()),
-            Self::Array(values) => Value::Array(Rc::new(RefCell::new(
+            Self::Array(values) => Value::Array(heap::alloc_array(
                 values
                     .into_iter()
                     .map(Self::into_value)
                     .collect::<Result<Vec<_>, _>>()?
                     .into(),
-            ))),
+            )),
             Self::Object(properties) => plain_object(
                 properties
                     .into_iter()
@@ -14039,14 +14145,14 @@ fn array_write_refusal(array: &ArrayHandle, index: usize) -> Option<String> {
     let present = array
         .get(index)
         .is_some_and(|value| !matches!(value, Value::Uninitialized));
-    match array.integrity {
+    match array.integrity() {
         Integrity::Frozen => Some(format!(
             "Cannot assign to read only property '{index}' of object '[object Array]'"
         )),
         Integrity::Sealed | Integrity::Closed if !present => Some(format!(
             "Cannot add property {index}, object is not extensible"
         )),
-        _ if array.fixed_length && index >= array.len() => Some(format!(
+        _ if array.fixed_length() && index >= array.len() => Some(format!(
             "Cannot add property {index}, the array's length is read-only"
         )),
         _ => None,
@@ -14082,7 +14188,7 @@ fn set_array_element_unchecked(
 fn set_array_length(array: &ArrayHandle, value: Value) -> Result<(), ScriptError> {
     let (length, integrity, fixed) = {
         let array = array.borrow();
-        (array.len(), array.integrity, array.fixed_length)
+        (array.len(), array.integrity(), array.fixed_length())
     };
     if fixed && value.number().ok() != Some(length as f64) {
         return Err(runtime_error(
@@ -14118,7 +14224,7 @@ fn set_array_length(array: &ArrayHandle, value: Value) -> Result<(), ScriptError
     // elements in the property list past the new end go with the rest, unless one of them
     // cannot be deleted, which keeps the array long enough to hold it
     let kept = array
-        .properties
+        .properties()
         .iter()
         .filter(|(name, property)| {
             !property.configurable
@@ -14127,9 +14233,11 @@ fn set_array_length(array: &ArrayHandle, value: Value) -> Result<(), ScriptError
         .filter_map(|(name, _)| object::array_index(name))
         .max();
     let length = kept.map_or(wanted, |index| index as usize + 1);
-    array.properties.retain(|(name, _)| {
-        object::array_index(name).is_none_or(|index| (index as usize) < length)
-    });
+    if let Some(extra) = array.extra.as_mut() {
+        extra.properties.retain(|(name, _)| {
+            object::array_index(name).is_none_or(|index| (index as usize) < length)
+        });
+    }
     array.resize(length, Value::Uninitialized);
     if kept.is_some() {
         return Err(runtime_error(
@@ -15086,8 +15194,8 @@ fn first_class_name(arguments: &[Value]) -> Result<String, ScriptError> {
 }
 
 // Array.prototype.join(",") without running script; a cycle prints as empty, as join does
-fn array_display(array: &ArrayHandle, visiting: &mut Vec<*const RefCell<ArrayData>>) -> String {
-    let pointer = Rc::as_ptr(array);
+fn array_display(array: &ArrayHandle, visiting: &mut Vec<usize>) -> String {
+    let pointer = array.id();
     if visiting.contains(&pointer) {
         return String::new();
     }
@@ -15646,8 +15754,8 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Bool(left), Value::Bool(right)) => left == right,
         (Value::Number(left), Value::Number(right)) => left == right,
         (Value::String(left), Value::String(right)) => left == right,
-        (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
-        (Value::Array(left), Value::Array(right)) => Rc::ptr_eq(left, right),
+        (Value::Object(left), Value::Object(right)) => object::ObjectHandle::ptr_eq(left, right),
+        (Value::Array(left), Value::Array(right)) => heap::ArrayHandle::ptr_eq(left, right),
         (Value::Binding(_) | Value::ConstBinding(_), _)
         | (_, Value::Binding(_) | Value::ConstBinding(_)) => {
             values_equal(&left.resolve(), &right.resolve())
@@ -16036,12 +16144,362 @@ fn parse_fetch_options(
 
 // a failure raised by the host side of an API, which script sees as a TypeError
 impl ScriptRuntime {
-    // empties what this runtime's script made, for a page that is going away: cycles through
-    // references the collector does not trace would otherwise hold all of it for good
-    pub(crate) fn release_heap(self) -> usize {
-        let generation = self.generation;
+    // destroys this runtime's managed arena heap in bulk when its page goes away
+    pub(crate) fn release_heap(mut self) -> usize {
+        let id = std::mem::replace(&mut self.heap_id, 0);
         drop(self);
-        heap::clear_generation(generation)
+        heap::destroy_heap(id)
+    }
+
+    fn trace_roots(&self, tracer: &mut heap::Tracer) {
+        let ScriptRuntime {
+            document: _,
+            resources: _,
+            resource_provider: _,
+            base_url: _,
+            global,
+            intrinsics: _,
+            location: _,
+            history,
+            event_listeners,
+            event_handlers,
+            attribute_handlers,
+            focused_element: _,
+            forced_pseudo_classes: _,
+            pointer_modality: _,
+            control_values: _,
+            control_checked: _,
+            dirty_checked_controls: _,
+            indeterminate: _,
+            option_selected: _,
+            dirty_options: _,
+            dirty_controls: _,
+            last_user_edit: _,
+            resetting_forms: _,
+            custom_validity: _,
+            text_selections: _,
+            composition: _,
+            click_detail: _,
+            motion_detail: _,
+            pointer: _,
+            active_node: _,
+            key_detail: _,
+            key_text_suppressed: _,
+            reporting_error: _,
+            selection,
+            reported_selection: _,
+            layout_inputs: _,
+            measured: _,
+            measure_pinned: _,
+            controls: _,
+            disabled_controls: _,
+            checked_controls: _,
+            checked_version: _,
+            computed_styles: _,
+            computed_style_template,
+            heap_id: _,
+            has_weak_refs: _,
+            gc_safepoint_allowed: _,
+            gc_inhibit: _,
+            temp_roots,
+            active_microtasks,
+            active_module_scopes,
+            frames,
+            vm_stack,
+            bound_templates,
+            frame_interval: _,
+            visible: _,
+            media_queries: _,
+            media_list_prototype,
+            performance,
+            visual_viewport,
+            media_devices,
+            service_workers,
+            view_transition,
+            reported_viewport: _,
+            performance_entries,
+            perf_observers,
+            event_targets: _,
+            next_event_target: _,
+            held_targets,
+            observers,
+            next_observer: _,
+            xhr,
+            sockets: _,
+            notices: _,
+            channels: _,
+            readers,
+            ports: _,
+            animations,
+            audio,
+            images: _,
+            object_urls: _,
+            image_loads,
+            current_script: _,
+            media,
+            dialogs: _,
+            top_layer: _,
+            popovers: _,
+            popover_toggles: _,
+            hovered_node: _,
+            history_activation: _,
+            custom_definitions,
+            custom_states: _,
+            construction_stack: _,
+            when_defined,
+            custom_registry,
+            import_map: _,
+            selected_files: _,
+            file_lists: _,
+            file_picker: _,
+            clipboard_provider: _,
+            script_dialogs: _,
+            display: _,
+            screen_object,
+            scroll_offsets: _,
+            cookies: _,
+            viewport: _,
+            canvas_contexts: _,
+            webgl_contexts,
+            offscreen_canvases: _,
+            logs: _,
+            clock: _,
+            next_task_id: _,
+            tasks,
+            microtasks,
+            rejections,
+            pending_navigation: _,
+            pending_history: _,
+            pending_exception,
+            iterable_callsite: _,
+            nested_runs: _,
+            stack_base: _,
+            private_names: _,
+            symbol_counter: _,
+            joining,
+            template_cache,
+            registries: _,
+            fetches,
+            event_sources: _,
+            activated_at: _,
+            fullscreen_element: _,
+            font_set,
+            font_set_faces,
+            sheet_objects,
+            adopted_sheets,
+            lock_queue,
+            next_fetch_id: _,
+            pattern_cache: _,
+            random_state: _,
+            console_depth: _,
+            inspector,
+            debugger,
+            console_timers: _,
+            console_counts: _,
+            time_origin: _,
+            time_zone: _,
+            locale: _,
+            host_runtime_info: _,
+            bridge,
+            module_cache,
+            import_metas,
+            workers,
+            worker_sender: _,
+            worker_script_type: _,
+            worker_resource_sender: _,
+            worker_resource_receiver: _,
+            node_handles,
+            step_limit: _,
+            steps: _,
+            interrupted: _,
+            retained_orphans: _,
+            orphan_recheck_at: _,
+        } = self;
+
+        {
+            let env = global.borrow();
+            for value in env.values.values() {
+                tracer.trace_value(value);
+            }
+            for property in env.accessors.values() {
+                tracer.trace_slot(&property.slot);
+            }
+        }
+        tracer.trace_value(&history.borrow().state);
+        for listeners in event_listeners.values() {
+            for listener in listeners {
+                listener.trace(tracer);
+            }
+        }
+        for value in event_handlers.values() {
+            tracer.trace_value(value);
+        }
+        for (_, value) in attribute_handlers.values() {
+            tracer.trace_value(value);
+        }
+        tracer.mark_object(selection.object.clone());
+        if let Some(range) = selection.range() {
+            tracer.mark_object(range.object.clone());
+        }
+        if let Some(template) = computed_style_template {
+            tracer.trace_jsobject(template);
+        }
+        for value in temp_roots {
+            tracer.trace_value(value);
+        }
+        for frame in frames {
+            frame.trace(tracer);
+        }
+        for value in vm_stack {
+            tracer.trace_value(value);
+        }
+        for template in bound_templates.values() {
+            tracer.trace_object_template(template);
+        }
+        if let Some(proto) = media_list_prototype {
+            tracer.mark_object(proto.clone());
+        }
+        tracer.trace_value(performance);
+        if let Some(obj) = visual_viewport {
+            tracer.mark_object(obj.clone());
+        }
+        if let Some(obj) = media_devices {
+            tracer.mark_object(obj.clone());
+        }
+        if let Some(obj) = service_workers {
+            tracer.mark_object(obj.clone());
+        }
+        if let Some((value, vt)) = view_transition {
+            tracer.trace_value(value);
+            vt.trace(tracer);
+        }
+        for entry in performance_entries {
+            tracer.trace_value(&entry.detail);
+        }
+        for (object, observer) in perf_observers {
+            tracer.mark_object(object.clone());
+            observer.trace(tracer);
+        }
+        for handle in held_targets.values() {
+            tracer.mark_object(handle.clone());
+        }
+        for record in observers.values() {
+            record.trace(tracer);
+        }
+        for state in xhr.values() {
+            state.trace(tracer);
+        }
+        readers.trace(tracer);
+        animations.trace(tracer);
+        audio.trace(tracer);
+        for load in image_loads.values() {
+            load.trace(tracer);
+        }
+        media.trace(tracer);
+        for definition in custom_definitions {
+            definition.trace(tracer);
+        }
+        for promise in when_defined.values() {
+            tracer.trace_promise(promise);
+        }
+        tracer.trace_value(custom_registry);
+        if let Some(screen) = &*screen_object.borrow() {
+            tracer.trace_value(screen);
+        }
+        for (object, gl) in webgl_contexts.values() {
+            tracer.mark_object(object.clone());
+            if tracer.visit_rc(gl) {
+                gl.borrow().trace(tracer);
+            }
+        }
+        for task in tasks {
+            tracer.trace_value(&task.callback);
+            for arg in &task.arguments {
+                tracer.trace_value(arg);
+            }
+        }
+        for task in microtasks {
+            tracer.trace_value(&task.callback);
+            tracer.trace_value(&task.this);
+            for arg in &task.arguments {
+                tracer.trace_value(arg);
+            }
+            match &task.kind {
+                MicrotaskKind::Reaction(promise) => tracer.trace_promise(promise),
+                MicrotaskKind::Adopt(reject) => tracer.trace_value(reject),
+                MicrotaskKind::Plain => {}
+            }
+        }
+        for kind in active_microtasks {
+            match kind {
+                MicrotaskKind::Reaction(promise) => tracer.trace_promise(promise),
+                MicrotaskKind::Adopt(reject) => tracer.trace_value(reject),
+                MicrotaskKind::Plain => {}
+            }
+        }
+        for scope in active_module_scopes {
+            tracer.mark_scope(scope.clone());
+        }
+        for promise in rejections.borrow().iter() {
+            tracer.trace_promise(promise);
+        }
+        if let Some((value, _)) = pending_exception {
+            tracer.trace_value(value);
+        }
+        for array in joining {
+            tracer.mark_array(array.clone());
+        }
+        for (_, value) in template_cache.values() {
+            tracer.trace_value(value);
+        }
+        for fetch in fetches.borrow().iter() {
+            fetch.trace(tracer);
+        }
+        if let Some(obj) = &*font_set.borrow() {
+            tracer.mark_object(obj.clone());
+        }
+        for obj in font_set_faces.borrow().iter() {
+            tracer.mark_object(obj.clone());
+        }
+        for obj in sheet_objects.borrow().values() {
+            tracer.mark_object(obj.clone());
+        }
+        for list in adopted_sheets.borrow().values() {
+            for obj in list {
+                tracer.mark_object(obj.clone());
+            }
+        }
+        for req in lock_queue.borrow().iter() {
+            req.trace(tracer);
+        }
+        inspector.trace(tracer);
+        debugger.trace(tracer);
+        if let Some(state) = bridge {
+            state.trace(tracer);
+        }
+        for namespace in module_cache.values() {
+            for value in namespace.values.values() {
+                tracer.trace_value(value);
+            }
+        }
+        for meta in import_metas.values() {
+            tracer.mark_object(meta.clone());
+        }
+        for worker in workers {
+            tracer.trace_worker(worker);
+        }
+        for handle in node_handles.borrow().values() {
+            tracer.mark_object(handle.object.clone());
+        }
+    }
+}
+
+impl Drop for ScriptRuntime {
+    fn drop(&mut self) {
+        let id = std::mem::replace(&mut self.heap_id, 0);
+        if id != 0 {
+            heap::destroy_heap(id);
+        }
     }
 }
 
@@ -24459,7 +24917,8 @@ mod tests {
     fn structured_clone_rejects_cycles_and_functions_and_transfers_buffers() {
         let document = document("<p id='status'>idle</p>");
         let mut runtime = ScriptRuntime::new(document.clone());
-        let cyclic = Rc::new(RefCell::new(object::JsObject::new()));
+        let _heap = heap::enter(runtime.heap_id);
+        let cyclic = object::new_object(object::JsObject::new());
         cyclic
             .borrow_mut()
             .insert("self".to_string(), Value::Object(cyclic.clone()));

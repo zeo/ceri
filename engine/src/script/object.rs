@@ -2,10 +2,9 @@
 // link and an internal class slot for functions, boxed primitives and other exotic kinds
 
 use super::Value;
+pub(super) use super::heap::{ObjectHandle, ObjectWeak};
 use std::cell::{RefCell, UnsafeCell};
 use std::rc::{Rc, Weak};
-
-pub(super) type ObjectHandle = Rc<RefCell<JsObject>>;
 
 pub(super) const ATTR_ENUMERABLE: u8 = 1;
 pub(super) const ATTR_WRITABLE: u8 = 2;
@@ -133,7 +132,7 @@ impl<'a> PropertyRef<'a> {
         self.slot.value()
     }
 
-    pub(super) fn to_property(&self) -> Property {
+    pub(super) fn to_property(self) -> Property {
         Property {
             slot: self.slot.clone(),
             enumerable: self.enumerable,
@@ -212,7 +211,7 @@ pub(super) enum ObjectClass {
     Set(Rc<RefCell<super::collections::Collection>>),
     WeakMap(Rc<RefCell<super::collections::Collection>>),
     WeakSet(Rc<RefCell<super::collections::Collection>>),
-    WeakRef(std::rc::Weak<RefCell<JsObject>>),
+    WeakRef(ObjectWeak),
     // an Array Iterator, which reads its target live on every step
     ArrayIterator(Rc<RefCell<ArrayIteration>>),
     // an object that holds event listeners, keyed by this id in the runtime's registry
@@ -249,6 +248,8 @@ pub(super) enum ObjectClass {
     IteratorHelper(Rc<RefCell<super::iterator_helpers::HelperState>>),
 }
 
+type AttrTransitions = Vec<(Rc<str>, u8, Weak<Shape>)>;
+
 // the keys and attributes of an object in insertion order. objects that gained the same keys
 // with the same attributes in the same order share one, so each keeps only compact 16-byte slots
 pub(super) struct Shape {
@@ -259,7 +260,7 @@ pub(super) struct Shape {
     // the shapes one key longer with default data attributes, while some object still has them
     transitions: RefCell<KeyMap<Weak<Shape>>>,
     // shapes one key longer with non-default attributes (hidden, accessor, read-only)
-    attr_transitions: RefCell<Vec<(Rc<str>, u8, Weak<Shape>)>>,
+    attr_transitions: RefCell<AttrTransitions>,
     // the shape one key shorter, kept alive so the next object to take the same keys finds
     // the same path
     _parent: Option<Rc<Shape>>,
@@ -349,11 +350,9 @@ impl Shape {
     }
 
     fn recompute_flags(&mut self) {
-        self.has_enumerable = self
-            .keys
-            .iter()
-            .zip(&self.attrs)
-            .any(|(key, &attr)| (attr & ATTR_ENUMERABLE) != 0 && !is_symbol_key(key) && !is_private_key(key));
+        self.has_enumerable = self.keys.iter().zip(&self.attrs).any(|(key, &attr)| {
+            (attr & ATTR_ENUMERABLE) != 0 && !is_symbol_key(key) && !is_private_key(key)
+        });
         self.has_integer_key = self.keys.iter().any(|key| array_index(key).is_some());
     }
 
@@ -410,10 +409,11 @@ impl Shape {
         }
         let mut transitions = self.attr_transitions.borrow_mut();
         for (existing_key, existing_attrs, weak) in transitions.iter() {
-            if *existing_attrs == attrs && &**existing_key == key {
-                if let Some(next) = weak.upgrade() {
-                    return next;
-                }
+            if *existing_attrs == attrs
+                && &**existing_key == key
+                && let Some(next) = weak.upgrade()
+            {
+                return next;
             }
         }
         if transitions.len() >= 16 {
@@ -485,15 +485,15 @@ pub(super) enum IcGetHit {
 }
 
 struct DeepProtoChain {
-    skipped: Vec<(Weak<RefCell<JsObject>>, Weak<Shape>)>,
-    holder: Weak<RefCell<JsObject>>,
+    skipped: Vec<(ObjectWeak, Weak<Shape>)>,
+    holder: ObjectWeak,
     holder_shape: Weak<Shape>,
     index: u16,
     accessor: bool,
 }
 
 struct ProtoGuard {
-    holder: Weak<RefCell<JsObject>>,
+    holder: ObjectWeak,
     shape: Weak<Shape>,
 }
 
@@ -515,13 +515,13 @@ enum IcEntry {
     },
     ProtoData {
         receiver: Option<Weak<Shape>>,
-        holder: Weak<RefCell<JsObject>>,
+        holder: ObjectWeak,
         holder_shape: Weak<Shape>,
         index: u16,
     },
     ProtoAccessor {
         receiver: Weak<Shape>,
-        holder: Weak<RefCell<JsObject>>,
+        holder: ObjectWeak,
         holder_shape: Weak<Shape>,
         index: u16,
     },
@@ -530,7 +530,7 @@ enum IcEntry {
         chain: Box<DeepProtoChain>,
     },
     StringMethod {
-        holder: Weak<RefCell<JsObject>>,
+        holder: ObjectWeak,
         holder_shape: Weak<Shape>,
         index: u16,
     },
@@ -582,7 +582,10 @@ impl PropIc {
     }
 
     pub(super) fn record_array_length(&self) {
-        self.replace_or_insert(|entry| matches!(entry, IcEntry::ArrayLength), IcEntry::ArrayLength);
+        self.replace_or_insert(
+            |entry| matches!(entry, IcEntry::ArrayLength),
+            IcEntry::ArrayLength,
+        );
     }
 
     pub(super) fn record_string_length(&self) {
@@ -599,46 +602,172 @@ impl std::fmt::Debug for PropIc {
     }
 }
 
-// an object's property slots, or ones it holds in common with others made alike until it
-// changes them, as the many closures of one function do with their length and name
-#[derive(Clone)]
-enum Properties {
-    Own(Vec<Slot>),
-    Shared(Rc<[Slot]>),
+// sentinel capacity indicating ptr/len came from Rc<[Slot]>::into_raw rather than an owned Vec
+const SHARED_CAP: u32 = u32::MAX;
+
+// compact 16-byte slot storage: either an owned Vec<Slot> buffer or a shared Rc<[Slot]>
+// until mutated, keeping JsObject entries compact with branchless reads
+struct Properties {
+    ptr: std::ptr::NonNull<Slot>,
+    len: u32,
+    cap: u32,
 }
 
 impl Default for Properties {
     fn default() -> Self {
-        Self::Own(Vec::new())
+        Self {
+            ptr: std::ptr::NonNull::dangling(),
+            len: 0,
+            cap: 0,
+        }
+    }
+}
+
+impl Drop for Properties {
+    fn drop(&mut self) {
+        if self.cap == SHARED_CAP {
+            let raw =
+                std::ptr::slice_from_raw_parts(self.ptr.as_ptr() as *const Slot, self.len as usize);
+            // safety: SHARED_CAP entries were created from Rc::<[Slot]>::into_raw
+            drop(unsafe { Rc::from_raw(raw) });
+        } else if self.cap != 0 {
+            // safety: owned entries were created from Vec::<Slot> with matching len and cap
+            drop(unsafe {
+                Vec::from_raw_parts(self.ptr.as_ptr(), self.len as usize, self.cap as usize)
+            });
+        }
+    }
+}
+
+impl Clone for Properties {
+    fn clone(&self) -> Self {
+        if self.cap == SHARED_CAP {
+            let raw =
+                std::ptr::slice_from_raw_parts(self.ptr.as_ptr() as *const Slot, self.len as usize);
+            // safety: self owns one strong count on raw
+            unsafe { Rc::increment_strong_count(raw) };
+            Self {
+                ptr: self.ptr,
+                len: self.len,
+                cap: SHARED_CAP,
+            }
+        } else {
+            Self::from_vec(self.to_vec())
+        }
     }
 }
 
 impl std::ops::Deref for Properties {
     type Target = [Slot];
 
+    #[inline(always)]
     fn deref(&self) -> &[Slot] {
-        match self {
-            Self::Own(own) => own,
-            Self::Shared(shared) => shared,
-        }
+        // safety: ptr is valid and aligned for len initialized Slot elements (or dangling when len == 0)
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
     }
 }
 
 impl Properties {
-    fn own(&mut self) -> &mut Vec<Slot> {
-        if let Self::Shared(shared) = self {
-            *self = Self::Own(shared.to_vec());
+    fn from_vec(vec: Vec<Slot>) -> Self {
+        let len = vec.len();
+        let cap = vec.capacity();
+        assert!(cap < SHARED_CAP as usize, "object property count overflow");
+        let mut vec = std::mem::ManuallyDrop::new(vec);
+        let ptr = std::ptr::NonNull::new(vec.as_mut_ptr()).expect("vec pointer is non-null");
+        Self {
+            ptr,
+            len: len as u32,
+            cap: cap as u32,
         }
-        match self {
-            Self::Own(own) => own,
-            Self::Shared(_) => unreachable!("made its own just above"),
+    }
+
+    fn from_shared(shared: Rc<[Slot]>) -> Self {
+        let len = shared.len();
+        assert!(len < SHARED_CAP as usize, "shared property count overflow");
+        let raw = Rc::into_raw(shared);
+        let ptr = std::ptr::NonNull::new(raw as *mut Slot).expect("rc pointer is non-null");
+        Self {
+            ptr,
+            len: len as u32,
+            cap: SHARED_CAP,
+        }
+    }
+
+    fn make_owned(&mut self) {
+        if self.cap == SHARED_CAP {
+            let owned = self.to_vec();
+            *self = Self::from_vec(owned);
+        }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [Slot] {
+        self.make_owned();
+        // safety: now uniquely owned with len initialized Slot elements
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len as usize) }
+    }
+
+    fn with_vec<R>(&mut self, body: impl FnOnce(&mut Vec<Slot>) -> R) -> R {
+        self.make_owned();
+        let old = std::mem::take(self);
+        let vec = if old.cap == 0 {
+            Vec::new()
+        } else {
+            let old = std::mem::ManuallyDrop::new(old);
+            // safety: old was an owned buffer taken out of self
+            unsafe { Vec::from_raw_parts(old.ptr.as_ptr(), old.len as usize, old.cap as usize) }
+        };
+        struct WriteBack<'a> {
+            target: &'a mut Properties,
+            vec: std::mem::ManuallyDrop<Vec<Slot>>,
+        }
+        impl Drop for WriteBack<'_> {
+            fn drop(&mut self) {
+                // safety: drop runs once and moves the Vec back into target
+                let vec = unsafe { std::mem::ManuallyDrop::take(&mut self.vec) };
+                *self.target = Properties::from_vec(vec);
+            }
+        }
+        let mut guard = WriteBack {
+            target: self,
+            vec: std::mem::ManuallyDrop::new(vec),
+        };
+        body(&mut guard.vec)
+    }
+
+    fn push(&mut self, slot: Slot) {
+        self.with_vec(|vec| vec.push(slot));
+    }
+
+    fn reserve_exact(&mut self, additional: usize) {
+        self.with_vec(|vec| vec.reserve_exact(additional));
+    }
+
+    fn remove(&mut self, index: usize) -> Slot {
+        self.with_vec(|vec| vec.remove(index))
+    }
+
+    fn share(&mut self) -> Rc<[Slot]> {
+        if self.cap == SHARED_CAP {
+            let raw =
+                std::ptr::slice_from_raw_parts(self.ptr.as_ptr() as *const Slot, self.len as usize);
+            // safety: self owns one strong count; bump before handing out a clone
+            unsafe {
+                Rc::increment_strong_count(raw);
+                Rc::from_raw(raw)
+            }
+        } else {
+            let shared: Rc<[Slot]> = Rc::from(&**self);
+            *self = Self::from_shared(shared.clone());
+            shared
         }
     }
 
     fn capacity(&self) -> usize {
-        match self {
-            Self::Own(own) => own.capacity(),
-            Self::Shared(shared) => shared.len(),
+        if self.cap == SHARED_CAP {
+            self.len as usize
+        } else {
+            self.cap as usize
         }
     }
 }
@@ -647,6 +776,12 @@ impl Properties {
 pub(super) struct ObjectTemplate {
     shape: Rc<Shape>,
     properties: Rc<[Slot]>,
+}
+
+impl ObjectTemplate {
+    pub(super) fn slots(&self) -> &[Slot] {
+        &self.properties
+    }
 }
 
 impl std::fmt::Debug for ObjectTemplate {
@@ -726,7 +861,7 @@ impl JsObject {
         debug_assert_eq!(shape.keys.len(), slots.len());
         Self {
             shape,
-            properties: Properties::Own(slots),
+            properties: Properties::from_vec(slots),
             prototype,
             orphan: false,
             extensible: true,
@@ -748,8 +883,11 @@ impl JsObject {
         {
             return Self {
                 shape: template.shape.clone(),
-                properties: Properties::Own(
-                    properties.into_iter().map(|property| property.slot).collect(),
+                properties: Properties::from_vec(
+                    properties
+                        .into_iter()
+                        .map(|property| property.slot)
+                        .collect(),
                 ),
                 prototype: template.prototype.clone(),
                 orphan: template.orphan,
@@ -759,7 +897,7 @@ impl JsObject {
         }
         let mut object = Self {
             shape: Shape::root(),
-            properties: Properties::Own(Vec::with_capacity(properties.len())),
+            properties: Properties::from_vec(Vec::with_capacity(properties.len())),
             prototype: template.prototype.clone(),
             orphan: template.orphan,
             extensible: template.extensible,
@@ -787,22 +925,21 @@ impl JsObject {
             match entry {
                 IcEntry::Empty => break,
                 IcEntry::OwnData { shape, index, .. } => {
-                    if std::ptr::eq(shape.as_ptr(), shape_ptr) {
-                        if let Some(Slot::Data(value)) = self.properties.get(*index as usize) {
-                            return Some(IcGetHit::Value(value.resolve()));
-                        }
+                    if std::ptr::eq(shape.as_ptr(), shape_ptr)
+                        && let Some(Slot::Data(value)) = self.properties.get(*index as usize)
+                    {
+                        return Some(IcGetHit::Value(value.resolve()));
                     }
                 }
                 IcEntry::OwnAccessor { shape, index } => {
-                    if std::ptr::eq(shape.as_ptr(), shape_ptr) {
-                        if let Some(Slot::Accessor(accessors)) =
+                    if std::ptr::eq(shape.as_ptr(), shape_ptr)
+                        && let Some(Slot::Accessor(accessors)) =
                             self.properties.get(*index as usize)
-                        {
-                            return Some(match &accessors.get {
-                                Some(getter) => IcGetHit::Getter(getter.clone()),
-                                None => IcGetHit::Value(Value::Undefined),
-                            });
-                        }
+                    {
+                        return Some(match &accessors.get {
+                            Some(getter) => IcGetHit::Getter(getter.clone()),
+                            None => IcGetHit::Value(Value::Undefined),
+                        });
                     }
                 }
                 IcEntry::ProtoData {
@@ -813,14 +950,12 @@ impl JsObject {
                 } => {
                     if std::ptr::eq(receiver.as_ptr(), shape_ptr)
                         && !matches!(self.class, ObjectClass::String(_))
+                        && let Some(prototype) = &self.prototype
+                        && holder.matches(prototype)
+                        && let Some(value) =
+                            Self::held_data(prototype, holder_shape, *index as usize)
                     {
-                        if let Some(prototype) = &self.prototype
-                            && std::ptr::eq(Rc::as_ptr(prototype), holder.as_ptr())
-                            && let Some(value) =
-                                Self::held_data(prototype, holder_shape, *index as usize)
-                        {
-                            return Some(IcGetHit::Value(value));
-                        }
+                        return Some(IcGetHit::Value(value));
                     }
                 }
                 IcEntry::ProtoAccessor {
@@ -831,32 +966,28 @@ impl JsObject {
                 } => {
                     if std::ptr::eq(receiver.as_ptr(), shape_ptr)
                         && !matches!(self.class, ObjectClass::String(_))
+                        && let Some(prototype) = &self.prototype
+                        && holder.matches(prototype)
+                        && let Some(hit) =
+                            Self::held_accessor(prototype, holder_shape, *index as usize)
                     {
-                        if let Some(prototype) = &self.prototype
-                            && std::ptr::eq(Rc::as_ptr(prototype), holder.as_ptr())
-                            && let Some(hit) =
-                                Self::held_accessor(prototype, holder_shape, *index as usize)
-                        {
-                            return Some(hit);
-                        }
+                        return Some(hit);
                     }
                 }
                 IcEntry::DeepProto { receiver, chain } => {
                     if std::ptr::eq(receiver.as_ptr(), shape_ptr)
                         && !matches!(self.class, ObjectClass::String(_))
+                        && let Some(prototype) = &self.prototype
+                        && let Some(hit) = Self::check_chain(
+                            prototype,
+                            &chain.skipped,
+                            &chain.holder,
+                            &chain.holder_shape,
+                            chain.index as usize,
+                            chain.accessor,
+                        )
                     {
-                        if let Some(prototype) = &self.prototype
-                            && let Some(hit) = Self::check_chain(
-                                prototype,
-                                &chain.skipped,
-                                &chain.holder,
-                                &chain.holder_shape,
-                                chain.index as usize,
-                                chain.accessor,
-                            )
-                        {
-                            return Some(hit);
-                        }
+                        return Some(hit);
                     }
                 }
                 IcEntry::Missing { receiver, proto } => {
@@ -902,7 +1033,7 @@ impl JsObject {
                         if !plain {
                             return Err(value);
                         }
-                        if let Slot::Data(slot) = &mut self.properties.own()[index] {
+                        if let Slot::Data(slot) = &mut self.properties.as_mut_slice()[index] {
                             let old = std::mem::replace(slot, value);
                             old.fast_drop();
                         }
@@ -921,9 +1052,9 @@ impl JsObject {
                         if length == self.properties.capacity() {
                             let doubled = (length * 2).max(4);
                             let wanted = self.shape.longest.get().clamp(length + 1, doubled);
-                            self.properties.own().reserve_exact(wanted - length);
+                            self.properties.reserve_exact(wanted - length);
                         }
-                        self.properties.own().push(Slot::Data(value));
+                        self.properties.push(Slot::Data(value));
                         return Ok(());
                     }
                 }
@@ -935,7 +1066,6 @@ impl JsObject {
 
     #[inline]
     pub(super) fn ic_array_get(prototype: &ObjectHandle, ic: &PropIc) -> Option<Value> {
-        let proto_ptr = Rc::as_ptr(prototype);
         let inner = unsafe { &*ic.0.get() };
         for entry in &inner.entries {
             match entry {
@@ -945,7 +1075,7 @@ impl JsObject {
                     holder,
                     holder_shape,
                     index,
-                } if std::ptr::eq(proto_ptr, holder.as_ptr()) => {
+                } if holder.matches(prototype) => {
                     if let Some(value) = Self::held_data(prototype, holder_shape, *index as usize) {
                         return Some(value);
                     }
@@ -958,7 +1088,6 @@ impl JsObject {
 
     #[inline]
     pub(super) fn ic_string_get(prototype: &ObjectHandle, ic: &PropIc) -> Option<Value> {
-        let proto_ptr = Rc::as_ptr(prototype);
         let inner = unsafe { &*ic.0.get() };
         for entry in &inner.entries {
             match entry {
@@ -967,7 +1096,7 @@ impl JsObject {
                     holder,
                     holder_shape,
                     index,
-                } if std::ptr::eq(proto_ptr, holder.as_ptr()) => {
+                } if holder.matches(prototype) => {
                     if let Some(value) = Self::held_data(prototype, holder_shape, *index as usize) {
                         return Some(value);
                     }
@@ -978,14 +1107,11 @@ impl JsObject {
         None
     }
 
-    fn check_missing_proto(
-        prototype: &Option<ObjectHandle>,
-        guard: Option<&ProtoGuard>,
-    ) -> bool {
+    fn check_missing_proto(prototype: &Option<ObjectHandle>, guard: Option<&ProtoGuard>) -> bool {
         match (prototype, guard) {
             (None, None) => true,
             (Some(proto), Some(guard)) => {
-                if !std::ptr::eq(Rc::as_ptr(proto), guard.holder.as_ptr()) {
+                if !guard.holder.matches(proto) {
                     return false;
                 }
                 let Ok(borrowed) = proto.try_borrow() else {
@@ -993,7 +1119,10 @@ impl JsObject {
                 };
                 borrowed.prototype.is_none()
                     && !borrowed.orphan
-                    && !matches!(borrowed.class, ObjectClass::Proxy(_) | ObjectClass::String(_))
+                    && !matches!(
+                        borrowed.class,
+                        ObjectClass::Proxy(_) | ObjectClass::String(_)
+                    )
                     && std::ptr::eq(Rc::as_ptr(&borrowed.shape), guard.shape.as_ptr())
             }
             _ => false,
@@ -1010,11 +1139,7 @@ impl JsObject {
         holder.properties.get(index)?.value().map(Value::resolve)
     }
 
-    fn held_accessor(
-        holder: &ObjectHandle,
-        shape: &Weak<Shape>,
-        index: usize,
-    ) -> Option<IcGetHit> {
+    fn held_accessor(holder: &ObjectHandle, shape: &Weak<Shape>, index: usize) -> Option<IcGetHit> {
         let holder = holder.try_borrow().ok()?;
         if matches!(holder.class, ObjectClass::Proxy(_))
             || !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&holder.shape))
@@ -1032,26 +1157,28 @@ impl JsObject {
 
     fn check_chain(
         current: &ObjectHandle,
-        skipped: &[(Weak<RefCell<JsObject>>, Weak<Shape>)],
-        holder: &Weak<RefCell<JsObject>>,
+        skipped: &[(ObjectWeak, Weak<Shape>)],
+        holder: &ObjectWeak,
         holder_shape: &Weak<Shape>,
         index: usize,
         accessor: bool,
     ) -> Option<IcGetHit> {
         if let Some(((expected, shape), rest)) = skipped.split_first() {
-            if !std::ptr::eq(Rc::as_ptr(current), expected.as_ptr()) {
+            if !expected.matches(current) {
                 return None;
             }
             let borrowed = current.try_borrow().ok()?;
-            if matches!(borrowed.class, ObjectClass::Proxy(_) | ObjectClass::String(_))
-                || !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&borrowed.shape))
+            if matches!(
+                borrowed.class,
+                ObjectClass::Proxy(_) | ObjectClass::String(_)
+            ) || !std::ptr::eq(shape.as_ptr(), Rc::as_ptr(&borrowed.shape))
             {
                 return None;
             }
             let next = borrowed.prototype.as_ref()?;
             Self::check_chain(next, rest, holder, holder_shape, index, accessor)
         } else {
-            if !std::ptr::eq(Rc::as_ptr(current), holder.as_ptr()) {
+            if !holder.matches(current) {
                 return None;
             }
             if accessor {
@@ -1113,7 +1240,7 @@ impl JsObject {
             return;
         };
         // walk up to 6 prototype hops (covers HTML* -> Element -> Node -> EventTarget -> Object)
-        let mut skipped: Vec<(Weak<RefCell<JsObject>>, Weak<Shape>)> = Vec::new();
+        let mut skipped: Vec<(ObjectWeak, Weak<Shape>)> = Vec::new();
         let mut current = first_proto;
         for depth in 0..6 {
             let Ok(object) = current.try_borrow() else {
@@ -1133,14 +1260,14 @@ impl JsObject {
                     if accessor {
                         IcEntry::ProtoAccessor {
                             receiver: Rc::downgrade(&self.shape),
-                            holder: Rc::downgrade(&current),
+                            holder: current.downgrade(),
                             holder_shape: Rc::downgrade(&object.shape),
                             index: index_u16,
                         }
                     } else {
                         IcEntry::ProtoData {
                             receiver: Some(Rc::downgrade(&self.shape)),
-                            holder: Rc::downgrade(&current),
+                            holder: current.downgrade(),
                             holder_shape: Rc::downgrade(&object.shape),
                             index: index_u16,
                         }
@@ -1150,7 +1277,7 @@ impl JsObject {
                         receiver: Rc::downgrade(&self.shape),
                         chain: Box::new(DeepProtoChain {
                             skipped,
-                            holder: Rc::downgrade(&current),
+                            holder: current.downgrade(),
                             holder_shape: Rc::downgrade(&object.shape),
                             index: index_u16,
                             accessor,
@@ -1183,7 +1310,7 @@ impl JsObject {
                         IcEntry::Missing {
                             receiver: Rc::downgrade(&self.shape),
                             proto: Some(Box::new(ProtoGuard {
-                                holder: Rc::downgrade(&current),
+                                holder: current.downgrade(),
                                 shape: Rc::downgrade(&object.shape),
                             })),
                         },
@@ -1192,7 +1319,7 @@ impl JsObject {
                 return;
             }
             let next = object.prototype.clone().expect("checked above");
-            skipped.push((Rc::downgrade(&current), Rc::downgrade(&object.shape)));
+            skipped.push((current.downgrade(), Rc::downgrade(&object.shape)));
             drop(object);
             current = next;
         }
@@ -1226,11 +1353,14 @@ impl JsObject {
                     (borrowed.prototype.is_none()
                         && !borrowed.orphan
                         && !borrowed.shape.own
-                        && !matches!(borrowed.class, ObjectClass::Proxy(_) | ObjectClass::String(_))
+                        && !matches!(
+                            borrowed.class,
+                            ObjectClass::Proxy(_) | ObjectClass::String(_)
+                        )
                         && !borrowed.contains_key(key))
                     .then(|| {
                         Some(Box::new(ProtoGuard {
-                            holder: Rc::downgrade(proto),
+                            holder: proto.downgrade(),
                             shape: Rc::downgrade(&borrowed.shape),
                         }))
                     })
@@ -1279,7 +1409,7 @@ impl JsObject {
                 |existing| matches!(existing, IcEntry::ProtoData { receiver: None, .. }),
                 IcEntry::ProtoData {
                     receiver: None,
-                    holder: Rc::downgrade(prototype),
+                    holder: prototype.downgrade(),
                     holder_shape: Rc::downgrade(&object.shape),
                     index: index_u16,
                 },
@@ -1301,7 +1431,7 @@ impl JsObject {
             ic.replace_or_insert(
                 |existing| matches!(existing, IcEntry::StringMethod { .. }),
                 IcEntry::StringMethod {
-                    holder: Rc::downgrade(prototype),
+                    holder: prototype.downgrade(),
                     holder_shape: Rc::downgrade(&object.shape),
                     index: index_u16,
                 },
@@ -1315,11 +1445,7 @@ impl JsObject {
         if self.shape.own {
             return None;
         }
-        let shared: Rc<[Slot]> = match &self.properties {
-            Properties::Shared(shared) => shared.clone(),
-            Properties::Own(own) => Rc::from(own.as_slice()),
-        };
-        self.properties = Properties::Shared(shared.clone());
+        let shared = self.properties.share();
         Some(ObjectTemplate {
             shape: self.shape.clone(),
             properties: shared,
@@ -1333,7 +1459,7 @@ impl JsObject {
     ) -> Self {
         Self {
             shape: template.shape.clone(),
-            properties: Properties::Shared(template.properties.clone()),
+            properties: Properties::from_shared(template.properties.clone()),
             prototype,
             orphan: false,
             extensible: true,
@@ -1348,7 +1474,7 @@ impl JsObject {
     }
     // room for exactly this many properties, for objects whose properties are known when made
     pub(super) fn reserve(&mut self, properties: usize) {
-        self.properties.own().reserve_exact(properties);
+        self.properties.reserve_exact(properties);
     }
 
     // the prototype, defaulting host-built objects to the intrinsic their class implies
@@ -1423,7 +1549,7 @@ impl JsObject {
 
     pub(super) fn slot_mut(&mut self, key: &str) -> Option<&mut Slot> {
         self.position(key)
-            .map(move |position| &mut self.properties.own()[position])
+            .map(move |position| &mut self.properties.as_mut_slice()[position])
     }
 
     // defines or replaces a property with exact attributes
@@ -1440,7 +1566,7 @@ impl JsObject {
                 shape.attrs[position] = attrs;
                 shape.recompute_flags();
             }
-            self.properties.own()[position] = property.slot;
+            self.properties.as_mut_slice()[position] = property.slot;
             return;
         }
         if self.shape.own || self.properties.len() >= SHARED_KEYS {
@@ -1453,10 +1579,10 @@ impl JsObject {
                 // ever saves room
                 let doubled = (length * 2).max(4);
                 let wanted = self.shape.longest.get().clamp(length + 1, doubled);
-                self.properties.own().reserve_exact(wanted - length);
+                self.properties.reserve_exact(wanted - length);
             }
         }
-        self.properties.own().push(property.slot);
+        self.properties.push(property.slot);
     }
 
     // the data value of an own property; accessors read as absent for host code
@@ -1476,7 +1602,7 @@ impl JsObject {
                 let shape = self.own_shape();
                 shape.attrs[position] &= !ATTR_ACCESSOR;
             }
-            let slot = &mut self.properties.own()[position];
+            let slot = &mut self.properties.as_mut_slice()[position];
             let previous = slot.value().cloned();
             *slot = Slot::Data(value);
             return previous;
@@ -1487,7 +1613,7 @@ impl JsObject {
 
     pub(super) fn remove(&mut self, key: &str) -> Option<Value> {
         let position = self.position(key)?;
-        let slot = self.properties.own().remove(position);
+        let slot = self.properties.remove(position);
         let shape = self.own_shape();
         shape.keys.remove(position);
         shape.attrs.remove(position);
@@ -1619,27 +1745,6 @@ impl JsObject {
         self.prototype.as_ref()
     }
 
-    // empties an object the cycle collector found unreachable: what it held, and its class
-    pub(super) fn take_for_collection(&mut self) -> (Vec<Value>, ObjectClass) {
-        let mut values = Vec::new();
-        for slot in std::mem::take(&mut self.properties).iter().cloned() {
-            match slot {
-                Slot::Data(value) => values.push(value),
-                Slot::Accessor(accessors) => {
-                    values.extend(accessors.get.into_iter().chain(accessors.set))
-                }
-            }
-        }
-        self.shape = Shape::root();
-        if let Some(prototype) = self.prototype.take() {
-            values.push(Value::Object(prototype));
-        }
-        (
-            values,
-            std::mem::replace(&mut self.class, ObjectClass::Ordinary),
-        )
-    }
-
     pub(super) fn freeze(&mut self, writable: bool) {
         self.extensible = false;
         if !self.shape.attrs.is_empty() {
@@ -1676,10 +1781,9 @@ pub(super) fn is_private_key(key: &str) -> bool {
     key.starts_with(PRIVATE_PREFIX)
 }
 
+#[inline]
 pub(super) fn new_object(object: JsObject) -> ObjectHandle {
-    let handle = Rc::new(RefCell::new(object));
-    super::heap::register_object(&handle);
-    handle
+    super::heap::alloc_object(object)
 }
 
 #[cfg(test)]
@@ -1772,5 +1876,5 @@ mod tests {
 #[test]
 fn an_object_fits_the_allocator_class_below_its_old_one() {
     assert_eq!(std::mem::size_of::<ObjectClass>(), 16);
-    assert_eq!(std::mem::size_of::<JsObject>(), 64);
+    assert_eq!(std::mem::size_of::<JsObject>(), 56);
 }

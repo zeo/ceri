@@ -48,6 +48,12 @@ pub(super) struct RuleState {
     sheet: Value,
 }
 
+impl RuleState {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        tracer.trace_value(&self.sheet);
+    }
+}
+
 pub(super) struct CssomInterfaces {
     sheet: ObjectHandle,
     rules: Vec<(u16, ObjectHandle)>,

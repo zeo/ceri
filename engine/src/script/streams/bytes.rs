@@ -46,6 +46,28 @@ pub(super) struct ByteSource {
     request: Option<(ObjectHandle, Rc<RefCell<ByobRequest>>)>,
 }
 
+impl ByteSource {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        if let Some((obj, req)) = &self.request {
+            tracer.mark_object(obj.clone());
+            trace_byob_request(req, tracer);
+        }
+    }
+}
+
+pub(super) fn trace_byob_request(req: &Rc<RefCell<ByobRequest>>, tracer: &mut super::heap::Tracer) {
+    if !tracer.visit_rc(req) {
+        return;
+    }
+    let req = req.borrow();
+    if let Some(stream) = &req.stream {
+        super::trace_readable(stream, tracer);
+    }
+    if let Some(view) = &req.view {
+        tracer.trace_value(view);
+    }
+}
+
 pub(in crate::script) struct ByobRequest {
     stream: Option<Rc<RefCell<Readable>>>,
     view: Option<Value>,

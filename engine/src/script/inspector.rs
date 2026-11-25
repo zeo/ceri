@@ -64,6 +64,21 @@ pub(super) struct Inspector {
 }
 
 impl Inspector {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        for entry in &self.messages {
+            for arg in &entry.arguments {
+                tracer.trace_value(arg);
+            }
+        }
+        for (value, _) in self.objects.values() {
+            tracer.trace_value(value);
+        }
+        for awaited in &self.awaited {
+            tracer.trace_promise(&awaited.promise);
+        }
+        tracer.trace_value(&self.last_result);
+    }
+
     pub(super) fn new() -> Self {
         Self {
             context: NEXT_CONTEXT.fetch_add(1, Ordering::Relaxed),
@@ -195,6 +210,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn inspector_call(&mut self, session: u64, method: &str, params: &Json) -> Answer {
+        let _heap = super::heap::enter(self.heap_id);
         let answer = match method {
             _ if method.starts_with("Debugger.") => {
                 return self.debugger_call(session, method, params);
@@ -262,6 +278,7 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn inspector_node_object(&mut self, node: NodeId, group: &str) -> Json {
+        let _heap = super::heap::enter(self.heap_id);
         let value = self.node_value(node);
         self.remote_object(&value, group, false)
     }
@@ -283,6 +300,7 @@ impl ScriptRuntime {
         function: &str,
         arguments: Vec<NodeArgument>,
     ) -> Result<NodeCall, String> {
+        let _heap = super::heap::enter(self.heap_id);
         let arguments = arguments
             .into_iter()
             .map(|argument| match argument {
@@ -295,9 +313,14 @@ impl ScriptRuntime {
         let outcome = self
             .evaluate_console_source(function)
             .and_then(|function| self.call_function(function, this, arguments));
+        let root_base = self.temp_roots.len();
+        if let Ok(value) = &outcome {
+            self.temp_roots.push(value.clone());
+        }
         if let Err(error) = self.drain_microtasks() {
             self.report_exception(error);
         }
+        self.temp_roots.truncate(root_base);
         let value = match outcome {
             Ok(value) => value,
             Err(error) => {
@@ -370,6 +393,7 @@ impl ScriptRuntime {
 
     // answers for awaited promises that have settled since the last call
     pub(crate) fn inspector_settled(&mut self) -> Vec<(u64, Result<Json, String>)> {
+        let _heap = super::heap::enter(self.heap_id);
         let (settled, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.inspector.awaited)
             .into_iter()
             .partition(|awaited| {
@@ -480,11 +504,16 @@ impl ScriptRuntime {
         await_promise: bool,
     ) -> Answer {
         // a paused page runs no jobs until it resumes
+        let root_base = self.temp_roots.len();
+        if let Ok(value) = &outcome {
+            self.temp_roots.push(value.clone());
+        }
         if !self.debugger_paused()
             && let Err(error) = self.drain_microtasks()
         {
             self.report_exception(error);
         }
+        self.temp_roots.truncate(root_base);
         match outcome {
             Ok(Value::Promise(promise)) if await_promise => {
                 self.settle_or_wait(promise, group, by_value, preview)
@@ -534,7 +563,7 @@ impl ScriptRuntime {
             if let Ok((function, text)) = parser::parse_function_source("", &body, is_async, false)
             {
                 let code = compiler::Compiler::new(&text).compile_function(&function)?;
-                let closure = self.new_closure(code, None, None);
+                let closure = self.new_closure(code, None);
                 return self.call_function(closure, Value::Window, Vec::new());
             }
         }

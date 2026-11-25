@@ -46,6 +46,24 @@ pub(super) struct HelperState {
     done: bool,
 }
 
+impl HelperState {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        tracer.trace_value(&self.iterator);
+        tracer.trace_value(&self.next);
+        match &self.step {
+            Step::Map(cb) | Step::Filter(cb) => tracer.trace_value(cb),
+            Step::FlatMap(cb, inner) => {
+                tracer.trace_value(cb);
+                if let Some((iter, next)) = inner {
+                    tracer.trace_value(iter);
+                    tracer.trace_value(next);
+                }
+            }
+            Step::Take(_) | Step::Drop(_) | Step::Wrap => {}
+        }
+    }
+}
+
 pub(super) struct HelperInterfaces {
     helper: ObjectHandle,
     wrap: ObjectHandle,
@@ -178,7 +196,7 @@ impl ScriptRuntime {
         };
         let mut chain = object.borrow().explicit_prototype();
         while let Some(prototype) = chain {
-            if Rc::ptr_eq(&prototype, &self.intrinsics.iterator_prototype) {
+            if ObjectHandle::ptr_eq(&prototype, &self.intrinsics.iterator_prototype) {
                 return true;
             }
             chain = prototype.borrow().explicit_prototype();
@@ -205,7 +223,7 @@ impl ScriptRuntime {
             Value::Object(_) => self.prototype_from_constructor(&new_target)?,
             _ => self.intrinsics.iterator_prototype.clone(),
         };
-        if Rc::ptr_eq(&prototype, &self.intrinsics.iterator_prototype) {
+        if ObjectHandle::ptr_eq(&prototype, &self.intrinsics.iterator_prototype) {
             return Err(self.type_error("Abstract class Iterator not directly constructable"));
         }
         Ok(Value::Object(new_object(JsObject::with_prototype(

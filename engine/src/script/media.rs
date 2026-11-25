@@ -32,6 +32,19 @@ pub(super) struct MediaState {
     elements: HashMap<NodeId, MediaElement>,
 }
 
+impl MediaState {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        for element in self.elements.values() {
+            for waiter in &element.waiters {
+                tracer.trace_promise(waiter);
+            }
+            for (_, callback) in &element.frame_callbacks {
+                tracer.trace_value(callback);
+            }
+        }
+    }
+}
+
 struct MediaElement {
     // runs of the load algorithm; a task queued for an older one does nothing
     generation: u64,

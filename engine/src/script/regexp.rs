@@ -245,7 +245,7 @@ impl ScriptRuntime {
                 None => Value::Undefined,
             })
             .collect();
-        let array: ArrayHandle = Rc::new(RefCell::new(values.into()));
+        let array: ArrayHandle = super::heap::alloc_array(values.into());
         let start = found.captures[0].map_or(0, |(start, _)| start);
         self.set_array_expando(&array, "index", Value::Number(start as f64));
         self.set_array_expando(&array, "input", Value::String(text.into()));
@@ -263,7 +263,7 @@ impl ScriptRuntime {
                     None => Value::Undefined,
                 })
                 .collect();
-            let indices: ArrayHandle = Rc::new(RefCell::new(pairs.into()));
+            let indices: ArrayHandle = super::heap::alloc_array(pairs.into());
             let named = if data.regex.names.is_empty() {
                 Value::Undefined
             } else {
@@ -319,7 +319,9 @@ impl ScriptRuntime {
                 self.regexp_with_prototype(&source, &flags, prototype)
             }
             M::Source => match &this {
-                Value::Object(object) if Rc::ptr_eq(object, &self.intrinsics.regexp_prototype) => {
+                Value::Object(object)
+                    if ObjectHandle::ptr_eq(object, &self.intrinsics.regexp_prototype) =>
+                {
                     Ok(Value::String("(?:)".into()))
                 }
                 _ => {
@@ -351,7 +353,9 @@ impl ScriptRuntime {
                 Ok(Value::String(text.into()))
             }
             M::Flag(letter) => match &this {
-                Value::Object(object) if Rc::ptr_eq(object, &self.intrinsics.regexp_prototype) => {
+                Value::Object(object)
+                    if ObjectHandle::ptr_eq(object, &self.intrinsics.regexp_prototype) =>
+                {
                     Ok(Value::Undefined)
                 }
                 _ => {

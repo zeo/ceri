@@ -230,6 +230,23 @@ pub(super) struct Debugger {
     last_thrown: Option<Value>,
 }
 
+impl Debugger {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        if let Some((value, _)) = &self.thrown {
+            tracer.trace_value(value);
+        }
+        if let Some(value) = &self.last_thrown {
+            tracer.trace_value(value);
+        }
+        for snapshot in &self.mirror {
+            if let Some(scope) = &snapshot.scope {
+                tracer.mark_scope(scope.clone());
+            }
+            tracer.trace_value(&snapshot.this);
+        }
+    }
+}
+
 impl ScriptRuntime {
     pub(crate) fn set_debugger(&mut self, shared: SharedDebug) {
         self.debugger.shared = Some(shared);
@@ -754,11 +771,8 @@ impl ScriptRuntime {
             let (scope, reg_base) = if frame.code.uses_regs {
                 let reg_count = frame.code.registers as usize;
                 let slots = self.vm_stack[frame.reg_base..frame.reg_base + reg_count].to_vec();
-                let synthetic = Scope::new_with_slots(
-                    frame.code.layout.clone(),
-                    frame.scope.clone(),
-                    slots,
-                );
+                let synthetic =
+                    Scope::new_with_slots(frame.code.layout.clone(), frame.scope.clone(), slots);
                 (Some(synthetic), Some(frame.reg_base))
             } else {
                 (frame.scope.clone(), None)
@@ -1104,19 +1118,18 @@ impl ScriptRuntime {
                 .self_scope
                 .as_ref()
                 .is_some_and(|own| Rc::ptr_eq(own, &layout));
-            let kind = if !local
-                && Rc::ptr_eq(&layout, &snapshot.code.layout)
-                && !snapshot.code.is_script
-            {
-                local = true;
-                "local"
-            } else if parent.is_none() {
-                if module { "module" } else { "script" }
-            } else if local {
-                "closure"
-            } else {
-                "block"
-            };
+            let kind =
+                if !local && Rc::ptr_eq(&layout, &snapshot.code.layout) && !snapshot.code.is_script
+                {
+                    local = true;
+                    "local"
+                } else if parent.is_none() {
+                    if module { "module" } else { "script" }
+                } else if local {
+                    "closure"
+                } else {
+                    "block"
+                };
             let entries: Vec<(String, Value)> = layout
                 .names
                 .iter()
@@ -1202,7 +1215,7 @@ impl ScriptRuntime {
         let code = compiler::Compiler::new(&text)
             .compile_function_within(&function, &layers)
             .map_err(|error| self.throw_error("SyntaxError", error.message))?;
-        let closure = self.new_closure(code, snapshot.scope.clone(), None);
+        let closure = self.new_closure(code, snapshot.scope.clone());
         let this = match &snapshot.this {
             Value::Uninitialized => Value::Undefined,
             this => this.clone(),

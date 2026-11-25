@@ -82,7 +82,7 @@ pub(crate) enum WindowMethod {
 }
 
 pub(super) struct MediaQueryRecord {
-    object: Weak<RefCell<JsObject>>,
+    object: super::object::ObjectWeak,
     query: String,
     matches: bool,
 }
@@ -93,7 +93,7 @@ pub(super) struct PerformanceEntry {
     kind: &'static str,
     start: f64,
     duration: f64,
-    detail: Value,
+    pub(super) detail: Value,
 }
 
 impl PerformanceEntry {
@@ -1481,10 +1481,9 @@ impl ScriptRuntime {
             list.define("matches".to_string(), Property::data(Value::Bool(matches)));
             list.define("onchange".to_string(), Property::data(Value::Null));
         }
-        self.media_queries
-            .retain(|record| record.object.strong_count() != 0);
+        self.media_queries.retain(|record| record.object.is_alive());
         self.media_queries.push(MediaQueryRecord {
-            object: Rc::downgrade(&object),
+            object: object.downgrade(),
             query,
             matches,
         });
@@ -1511,8 +1510,7 @@ impl ScriptRuntime {
     // re-evaluates live media query lists after the viewport or preferences change, firing
     // change at each whose answer flipped
     pub(crate) fn evaluate_media_queries(&mut self) -> Result<(), ScriptError> {
-        self.media_queries
-            .retain(|record| record.object.strong_count() != 0);
+        self.media_queries.retain(|record| record.object.is_alive());
         let mut changed = Vec::new();
         for index in 0..self.media_queries.len() {
             let matches = self.media_matches(&self.media_queries[index].query);

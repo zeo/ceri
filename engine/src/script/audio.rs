@@ -355,6 +355,42 @@ pub(super) struct AudioState {
     finished: Option<(Sender<Decoded>, Receiver<Decoded>)>,
 }
 
+impl AudioState {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        for object in self.objects.values() {
+            match object {
+                AudioObject::Context(ctx) => tracer.mark_object(ctx.destination.clone()),
+                AudioObject::Node(node) => {
+                    for (_, out) in &node.outputs {
+                        tracer.mark_object(out.clone());
+                    }
+                    match &node.kind {
+                        NodeKind::Destination => {}
+                        NodeKind::Gain(param) => tracer.mark_object(param.clone()),
+                        NodeKind::Source(src) => {
+                            if let Some(buf) = &src.buffer {
+                                tracer.mark_object(buf.clone());
+                            }
+                            tracer.mark_object(src.rate.clone());
+                        }
+                    }
+                }
+                AudioObject::Param(_) => {}
+                AudioObject::Buffer(buf) => {
+                    for view in buf.views.iter().flatten() {
+                        tracer.trace_typed_array(view);
+                    }
+                }
+            }
+        }
+        for decode in &self.decodes {
+            tracer.trace_promise(&decode.promise);
+            tracer.trace_value(&decode.success);
+            tracer.trace_value(&decode.failure);
+        }
+    }
+}
+
 struct Decoding {
     key: u64,
     promise: PromiseHandle,
@@ -978,7 +1014,11 @@ impl ScriptRuntime {
         self.audio.source(id).playing = true;
         self.audio.context(context).playing.push(id);
         // a playing source sounds to its end even when script lets go of it
-        if let Some(object) = self.event_targets.get(&id).and_then(Weak::upgrade) {
+        if let Some(object) = self
+            .event_targets
+            .get(&id)
+            .and_then(super::object::ObjectWeak::upgrade)
+        {
             self.held_targets.insert(id, object);
         }
     }
@@ -1310,7 +1350,7 @@ impl ScriptRuntime {
                 Ok(self
                     .event_targets
                     .get(&context)
-                    .and_then(Weak::upgrade)
+                    .and_then(super::object::ObjectWeak::upgrade)
                     .map_or(Value::Null, Value::Object))
             }
             AudioMember::NumberOfInputs => number(match self.audio.node(id).kind {

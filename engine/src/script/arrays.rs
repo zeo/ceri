@@ -116,16 +116,18 @@ fn array_method_refusal(
     use super::Integrity;
     use ArrayMethod as M;
     let length = array.len();
+    let integrity = array.integrity();
+    let fixed_length = array.fixed_length();
     let adding = |count: usize| {
-        (count > 0 && (array.integrity >= Integrity::Closed || array.fixed_length))
+        (count > 0 && (integrity >= Integrity::Closed || fixed_length))
             .then(|| format!("Cannot add property {length}, object is not extensible"))
     };
     let removing = |count: usize| {
-        (count > 0 && (array.integrity >= Integrity::Sealed || array.fixed_length))
+        (count > 0 && (integrity >= Integrity::Sealed || fixed_length))
             .then(|| format!("Cannot delete property '{}' of [object Array]", length - 1))
     };
     let changing = || {
-        (length > 0 && array.integrity == Integrity::Frozen).then(|| {
+        (length > 0 && integrity == Integrity::Frozen).then(|| {
             "Cannot assign to read only property '0' of object '[object Array]'".to_string()
         })
     };
@@ -696,7 +698,7 @@ impl ScriptRuntime {
                     }
                     _ => {
                         let values = self.receiver_values(&this, name)?;
-                        let array: ArrayHandle = Rc::new(RefCell::new(values.into()));
+                        let array = super::heap::alloc_array(values.into());
                         Ok(Value::String(self.join_array(&array, &separator)?.into()))
                     }
                 }
@@ -764,6 +766,11 @@ impl ScriptRuntime {
                 let array = self.receiver_array(&this, name)?;
                 let mut array = array.borrow_mut();
                 check_length(array.len().saturating_add(arguments.len()))?;
+                // keep 1-2 element arrays compact instead of jumping straight to capacity 4
+                let needed = array.len() + arguments.len();
+                if needed <= 2 && array.capacity() < needed {
+                    array.reserve_exact(arguments.len());
+                }
                 array.extend(arguments);
                 Ok(Value::Number(array.len() as f64))
             }

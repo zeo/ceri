@@ -99,7 +99,7 @@ impl ScriptRuntime {
     pub(super) fn offscreen_object(&self, node: NodeId) -> Option<Value> {
         self.offscreen_canvases
             .get(&node)
-            .and_then(std::rc::Weak::upgrade)
+            .and_then(super::object::ObjectWeak::upgrade)
             .map(Value::Object)
     }
 
@@ -138,7 +138,7 @@ impl ScriptRuntime {
             Some(prototype),
             ObjectClass::Offscreen(handle),
         ));
-        self.offscreen_canvases.insert(node, Rc::downgrade(&object));
+        self.offscreen_canvases.insert(node, object.downgrade());
         Ok(Value::Object(object))
     }
 

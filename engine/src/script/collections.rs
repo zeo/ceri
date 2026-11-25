@@ -60,8 +60,8 @@ pub(super) fn value_address(value: &Value) -> usize {
         };
     }
     match value {
-        Value::Object(handle) => address!(handle),
-        Value::Array(handle) => address!(handle),
+        Value::Object(handle) => handle.id(),
+        Value::Array(handle) => handle.id(),
         Value::Promise(handle) => address!(handle),
         Value::Iterator(handle) => address!(handle),
         Value::Error(handle) => address!(handle),
@@ -97,7 +97,7 @@ pub(super) struct Collection {
     index: HashMap<KeyId, usize>,
     live: usize,
     // weak tables hold their object keys through these, so an unreachable key frees its entry
-    weak_keys: Vec<Option<Weak<RefCell<JsObject>>>>,
+    weak_keys: Vec<Option<super::object::ObjectWeak>>,
     weak: bool,
     // iterations in progress hold positions, so the table only compacts when there are none
     cursors: usize,
@@ -142,9 +142,8 @@ impl Collection {
             key => key,
         };
         if self.weak {
-            self.prune();
             let weak = match &key {
-                Value::Object(object) => Some(Rc::downgrade(object)),
+                Value::Object(object) => Some(object.downgrade()),
                 _ => None,
             };
             self.weak_keys.push(weak);
@@ -198,7 +197,7 @@ impl Collection {
     }
 
     // drops weak entries whose key object has been freed
-    fn prune(&mut self) {
+    pub(super) fn prune(&mut self) {
         if !self.weak {
             return;
         }
@@ -206,7 +205,7 @@ impl Collection {
             .weak_keys
             .iter()
             .enumerate()
-            .filter(|(_, key)| key.as_ref().is_some_and(|key| key.strong_count() == 0))
+            .filter(|(_, key)| key.as_ref().is_some_and(|key| !key.is_alive()))
             .map(|(position, _)| position)
             .collect();
         if dead.is_empty() {
@@ -217,6 +216,35 @@ impl Collection {
             self.entries[position] = None;
             self.weak_keys[position] = None;
             self.live -= 1;
+        }
+    }
+
+    pub(super) fn trace_strong(&self, tracer: &mut super::heap::Tracer) {
+        for (key, value) in self.entries.iter().flatten() {
+            tracer.trace_value(key);
+            tracer.trace_value(value);
+        }
+    }
+
+    pub(super) fn trace_non_object_keys(&self, tracer: &mut super::heap::Tracer) {
+        for (position, entry) in self.entries.iter().enumerate() {
+            if let Some((key, value)) = entry
+                && self.weak_keys.get(position).and_then(|k| *k).is_none()
+            {
+                tracer.trace_value(key);
+                tracer.trace_value(value);
+            }
+        }
+    }
+
+    pub(super) fn trace_weak_values(&self, tracer: &mut super::heap::Tracer) {
+        for (position, entry) in self.entries.iter().enumerate() {
+            if let Some((_, value)) = entry
+                && let Some(Some(weak_key)) = self.weak_keys.get(position)
+                && tracer.is_object_marked(*weak_key)
+            {
+                tracer.trace_value(value);
+            }
         }
     }
 
@@ -344,10 +372,19 @@ pub(super) struct Registry {
     cells: Vec<RegistryCell>,
 }
 
+impl Registry {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        tracer.trace_value(&self.cleanup);
+        for cell in &self.cells {
+            tracer.trace_value(&cell.held);
+        }
+    }
+}
+
 struct RegistryCell {
-    target: Weak<RefCell<JsObject>>,
+    target: super::object::ObjectWeak,
     held: Value,
-    token: Option<Weak<RefCell<JsObject>>>,
+    token: Option<super::object::ObjectWeak>,
 }
 
 fn argument(arguments: &[Value], index: usize) -> Value {
@@ -742,10 +779,11 @@ impl ScriptRuntime {
                 let Value::Object(target) = &first else {
                     return Err(self.type_error("WeakRef: target must be an object"));
                 };
+                self.has_weak_refs.set(true);
                 let prototype = self.intrinsics.weak_ref_prototype.clone();
                 Ok(Value::Object(new_object(JsObject::with_prototype(
                     Some(prototype),
-                    ObjectClass::WeakRef(Rc::downgrade(target)),
+                    ObjectClass::WeakRef(target.downgrade()),
                 ))))
             }
             M::RegistryConstructor => {
@@ -755,6 +793,7 @@ impl ScriptRuntime {
                 if !is_callable(&first) {
                     return Err(self.type_error("FinalizationRegistry: cleanup must be callable"));
                 }
+                self.has_weak_refs.set(true);
                 let registry = Rc::new(RefCell::new(Registry {
                     cleanup: first,
                     cells: Vec::new(),
@@ -793,9 +832,7 @@ impl ScriptRuntime {
                     let mut registry = registry.borrow_mut();
                     let before = registry.cells.len();
                     registry.cells.retain(|cell| {
-                        cell.token
-                            .as_ref()
-                            .is_none_or(|held| held.as_ptr() != Rc::as_ptr(&token))
+                        cell.token.as_ref().is_none_or(|held| !held.matches(&token))
                     });
                     return Ok(Value::Bool(registry.cells.len() != before));
                 }
@@ -805,15 +842,15 @@ impl ScriptRuntime {
                     );
                 };
                 let held = argument(&arguments, 1);
-                if matches!(&held, Value::Object(held) if Rc::ptr_eq(held, target)) {
+                if matches!(&held, Value::Object(held) if ObjectHandle::ptr_eq(held, target)) {
                     return Err(self.type_error(
                         "FinalizationRegistry.prototype.register: target and holdings must not be same",
                     ));
                 }
                 registry.borrow_mut().cells.push(RegistryCell {
-                    target: Rc::downgrade(target),
+                    target: target.downgrade(),
                     held,
-                    token: token.as_ref().map(Rc::downgrade),
+                    token: token.as_ref().map(ObjectHandle::downgrade),
                 });
                 Ok(Value::Undefined)
             }
@@ -849,7 +886,7 @@ impl ScriptRuntime {
             let mut registry = registry.borrow_mut();
             let cleanup = registry.cleanup.clone();
             registry.cells.retain(|cell| {
-                let alive = cell.target.strong_count() > 0;
+                let alive = cell.target.is_alive();
                 if !alive {
                     due.push((cleanup.clone(), cell.held.clone()));
                 }

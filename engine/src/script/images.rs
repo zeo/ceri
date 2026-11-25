@@ -18,6 +18,14 @@ pub(super) struct ImageLoad {
     waiters: Vec<PromiseHandle>,
 }
 
+impl ImageLoad {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        for waiter in &self.waiters {
+            tracer.trace_promise(waiter);
+        }
+    }
+}
+
 // the key layout and script both cache a decoded image reference under
 pub(crate) fn image_key(base: &AppUrl, reference: &str) -> Option<String> {
     let reference = reference.trim();

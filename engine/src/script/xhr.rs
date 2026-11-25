@@ -169,6 +169,14 @@ pub(super) struct XhrState {
     generation: u64,
 }
 
+impl XhrState {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        if let Some(upload) = &self.upload {
+            tracer.mark_object(upload.clone());
+        }
+    }
+}
+
 impl ScriptRuntime {
     pub(super) fn construct_xhr(&mut self, new_target: Value) -> Result<Value, ScriptError> {
         let prototype = match new_target {

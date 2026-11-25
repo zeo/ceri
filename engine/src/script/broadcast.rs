@@ -193,7 +193,7 @@ impl ScriptRuntime {
             let live = &self.event_targets;
             self.channels
                 .made
-                .retain(|id, _| live.get(id).is_some_and(|target| target.strong_count() > 0));
+                .retain(|id, _| live.get(id).is_some_and(|target| target.is_alive()));
             let mut hearers: Vec<u32> = self
                 .channels
                 .made

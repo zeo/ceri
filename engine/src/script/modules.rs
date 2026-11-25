@@ -53,8 +53,14 @@ impl ScriptRuntime {
             };
             self.module_cache.insert(current.clone(), namespace);
         }
+        // keep every module scope in the graph rooted while evaluating modules
+        let module_root_base = self.active_module_scopes.len();
+        self.active_module_scopes
+            .extend(graph.records.values().map(|record| record.scope.clone()));
+        let eval_result = self.evaluate(&mut graph, &key);
+        self.active_module_scopes.truncate(module_root_base);
         // a module graph that fails to run leaves nothing behind for a later import to find
-        if let Err(error) = self.evaluate(&mut graph, &key) {
+        if let Err(error) = eval_result {
             for current in &keys {
                 self.module_cache.remove(current);
             }
@@ -73,6 +79,7 @@ impl ScriptRuntime {
         let key = url.to_string();
         let module = parser::parse_module(source)?;
         let mut module = compiler::Compiler::new(source).compile_module(&module)?;
+        module.code.set_url(&Rc::new(url.clone()));
         self.register_script(&module.code, &key, true);
         let scope = vm::Scope::new(module.code.layout.clone(), None);
         // an import exported again is resolved through the module it came from, since this

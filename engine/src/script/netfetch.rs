@@ -21,6 +21,18 @@ pub(super) struct PendingFetch {
     signal: Option<AbortSignalHandle>,
 }
 
+impl PendingFetch {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        tracer.trace_promise(&self.promise);
+        if let Some((readable, _)) = &self.body {
+            super::streams::trace_readable(readable, tracer);
+        }
+        if let Some(signal) = &self.signal {
+            tracer.trace_abort_signal(signal);
+        }
+    }
+}
+
 impl ScriptRuntime {
     // hands the request to the host's thread when it takes one; none leaves it to be answered in place
     pub(super) fn spawn_fetch(

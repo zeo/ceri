@@ -21,6 +21,26 @@ pub(super) struct FromAsync {
     values: RefCell<Vec<Value>>,
 }
 
+impl FromAsync {
+    pub(super) fn trace(self: &Rc<Self>, tracer: &mut super::heap::Tracer) {
+        if !tracer.visit_rc(self) {
+            return;
+        }
+        tracer.trace_promise(&self.result);
+        match &self.source {
+            Source::Async(iter, next) => {
+                tracer.trace_value(iter);
+                tracer.trace_value(next);
+            }
+            Source::Sync(iter) | Source::ArrayLike(iter, _) => tracer.trace_value(iter),
+        }
+        tracer.trace_value(&self.mapper);
+        for value in self.values.borrow().iter() {
+            tracer.trace_value(value);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Phase {
     // an async iterator's next settled with a result object

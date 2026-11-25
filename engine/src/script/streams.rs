@@ -158,6 +158,256 @@ pub(super) struct Collect {
     result: PromiseHandle,
 }
 
+pub(super) fn trace_readable(readable: &Rc<RefCell<Readable>>, tracer: &mut super::heap::Tracer) {
+    if !tracer.visit_rc(readable) {
+        return;
+    }
+    let r = readable.borrow();
+    if let State::Errored(err) = &r.state {
+        tracer.trace_value(err);
+    }
+    for (chunk, _) in &r.queue {
+        tracer.trace_value(chunk);
+    }
+    if let Some(size) = &r.size {
+        tracer.trace_value(size);
+    }
+    match &r.source {
+        Source::Script {
+            object,
+            pull,
+            cancel,
+        } => {
+            tracer.trace_value(object);
+            if let Some(v) = pull {
+                tracer.trace_value(v);
+            }
+            if let Some(v) = cancel {
+                tracer.trace_value(v);
+            }
+        }
+        Source::Iterator { iterator, next } => {
+            tracer.trace_value(iterator);
+            tracer.trace_value(next);
+        }
+        Source::Tee(tee, _) => trace_tee(tee, tracer),
+        Source::Transform(state) => trace_transform(state, tracer),
+        Source::Body(_) | Source::Network(_) => {}
+    }
+    if let Some(reader) = &r.reader {
+        trace_reader(reader, tracer);
+    }
+    if let Some(controller) = &r.controller {
+        tracer.mark_object(controller.clone());
+    }
+    if let Some(bytes) = &r.bytes {
+        bytes.trace(tracer);
+    }
+}
+
+fn trace_reader(reader: &Rc<RefCell<Reader>>, tracer: &mut super::heap::Tracer) {
+    if !tracer.visit_rc(reader) {
+        return;
+    }
+    let r = reader.borrow();
+    if let Some(stream) = &r.stream {
+        trace_readable(stream, tracer);
+    }
+    for req in &r.requests {
+        tracer.trace_promise(req);
+    }
+    tracer.trace_promise(&r.closed);
+}
+
+fn trace_tee(tee: &Rc<TeeState>, tracer: &mut super::heap::Tracer) {
+    if !tracer.visit_rc(tee) {
+        return;
+    }
+    trace_reader(&tee.reader, tracer);
+    trace_readable(&tee.original, tracer);
+    for branch in tee.branches.borrow().iter() {
+        trace_readable(branch, tracer);
+    }
+    for reason in tee.reasons.borrow().iter() {
+        tracer.trace_value(reason);
+    }
+    tracer.trace_promise(&tee.cancel_promise);
+}
+
+fn trace_writable(writable: &Rc<RefCell<Writable>>, tracer: &mut super::heap::Tracer) {
+    if !tracer.visit_rc(writable) {
+        return;
+    }
+    let w = writable.borrow();
+    match &w.state {
+        WriteState::Erroring(v) | WriteState::Errored(v) => tracer.trace_value(v),
+        WriteState::Writable | WriteState::Closed => {}
+    }
+    for item in &w.queue {
+        match item {
+            WriteItem::Chunk(v, _, p) => {
+                tracer.trace_value(v);
+                tracer.trace_promise(p);
+            }
+            WriteItem::Close(p) => tracer.trace_promise(p),
+        }
+    }
+    if let Some(size) = &w.size {
+        tracer.trace_value(size);
+    }
+    match &w.sink {
+        Sink::Script {
+            object,
+            write,
+            close,
+            abort,
+        } => {
+            tracer.trace_value(object);
+            for v in [write, close, abort].into_iter().flatten() {
+                tracer.trace_value(v);
+            }
+        }
+        Sink::Transform(state) => trace_transform(state, tracer),
+    }
+    if let Some((reason, promise)) = &w.pending_abort {
+        tracer.trace_value(reason);
+        tracer.trace_promise(promise);
+    }
+    if let Some(writer) = &w.writer {
+        trace_writer(writer, tracer);
+    }
+    if let Some(controller) = &w.controller {
+        tracer.mark_object(controller.clone());
+    }
+    tracer.trace_abort_signal(&w.signal);
+}
+
+fn trace_writer(writer: &Rc<RefCell<Writer>>, tracer: &mut super::heap::Tracer) {
+    if !tracer.visit_rc(writer) {
+        return;
+    }
+    let w = writer.borrow();
+    if let Some(stream) = &w.stream {
+        trace_writable(stream, tracer);
+    }
+    tracer.trace_promise(&w.ready);
+    tracer.trace_promise(&w.closed);
+}
+
+fn trace_transform(state: &Rc<TransformState>, tracer: &mut super::heap::Tracer) {
+    if !tracer.visit_rc(state) {
+        return;
+    }
+    if let Some(r) = &*state.readable.borrow() {
+        trace_readable(r, tracer);
+    }
+    if let Some(w) = &*state.writable.borrow() {
+        trace_writable(w, tracer);
+    }
+    match &state.transformer {
+        Transformer::Script {
+            object,
+            transform,
+            flush,
+            cancel,
+        } => {
+            tracer.trace_value(object);
+            for v in [transform, flush, cancel].into_iter().flatten() {
+                tracer.trace_value(v);
+            }
+        }
+        Transformer::Decode(decoder) => tracer.trace_value(decoder),
+        Transformer::Encode(_) | Transformer::Compress { .. } => {}
+    }
+    if let Some(controller) = &*state.controller.borrow() {
+        tracer.mark_object(controller.clone());
+    }
+    if let Some(p) = &*state.backpressure_change.borrow() {
+        tracer.trace_promise(p);
+    }
+}
+
+fn trace_pipe(pipe: &Rc<Pipe>, tracer: &mut super::heap::Tracer) {
+    if !tracer.visit_rc(pipe) {
+        return;
+    }
+    trace_reader(&pipe.reader, tracer);
+    trace_writer(&pipe.writer, tracer);
+    trace_readable(&pipe.source, tracer);
+    trace_writable(&pipe.dest, tracer);
+    tracer.trace_promise(&pipe.result);
+}
+
+impl StreamHandle {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        match self {
+            Self::Readable(r) | Self::Controller(r) | Self::ByteController(r) => {
+                trace_readable(r, tracer)
+            }
+            Self::Reader(r) | Self::ByobReader(r) => trace_reader(r, tracer),
+            Self::Iterator(iter) => {
+                if tracer.visit_rc(iter) {
+                    trace_reader(&iter.borrow().reader, tracer);
+                }
+            }
+            Self::Writable(w) | Self::WritableController(w) => trace_writable(w, tracer),
+            Self::Writer(w) => trace_writer(w, tracer),
+            Self::TransformController(state) => trace_transform(state, tracer),
+            Self::Pair(pair) => {
+                if tracer.visit_rc(pair) {
+                    tracer.trace_value(&pair.readable);
+                    tracer.trace_value(&pair.writable);
+                    if let PairKind::Decoder(d) = &pair.kind {
+                        tracer.trace_value(d);
+                    }
+                }
+            }
+            Self::ByobRequest(req) => bytes::trace_byob_request(req, tracer),
+            Self::Strategy(_) => {}
+        }
+    }
+}
+
+impl StreamFunction {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        match self {
+            Self::Started(r, _)
+            | Self::Pulled(r, _)
+            | Self::FromStep(r, _)
+            | Self::FromValue(r, _) => trace_readable(r, tracer),
+            Self::TeeRead(tee, _) => trace_tee(tee, tracer),
+            Self::IterationRead(iter) => {
+                if tracer.visit_rc(iter) {
+                    trace_reader(&iter.borrow().reader, tracer);
+                }
+            }
+            Self::ReturnDone(v) => tracer.trace_value(v),
+            Self::WriterStarted(w, _) | Self::Wrote(w, _, _) => trace_writable(w, tracer),
+            Self::TransformAfterBackpressure(state, v) => {
+                trace_transform(state, tracer);
+                tracer.trace_value(v);
+            }
+            Self::TransformFailed(state) | Self::Flushed(state, _) => {
+                trace_transform(state, tracer)
+            }
+            Self::PipeReady(p, _) | Self::PipeRead(p, _) | Self::PipeClosed(p, _) => {
+                trace_pipe(p, tracer)
+            }
+            Self::PipeSignal(p, sig) => {
+                trace_pipe(p, tracer);
+                tracer.trace_abort_signal(sig);
+            }
+            Self::Collected(c, _) => {
+                if tracer.visit_rc(c) {
+                    trace_reader(&c.reader, tracer);
+                    tracer.trace_promise(&c.result);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl StreamFunction {
     pub(super) fn is_constructor(&self) -> bool {
         matches!(

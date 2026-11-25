@@ -371,6 +371,7 @@ impl ScriptRuntime {
     // a press outside the auto popovers closes the ones above the popover it landed in, where
     // a button that opens a popover counts as inside it
     pub(crate) fn light_dismiss_popovers(&mut self, target: NodeId) -> Result<(), ScriptError> {
+        let _heap = super::heap::enter(self.heap_id);
         if self.topmost_auto_popover().is_none() {
             return Ok(());
         }

@@ -26,6 +26,12 @@ pub(crate) struct Write {
 
 pub(crate) type WriteHandle = Rc<RefCell<Write>>;
 
+impl Write {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        tracer.trace_promise(&self.done);
+    }
+}
+
 fn not_allowed(message: &str) -> Value {
     dom_exception("NotAllowedError", message)
 }

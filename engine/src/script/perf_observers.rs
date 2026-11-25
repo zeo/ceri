@@ -33,6 +33,15 @@ pub(super) struct PerfObserver {
     queued: Cell<bool>,
 }
 
+impl PerfObserver {
+    pub(super) fn trace(self: &Rc<Self>, tracer: &mut super::heap::Tracer) {
+        if !tracer.visit_rc(self) {
+            return;
+        }
+        tracer.trace_value(&self.callback);
+    }
+}
+
 pub(super) struct PerfInterfaces {
     observer: ObjectHandle,
     list: ObjectHandle,

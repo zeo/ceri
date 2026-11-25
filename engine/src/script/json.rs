@@ -116,7 +116,7 @@ impl JsonParser<'_> {
         self.skip_whitespace();
         if self.bytes.get(self.position) == Some(&b']') {
             self.position += 1;
-            return Ok(Value::Array(Rc::new(RefCell::new(values.into()))));
+            return Ok(Value::Array(super::heap::alloc_array(values.into())));
         }
         loop {
             self.skip_whitespace();
@@ -126,7 +126,7 @@ impl JsonParser<'_> {
                 Some(b',') => self.position += 1,
                 Some(b']') => {
                     self.position += 1;
-                    return Ok(Value::Array(Rc::new(RefCell::new(values.into()))));
+                    return Ok(Value::Array(super::heap::alloc_array(values.into())));
                 }
                 _ => return Err(self.unexpected()),
             }
@@ -283,8 +283,8 @@ struct Stringifier {
 
 fn identity(value: &Value) -> Option<usize> {
     match value {
-        Value::Object(object) => Some(Rc::as_ptr(object) as *const u8 as usize),
-        Value::Array(array) => Some(Rc::as_ptr(array) as *const u8 as usize),
+        Value::Object(object) => Some(object.id()),
+        Value::Array(array) => Some(array.id()),
         _ => None,
     }
 }

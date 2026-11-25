@@ -115,6 +115,28 @@ pub(crate) enum GlObject {
     Extension(Weak<RefCell<GlContext>>),
 }
 
+impl GlContext {
+    pub(in crate::script) fn trace(&self, tracer: &mut crate::script::heap::Tracer) {
+        tracer.trace_value(&self.canvas);
+        for wrapper in self.wrappers.values() {
+            tracer.mark_object(wrapper.clone());
+        }
+        for ext in self.extensions.values() {
+            tracer.mark_object(ext.clone());
+        }
+    }
+}
+
+impl GlObject {
+    pub(in crate::script) fn trace(&self, tracer: &mut crate::script::heap::Tracer) {
+        if let Self::Context(ctx) = self
+            && tracer.visit_rc(ctx)
+        {
+            ctx.borrow().trace(tracer);
+        }
+    }
+}
+
 pub(super) type WebGlHandle = (ObjectHandle, Rc<RefCell<GlContext>>);
 
 pub(super) struct WebGlInterfaces {

@@ -302,6 +302,8 @@ pub(super) const PRIVATE_METHOD: u8 = 3;
 pub(super) const PRIVATE_GETTER: u8 = 4;
 pub(super) const PRIVATE_SETTER: u8 = 5;
 
+pub(super) type ObjectShapeEntry = (Box<[Name]>, std::cell::OnceCell<Rc<super::object::Shape>>);
+
 #[derive(Debug)]
 pub(super) struct Code {
     pub(super) ops: Vec<Op>,
@@ -337,7 +339,7 @@ pub(super) struct Code {
     // per-site polymorphic inline caches for GetProp and SetProp
     pub(super) ics: Box<[super::object::PropIc]>,
     // static key lists for MakeObject literals, lazily materialized into shared Shapes
-    pub(super) object_shapes: Box<[(Box<[Name]>, std::cell::OnceCell<Rc<super::object::Shape>>)]>,
+    pub(super) object_shapes: Box<[ObjectShapeEntry]>,
     // what each closure of this code starts as, when it has no prototype of its own
     pub(super) function_template: std::cell::RefCell<Option<super::object::ObjectTemplate>>,
     // where a run starts: past the prologue slots no arrow needed, which would only be stepped over
@@ -351,6 +353,20 @@ pub(super) struct Code {
     pub(super) captures_nothing: bool,
     // true for top-level script and module bodies
     pub(super) is_script: bool,
+    // the module URL this code was compiled in, shared by every closure of this code
+    pub(super) url: std::cell::OnceCell<Rc<super::AppUrl>>,
+}
+
+impl Code {
+    pub(super) fn set_url(&self, url: &Rc<super::AppUrl>) {
+        let _ = self.url.set(url.clone());
+        for child in &self.children {
+            child.set_url(url);
+        }
+        for class in &self.classes {
+            class.constructor.set_url(url);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1540,7 +1556,9 @@ impl Compiler {
                 _ => {}
             }
         }
-        let ics = (0..ic_count).map(|_| super::object::PropIc::default()).collect();
+        let ics = (0..ic_count)
+            .map(|_| super::object::PropIc::default())
+            .collect();
         let object_shapes = state
             .object_shapes
             .into_iter()
@@ -1643,11 +1661,7 @@ impl Compiler {
                         index,
                         name,
                     } => *op = Op::GetReg { reg: index, name },
-                    Op::GetLocal {
-                        depth,
-                        index,
-                        name,
-                    } if depth != GLOBAL => {
+                    Op::GetLocal { depth, index, name } if depth != GLOBAL => {
                         *op = Op::GetLocal {
                             depth: depth - 1,
                             index,
@@ -1659,11 +1673,7 @@ impl Compiler {
                         index,
                         name,
                     } => *op = Op::SetReg { reg: index, name },
-                    Op::SetLocal {
-                        depth,
-                        index,
-                        name,
-                    } if depth != GLOBAL => {
+                    Op::SetLocal { depth, index, name } if depth != GLOBAL => {
                         *op = Op::SetLocal {
                             depth: depth - 1,
                             index,
@@ -1721,6 +1731,7 @@ impl Compiler {
             linear_params,
             captures_nothing,
             is_script: state.is_global,
+            url: std::cell::OnceCell::new(),
             names: state.names,
             children: state.children,
             classes: state.classes,

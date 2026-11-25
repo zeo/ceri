@@ -143,13 +143,25 @@ struct IntersectionConfig {
 
 pub(super) struct ObserverRecord {
     kind: ObserverKind,
-    object: Weak<RefCell<JsObject>>,
+    object: super::object::ObjectWeak,
     // the observer stays alive while it observes something, as the standard requires
     held: Option<ObjectHandle>,
     callback: Value,
     observations: Vec<Observation>,
     queue: Vec<Value>,
     intersection: IntersectionConfig,
+}
+
+impl ObserverRecord {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        if let Some(held) = &self.held {
+            tracer.mark_object(held.clone());
+        }
+        tracer.trace_value(&self.callback);
+        for value in &self.queue {
+            tracer.trace_value(value);
+        }
+    }
 }
 
 fn intersect(left: Rect, right: Rect) -> Option<Rect> {
@@ -231,7 +243,7 @@ impl ScriptRuntime {
             id,
             ObserverRecord {
                 kind,
-                object: Rc::downgrade(&object),
+                object: object.downgrade(),
                 held: None,
                 callback,
                 observations: Vec::new(),
@@ -660,7 +672,11 @@ impl ScriptRuntime {
         entries: Value,
         observer: Value,
     ) -> Result<(), ScriptError> {
-        match self.call_function(callback, observer.clone(), vec![entries, observer]) {
+        let prev_gc = self.gc_safepoint_allowed;
+        self.gc_safepoint_allowed = self.nested_runs == 0 && self.gc_inhibit == 0;
+        let outcome = self.call_function(callback, observer.clone(), vec![entries, observer]);
+        self.gc_safepoint_allowed = prev_gc;
+        match outcome {
             Ok(_) => Ok(()),
             Err(error) if self.interrupted => Err(error),
             Err(error) => {
@@ -673,7 +689,7 @@ impl ScriptRuntime {
     // the resize and intersection steps of updating the rendering
     pub(super) fn run_layout_observers(&mut self) -> Result<(), ScriptError> {
         self.observers
-            .retain(|_, record| record.held.is_some() || record.object.strong_count() != 0);
+            .retain(|_, record| record.held.is_some() || record.object.is_alive());
         let ids = self
             .observer_ids()
             .into_iter()
@@ -701,17 +717,28 @@ impl ScriptRuntime {
                 .map(|id| (id, runtime.intersection_entries(id)))
                 .collect::<Vec<_>>()
         });
+        // keep every prebuilt entry rooted while earlier observer callbacks and microtasks run
+        let root_base = self.temp_roots.len();
+        self.temp_roots.extend(
+            pending
+                .iter()
+                .flat_map(|(_, entries)| entries.iter().cloned()),
+        );
+        let mut outcome = Ok(());
         for (id, entries) in pending {
             // a callback before this one may have disconnected it, which drops its entries
             if self
                 .observers
                 .get(&id)
                 .is_some_and(|record| !record.observations.is_empty())
+                && let Err(error) = self.notify_observer(id, entries)
             {
-                self.notify_observer(id, entries)?;
+                outcome = Err(error);
+                break;
             }
         }
-        Ok(())
+        self.temp_roots.truncate(root_base);
+        outcome
     }
 
     fn notify_observer(&mut self, id: u32, entries: Vec<Value>) -> Result<(), ScriptError> {

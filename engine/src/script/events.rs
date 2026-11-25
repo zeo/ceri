@@ -413,6 +413,17 @@ pub(super) struct Listener {
     removed: Rc<Cell<bool>>,
 }
 
+impl Listener {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        if let Some(cb) = &self.callback {
+            tracer.trace_value(cb);
+        }
+        if let Some(signal) = &self.signal {
+            tracer.trace_abort_signal(signal);
+        }
+    }
+}
+
 #[derive(Default)]
 struct DispatchState {
     target: Option<Value>,
@@ -449,6 +460,23 @@ pub(super) struct EventRecord {
 }
 
 impl EventRecord {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        tracer.mark_object(self.object.clone());
+        for value in self.fields.borrow().values() {
+            tracer.trace_value(value);
+        }
+        let state = self.state.borrow();
+        if let Some(target) = &state.target {
+            tracer.trace_value(target);
+        }
+        if let Some(current) = &state.current_target {
+            tracer.trace_value(current);
+        }
+        for value in &state.path {
+            tracer.trace_value(value);
+        }
+    }
+
     pub(super) fn set_field(&self, name: &str, value: Value) {
         self.fields.borrow_mut().insert(name.to_string(), value);
     }
@@ -804,7 +832,7 @@ impl ScriptRuntime {
             ListenerTarget::Object(id) => self
                 .event_targets
                 .get(&id)
-                .and_then(Weak::upgrade)
+                .and_then(super::object::ObjectWeak::upgrade)
                 .map_or(Value::Null, Value::Object),
         }
     }
@@ -817,15 +845,14 @@ impl ScriptRuntime {
             Some(prototype),
             ObjectClass::EventTarget(id),
         ));
-        self.event_targets.insert(id, Rc::downgrade(&object));
+        self.event_targets.insert(id, object.downgrade());
         object
     }
 
     // forgets listeners of event target objects that script can no longer reach
     pub(super) fn prune_event_targets(&mut self) {
         let before = self.event_targets.len();
-        self.event_targets
-            .retain(|_, object| object.strong_count() != 0);
+        self.event_targets.retain(|_, object| object.is_alive());
         if self.event_targets.len() == before {
             return;
         }
@@ -949,7 +976,10 @@ impl ScriptRuntime {
                     .is_some_and(|existing| values_equal(existing, &callback))
         });
         if let ListenerTarget::Object(id) = target
-            && let Some(object) = self.event_targets.get(&id).and_then(Weak::upgrade)
+            && let Some(object) = self
+                .event_targets
+                .get(&id)
+                .and_then(super::object::ObjectWeak::upgrade)
         {
             self.held_targets.insert(id, object);
         }
@@ -1147,6 +1177,7 @@ impl ScriptRuntime {
         event: &Rc<EventRecord>,
         target: ListenerTarget,
     ) -> Result<bool, ScriptError> {
+        let _heap = super::heap::enter(self.heap_id);
         let event_type = event.event_type();
         let path = self.event_path(target, &event_type, event.composed);
         {
@@ -1161,26 +1192,39 @@ impl ScriptRuntime {
             state.target = Some(self.target_value(target));
             state.path = path.iter().map(|&item| self.target_value(item)).collect();
         }
+        let inhibit_gc = event.interface == "MediaQueryListEvent";
+        if inhibit_gc {
+            self.gc_inhibit += 1;
+        }
+        let root_base = self.temp_roots.len();
+        self.temp_roots.push(Value::Event(event.clone()));
         let mut invoked = false;
-        for &item in path.iter().skip(1).rev() {
-            if event.state.borrow().stop {
-                break;
-            }
-            invoked |= self.invoke_listeners(event, item, 1, true, &event_type)?;
-        }
-        // at the target, capturing listeners run before the others
-        for capture in [true, false] {
-            if !event.state.borrow().stop {
-                invoked |= self.invoke_listeners(event, target, 2, capture, &event_type)?;
-            }
-        }
-        if event.meta.borrow().bubbles {
-            for &item in path.iter().skip(1) {
+        let outcome = (|| -> Result<bool, ScriptError> {
+            for &item in path.iter().skip(1).rev() {
                 if event.state.borrow().stop {
                     break;
                 }
-                invoked |= self.invoke_listeners(event, item, 3, false, &event_type)?;
+                invoked |= self.invoke_listeners(event, item, 1, true, &event_type)?;
             }
+            // at the target, capturing listeners run before the others
+            for capture in [true, false] {
+                if !event.state.borrow().stop {
+                    invoked |= self.invoke_listeners(event, target, 2, capture, &event_type)?;
+                }
+            }
+            if event.meta.borrow().bubbles {
+                for &item in path.iter().skip(1) {
+                    if event.state.borrow().stop {
+                        break;
+                    }
+                    invoked |= self.invoke_listeners(event, item, 3, false, &event_type)?;
+                }
+            }
+            Ok(invoked)
+        })();
+        self.temp_roots.truncate(root_base);
+        if inhibit_gc {
+            self.gc_inhibit -= 1;
         }
         let mut state = event.state.borrow_mut();
         state.dispatching = false;
@@ -1189,7 +1233,7 @@ impl ScriptRuntime {
         state.stop = false;
         state.stop_immediate = false;
         state.path.clear();
-        Ok(invoked)
+        outcome
     }
 
     // the capturing or non-capturing listeners of one target, with the event in phase 1
@@ -1254,6 +1298,11 @@ impl ScriptRuntime {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let root_base = self.temp_roots.len();
+        self.temp_roots.push(current.clone());
+        self.temp_roots
+            .extend(snapshot.iter().filter_map(|(cb, ..)| cb.clone()));
+        let mut outcome = Ok(invoked);
         for (callback, once, passive, removed) in snapshot {
             if removed.get() {
                 continue;
@@ -1278,13 +1327,18 @@ impl ScriptRuntime {
             } else {
                 CallbackKind::Listener
             };
-            self.call_listener(event, &callback, &current, kind)?;
+            let step = self.call_listener(event, &callback, &current, kind);
             event.state.borrow_mut().passive = false;
+            if let Err(error) = step {
+                outcome = Err(error);
+                break;
+            }
             if event.state.borrow().stop_immediate {
                 break;
             }
         }
-        Ok(invoked)
+        self.temp_roots.truncate(root_base);
+        outcome.map(|_| invoked)
     }
 
     fn call_listener(
@@ -1295,6 +1349,8 @@ impl ScriptRuntime {
         kind: CallbackKind,
     ) -> Result<(), ScriptError> {
         let argument = Value::Event(event.clone());
+        let prev_gc = self.gc_safepoint_allowed;
+        self.gc_safepoint_allowed = self.nested_runs == 0 && self.gc_inhibit == 0;
         let outcome = if kind == CallbackKind::ErrorHandler && is_callable(callback) {
             let field = |name: &str, fallback: Value| event.field(name).unwrap_or(fallback);
             let arguments = vec![
@@ -1318,6 +1374,7 @@ impl ScriptRuntime {
                 Err(error) => Err(error),
             }
         };
+        self.gc_safepoint_allowed = prev_gc;
         match outcome {
             // window.onerror cancels by returning true, other handlers by returning false
             Ok(Value::Bool(true)) if kind == CallbackKind::ErrorHandler => self.cancel_event(event),

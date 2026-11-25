@@ -44,6 +44,18 @@ pub(super) struct DisposableStack {
     resources: RefCell<Vec<Resource>>,
 }
 
+impl DisposableStack {
+    pub(super) fn trace(self: &Rc<Self>, tracer: &mut super::heap::Tracer) {
+        if !tracer.visit_rc(self) {
+            return;
+        }
+        for resource in self.resources.borrow().iter() {
+            tracer.trace_value(&resource.value);
+            tracer.trace_value(&resource.method);
+        }
+    }
+}
+
 // an async disposal under way: what is left, the error so far, and whether anything was awaited
 pub(super) struct AsyncDisposal {
     result: PromiseHandle,
@@ -51,6 +63,22 @@ pub(super) struct AsyncDisposal {
     error: RefCell<Option<Value>>,
     awaited: Cell<bool>,
     needs_await: Cell<bool>,
+}
+
+impl AsyncDisposal {
+    pub(super) fn trace(self: &Rc<Self>, tracer: &mut super::heap::Tracer) {
+        if !tracer.visit_rc(self) {
+            return;
+        }
+        tracer.trace_promise(&self.result);
+        for resource in self.resources.borrow().iter() {
+            tracer.trace_value(&resource.value);
+            tracer.trace_value(&resource.method);
+        }
+        if let Some(error) = &*self.error.borrow() {
+            tracer.trace_value(error);
+        }
+    }
 }
 
 pub(super) struct DisposableInterfaces {

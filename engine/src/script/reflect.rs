@@ -125,16 +125,34 @@ impl ScriptRuntime {
         key: &str,
         receiver: &Value,
     ) -> Result<Value, ScriptError> {
+        match self.proxy_get_tail(proxy, key, receiver)? {
+            super::operations::GetOutcome::Value(value) => Ok(value),
+            super::operations::GetOutcome::Call {
+                callee,
+                this,
+                arguments,
+            } => self.call_function(callee, this, arguments),
+        }
+    }
+
+    pub(super) fn proxy_get_tail(
+        &mut self,
+        proxy: &ProxyData,
+        key: &str,
+        receiver: &Value,
+    ) -> Result<super::operations::GetOutcome, ScriptError> {
         let (target, trap) = self.proxy_trap(proxy, "get")?;
         match trap {
-            Some(trap) => self.call_function(
-                trap,
-                Self::proxy_handler(proxy),
-                vec![target, key_value(key), receiver.clone()],
-            ),
+            Some(trap) => Ok(super::operations::GetOutcome::Call {
+                callee: trap,
+                this: Self::proxy_handler(proxy),
+                arguments: vec![target, key_value(key), receiver.clone()],
+            }),
             None => match &target {
-                Value::Object(object) => self.ordinary_get(object.clone(), key, receiver),
-                other => self.get_property(other, key),
+                Value::Object(object) => self.ordinary_get_tail(object.clone(), key, receiver),
+                other => self
+                    .get_property(other, key)
+                    .map(super::operations::GetOutcome::Value),
             },
         }
     }
@@ -413,7 +431,7 @@ impl ScriptRuntime {
                     Ok(()) => Ok(Value::Bool(true)),
                     Err(error) => {
                         let thrown = self.take_thrown(error);
-                        let is_type_error = matches!(&thrown, Value::Object(object) if object.borrow().prototype_or(&self.intrinsics).is_some_and(|prototype| Rc::ptr_eq(&prototype, &self.intrinsics.type_error_prototype)));
+                        let is_type_error = matches!(&thrown, Value::Object(object) if object.borrow().prototype_or(&self.intrinsics).is_some_and(|prototype| ObjectHandle::ptr_eq(&prototype, &self.intrinsics.type_error_prototype)));
                         if is_type_error {
                             Ok(Value::Bool(false))
                         } else {
@@ -448,7 +466,7 @@ impl ScriptRuntime {
                             None => match &target {
                                 Value::Object(object) => object.borrow().extensible,
                                 Value::Array(array) => {
-                                    array.borrow().integrity == super::Integrity::Open
+                                    array.borrow().integrity() == super::Integrity::Open
                                 }
                                 _ => false,
                             },
@@ -477,8 +495,9 @@ impl ScriptRuntime {
                                 None => {
                                     if let Value::Array(array) = &target {
                                         let mut array = array.borrow_mut();
-                                        array.integrity =
-                                            array.integrity.max(super::Integrity::Closed);
+                                        let extra = array.extra_mut();
+                                        extra.integrity =
+                                            extra.integrity.max(super::Integrity::Closed);
                                     }
                                     if let Value::Object(target) = target {
                                         target.borrow_mut().extensible = false;

@@ -2404,7 +2404,7 @@ impl ScriptRuntime {
                 }
                 Ok(Value::Undefined)
             }
-            "getLineDash" => Ok(Value::Array(Rc::new(RefCell::new(
+            "getLineDash" => Ok(Self::new_array(
                 context
                     .borrow()
                     .state
@@ -2412,7 +2412,7 @@ impl ScriptRuntime {
                     .iter()
                     .map(|&length| Value::Number(length.into()))
                     .collect(),
-            )))),
+            )),
             "createLinearGradient" | "createRadialGradient" => {
                 let radial = name == "createRadialGradient";
                 let count = if radial { 6 } else { 4 };

@@ -1848,7 +1848,7 @@ impl ScriptRuntime {
         let code = Compiler::new(&source)
             .compile_function(&function)
             .map_err(|error| self.throw_error("SyntaxError", error.message))?;
-        Ok(self.new_closure(code, None, None))
+        Ok(self.new_closure(code, None))
     }
 
     // an indirect eval: its source runs as sloppy global code
@@ -2103,7 +2103,7 @@ impl ScriptRuntime {
             Value::String(text) => string_own_property(text, key),
             Value::Array(array) if array.borrow().own(key).is_some() => {
                 let mut property = array.borrow().own(key).cloned().expect("checked above");
-                let integrity = array.borrow().integrity;
+                let integrity = array.borrow().integrity();
                 if integrity >= super::Integrity::Sealed {
                     property.configurable = false;
                 }
@@ -2113,13 +2113,13 @@ impl ScriptRuntime {
                 Some(property)
             }
             Value::Array(array) => {
-                let integrity = array.borrow().integrity;
+                let integrity = array.borrow().integrity();
                 if key == "length" {
                     Some(Property {
                         slot: Slot::Data(Value::Number(array.borrow().len() as f64)),
                         enumerable: false,
                         writable: integrity != super::Integrity::Frozen
-                            && !array.borrow().fixed_length,
+                            && !array.borrow().fixed_length(),
                         configurable: false,
                     })
                 } else if let Some(index) = array_index(key) {
@@ -2204,7 +2204,7 @@ impl ScriptRuntime {
                     .map(|(index, _)| index)
                     .chain(
                         array
-                            .properties
+                            .properties()
                             .iter()
                             .filter_map(|(name, _)| array_index(name).map(|index| index as usize)),
                     )
@@ -2220,7 +2220,7 @@ impl ScriptRuntime {
                 }
                 keys.extend(
                     array
-                        .properties
+                        .properties()
                         .iter()
                         .map(|(name, _)| name)
                         .filter(|name| array_index(name).is_none())
@@ -2395,7 +2395,10 @@ impl ScriptRuntime {
             }
             _ => return Err(self.type_error("Object.defineProperty called on non-object")),
         };
-        let existing = object.borrow().property(&key).map(|property| property.to_property());
+        let existing = object
+            .borrow()
+            .property(&key)
+            .map(|property| property.to_property());
         match existing {
             None => {
                 if !object.borrow().extensible {
@@ -2493,7 +2496,7 @@ impl ScriptRuntime {
         "function () { [native code] }".to_string()
     }
 
-    fn array_like_values(&mut self, value: &Value) -> Result<Vec<Value>, ScriptError> {
+    pub(super) fn array_like_values(&mut self, value: &Value) -> Result<Vec<Value>, ScriptError> {
         match value {
             Value::Undefined | Value::Null => Ok(Vec::new()),
             Value::Array(array) => Ok(array.borrow().to_vec()),
@@ -2733,7 +2736,8 @@ impl ScriptRuntime {
                             _ => super::Integrity::Closed,
                         };
                         let mut array = array.borrow_mut();
-                        array.integrity = array.integrity.max(wanted);
+                        let extra = array.extra_mut();
+                        extra.integrity = extra.integrity.max(wanted);
                         None
                     }
                     _ => None,
@@ -2771,14 +2775,15 @@ impl ScriptRuntime {
                         } else {
                             super::Integrity::Sealed
                         };
-                        array.integrity >= wanted
-                            || (array.integrity == super::Integrity::Closed && empty)
+                        let integrity = array.integrity();
+                        integrity >= wanted
+                            || (integrity == super::Integrity::Closed && empty)
                     }
                     value => is_primitive(value),
                 }))
             }
             Native::ObjectIsExtensible => Ok(Value::Bool(match &first {
-                Value::Array(array) => array.borrow().integrity == super::Integrity::Open,
+                Value::Array(array) => array.borrow().integrity() == super::Integrity::Open,
                 Value::Object(object) => object.borrow().extensible,
                 Value::TypedArray(array) => array
                     .borrow()
@@ -2803,7 +2808,7 @@ impl ScriptRuntime {
                 };
                 let mut current = self.prototype_of(&first);
                 while let Some(object) = current {
-                    if Rc::ptr_eq(&object, &prototype) {
+                    if ObjectHandle::ptr_eq(&object, &prototype) {
                         return Ok(Value::Bool(true));
                     }
                     current = object.borrow().prototype_or(&self.intrinsics);
@@ -3736,7 +3741,7 @@ impl ScriptRuntime {
                 let array = Self::new_array(values);
                 if subclass && let Value::Array(handle) = &array {
                     let prototype = self.prototype_from_constructor(&new_target)?;
-                    handle.borrow_mut().prototype = Some(Some(prototype));
+                    handle.borrow_mut().extra_mut().prototype = Some(Some(prototype));
                 }
                 Ok(array)
             }
@@ -3762,7 +3767,7 @@ impl ScriptRuntime {
                     && let Value::Object(prototype) = self.get_property(&new_target, "prototype")?
                     && !self
                         .prototype_of(&made)
-                        .is_some_and(|current| Rc::ptr_eq(&current, &prototype))
+                        .is_some_and(|current| ObjectHandle::ptr_eq(&current, &prototype))
                 {
                     super::typed_object(array)
                         .borrow_mut()
@@ -3883,8 +3888,8 @@ impl ScriptRuntime {
             {
                 return Err(self.type_error("Cannot redefine property: length"));
             }
-            let fixed =
-                array.borrow().fixed_length || array.borrow().integrity == super::Integrity::Frozen;
+            let fixed = array.borrow().fixed_length()
+                || array.borrow().integrity() == super::Integrity::Frozen;
             if fixed && present[3] && property.writable {
                 return Err(self.type_error("Cannot redefine property: length"));
             }
@@ -3894,7 +3899,7 @@ impl ScriptRuntime {
                 set_array_length(array, value.clone())?;
             }
             if present[3] && !property.writable {
-                array.borrow_mut().fixed_length = true;
+                array.borrow_mut().extra_mut().fixed_length = true;
             }
             return Ok(());
         }
@@ -3904,7 +3909,7 @@ impl ScriptRuntime {
             |runtime: &mut Self| runtime.type_error(format!("Cannot redefine property: {key}"));
         match &current {
             None => {
-                if array.borrow().integrity != super::Integrity::Open {
+                if array.borrow().integrity() != super::Integrity::Open {
                     return Err(self.type_error(format!(
                         "Cannot define property {key}, object is not extensible"
                     )));
@@ -3981,7 +3986,9 @@ impl ScriptRuntime {
             && property.enumerable
             && property.configurable;
         let mut data = array.borrow_mut();
-        data.properties.retain(|(name, _)| *name != key);
+        if let Some(extra) = data.extra.as_mut() {
+            extra.properties.retain(|(name, _)| *name != key);
+        }
         match (index, plain) {
             (Some(index), true) => {
                 let Slot::Data(value) = property.slot else {
@@ -4000,11 +4007,11 @@ impl ScriptRuntime {
                     data.resize(index + 1, Value::Uninitialized);
                 }
                 data[index] = Value::Uninitialized;
-                data.properties.push((key, property));
+                data.extra_mut().properties.push((key, property));
                 Ok(())
             }
             (None, _) => {
-                data.properties.push((key, property));
+                data.extra_mut().properties.push((key, property));
                 Ok(())
             }
         }
@@ -4018,17 +4025,17 @@ impl ScriptRuntime {
     ) -> bool {
         let current = self.prototype_of(&Value::Array(array.clone()));
         let same = match (&current, &prototype) {
-            (Some(current), Some(prototype)) => Rc::ptr_eq(current, prototype),
+            (Some(current), Some(prototype)) => ObjectHandle::ptr_eq(current, prototype),
             (None, None) => true,
             _ => false,
         };
         if same {
             return true;
         }
-        if array.borrow().integrity != super::Integrity::Open {
+        if array.borrow().integrity() != super::Integrity::Open {
             return false;
         }
-        array.borrow_mut().prototype = Some(prototype);
+        array.borrow_mut().extra_mut().prototype = Some(prototype);
         true
     }
 
@@ -4059,7 +4066,7 @@ impl ScriptRuntime {
             };
         }
         let unchanged = match (&object.borrow().prototype_or(&self.intrinsics), &prototype) {
-            (Some(current), Some(next)) => Rc::ptr_eq(current, next),
+            (Some(current), Some(next)) => ObjectHandle::ptr_eq(current, next),
             (None, None) => true,
             _ => false,
         };
@@ -4071,7 +4078,7 @@ impl ScriptRuntime {
         }
         let mut current = prototype.clone();
         while let Some(link) = current {
-            if Rc::ptr_eq(&link, object) {
+            if ObjectHandle::ptr_eq(&link, object) {
                 return Err(self.type_error("Cyclic __proto__ value"));
             }
             current = link.borrow().prototype_or(&self.intrinsics);

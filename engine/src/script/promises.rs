@@ -75,6 +75,45 @@ pub(super) enum PromiseFunction {
     DisposalStep(Rc<super::disposables::AsyncDisposal>, bool),
 }
 
+impl PromiseFunction {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        match self {
+            Self::Capability(cap) => {
+                if tracer.visit_rc(cap) {
+                    if let Some(v) = &*cap.resolve.borrow() {
+                        tracer.trace_value(v);
+                    }
+                    if let Some(v) = &*cap.reject.borrow() {
+                        tracer.trace_value(v);
+                    }
+                }
+            }
+            Self::Resolving { promise, .. } => tracer.trace_promise(promise),
+            Self::Element { state, .. } => {
+                if tracer.visit_rc(state) {
+                    for value in state.values.borrow().iter() {
+                        tracer.trace_value(value);
+                    }
+                    tracer.trace_value(&state.resolve);
+                    tracer.trace_value(&state.reject);
+                }
+            }
+            Self::AfterFinally {
+                callback,
+                constructor,
+                ..
+            } => {
+                tracer.trace_value(callback);
+                tracer.trace_value(constructor);
+            }
+            Self::Settle { value, .. } => tracer.trace_value(value),
+            Self::FromAsyncStep(state, _) => state.trace(tracer),
+            Self::DisposalStep(disposal, _) => disposal.trace(tracer),
+            _ => {}
+        }
+    }
+}
+
 fn argument(arguments: &[Value], index: usize) -> Value {
     arguments.get(index).cloned().unwrap_or(Value::Undefined)
 }
@@ -120,7 +159,7 @@ impl ScriptRuntime {
     }
 
     pub(super) fn is_intrinsic_promise(&self, value: &Value) -> bool {
-        matches!(value, Value::Object(object) if Rc::ptr_eq(object, &self.intrinsics.promise_constructor))
+        matches!(value, Value::Object(object) if ObjectHandle::ptr_eq(object, &self.intrinsics.promise_constructor))
     }
 
     // NewPromiseCapability: a promise made by a constructor with the resolve and reject it

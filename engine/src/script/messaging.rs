@@ -141,7 +141,11 @@ impl ScriptRuntime {
                 let message = clone_payload(&message, MAX_CLONE_BYTES)?;
                 if let Some(Some(other)) = self.ports.partners.get(&id).copied() {
                     // a port with a message on its way stays alive to hear it
-                    if let Some(object) = self.event_targets.get(&other).and_then(Weak::upgrade) {
+                    if let Some(object) = self
+                        .event_targets
+                        .get(&other)
+                        .and_then(super::object::ObjectWeak::upgrade)
+                    {
                         self.held_targets.insert(other, object);
                     }
                     self.ports.inbox.push((Some(other), message));

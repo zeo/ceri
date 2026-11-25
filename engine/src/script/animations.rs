@@ -58,6 +58,15 @@ pub(super) struct Animations {
     next_order: u64,
 }
 
+impl Animations {
+    pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
+        for state in self.states.values() {
+            tracer.trace_promise(&state.finished);
+            tracer.trace_promise(&state.ready);
+        }
+    }
+}
+
 fn define(target: &ObjectHandle, name: &str, get: ObjectHandle, set: Option<ObjectHandle>) {
     target.borrow_mut().define(
         name.to_string(),
@@ -394,7 +403,11 @@ impl ScriptRuntime {
         found.sort_unstable();
         let objects = found
             .into_iter()
-            .filter_map(|(_, id)| self.event_targets.get(&id).and_then(Weak::upgrade))
+            .filter_map(|(_, id)| {
+                self.event_targets
+                    .get(&id)
+                    .and_then(super::object::ObjectWeak::upgrade)
+            })
             .map(Value::Object)
             .collect();
         Self::new_array(objects)
@@ -457,7 +470,7 @@ impl ScriptRuntime {
         let object = self
             .event_targets
             .get(&handle)
-            .and_then(Weak::upgrade)
+            .and_then(super::object::ObjectWeak::upgrade)
             .map_or(Value::Undefined, Value::Object);
         self.settle_promise(&finished, PromiseOutcome::Fulfilled(object));
         self.fire(
@@ -479,7 +492,11 @@ impl ScriptRuntime {
     }
 
     fn hold_animation(&mut self, handle: u32) {
-        if let Some(object) = self.event_targets.get(&handle).and_then(Weak::upgrade) {
+        if let Some(object) = self
+            .event_targets
+            .get(&handle)
+            .and_then(super::object::ObjectWeak::upgrade)
+        {
             self.held_targets.insert(handle, object);
         }
     }
