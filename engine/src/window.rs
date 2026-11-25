@@ -1117,8 +1117,10 @@ struct AppWindow {
     display: Option<InputEvent>,
     page_shown: bool,
     zoom: f32,
-    // dropped before the native window so surfaces release before destroywindow
+    // dropped before the native window so surfaces and uia subclass release before destroywindow
     output: Option<Output>,
+    #[cfg(target_os = "windows")]
+    uia: Option<crate::host::uia::WindowUiaBridge>,
     window: Option<Rc<Window>>,
     handle: Option<NativeHandle>,
     cursor: (f32, f32),
@@ -1232,6 +1234,8 @@ where
             zoom: 1.0,
             window: None,
             output: None,
+            #[cfg(target_os = "windows")]
+            uia: None,
             handle: None,
             cursor: (0.0, 0.0),
             pressed: Vec::new(),
@@ -1497,6 +1501,10 @@ impl AppWindow {
         }
         window.set_ime_allowed(true);
         self.handle = native_handle(&window);
+        #[cfg(target_os = "windows")]
+        if let Some(NativeHandle::Win32 { hwnd }) = self.handle {
+            self.uia = crate::host::uia::WindowUiaBridge::attach(hwnd, self.worker.accessibility());
+        }
         self.normal = remembered.map(|known| WindowGeometry {
             maximized: false,
             ..known
@@ -1933,6 +1941,10 @@ impl AppWindow {
                 }
                 eprintln!("ceri: the engine restarted after {detail}");
                 self.worker = worker;
+                #[cfg(target_os = "windows")]
+                if let Some(uia) = &mut self.uia {
+                    uia.rebind(self.worker.accessibility());
+                }
                 self.announce_planes();
                 self.navigation_pending = !recovering;
                 self.render_request = None;
@@ -2079,6 +2091,10 @@ impl AppWindow {
                         Ok(frame) => {
                             if frame.is_some() {
                                 self.latest_frame = frame;
+                                #[cfg(target_os = "windows")]
+                                if let Some(uia) = &self.uia {
+                                    uia.sync_focus();
+                                }
                                 request_redraw = true;
                             }
                         }

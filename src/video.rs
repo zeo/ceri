@@ -356,7 +356,11 @@ mod platform {
             }
             let y_line = &y_plane[sy * pitch + left..sy * pitch + left + width];
             let out = &mut bgra[row * width * 4..(row + 1) * width * 4];
-            for (col, (&y_byte, pixel)) in y_line.iter().zip(out.chunks_exact_mut(4)).enumerate() {
+            for (col, (&y_byte, pixel)) in y_line
+                .iter()
+                .zip(out.as_chunks_mut::<4>().0.iter_mut())
+                .enumerate()
+            {
                 let sx = left + col;
                 let cx0 = sx / 2;
                 let cx1 = if sx & 1 == 0 {

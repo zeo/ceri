@@ -15,7 +15,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod a11y;
 mod automation;
+#[cfg(all(target_os = "windows", feature = "windowed"))]
+pub(crate) mod uia;
+
+#[cfg(all(target_os = "windows", feature = "windowed"))]
+pub(crate) use a11y::SharedAccessibility;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerButton {
@@ -227,6 +233,18 @@ pub(crate) enum EngineWorkerCommand {
     Accessibility {
         request_id: u64,
     },
+    #[cfg_attr(
+        not(all(target_os = "windows", feature = "windowed")),
+        allow(dead_code)
+    )]
+    AccessibilitySnapshot {
+        reply: SyncSender<Option<Arc<a11y::AccessibilitySnapshot>>>,
+    },
+    #[cfg_attr(
+        not(all(target_os = "windows", feature = "windowed")),
+        allow(dead_code)
+    )]
+    AccessibilityAction(a11y::AccessibilityAction),
     NavigationFailure {
         request_id: u64,
     },
@@ -247,6 +265,11 @@ pub struct EngineWorker {
     next_request_id: u64,
     // the window's entry in the devtools target list, while devtools are served
     _devtools: Option<crate::devtools::Registration>,
+    #[cfg_attr(
+        not(all(target_os = "windows", feature = "windowed")),
+        allow(dead_code)
+    )]
+    accessibility: Arc<a11y::SharedAccessibility>,
 }
 
 impl EngineWorker {
@@ -257,6 +280,8 @@ impl EngineWorker {
         let (commands, command_receiver) = mpsc::sync_channel(64);
         let (events, event_receiver) = mpsc::channel();
         let (ready, ready_receiver) = mpsc::channel();
+        let accessibility = Arc::new(a11y::SharedAccessibility::new(commands.clone()));
+        let worker_a11y = accessibility.clone();
         thread::Builder::new()
             .name("ceri-engine".to_string())
             .stack_size(ENGINE_STACK)
@@ -270,7 +295,12 @@ impl EngineWorker {
                     }
                 };
                 let _ = ready.send(Ok(()));
-                run_engine_worker(EngineHost::new(browser, viewport), command_receiver, events);
+                run_engine_worker(
+                    EngineHost::new(browser, viewport),
+                    command_receiver,
+                    events,
+                    worker_a11y,
+                );
                 crate::font::clear_active_fonts();
                 #[cfg(windows)]
                 crate::dwrite::release_thread();
@@ -282,6 +312,7 @@ impl EngineWorker {
                 events: event_receiver,
                 next_request_id: 1,
                 _devtools: None,
+                accessibility,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err("engine worker stopped during initialization".to_string()),
@@ -311,6 +342,8 @@ impl EngineWorker {
         let (events, event_receiver) = mpsc::channel();
         let (ready, ready_receiver) = mpsc::channel();
         let wake = commands.clone();
+        let accessibility = Arc::new(a11y::SharedAccessibility::new(commands.clone()));
+        let worker_a11y = accessibility.clone();
         let devtools = crate::devtools::register(commands.clone());
         let page = devtools
             .as_ref()
@@ -344,6 +377,7 @@ impl EngineWorker {
                     events,
                     notify,
                     page,
+                    worker_a11y,
                 );
                 // release thread-local fonts before unregistering the directwrite loader
                 crate::font::clear_active_fonts();
@@ -379,6 +413,7 @@ impl EngineWorker {
                 events: event_receiver,
                 next_request_id: 1,
                 _devtools: devtools,
+                accessibility,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err("engine worker stopped during initialization".to_string()),
@@ -417,6 +452,11 @@ impl EngineWorker {
     #[cfg(feature = "windowed")]
     pub(crate) fn show_planes(&mut self) -> Result<(), String> {
         self.queue(EngineWorkerCommand::Planes)
+    }
+
+    #[cfg(all(target_os = "windows", feature = "windowed"))]
+    pub(crate) fn accessibility(&self) -> Arc<SharedAccessibility> {
+        self.accessibility.clone()
     }
 
     pub fn accessibility_tree(&mut self) -> Result<u64, String> {
@@ -472,10 +512,14 @@ fn run_engine_worker(
     mut host: EngineHost,
     commands: Receiver<EngineWorkerCommand>,
     events: Sender<EngineWorkerEvent>,
+    accessibility: Arc<a11y::SharedAccessibility>,
 ) {
     while let Ok(command) = commands.recv() {
-        let Some(event) = answer(&mut host, command) else {
+        if matches!(command, EngineWorkerCommand::Shutdown) {
             break;
+        }
+        let Some(event) = answer(&mut host, command, &accessibility) else {
+            continue;
         };
         if events.send(event).is_err() {
             break;
@@ -491,6 +535,7 @@ fn run_live_engine_worker(
     events: Sender<EngineWorkerEvent>,
     notify: Waker,
     page: Option<Arc<Mutex<crate::devtools::PageInfo>>>,
+    accessibility: Arc<a11y::SharedAccessibility>,
 ) {
     let commands = Rc::new(commands);
     let queued = Rc::new(RefCell::new(VecDeque::new()));
@@ -612,11 +657,19 @@ fn run_live_engine_worker(
         let started = Instant::now();
         let event = match command {
             Some(EngineWorkerCommand::Shutdown) => break,
-            Some(command) => answer(&mut host, command),
+            Some(command) => answer(&mut host, command, &accessibility),
             None => None,
         };
         host.browser.flush_inspector();
         if let Some(event) = event {
+            if accessibility.is_active()
+                && matches!(
+                    event,
+                    EngineWorkerEvent::Navigated { .. } | EngineWorkerEvent::Frame { .. }
+                )
+            {
+                accessibility.publish(host.accessibility_snapshot().map(Arc::new));
+            }
             if let Some(page) = &page
                 && matches!(
                     event,
@@ -779,7 +832,11 @@ fn is_pointer_move(command: &EngineWorkerCommand) -> bool {
     )
 }
 
-fn answer(host: &mut EngineHost, command: EngineWorkerCommand) -> Option<EngineWorkerEvent> {
+fn answer(
+    host: &mut EngineHost,
+    command: EngineWorkerCommand,
+    accessibility: &a11y::SharedAccessibility,
+) -> Option<EngineWorkerEvent> {
     Some(match command {
         EngineWorkerCommand::Navigate { request_id, url } => EngineWorkerEvent::Navigated {
             request_id,
@@ -802,6 +859,23 @@ fn answer(host: &mut EngineHost, command: EngineWorkerCommand) -> Option<EngineW
             request_id,
             tree: host.accessibility_tree(),
         },
+        EngineWorkerCommand::AccessibilitySnapshot { reply } => {
+            let snapshot = host.accessibility_snapshot().map(Arc::new);
+            accessibility.publish(snapshot.clone());
+            let _ = reply.send(snapshot);
+            return None;
+        }
+        EngineWorkerCommand::AccessibilityAction(action) => {
+            match host.perform_accessibility_action(action) {
+                Ok(_) => {
+                    if accessibility.is_active() {
+                        accessibility.publish(host.accessibility_snapshot().map(Arc::new));
+                    }
+                    return None;
+                }
+                Err(error) => return Some(EngineWorkerEvent::Failed(error)),
+            }
+        }
         EngineWorkerCommand::NavigationFailure { request_id } => {
             EngineWorkerEvent::NavigationFailure {
                 request_id,
@@ -3969,9 +4043,12 @@ mod tests {
                     }
                 })
                 .to_string();
+                let (tx, _rx) = mpsc::sync_channel(1);
+                let accessibility = a11y::SharedAccessibility::new(tx);
                 let event = answer(
                     host,
                     EngineWorkerCommand::Inspector(Inbound::Message { session: 1, text }),
+                    &accessibility,
                 );
                 let reply = messages.try_recv().expect("cdp should receive a reply");
                 assert!(reply.contains(&format!(r#""id":{id}"#)), "{reply}");
