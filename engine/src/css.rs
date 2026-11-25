@@ -2456,6 +2456,8 @@ pub struct Stylesheet {
     motion_index: RuleIndex,
     // indexed rules that declare a custom property, so unchanged elements skip full cascades
     custom_prop_index: RuleIndex,
+    // indexed pseudo-element rules that declare content, so most elements skip ::before/::after cascades
+    generated_content_index: RuleIndex,
     has_custom_properties: bool,
     has_transitions: bool,
     has_animations: bool,
@@ -2652,12 +2654,41 @@ fn custom_property_rules(rules: &[Rule]) -> Vec<usize> {
         .collect()
 }
 
-// rules bucketed by the rightmost id, class or tag, so an element only tries plausible rules
+fn generated_content_rules(rules: &[Rule]) -> Vec<usize> {
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| {
+            rule.declarations
+                .iter()
+                .any(|declaration| declaration.property == "content")
+                && rule.selectors.iter().any(|selector| {
+                    selector
+                        .parts
+                        .last()
+                        .is_some_and(|part| part.compound.pseudo_element.is_some())
+                })
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn is_root_element(document: &Document, node: NodeId, state: &StyleState) -> bool {
+    state.root.map_or_else(
+        || document.document_element() == Some(node),
+        |root| root == node,
+    )
+}
+
+// rules bucketed by the rightmost id, class, tag, attribute or :root, so an element only
+// tries plausible rules
 #[derive(Clone, Debug, Default)]
 struct RuleIndex {
     by_id: HashMap<String, Vec<usize>>,
     by_class: HashMap<String, Vec<usize>>,
     by_tag: HashMap<String, Vec<usize>>,
+    by_attr: HashMap<String, Vec<usize>>,
+    root_only: Vec<usize>,
     universal: Vec<usize>,
 }
 
@@ -2685,6 +2716,20 @@ impl RuleIndex {
                         .push(position);
                 } else if let Some(tag) = subject.tag.as_ref() {
                     index.by_tag.entry(tag.clone()).or_default().push(position);
+                } else if let Some(attribute) = subject.attributes.first() {
+                    let (AttributeSelector::Exists(name) | AttributeSelector::Match { name, .. }) =
+                        attribute;
+                    index
+                        .by_attr
+                        .entry(name.to_ascii_lowercase())
+                        .or_default()
+                        .push(position);
+                } else if subject
+                    .pseudo_classes
+                    .iter()
+                    .any(|class| matches!(class, PseudoClass::Root))
+                {
+                    index.root_only.push(position);
                 } else {
                     index.universal.push(position);
                 }
@@ -2695,6 +2740,8 @@ impl RuleIndex {
             .values_mut()
             .chain(index.by_class.values_mut())
             .chain(index.by_tag.values_mut())
+            .chain(index.by_attr.values_mut())
+            .chain(std::iter::once(&mut index.root_only))
             .chain(std::iter::once(&mut index.universal))
         {
             bucket.sort_unstable();
@@ -2703,8 +2750,16 @@ impl RuleIndex {
         index
     }
 
-    fn any_candidate(&self, subject: &Element, mut check: impl FnMut(usize) -> bool) -> bool {
+    fn any_candidate(
+        &self,
+        subject: &Element,
+        is_root: bool,
+        mut check: impl FnMut(usize) -> bool,
+    ) -> bool {
         if self.universal.iter().any(|&index| check(index)) {
+            return true;
+        }
+        if is_root && self.root_only.iter().any(|&index| check(index)) {
             return true;
         }
         if let Some(bucket) = self.by_tag.get(&subject.name)
@@ -2725,12 +2780,36 @@ impl RuleIndex {
                 return true;
             }
         }
+        if !self.by_attr.is_empty() && !subject.attrs.is_empty() {
+            if self.by_attr.len() <= subject.attrs.len() {
+                for (name, bucket) in &self.by_attr {
+                    if subject.attr(name).is_some() && bucket.iter().any(|&index| check(index)) {
+                        return true;
+                    }
+                }
+            } else {
+                for name in subject.attrs.keys() {
+                    let bucket = self.by_attr.get(name.as_str()).or_else(|| {
+                        name.bytes()
+                            .any(|byte| byte.is_ascii_uppercase())
+                            .then(|| self.by_attr.get(&name.to_ascii_lowercase()))
+                            .flatten()
+                    });
+                    if let Some(bucket) = bucket
+                        && bucket.iter().any(|&index| check(index))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
         false
     }
 
     // whether any rule could match the element, without building the list
-    fn has_candidates(&self, subject: &Element) -> bool {
-        !self.universal.is_empty()
+    fn has_candidates(&self, subject: &Element, is_root: bool) -> bool {
+        if !self.universal.is_empty()
+            || (is_root && !self.root_only.is_empty())
             || self.by_tag.contains_key(&subject.name)
             || subject
                 .attr("id")
@@ -2738,13 +2817,31 @@ impl RuleIndex {
             || subject
                 .classes()
                 .any(|class| self.by_class.contains_key(class))
+        {
+            return true;
+        }
+        if !self.by_attr.is_empty() && !subject.attrs.is_empty() {
+            if self.by_attr.len() <= subject.attrs.len() {
+                return self.by_attr.keys().any(|name| subject.attr(name).is_some());
+            }
+            return subject.attrs.keys().any(|name| {
+                self.by_attr.contains_key(name.as_str())
+                    || (name.bytes().any(|byte| byte.is_ascii_uppercase())
+                        && self.by_attr.contains_key(&name.to_ascii_lowercase()))
+            });
+        }
+        false
     }
 
-    fn fill_candidates(&self, subject: &Element, candidates: &mut Vec<usize>) {
+    fn fill_candidates(&self, subject: &Element, is_root: bool, candidates: &mut Vec<usize>) {
         candidates.clear();
         let mut buckets = 0usize;
         if !self.universal.is_empty() {
             candidates.extend_from_slice(&self.universal);
+            buckets += 1;
+        }
+        if is_root && !self.root_only.is_empty() {
+            candidates.extend_from_slice(&self.root_only);
             buckets += 1;
         }
         if let Some(bucket) = self.by_tag.get(&subject.name) {
@@ -2763,15 +2860,38 @@ impl RuleIndex {
                 buckets += 1;
             }
         }
+        if !self.by_attr.is_empty() && !subject.attrs.is_empty() {
+            if self.by_attr.len() <= subject.attrs.len() {
+                for (name, bucket) in &self.by_attr {
+                    if subject.attr(name).is_some() {
+                        candidates.extend_from_slice(bucket);
+                        buckets += 1;
+                    }
+                }
+            } else {
+                for name in subject.attrs.keys() {
+                    let bucket = self.by_attr.get(name.as_str()).or_else(|| {
+                        name.bytes()
+                            .any(|byte| byte.is_ascii_uppercase())
+                            .then(|| self.by_attr.get(&name.to_ascii_lowercase()))
+                            .flatten()
+                    });
+                    if let Some(bucket) = bucket {
+                        candidates.extend_from_slice(bucket);
+                        buckets += 1;
+                    }
+                }
+            }
+        }
         if buckets > 1 {
             candidates.sort_unstable();
             candidates.dedup();
         }
     }
 
-    fn candidates(&self, subject: &Element) -> Vec<usize> {
+    fn candidates(&self, subject: &Element, is_root: bool) -> Vec<usize> {
         let mut candidates = Vec::new();
-        self.fill_candidates(subject, &mut candidates);
+        self.fill_candidates(subject, is_root, &mut candidates);
         candidates
     }
 }
@@ -3272,6 +3392,8 @@ impl Stylesheet {
         let custom_rules = custom_property_rules(&rules);
         let has_custom_properties = !custom_rules.is_empty();
         let custom_prop_index = RuleIndex::build_subset(&rules, &custom_rules);
+        let content_rules = generated_content_rules(&rules);
+        let generated_content_index = RuleIndex::build_subset(&rules, &content_rules);
         let has_transitions = rules.iter().any(|rule| {
             rule.declarations
                 .iter()
@@ -3303,6 +3425,7 @@ impl Stylesheet {
             index,
             motion_index,
             custom_prop_index,
+            generated_content_index,
             has_custom_properties,
             has_transitions,
             has_animations,
@@ -3326,6 +3449,8 @@ impl Stylesheet {
         let custom_rules = custom_property_rules(&rules);
         let has_custom_properties = !custom_rules.is_empty();
         let custom_prop_index = RuleIndex::build_subset(&rules, &custom_rules);
+        let content_rules = generated_content_rules(&rules);
+        let generated_content_index = RuleIndex::build_subset(&rules, &content_rules);
         let has_transitions = rules.iter().any(|rule| {
             rule.declarations
                 .iter()
@@ -3358,6 +3483,7 @@ impl Stylesheet {
                 index,
                 motion_index,
                 custom_prop_index,
+                generated_content_index,
                 has_custom_properties,
                 has_transitions,
                 has_animations,
@@ -3508,14 +3634,16 @@ impl Stylesheet {
         if !self.has_custom_properties {
             return false;
         }
-        self.custom_prop_index.any_candidate(element, |index| {
-            let rule = &self.rules[index];
-            rule.applies(document, node, state)
-                && rule
-                    .selectors
-                    .iter()
-                    .any(|selector| selector.matches(document, node, None, state))
-        })
+        let is_root = is_root_element(document, node, state);
+        self.custom_prop_index
+            .any_candidate(element, is_root, |index| {
+                let rule = &self.rules[index];
+                rule.applies(document, node, state)
+                    && rule
+                        .selectors
+                        .iter()
+                        .any(|selector| selector.matches(document, node, None, state))
+            })
     }
 
     fn populate_custom_properties_afresh(&self, document: &Document, state: &mut StyleState) {
@@ -3625,17 +3753,38 @@ impl Stylesheet {
     }
 
     fn cascade_content(&self, context: StyleContext<'_>) -> Option<String> {
+        if !context.document.has_shadow_roots() {
+            let element = context.document.element(context.node)?;
+            let is_root = is_root_element(context.document, context.node, context.state);
+            let may_generate =
+                self.generated_content_index
+                    .any_candidate(element, is_root, |index| {
+                        let rule = &self.rules[index];
+                        rule.applies(context.document, context.node, context.state)
+                            && rule.selectors.iter().any(|selector| {
+                                selector.matches(
+                                    context.document,
+                                    context.node,
+                                    context.pseudo,
+                                    context.state,
+                                )
+                            })
+                    });
+            if !may_generate {
+                return None;
+            }
+        }
         let values = self.cascaded_values(
             context.document,
             context.node,
             context.pseudo,
             context.state,
         );
+        let (_, _, raw) = values.get("content")?;
         let empty = BTreeMap::new();
         let custom_properties =
             inherited_custom_properties(context.state, context.document, context.node)
                 .unwrap_or(&empty);
-        let (_, _, raw) = values.get("content")?;
         let resolved = resolve_custom_value(raw, custom_properties)?;
         let resolved = resolved.trim();
         if resolved.eq_ignore_ascii_case("none") || resolved.eq_ignore_ascii_case("normal") {
@@ -4153,9 +4302,10 @@ impl Stylesheet {
             return Vec::new();
         };
         let mut matched = Vec::new();
+        let is_root = is_root_element(document, node, state);
         with_user_agent_sheet(|ua| {
             for (user_agent, sheet) in [(true, ua), (false, self)] {
-                for position in sheet.index.candidates(element) {
+                for position in sheet.index.candidates(element, is_root) {
                     let Some(rule) = sheet.rules.get(position) else {
                         continue;
                     };
@@ -4238,14 +4388,16 @@ impl Stylesheet {
             state,
             host_only,
         } = target;
-        if !self.index.has_candidates(element) {
+        let is_root = is_root_element(document, node, state);
+        if !self.index.has_candidates(element, is_root) {
             return;
         }
         thread_local! {
             static CANDIDATES: std::cell::Cell<Vec<usize>> = const { std::cell::Cell::new(Vec::new()) };
         }
         let mut candidates = CANDIDATES.with(std::cell::Cell::take);
-        self.index.fill_candidates(element, &mut candidates);
+        self.index
+            .fill_candidates(element, is_root, &mut candidates);
         for &position in &candidates {
             let Some(rule) = self.rules.get(position) else {
                 continue;
@@ -4317,15 +4469,13 @@ impl Stylesheet {
     }
 
     // a cheap check before a full cascade: only rules that declare motion, or inline style
-    pub(crate) fn may_animate(
+    pub(crate) fn may_animate_element(
         &self,
         document: &Document,
         node: NodeId,
+        element: &Element,
         state: &StyleState,
     ) -> bool {
-        let Some(element) = document.element(node) else {
-            return false;
-        };
         if state.script_animations.contains_key(&node) {
             return true;
         }
@@ -4336,7 +4486,8 @@ impl Stylesheet {
         {
             return true;
         }
-        self.motion_index.any_candidate(element, |index| {
+        let is_root = is_root_element(document, node, state);
+        self.motion_index.any_candidate(element, is_root, |index| {
             let rule = &self.rules[index];
             rule.applies(document, node, state)
                 && rule
@@ -5029,25 +5180,36 @@ impl AttributeSelector {
                     return false;
                 };
                 let (actual, value) = if *ignore_case {
-                    (actual.to_ascii_lowercase(), value.to_ascii_lowercase())
+                    (
+                        Cow::Owned(actual.to_ascii_lowercase()),
+                        Cow::Owned(value.to_ascii_lowercase()),
+                    )
                 } else {
-                    (actual.to_string(), value.clone())
+                    (Cow::Borrowed(actual), Cow::Borrowed(value.as_str()))
                 };
                 match operator {
                     AttributeOperator::Equals => actual == value,
                     AttributeOperator::Includes => {
                         !value.is_empty()
-                            && actual.split_ascii_whitespace().any(|word| word == value)
+                            && actual
+                                .split_ascii_whitespace()
+                                .any(|word| word == value.as_ref())
                     }
                     AttributeOperator::DashMatch => {
                         actual == value
                             || actual
-                                .strip_prefix(value.as_str())
+                                .strip_prefix(value.as_ref())
                                 .is_some_and(|rest| rest.starts_with('-'))
                     }
-                    AttributeOperator::Prefix => !value.is_empty() && actual.starts_with(&value),
-                    AttributeOperator::Suffix => !value.is_empty() && actual.ends_with(&value),
-                    AttributeOperator::Substring => !value.is_empty() && actual.contains(&value),
+                    AttributeOperator::Prefix => {
+                        !value.is_empty() && actual.starts_with(value.as_ref())
+                    }
+                    AttributeOperator::Suffix => {
+                        !value.is_empty() && actual.ends_with(value.as_ref())
+                    }
+                    AttributeOperator::Substring => {
+                        !value.is_empty() && actual.contains(value.as_ref())
+                    }
                 }
             }
         }
@@ -6290,21 +6452,6 @@ fn parse_transitions(value: &str) -> [Option<Transition>; MAX_TRANSITIONS] {
         next += 1;
     }
     transitions
-}
-
-pub(crate) fn animation_from(values: &BTreeMap<String, String>) -> Option<Animation> {
-    values
-        .get("animation")
-        .or_else(|| values.get("animation-name"))
-        .and_then(|value| parse_animation(value))
-}
-
-pub(crate) fn transitions_from(
-    values: &BTreeMap<String, String>,
-) -> [Option<Transition>; MAX_TRANSITIONS] {
-    values
-        .get("transition")
-        .map_or([None; MAX_TRANSITIONS], |value| parse_transitions(value))
 }
 
 fn parse_animation(value: &str) -> Option<Animation> {
@@ -9224,7 +9371,41 @@ fn parse_number(value: &str) -> Option<f32> {
 }
 
 // an element without its own entry reads its nearest ancestor's properties
-fn inherited_custom_properties<'a>(
+impl CascadeIdentity {
+    pub(crate) fn value<'a>(
+        &'a self,
+        property: &str,
+        custom_properties: Option<&BTreeMap<String, String>>,
+    ) -> Option<Cow<'a, str>> {
+        let (_, _, raw) = self.0.get(property)?;
+        match custom_properties {
+            Some(properties) => resolve_custom_value(raw, properties),
+            None => {
+                let empty = BTreeMap::new();
+                resolve_custom_value(raw, &empty)
+            }
+        }
+    }
+
+    pub(crate) fn transitions(
+        &self,
+        custom_properties: Option<&BTreeMap<String, String>>,
+    ) -> [Option<Transition>; MAX_TRANSITIONS] {
+        self.value("transition", custom_properties)
+            .map_or([None; MAX_TRANSITIONS], |value| parse_transitions(&value))
+    }
+
+    pub(crate) fn animation(
+        &self,
+        custom_properties: Option<&BTreeMap<String, String>>,
+    ) -> Option<Animation> {
+        self.value("animation", custom_properties)
+            .or_else(|| self.value("animation-name", custom_properties))
+            .and_then(|value| parse_animation(&value))
+    }
+}
+
+pub(crate) fn inherited_custom_properties<'a>(
     state: &'a StyleState,
     document: &Document,
     node: NodeId,

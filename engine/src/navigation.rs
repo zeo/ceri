@@ -2076,17 +2076,22 @@ impl Browser {
                 continue;
             }
             let mut keys = Vec::new();
-            let values = stylesheet.declared_values(context);
-            for transition in crate::css::transitions_from(&values).into_iter().flatten() {
+            let custom_properties =
+                crate::css::inherited_custom_properties(&state, &document, node);
+            for transition in identity
+                .transitions(custom_properties)
+                .into_iter()
+                .flatten()
+            {
                 for property in transition.property.expand() {
-                    let Some(value) = values.get(property.name()) else {
+                    let Some(value) = identity.value(property.name(), custom_properties) else {
                         continue;
                     };
                     let key = (node, property);
                     seen.insert(key);
                     keys.push(key);
                     match self.declared.get(&key) {
-                        Some(previous) if previous == value => {}
+                        Some(previous) if previous.as_str() == value.as_ref() => {}
                         Some(previous) => {
                             // a change while a transition runs replaces it
                             if let Some(running) = self.transitions.get(&key)
@@ -2103,7 +2108,7 @@ impl Browser {
                                     key,
                                     TransitionState {
                                         from: previous.clone(),
-                                        to: value.clone(),
+                                        to: value.to_string(),
                                         started: clock,
                                         finishes: clock
                                             .saturating_add(transition.delay)
@@ -2128,10 +2133,11 @@ impl Browser {
                         }
                         None => {}
                     }
-                    self.declared.insert(key, value.clone());
+                    self.declared.insert(key, value.into_owned());
                 }
             }
-            if let Some(animation) = crate::css::animation_from(&values)
+            if let Some(animation) = identity
+                .animation(custom_properties)
                 .filter(|animation| stylesheet.has_keyframes(&animation.name))
             {
                 seen_animations.insert(node);
@@ -4385,8 +4391,9 @@ fn collect_motion_candidates(
     document: &Document,
 ) -> Vec<NodeId> {
     document
-        .descendants(document.root())
-        .filter(|&node| stylesheet.may_animate(document, node, state))
+        .connected_elements()
+        .filter(|&(node, element)| stylesheet.may_animate_element(document, node, element, state))
+        .map(|(node, _)| node)
         .collect()
 }
 
