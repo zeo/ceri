@@ -356,6 +356,7 @@ pub(super) const FLAG_OWNS_SCOPE: u8 = 1 << 1;
 pub(super) const FLAG_CONSTRUCT: u8 = 1 << 2;
 const FLAG_EVAL: u8 = 1 << 3;
 pub(super) const FLAG_CALLEE_ON_STACK: u8 = 1 << 4;
+pub(super) const FLAG_CALLBACK_REUSE: u8 = 1 << 5;
 
 // rare per-frame state kept out of line so ordinary calls push zero heap allocations
 pub(super) struct FrameExtra {
@@ -3359,15 +3360,18 @@ impl ScriptRuntime {
                     let Some(jit) = jit_opt else {
                         break;
                     };
+                    let Some(target) = jit.try_target(pc) else {
+                        break;
+                    };
                     // keep Rc<Code> (and its executable JitCode buffer) alive even if Op::Return
                     // pops the last frame referencing this Code before the JIT epilogue runs
                     let _keep_code = unsafe { self.frames.get_unchecked(top) }.code.clone();
                     match super::jit::run_jit_frame(
                         self,
                         jit,
+                        target,
                         heap_ptr,
                         top,
-                        pc,
                         frame_floor,
                         sampling,
                         &mut safepoint_at,
@@ -4944,6 +4948,8 @@ impl ScriptRuntime {
                         });
                         unsafe { push_unchecked(&mut self.vm_stack, Value::String(key.into())) };
                     }
+                }
+                Op::TemplateConcat(1) if matches!(self.vm_stack.last(), Some(Value::String(_))) => {
                 }
                 Op::ChainStart => {
                     let offset =
@@ -8230,6 +8236,9 @@ impl ScriptRuntime {
                 self.vm_stack.push(result);
             }
             Op::TemplateConcat(count) => {
+                if count == 1 && matches!(self.vm_stack.last(), Some(Value::String(_))) {
+                    return Ok(None);
+                }
                 let parts = self.pop_arguments(count as usize);
                 let mut text = String::new();
                 for part in parts {

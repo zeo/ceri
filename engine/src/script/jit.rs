@@ -12,8 +12,8 @@ use super::object::{
     SHARED_CAP,
 };
 use super::vm::{
-    Closure, FLAG_CALLEE_ON_STACK, FLAG_OWNS_SCOPE, FLAG_USES_REGS, FastNativeCall, Frame, Grown,
-    MAX_FRAMES, RunResult, Scope,
+    Closure, FLAG_CALLBACK_REUSE, FLAG_CALLEE_ON_STACK, FLAG_OWNS_SCOPE, FLAG_USES_REGS,
+    FastNativeCall, Frame, Grown, MAX_FRAMES, RunResult, Scope,
 };
 use super::*;
 use std::cell::Cell;
@@ -29,6 +29,7 @@ const STATUS_FRAME_CHANGED: u32 = 1;
 const STATUS_DONE: u32 = 2;
 const STATUS_ERR: u32 = 3;
 const STATUS_DISPATCH_NEXT: u32 = 4;
+const STATUS_CALLBACK_DONE: u32 = 5;
 const STATUS_FALLBACK: u32 = u32::MAX;
 
 // x86-64 register numbers
@@ -60,6 +61,7 @@ const XMM0: u8 = 0;
 const XMM1: u8 = 1;
 
 // condition codes for 0F 8x rel32
+const CC_B: u8 = 0x2;
 const CC_AE: u8 = 0x3;
 const CC_E: u8 = 0x4;
 const CC_NE: u8 = 0x5;
@@ -313,8 +315,18 @@ impl JitCode {
     }
 
     #[inline(always)]
+    pub(super) fn try_target(&self, pc: usize) -> Option<*const u8> {
+        let offset = unsafe { *self.pc_offsets.get_unchecked(pc) };
+        if offset == u32::MAX {
+            None
+        } else {
+            Some(unsafe { self.ptr.add(offset as usize) })
+        }
+    }
+
+    #[inline(always)]
     pub(super) fn target(&self, pc: usize) -> *const u8 {
-        unsafe { self.ptr.add(*self.pc_offsets.get_unchecked(pc) as usize) }
+        self.try_target(pc).expect("jit entry pc")
     }
 }
 
@@ -350,6 +362,8 @@ pub(super) struct JitRun {
     pub(super) ctx: JitCtx,
     pub(super) error: Option<ScriptError>,
     pub(super) result: Option<RunResult>,
+    // direct return slot for reusable callback frames to avoid Option<RunResult> churn
+    pub(super) callback_ret: Value,
     // keeps the returning function's Rc<Code> alive across the tail-jump into its caller
     pub(super) prev_code: Option<Rc<Code>>,
 }
@@ -719,6 +733,16 @@ impl Asm {
         self.rex_if(0, b, 0, a);
         self.emit(0x39);
         self.modrm(3, b, a);
+    }
+
+    fn cmp_r_r(&mut self, a: u8, b: u8) {
+        self.rex(1, b, 0, a);
+        self.emit(0x39);
+        self.modrm(3, b, a);
+    }
+
+    fn cmp_r_imm(&mut self, r: u8, imm: i32) {
+        self.alu_ri(7, r, imm);
     }
 
     fn cmp_r8_imm(&mut self, r: u8, imm: u8) {
@@ -1116,7 +1140,9 @@ unsafe fn try_dispatch_top(run: *mut JitRun, rt: &mut ScriptRuntime) -> u32 {
         let pc = frame.pc;
         let reg_base = frame.reg_base;
         let max_pushes = code_ref.max_pushes as usize;
-        let target = jit.target(pc);
+        let Some(target) = jit.try_target(pc) else {
+            return STATUS_FRAME_CHANGED;
+        };
         let ctx = &mut (*run).ctx;
         ctx.top = new_top;
         ctx.reg_base = reg_base;
@@ -1664,6 +1690,16 @@ extern "sysv64" fn helper_str_eq(a: *const Value, b: *const Value) -> u32 {
         } else {
             0
         }
+    }
+}
+
+extern "sysv64" fn helper_str_eq_raw(a: *const u8, b: *const u8) -> u32 {
+    unsafe {
+        // safety: both pointers are live JsStr headers with identical byte length
+        let len = *(a.add(8) as *const usize);
+        let sa = std::slice::from_raw_parts(a.add(16), len);
+        let sb = std::slice::from_raw_parts(b.add(16), len);
+        u32::from(sa == sb)
     }
 }
 
@@ -3319,6 +3355,12 @@ extern "sysv64" fn helper_return(run: *mut JitRun, next_pc: usize) -> u32 {
             if needs_cleanup {
                 clean_return_slow(ctx, rt, heap, top, chain_base, pending_base, iter_base);
             }
+            if at_floor && (rt.frames.get_unchecked(top).flags & FLAG_CALLBACK_REUSE) != 0 {
+                // keep the reusable callback frame and callee slot intact across iterations
+                rt.vm_stack.set_len(reg_base);
+                std::ptr::write(&mut (*run).callback_ret, ret_val);
+                return STATUS_CALLBACK_DONE;
+            }
             let frame_ptr = rt.frames.as_mut_ptr().add(top);
             rt.frames.set_len(top);
             if let Some(keep_code) = Frame::drop_in_place_keep_unique_code(frame_ptr) {
@@ -4388,6 +4430,62 @@ impl<'a> Compiler<'a> {
         self.asm.mov_r_mem(R9, rbase, rdisp + 8);
         self.asm.cmp_r_mem(R8, R9, 8);
         self.asm.jcc(CC_NE, ret_false);
+        self.asm.test_rr(R8, R8);
+        self.asm.jcc(CC_E, ret_true);
+        let call_str_eq = self.asm.label();
+        let len_lt_8 = self.asm.label();
+        let len_lt_4 = self.asm.label();
+        self.asm.cmp_r_imm(R8, 16);
+        self.asm.jcc(CC_A, call_str_eq);
+        self.asm.cmp_r_imm(R8, 8);
+        self.asm.jcc(CC_B, len_lt_8);
+        // 8..=16 bytes: compare two overlapping 8-byte spans with no uninitialized reads
+        self.asm.mov_r_mem(RAX, RDX, 16);
+        self.asm.cmp_r_mem(RAX, R9, 16);
+        self.asm.jcc(CC_NE, ret_false);
+        self.asm.add_rr(RDX, R8);
+        self.asm.add_rr(R9, R8);
+        self.asm.mov_r_mem(RAX, RDX, 8);
+        self.asm.cmp_r_mem(RAX, R9, 8);
+        self.asm.jcc(CC_E, ret_true);
+        self.asm.jmp(ret_false);
+
+        self.asm.bind(len_lt_8);
+        self.asm.cmp_r_imm(R8, 4);
+        self.asm.jcc(CC_B, len_lt_4);
+        // 4..=7 bytes: compare two overlapping 4-byte spans with no uninitialized reads
+        self.asm.mov_r32_mem(RAX, RDX, 16);
+        self.asm.cmp_r32_mem(RAX, R9, 16);
+        self.asm.jcc(CC_NE, ret_false);
+        self.asm.add_rr(RDX, R8);
+        self.asm.add_rr(R9, R8);
+        self.asm.mov_r32_mem(RAX, RDX, 12);
+        self.asm.cmp_r32_mem(RAX, R9, 12);
+        self.asm.jcc(CC_E, ret_true);
+        self.asm.jmp(ret_false);
+
+        self.asm.bind(len_lt_4);
+        self.asm.movzx_r_m8(RAX, RDX, 16);
+        self.asm.movzx_r_m8(RCX, R9, 16);
+        self.asm.cmp_r32_r32(RAX, RCX);
+        self.asm.jcc(CC_NE, ret_false);
+        self.asm.cmp_r_imm(R8, 1);
+        self.asm.jcc(CC_E, ret_true);
+        self.asm.add_rr(RDX, R8);
+        self.asm.add_rr(R9, R8);
+        self.asm.movzx_r_m8(RAX, RDX, 15);
+        self.asm.movzx_r_m8(RCX, R9, 15);
+        self.asm.cmp_r32_r32(RAX, RCX);
+        self.asm.jcc(CC_NE, ret_false);
+        self.asm.cmp_r_imm(R8, 2);
+        self.asm.jcc(CC_E, ret_true);
+        self.asm.movzx_r_m8(RAX, RDX, 14);
+        self.asm.movzx_r_m8(RCX, R9, 14);
+        self.asm.cmp_r32_r32(RAX, RCX);
+        self.asm.jcc(CC_E, ret_true);
+        self.asm.jmp(ret_false);
+
+        self.asm.bind(call_str_eq);
         self.asm.lea_mem(RDI, lbase, ldisp);
         self.asm.lea_mem(RSI, rbase, rdisp);
         self.asm.call_abs(helper_str_eq as *const () as usize);
@@ -4578,12 +4676,183 @@ impl<'a> Compiler<'a> {
         lbl
     }
 
+    // drops a Value::String located at [base + disp] without rechecking its tag
+    fn emit_drop_string(&mut self, base: u8, disp: i32) {
+        let done = self.asm.label();
+        self.asm.mov_r_mem(RCX, base, disp + 8);
+        self.asm.sub_m64_imm(RCX, 0, 1);
+        self.asm.jcc(CC_NE, done);
+        self.asm.add_m64_imm(RCX, 0, 1);
+        self.asm.lea_mem(RDI, base, disp);
+        self.asm
+            .call_abs(helper_drop_in_place as *const () as usize);
+        self.asm.bind(done);
+    }
+
+    // compares [R_SP - VAL_SIZE] strictly against a constant string without pushing it
+    fn emit_const_str_eq(
+        &mut self,
+        index: u32,
+        invert: bool,
+        branch: Option<(bool, usize)>,
+        fallthrough: usize,
+    ) {
+        let text = &self.code.names[index as usize];
+        let raw_ptr = text.as_raw_ptr() as u64;
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let not_str = self.asm.label();
+        let matched = self.asm.label();
+        let not_matched = self.asm.label();
+        let not_matched_dropped = self.asm.label();
+
+        self.asm.movzx_r_m8(RAX, R_SP, -VAL_SIZE);
+        self.asm.cmp_r8_imm(RAX, VALUE_TAG_STRING);
+        self.asm.jcc(CC_NE, not_str);
+
+        self.asm.mov_r_mem(RDX, R_SP, -VAL_SIZE + 8);
+        self.asm.mov_r_mem(R8, RDX, 8);
+        match len {
+            0 => {
+                self.asm.test_rr(R8, R8);
+                self.asm.jcc(CC_E, matched);
+                self.asm.jmp(not_matched);
+            }
+            1 => {
+                self.asm.cmp_r_imm(R8, 1);
+                self.asm.jcc(CC_NE, not_matched);
+                self.asm.cmp_m8_imm(RDX, 16, bytes[0]);
+                self.asm.jcc(CC_E, matched);
+                self.asm.jmp(not_matched);
+            }
+            2 => {
+                let w = u16::from_le_bytes([bytes[0], bytes[1]]) as i32;
+                self.asm.cmp_r_imm(R8, 2);
+                self.asm.jcc(CC_NE, not_matched);
+                self.asm.movzx_r_m16(RAX, RDX, 16);
+                self.asm.cmp_r32_imm(RAX, w);
+                self.asm.jcc(CC_E, matched);
+                self.asm.jmp(not_matched);
+            }
+            3 => {
+                let w = u16::from_le_bytes([bytes[0], bytes[1]]) as i32;
+                self.asm.cmp_r_imm(R8, 3);
+                self.asm.jcc(CC_NE, not_matched);
+                self.asm.movzx_r_m16(RAX, RDX, 16);
+                self.asm.cmp_r32_imm(RAX, w);
+                self.asm.jcc(CC_NE, not_matched);
+                self.asm.cmp_m8_imm(RDX, 18, bytes[2]);
+                self.asm.jcc(CC_E, matched);
+                self.asm.jmp(not_matched);
+            }
+            4 => {
+                let d = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                self.asm.cmp_r_imm(R8, 4);
+                self.asm.jcc(CC_NE, not_matched);
+                self.asm.cmp_m32_imm(RDX, 16, d);
+                self.asm.jcc(CC_E, matched);
+                self.asm.jmp(not_matched);
+            }
+            5..=7 => {
+                let d0 = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                let tail = len - 4;
+                let d1 = i32::from_le_bytes([
+                    bytes[tail],
+                    bytes[tail + 1],
+                    bytes[tail + 2],
+                    bytes[tail + 3],
+                ]);
+                self.asm.cmp_r_imm(R8, len as i32);
+                self.asm.jcc(CC_NE, not_matched);
+                self.asm.cmp_m32_imm(RDX, 16, d0);
+                self.asm.jcc(CC_NE, not_matched);
+                self.asm.cmp_m32_imm(RDX, 16 + tail as i32, d1);
+                self.asm.jcc(CC_E, matched);
+                self.asm.jmp(not_matched);
+            }
+            8 => {
+                let q = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+                self.asm.cmp_r_imm(R8, 8);
+                self.asm.jcc(CC_NE, not_matched);
+                self.asm.mov_ri64(RAX, q);
+                self.asm.cmp_r_mem(RAX, RDX, 16);
+                self.asm.jcc(CC_E, matched);
+                self.asm.jmp(not_matched);
+            }
+            9..=16 => {
+                let q0 = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+                let tail = len - 8;
+                let q1 = u64::from_le_bytes(bytes[tail..tail + 8].try_into().expect("8 bytes"));
+                self.asm.cmp_r_imm(R8, len as i32);
+                self.asm.jcc(CC_NE, not_matched);
+                self.asm.mov_ri64(RAX, q0);
+                self.asm.cmp_r_mem(RAX, RDX, 16);
+                self.asm.jcc(CC_NE, not_matched);
+                self.asm.mov_ri64(RAX, q1);
+                self.asm.cmp_r_mem(RAX, RDX, 16 + tail as i32);
+                self.asm.jcc(CC_E, matched);
+                self.asm.jmp(not_matched);
+            }
+            _ => {
+                self.asm.mov_ri64(RAX, raw_ptr);
+                self.asm.cmp_r_r(RDX, RAX);
+                self.asm.jcc(CC_E, matched);
+                self.asm.cmp_r_imm(R8, len as i32);
+                self.asm.jcc(CC_NE, not_matched);
+                self.asm.mov_rr(RDI, RDX);
+                self.asm.mov_rr(RSI, RAX);
+                self.asm.call_abs(helper_str_eq_raw as *const () as usize);
+                self.asm.test_r32(RAX, RAX);
+                self.asm.jcc(CC_NE, matched);
+                self.asm.jmp(not_matched);
+            }
+        }
+
+        self.asm.bind(not_str);
+        // AL still holds the non-string lhs tag
+        self.emit_drop_value(R_SP, -VAL_SIZE);
+        self.asm.jmp(not_matched_dropped);
+
+        self.asm.bind(matched);
+        self.emit_drop_string(R_SP, -VAL_SIZE);
+        if let Some((jump_on_true, target)) = branch {
+            self.asm.sub_ri(R_SP, VAL_SIZE);
+            let res_true = !invert;
+            if res_true == jump_on_true {
+                self.asm.jmp(self.pc_labels[target]);
+            } else {
+                self.asm.jmp(self.pc_labels[fallthrough]);
+            }
+        } else {
+            self.asm.mov_m8_imm(R_SP, -VAL_SIZE, VALUE_TAG_BOOL);
+            self.asm.mov_m8_imm(R_SP, -VAL_SIZE + 8, u8::from(!invert));
+            self.asm.jmp(self.pc_labels[fallthrough]);
+        }
+
+        self.asm.bind(not_matched);
+        self.emit_drop_string(R_SP, -VAL_SIZE);
+        self.asm.bind(not_matched_dropped);
+        if let Some((jump_on_true, target)) = branch {
+            self.asm.sub_ri(R_SP, VAL_SIZE);
+            let res_true = invert;
+            if res_true == jump_on_true {
+                self.asm.jmp(self.pc_labels[target]);
+            }
+        } else {
+            self.asm.mov_m8_imm(R_SP, -VAL_SIZE, VALUE_TAG_BOOL);
+            self.asm.mov_m8_imm(R_SP, -VAL_SIZE + 8, u8::from(invert));
+        }
+    }
+
     fn emit_all(&mut self) {
         self.emit_prologue();
         let ops_len = self.code.ops.len();
         let mut is_target = vec![false; ops_len + 1];
+        if self.code.entry <= ops_len {
+            is_target[self.code.entry] = true;
+        }
         for op in &self.code.ops {
-            let t = match *op {
+            match *op {
                 Op::Jump(t)
                 | Op::JumpIfFalse(t)
                 | Op::JumpIfTrue(t)
@@ -4597,23 +4866,75 @@ impl<'a> Compiler<'a> {
                 | Op::JumpIfNotCompare { target: t, .. }
                 | Op::JumpIfNotCompareRegs { target: t, .. }
                 | Op::IterStep(t)
+                | Op::IterResultUnpack(t)
                 | Op::ForInNext(t)
-                | Op::Exit { target: t, .. } => Some(t as usize),
-                _ => None,
-            };
-            if let Some(t) = t
-                && t <= ops_len
-            {
-                is_target[t] = true;
+                | Op::DelegateStep(t)
+                | Op::DelegateUnpack(t)
+                | Op::Exit { target: t, .. } => {
+                    let t = t as usize;
+                    if t <= ops_len {
+                        is_target[t] = true;
+                    }
+                }
+                Op::PushHandler { catch, finally } => {
+                    if (catch as usize) <= ops_len {
+                        is_target[catch as usize] = true;
+                    }
+                    if (finally as usize) <= ops_len {
+                        is_target[finally as usize] = true;
+                    }
+                }
+                _ => {}
             }
         }
-        for (op_pc, &target) in is_target.iter().enumerate().take(ops_len) {
+        let mut op_pc = 0usize;
+        while op_pc < ops_len {
             self.asm.bind(self.pc_labels[op_pc]);
-            if target {
+            if is_target[op_pc] {
                 self.block_start = op_pc;
             }
             let op = self.code.ops[op_pc];
+            if let Op::String(index) = op {
+                // elide zero-interpolation TemplateConcat(1) and fuse constant string equality
+                let has_tc1 = op_pc + 1 < ops_len
+                    && !is_target[op_pc + 1]
+                    && matches!(self.code.ops[op_pc + 1], Op::TemplateConcat(1));
+                let after_str = op_pc + 1 + usize::from(has_tc1);
+                if after_str < ops_len
+                    && !is_target[after_str]
+                    && let Op::Binary(
+                        bin_op @ (BinaryOperator::StrictEqual | BinaryOperator::StrictNotEqual),
+                    ) = self.code.ops[after_str]
+                {
+                    let invert = matches!(bin_op, BinaryOperator::StrictNotEqual);
+                    let next_after_bin = after_str + 1;
+                    let branch = if next_after_bin < ops_len && !is_target[next_after_bin] {
+                        match self.code.ops[next_after_bin] {
+                            Op::JumpIfFalse(t) if (t as usize) > next_after_bin => {
+                                Some((false, t as usize))
+                            }
+                            Op::JumpIfTrue(t) if (t as usize) > next_after_bin => {
+                                Some((true, t as usize))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let end_pc = next_after_bin + usize::from(branch.is_some());
+                    self.emit_const_str_eq(index, invert, branch, end_pc);
+                    // leave interior fused pc_labels unbound so OSR cannot enter mid-sequence
+                    op_pc = end_pc;
+                    continue;
+                }
+                if has_tc1 {
+                    self.emit_op(op_pc, op);
+                    op_pc += 2;
+                    continue;
+                }
+            }
             self.emit_op(op_pc, op);
+            op_pc += 1;
         }
         self.asm.bind(self.pc_labels[ops_len]);
         self.emit_epilogue();
@@ -5253,6 +5574,10 @@ impl<'a> Compiler<'a> {
                 self.emit_step_op_call(op_pc, true);
             }
             Op::TemplateConcat(count) => {
+                if count == 1 {
+                    self.asm.cmp_m8_imm(R_SP, -VAL_SIZE, VALUE_TAG_STRING);
+                    self.asm.jcc(CC_E, next_label);
+                }
                 let slow = self.defer_step_op(op_pc, false, next_label);
                 let bytes = count as i32 * VAL_SIZE;
                 self.asm.lea_mem(RDI, R_SP, -bytes);
@@ -6085,7 +6410,7 @@ impl<'a> Compiler<'a> {
         let pc_offsets: Box<[u32]> = self
             .pc_labels
             .iter()
-            .map(|&lbl| self.asm.labels[lbl].expect("pc label bound") as u32)
+            .map(|&lbl| self.asm.labels[lbl].map_or(u32::MAX, |off| off as u32))
             .collect();
         let (slab, ptr) = unsafe { (&mut *heap.jit_pool_ptr()).alloc(&self.asm.code)? };
         Some(JitCode {
@@ -6100,9 +6425,9 @@ impl<'a> Compiler<'a> {
 pub(super) fn run_jit_frame(
     rt: &mut ScriptRuntime,
     jit: &JitCode,
+    target: *const u8,
     heap_ptr: *const Heap,
     top: usize,
-    pc: usize,
     frame_floor: usize,
     sampling: bool,
     safepoint_at: &mut u64,
@@ -6150,13 +6475,13 @@ pub(super) fn run_jit_frame(
         },
         error: None,
         result: None,
+        callback_ret: Value::Undefined,
         prev_code: None,
     };
     if max_scope_depth > 0 {
         unsafe { refresh_scope_cache(&mut run.ctx, rt) };
     }
     let entry = jit.entry();
-    let target = jit.target(pc);
     let status = entry(&mut run, target);
     *safepoint_at = run.ctx.safepoint_at;
     rt.steps = run.ctx.steps;
@@ -6191,6 +6516,7 @@ pub(super) struct JitCallbackSession<'a> {
     pending_floor: usize,
     iter_floor: usize,
     sampling: bool,
+    frame_live: bool,
     run: JitRun,
 }
 
@@ -6286,6 +6612,7 @@ impl<'a> JitCallbackSession<'a> {
             },
             error: None,
             result: None,
+            callback_ret: Value::Undefined,
             prev_code: None,
         };
         if max_scope_depth > 0 && scope_raw != 0 {
@@ -6312,7 +6639,7 @@ impl<'a> JitCallbackSession<'a> {
                 }
             }
         }
-        Some(Self {
+        let mut session = Self {
             rt,
             _heap_guard: heap_guard,
             entry,
@@ -6334,8 +6661,11 @@ impl<'a> JitCallbackSession<'a> {
             pending_floor,
             iter_floor,
             sampling,
+            frame_live: false,
             run,
-        })
+        };
+        session.push_reusable_frame();
+        Some(session)
     }
 
     #[inline(always)]
@@ -6346,6 +6676,69 @@ impl<'a> JitCallbackSession<'a> {
     #[inline(always)]
     pub(super) fn heap_ptr(&self) -> *const Heap {
         self.run.ctx.heap
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_reusable_frame(&mut self) {
+        let needed = 1 + self.reg_count + self.max_pushes;
+        if self.rt.vm_stack.capacity() - self.stack_floor < needed {
+            self.rt.vm_stack.reserve(needed);
+        }
+        if self.rt.frames.capacity() <= self.frame_floor {
+            reserve_frame_slot(&mut self.rt.frames);
+        }
+        unsafe {
+            let stack_ptr = self.rt.vm_stack.as_mut_ptr();
+            let cap = self.rt.vm_stack.capacity();
+            stack_ptr.add(self.stack_floor).write(self.callee.clone());
+            self.rt.vm_stack.set_len(self.stack_floor + 1);
+            let new_len = self.stack_floor + 1 + self.reg_count;
+            let frame_slot = self.rt.frames.as_mut_ptr().add(self.frame_floor);
+            frame_slot.write(Frame {
+                code: self.code.clone(),
+                closure: Some(self.closure.clone()),
+                pc: self.code.entry,
+                reg_base: self.stack_floor + 1,
+                stack_base: new_len,
+                return_base: self.stack_floor,
+                return_target: std::ptr::null(),
+                handler_base: self.handler_floor as u32,
+                chain_base: self.chain_floor as u32,
+                pending_base: self.pending_floor as u32,
+                iter_base: self.iter_floor as u32,
+                scope: self.closure.scope.clone(),
+                this: self.this.clone(),
+                function: Value::Undefined,
+                scopes: 0,
+                escaped_scopes: 0,
+                flags: FLAG_USES_REGS | FLAG_CALLEE_ON_STACK | FLAG_CALLBACK_REUSE,
+                extra: None,
+            });
+            self.rt.frames.set_len(self.frame_floor + 1);
+            let ctx = &mut self.run.ctx;
+            ctx.stack_ptr = stack_ptr;
+            ctx.stack_end = stack_ptr.add(cap);
+            ctx.stack_safe_limit = stack_ptr.add(cap.saturating_sub(self.max_pushes));
+            ctx.regs = stack_ptr.add(self.stack_floor + 1);
+            ctx.top = self.frame_floor;
+            ctx.reg_base = self.stack_floor + 1;
+            ctx.max_pushes = self.max_pushes;
+            ctx.this_ptr = &(*frame_slot).this as *const Value;
+            ctx.next_target = std::ptr::null();
+        }
+        self.frame_live = true;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn pop_reusable_frame(&mut self) {
+        if self.frame_live {
+            self.frame_live = false;
+            self.rt.frames.truncate(self.frame_floor);
+            // safety: callee at stack_floor is Copy Value::Object; registers were dropped by return
+            unsafe { self.rt.vm_stack.set_len(self.stack_floor) };
+        }
     }
 
     #[cold]
@@ -6361,6 +6754,7 @@ impl<'a> JitCallbackSession<'a> {
         self.run.ctx.stack_end = unsafe { stack_ptr.add(cap) };
         self.run.ctx.stack_safe_limit =
             unsafe { stack_ptr.add(cap.saturating_sub(self.max_pushes)) };
+        self.run.ctx.regs = unsafe { stack_ptr.add(self.stack_floor + 1) };
         self.run.ctx.steps = self.rt.steps;
         self.run.ctx.safepoint_at = self.rt.jit_callback_safepoint(self.sampling);
         self.run.ctx.cached_scope_raw = 0;
@@ -6370,6 +6764,7 @@ impl<'a> JitCallbackSession<'a> {
     #[cold]
     #[inline(never)]
     pub(super) fn with_runtime<R>(&mut self, f: impl FnOnce(&mut ScriptRuntime) -> R) -> R {
+        self.pop_reusable_frame();
         self.rt.steps = self.run.ctx.steps;
         let out = f(self.rt);
         self.resync_after_external();
@@ -6379,10 +6774,12 @@ impl<'a> JitCallbackSession<'a> {
     #[cold]
     #[inline(never)]
     fn hit_safepoint_cold(&mut self) -> Result<(), ScriptError> {
+        self.pop_reusable_frame();
         self.rt.steps = self.run.ctx.steps;
         match self.rt.jit_hit_safepoint(self.sampling, self.code.entry) {
             Ok(next) => {
                 self.run.ctx.safepoint_at = next;
+                self.resync_after_external();
                 Ok(())
             }
             Err(err) => {
@@ -6395,7 +6792,20 @@ impl<'a> JitCallbackSession<'a> {
     #[cold]
     #[inline(never)]
     fn finish_slow_call(&mut self, status: u32) -> Result<Value, ScriptError> {
+        self.frame_live = false;
         self.rt.steps = self.run.ctx.steps;
+        if status == STATUS_DONE {
+            let res = match self.run.result.take().expect("jit done result") {
+                RunResult::Return(value) => Ok(value),
+                _ => Err(runtime_error("a plain call cannot suspend")),
+            };
+            self.resync_after_external();
+            return res;
+        }
+        // clear callback reuse before handing the live frame back to the VM loop
+        if let Some(frame) = self.rt.frames.get_mut(self.frame_floor) {
+            frame.flags &= !FLAG_CALLBACK_REUSE;
+        }
         let err = match status {
             STATUS_FRAME_CHANGED => None,
             STATUS_ERR => Some(self.run.error.take().expect("jit error")),
@@ -6417,44 +6827,16 @@ impl<'a> JitCallbackSession<'a> {
     #[inline(always)]
     unsafe fn enter_and_run(&mut self, keep: usize) -> Result<Value, ScriptError> {
         unsafe {
-            let new_len = self.stack_floor + 1 + self.reg_count;
-            let base = self.run.ctx.stack_ptr.add(self.stack_floor);
-            base.write(self.callee.clone());
-            fill_undefined_fast(base.add(1 + keep), self.reg_count - keep);
-            if self.rt.frames.capacity() <= self.frame_floor {
-                reserve_frame_slot(&mut self.rt.frames);
-            }
-            let frame_slot = self.rt.frames.as_mut_ptr().add(self.frame_floor);
-            frame_slot.write(Frame {
-                code: self.code.clone(),
-                closure: Some(self.closure.clone()),
-                pc: self.code.entry,
-                reg_base: self.stack_floor + 1,
-                stack_base: new_len,
-                return_base: self.stack_floor,
-                return_target: std::ptr::null(),
-                handler_base: self.handler_floor as u32,
-                chain_base: self.chain_floor as u32,
-                pending_base: self.pending_floor as u32,
-                iter_base: self.iter_floor as u32,
-                scope: self.closure.scope.clone(),
-                this: self.this.clone(),
-                function: Value::Undefined,
-                scopes: 0,
-                escaped_scopes: 0,
-                flags: FLAG_USES_REGS | FLAG_CALLEE_ON_STACK,
-                extra: None,
-            });
-            self.rt.frames.set_len(self.frame_floor + 1);
+            let regs = self.run.ctx.regs;
+            fill_undefined_fast(regs.add(keep), self.reg_count - keep);
             let ctx = &mut self.run.ctx;
             ctx.rt = self.rt as *mut ScriptRuntime;
             ctx.top = self.frame_floor;
             ctx.reg_base = self.stack_floor + 1;
             ctx.max_pushes = self.max_pushes;
             ctx.stack_safe_limit = ctx.stack_end.sub(self.max_pushes);
-            ctx.sp = ctx.stack_ptr.add(new_len);
-            ctx.regs = ctx.stack_ptr.add(self.stack_floor + 1);
-            ctx.this_ptr = &(*frame_slot).this as *const Value;
+            ctx.sp = regs.add(self.reg_count);
+            ctx.this_ptr = &self.rt.frames.get_unchecked(self.frame_floor).this as *const Value;
             ctx.next_target = std::ptr::null();
             if self.max_scope_depth > 0
                 && (self.scope_raw == 0
@@ -6471,11 +6853,11 @@ impl<'a> JitCallbackSession<'a> {
                 );
             }
             let status = (self.entry)(&mut self.run, self.target);
-            if status == STATUS_DONE {
-                return match self.run.result.take().expect("jit done result") {
-                    RunResult::Return(value) => Ok(value),
-                    _ => Err(runtime_error("a plain call cannot suspend")),
-                };
+            if status == STATUS_CALLBACK_DONE {
+                return Ok(std::mem::replace(
+                    &mut self.run.callback_ret,
+                    Value::Undefined,
+                ));
             }
             self.finish_slow_call(status)
         }
@@ -6486,10 +6868,14 @@ impl<'a> JitCallbackSession<'a> {
         if self.run.ctx.steps >= self.run.ctx.safepoint_at {
             self.hit_safepoint_cold()?;
         }
+        if !self.frame_live {
+            self.push_reusable_frame();
+        }
         let need_bytes = (self.stack_floor + 1 + self.reg_count + self.max_pushes)
             * std::mem::size_of::<Value>();
         if (self.run.ctx.stack_end as usize - self.run.ctx.stack_ptr as usize) < need_bytes {
-            self.resync_after_external();
+            self.pop_reusable_frame();
+            self.push_reusable_frame();
         }
         Ok(())
     }
@@ -6506,7 +6892,7 @@ impl<'a> JitCallbackSession<'a> {
         unsafe {
             let keep = self.param_count.min(1);
             if keep == 1 {
-                self.run.ctx.stack_ptr.add(self.stack_floor + 1).write(a0);
+                self.run.ctx.regs.write(a0);
             } else {
                 a0.fast_drop();
             }
@@ -6519,7 +6905,7 @@ impl<'a> JitCallbackSession<'a> {
         self.ensure_ready()?;
         unsafe {
             let keep = self.param_count.min(2);
-            let args = self.run.ctx.stack_ptr.add(self.stack_floor + 1);
+            let args = self.run.ctx.regs;
             if keep >= 1 {
                 args.write(a0);
             } else {
@@ -6539,7 +6925,7 @@ impl<'a> JitCallbackSession<'a> {
         self.ensure_ready()?;
         unsafe {
             let keep = self.param_count.min(3);
-            let args = self.run.ctx.stack_ptr.add(self.stack_floor + 1);
+            let args = self.run.ctx.regs;
             if keep >= 1 {
                 args.write(a0);
             } else {
@@ -6570,7 +6956,7 @@ impl<'a> JitCallbackSession<'a> {
         self.ensure_ready()?;
         unsafe {
             let keep = self.param_count.min(4);
-            let args = self.run.ctx.stack_ptr.add(self.stack_floor + 1);
+            let args = self.run.ctx.regs;
             if keep >= 1 {
                 args.write(a0);
             } else {
@@ -6598,6 +6984,7 @@ impl<'a> JitCallbackSession<'a> {
 
 impl Drop for JitCallbackSession<'_> {
     fn drop(&mut self) {
+        self.pop_reusable_frame();
         self.rt.steps = self.run.ctx.steps;
         self.rt.jit_callback_exit(self.mirror_base);
     }
@@ -7362,5 +7749,88 @@ mod tests {
         // reduce adds sum(1..=4)=10 + 4*(1+2+12+i+3) = 10 + 4*(18+i) = 82 + 4*i
         // per i: 110 + 6*i; sum over 0..40 = 40*110 + 6*780 = 4400 + 4680 = 9080
         assert_eq!(out, "9080|40|20:20|0:0|true");
+    }
+
+    #[test]
+    fn jit_const_and_short_string_eq_template_concat1_and_reusable_callbacks() {
+        let out = run_js(
+            r#"
+            const cases = [
+                "", "a", "ab", "abc", "abcd", "block", "online", "abcdefg",
+                "outbound", "permanent", "0123456789ab", "0123456789abcdef",
+                "0123456789abcdefg", "abcdefghijklmnopqrstuvwxyz0123456789"
+            ];
+            function checkConst(s) {
+                let hits = 0;
+                if (s === ``) hits += 1;
+                if (s === `a`) hits += 2;
+                if (s === `ab`) hits += 4;
+                if (s === `abc`) hits += 8;
+                if (s === `abcd`) hits += 16;
+                if (s === `block`) hits += 32;
+                if (s === `online`) hits += 64;
+                if (s === `abcdefg`) hits += 128;
+                if (s === `outbound`) hits += 256;
+                if (s === `permanent`) hits += 512;
+                if (s === `0123456789ab`) hits += 1024;
+                if (s === `0123456789abcdef`) hits += 2048;
+                if (s === `0123456789abcdefg`) hits += 4096;
+                if (s === `abcdefghijklmnopqrstuvwxyz0123456789`) hits += 8192;
+                const notBlock = s !== `block`;
+                return hits + (notBlock ? 0 : 100000);
+            }
+            function checkDyn(a, b) {
+                return (a === b ? 1 : 0) + (a !== b ? 10 : 0);
+            }
+            let mask = 0;
+            let dynOk = 0;
+            let tplOk = 0;
+            for (let round = 0; round < 30; round++) {
+                mask = 0;
+                for (let i = 0; i < cases.length; i++) {
+                    const fresh = cases[i].slice(0) + "";
+                    const v = checkConst(fresh);
+                    mask += v;
+                    if (checkDyn(fresh, cases[i]) !== 1) throw new Error("dyn eq " + i);
+                    if (cases[i].length > 0) {
+                        const mid = cases[i].length >> 1;
+                        const mutated = cases[i].slice(0, mid) + "Z" + cases[i].slice(mid + 1);
+                        if (checkDyn(fresh, mutated) !== 10) throw new Error("dyn ne " + i);
+                        if (checkConst(mutated) !== 0) throw new Error("const ne " + i);
+                    }
+                    dynOk++;
+                }
+                if (checkConst(null) !== 0 || checkConst(123) !== 0 || checkConst({}) !== 0) {
+                    throw new Error("non-string const");
+                }
+                const obj = { toString() { return "custom"; } };
+                if (`${"str"}` === "str" && `${42}` === "42" && `${obj}` === "custom") tplOk++;
+            }
+            // reusable callback frame with finally (helper_return_slow) and normal returns
+            let finCount = 0;
+            const finMapped = [1, 2, 3, 4, 5, 6].map(x => {
+                if (x === 3) {
+                    try { return x * 10; } finally { finCount++; }
+                }
+                return x + 1;
+            });
+            // recursive OSR entry cannot land mid-fusion after Op::String before Binary(StrictEqual)
+            function osrStrCheck(v, depth) {
+                let kind = typeof v;
+                if (depth > 0) osrStrCheck("warm", depth - 1);
+                if (kind === `string` || kind === `number`) return "scalar:" + kind;
+                return "other:" + kind;
+            }
+            const osrRes = osrStrCheck({}, 24);
+            document.getElementById("out").textContent =
+                [mask, dynOk, tplOk, finCount, finMapped.join(","), osrRes].join("|");
+            "#,
+        )
+        .expect("const/short string eq and reusable callback");
+        let expected_mask = (1 << 14) - 1 + 100_000;
+        assert_eq!(
+            out,
+            format!("{expected_mask}|420|30|1|2,3,30,5,6,7|other:object")
+        );
     }
 }

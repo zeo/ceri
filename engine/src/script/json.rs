@@ -497,6 +497,13 @@ fn identity(value: &Value) -> Option<usize> {
 }
 
 impl ScriptRuntime {
+    pub(super) fn parse_json_str(&mut self, source: &str) -> Result<Value, ScriptError> {
+        let _heap = super::heap::enter(self.heap_id);
+        let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
+        parse_with(source, Some(heap), Some(&self.intrinsics.object_prototype))
+            .map_err(|message| self.throw_error("SyntaxError", message))
+    }
+
     pub(super) fn json_parse(&mut self, text: Value, reviver: Value) -> Result<Value, ScriptError> {
         let _heap = super::heap::enter(self.heap_id);
         let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };

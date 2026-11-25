@@ -1,7 +1,7 @@
 // window.ceri: invoke() sends a command to the host and settles when the host replies,
 // listen() hears events the host emits, emit() sends one the other way
 
-use super::object::Property;
+use super::object::{JsObject, Property, Shape, Slot};
 use super::operations::plain_object;
 use super::*;
 use crate::bridge::{
@@ -243,7 +243,7 @@ impl ScriptRuntime {
             };
             settled += 1;
             let outcome = match result {
-                Ok(text) => match self.parse_json(&text) {
+                Ok(text) => match self.parse_json_str(&text) {
                     Ok(value) => PromiseOutcome::Fulfilled(value),
                     Err(error) => {
                         let thrown = self.take_thrown(error);
@@ -310,34 +310,133 @@ impl ScriptRuntime {
         if name == super::broadcast::RELAYED {
             return self.receive_broadcast(payload);
         }
-        let listeners = self
-            .bridge
-            .as_ref()
-            .map(|state| {
-                state
-                    .listeners
-                    .iter()
-                    .filter(|(_, listened, _)| listened == name)
-                    .map(|(_, _, callback)| callback.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if listeners.is_empty() {
+        let mut single: Option<Value> = None;
+        let mut many: Vec<Value> = Vec::new();
+        if let Some(state) = self.bridge.as_ref() {
+            for (_, listened, callback) in &state.listeners {
+                if listened == name {
+                    if many.is_empty() {
+                        if let Some(first) = single.take() {
+                            many.push(first);
+                            many.push(callback.clone());
+                        } else {
+                            single = Some(callback.clone());
+                        }
+                    } else {
+                        many.push(callback.clone());
+                    }
+                }
+            }
+        }
+        if single.is_none() && many.is_empty() {
             return Ok(0);
         }
-        let payload = self.parse_json(payload)?;
-        let event = plain_object([
-            ("event".to_string(), Value::String(name.to_string().into())),
-            ("payload".to_string(), payload),
-        ]);
-        for listener in &listeners {
-            if let Err(error) = self.call(listener.clone(), vec![event.clone()]) {
+        let payload = self.parse_json_str(payload)?;
+        thread_local! {
+            static EVENT_SHAPE: Rc<Shape> = Shape::from_keys(&["event", "payload"]);
+        }
+        let shape = EVENT_SHAPE.with(Rc::clone);
+        let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
+        let event = Value::Object(heap.alloc_object_fast(JsObject::from_shape(
+            shape,
+            vec![
+                Slot::Data(Value::String(JsStr::new(name))),
+                Slot::Data(payload),
+            ],
+            Some(self.intrinsics.object_prototype.clone()),
+        )));
+        let delivered = if let Some(listener) = single {
+            let outcome = match Self::simple_closure(&listener) {
+                Some(closure) => {
+                    self.call_simple_closure(&closure, &listener, Value::Undefined, &[event])
+                }
+                None => self.call(listener, vec![event]),
+            };
+            if let Err(error) = outcome {
                 let thrown = self.take_thrown(error);
                 let message = self.thrown_message(&thrown);
                 self.report(format!("uncaught error in a ceri listener: {message}"));
             }
-        }
+            1
+        } else {
+            for listener in &many {
+                let outcome = match Self::simple_closure(listener) {
+                    Some(closure) => self.call_simple_closure(
+                        &closure,
+                        listener,
+                        Value::Undefined,
+                        std::slice::from_ref(&event),
+                    ),
+                    None => self.call(listener.clone(), vec![event.clone()]),
+                };
+                if let Err(error) = outcome {
+                    let thrown = self.take_thrown(error);
+                    let message = self.thrown_message(&thrown);
+                    self.report(format!("uncaught error in a ceri listener: {message}"));
+                }
+            }
+            many.len()
+        };
         self.drain_microtasks()?;
-        Ok(listeners.len())
+        Ok(delivered)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopRouter;
+    impl CommandRouter for NoopRouter {
+        fn invoke(&self, _call: CommandCall, _reply: CommandReply) {}
+    }
+
+    #[test]
+    fn host_events_deliver_non_orphan_json_and_isolate_errors() {
+        let document = crate::dom::Document::parse("<p id='out'></p>").expect("doc");
+        let document = Rc::new(RefCell::new(document));
+        let mut rt = ScriptRuntime::new(document.clone());
+        rt.set_host_bridge(
+            HostBridge::new(Rc::new(NoopRouter), Capabilities::default(), "main"),
+            "https://app.ceri.invalid".to_string(),
+            None,
+        );
+        rt.execute(
+            r#"
+            let seen = [];
+            window.ceri.listen("tick", (e) => {
+                if (Object.getPrototypeOf(e) !== Object.prototype) throw new Error("ev proto");
+                if (Object.getPrototypeOf(e.payload) !== Object.prototype) throw new Error("pl proto");
+                if (e.payload.missing !== undefined) throw new Error("missing");
+                seen.push(e.event + ":" + e.payload.n);
+            });
+            "#,
+        )
+        .expect("listen 1");
+        assert_eq!(rt.dispatch_host_event("other", "{}").expect("0"), 0);
+        for i in 0..25 {
+            let delivered = rt
+                .dispatch_host_event("tick", &format!(r#"{{"n":{i}}}"#))
+                .expect("single");
+            assert_eq!(delivered, 1);
+        }
+        rt.execute(
+            r#"
+            window.ceri.listen("tick", () => { throw new Error("boom"); });
+            window.ceri.listen("tick", (e) => { seen.push("second:" + e.payload.n); });
+            "#,
+        )
+        .expect("listen 2");
+        assert_eq!(
+            rt.dispatch_host_event("tick", r#"{"n":99}"#).expect("many"),
+            3
+        );
+        rt.execute(r#"document.getElementById("out").textContent = seen.length + "|" + seen[seen.length - 1];"#)
+            .expect("write out");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some("27|second:99")
+        );
     }
 }
