@@ -1720,25 +1720,21 @@ impl Browser {
     }
 
     fn find_subresource(&self, url: &AppUrl) -> Result<LoadedResource, NavigationError> {
-        match self.resources.load_subresource(url) {
-            Ok(resource) => Ok(LoadedResource {
-                url: url.clone(),
-                resource,
-            }),
-            Err(NavigationError::ResourceNotFound(path)) => {
-                if let Some(provider) = &self.resource_provider
-                    && let Some((loaded_url, resource)) =
-                        load_provider_resource(provider.as_ref(), url)?
-                {
-                    return Ok(LoadedResource {
-                        url: loaded_url,
-                        resource,
-                    });
-                }
-                Err(NavigationError::ResourceNotFound(path))
-            }
-            Err(error) => Err(error),
-        }
+        find_subresource_in(&self.resources, self.resource_provider.as_deref(), url)
+    }
+
+    fn web_font_fetcher(&self) -> crate::font::WebFontFetcher {
+        let resources = self.resources.clone();
+        let provider = self.resource_provider.clone();
+        Rc::new(move |url: &str| {
+            let parsed = AppUrl::parse(url).ok()?;
+            let sent = crate::netlog::send();
+            let loaded = find_subresource_in(&resources, provider.as_deref(), &parsed);
+            crate::netlog::record(sent, &ResourceRequest::get(parsed.clone()), None, || {
+                recorded(&parsed, &loaded)
+            });
+            loaded.ok().map(|loaded| loaded.resource.body)
+        })
     }
 
     pub fn navigate(&mut self, input: &str) -> Result<NavigationStatus, NavigationError> {
@@ -1901,6 +1897,8 @@ impl Browser {
         for dropped in dropped_rules {
             runtime.report(format!("dropped CSS rule: {dropped}"));
         }
+        self.fonts
+            .set_web_font_fetcher(Some(self.web_font_fetcher()));
         load_web_fonts(&load, &self.fonts, &url, &parsed_stylesheet, &policies);
         runtime.report_refusals();
         let layout_inputs = self.layout_inputs(parsed_stylesheet, sheets, &document.borrow());
@@ -4419,8 +4417,33 @@ fn expand_imports(
     expanded
 }
 
-// fetches each @font-face rule's first source that loads and parses; a rule with none is
-// skipped, and its family falls back to installed faces
+fn find_subresource_in(
+    resources: &ResourceBundle,
+    provider: Option<&dyn ResourceProvider>,
+    url: &AppUrl,
+) -> Result<LoadedResource, NavigationError> {
+    match resources.load_subresource(url) {
+        Ok(resource) => Ok(LoadedResource {
+            url: url.clone(),
+            resource,
+        }),
+        Err(NavigationError::ResourceNotFound(path)) => {
+            if let Some(provider) = provider
+                && let Some((loaded_url, resource)) = load_provider_resource(provider, url)?
+            {
+                return Ok(LoadedResource {
+                    url: loaded_url,
+                    resource,
+                });
+            }
+            Err(NavigationError::ResourceNotFound(path))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+// registers each @font-face rule's resolved and CSP-permitted sources; when a lazy fetcher is
+// installed on the font set, bytes are fetched and decoded on first matching glyph
 fn load_web_fonts(
     load: LoadResource,
     fonts: &FontSet,
@@ -4429,17 +4452,38 @@ fn load_web_fonts(
     policies: &Policies,
 ) {
     fonts.clear_web_faces();
+    let fetcher = fonts.web_font_fetcher();
     for rule in stylesheet.font_faces() {
-        let face = rule.sources.iter().find_map(|source| {
-            let url = base.resolve(source).ok()?;
-            let check = policies.url(Directive::Font, &url.to_string(), Initiator::default());
-            if !policies.permits(check) {
-                return None;
-            }
-            let resource = load(&url).ok()?;
+        let urls: Vec<AppUrl> = rule
+            .sources
+            .iter()
+            .filter_map(|source| {
+                let url = base.resolve(source).ok()?;
+                let check = policies.url(Directive::Font, &url.to_string(), Initiator::default());
+                policies.permits(check).then_some(url)
+            })
+            .collect();
+        if urls.is_empty() {
+            continue;
+        }
+        if let Some(fetcher) = fetcher.clone() {
+            let url_strings: Vec<String> = urls.iter().map(ToString::to_string).collect();
+            fonts.add_lazy_web_face(
+                &rule.family,
+                rule.weights,
+                rule.italic,
+                rule.ranges.clone(),
+                Rc::new(move || {
+                    url_strings.iter().find_map(|url| {
+                        let body = fetcher(url)?;
+                        crate::font::FontFace::parse(body).ok().map(Rc::new)
+                    })
+                }),
+            );
+        } else if let Some(face) = urls.iter().find_map(|url| {
+            let resource = load(url).ok()?;
             crate::font::FontFace::parse(resource.body).ok()
-        });
-        if let Some(face) = face {
+        }) {
             fonts.add_web_face(
                 &rule.family,
                 rule.weights,

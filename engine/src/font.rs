@@ -1401,34 +1401,103 @@ impl FontSource for SingleFaceSource {
     }
 }
 
+pub(crate) type WebFontFetcher = Rc<dyn Fn(&str) -> Option<Vec<u8>>>;
+type WebFontLoader = Rc<dyn Fn() -> Option<Rc<FontFace>>>;
+
+struct LazyWebFace {
+    loader: WebFontLoader,
+    loaded: std::cell::OnceCell<Option<Rc<FontFace>>>,
+}
+
+impl LazyWebFace {
+    fn resolve(&self) -> Option<Rc<FontFace>> {
+        self.loaded.get_or_init(|| (self.loader)()).clone()
+    }
+}
+
+#[derive(Clone)]
+enum FaceSource {
+    Ready(Rc<FontFace>),
+    Lazy(Rc<LazyWebFace>),
+}
+
+impl FaceSource {
+    fn resolve(&self) -> Option<Rc<FontFace>> {
+        match self {
+            Self::Ready(face) => Some(face.clone()),
+            Self::Lazy(lazy) => lazy.resolve(),
+        }
+    }
+
+    fn same_source(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ready(left), Self::Ready(right)) => Rc::ptr_eq(left, right),
+            (Self::Lazy(left), Self::Lazy(right)) => Rc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+#[inline]
+fn range_contains(ranges: &[(u32, u32)], character: char) -> bool {
+    if ranges.is_empty() {
+        return true;
+    }
+    let point = u32::from(character);
+    ranges
+        .iter()
+        .any(|&(first, last)| (first..=last).contains(&point))
+}
+
+type PrimaryFace = (Rc<FontFace>, Option<(u16, u16)>);
+
 // a face loaded from an @font-face rule, for one family, weight range and slant
 struct WebFace {
     family: String,
-    weights: (u16, u16),
+    // none when @font-face omitted font-weight; variable faces use their wght range once loaded
+    weights: Option<(u16, u16)>,
     italic: bool,
     // code point ranges the face is used for, all of them when empty
     ranges: Rc<[(u32, u32)]>,
-    face: Rc<FontFace>,
+    source: FaceSource,
+}
+
+impl WebFace {
+    fn match_weights(&self) -> (u16, u16) {
+        if let Some(weights) = self.weights {
+            return weights;
+        }
+        match &self.source {
+            FaceSource::Ready(face) => face.weight_range(),
+            FaceSource::Lazy(lazy) => lazy
+                .loaded
+                .get()
+                .and_then(|loaded| loaded.as_ref())
+                .map_or((400, 400), |face| face.weight_range()),
+        }
+    }
 }
 
 // a face in a stack, limited to an @font-face unicode-range when it has one, and the weights
 // it is used for
 #[derive(Clone)]
 struct StackFace {
-    face: Rc<FontFace>,
+    source: FaceSource,
     ranges: Rc<[(u32, u32)]>,
-    weights: (u16, u16),
+    weights: Option<(u16, u16)>,
 }
 
 impl StackFace {
-    fn covers(&self, character: char) -> bool {
-        let point = u32::from(character);
-        (self.ranges.is_empty()
-            || self
-                .ranges
-                .iter()
-                .any(|&(first, last)| (first..=last).contains(&point)))
-            && self.face.has_glyph(character)
+    fn covers(&self, character: char) -> Option<Rc<FontFace>> {
+        if !range_contains(&self.ranges, character) {
+            return None;
+        }
+        let face = self.source.resolve()?;
+        face.has_glyph(character).then_some(face)
+    }
+
+    fn weights_for(&self, face: &FontFace) -> (u16, u16) {
+        self.weights.unwrap_or_else(|| face.weight_range())
     }
 }
 
@@ -1463,10 +1532,14 @@ type ColorGlyphCache = HashMap<(GlyphKey, [u8; 4]), Option<Rc<ColorGlyph>>>;
 pub struct FontSet {
     source: Option<Rc<dyn FontSource>>,
     web_faces: RefCell<Vec<WebFace>>,
+    web_font_fetcher: RefCell<Option<WebFontFetcher>>,
+    // cached answer to whether any registered web face actually loads when no system source exists
+    has_usable_web_face: Cell<Option<bool>>,
     // counts the changes to the web faces, which change what text measures
     web_face_changes: Cell<u64>,
     // the faces a stack's families supply, in order
     stacks: RefCell<HashMap<(FontStack, FontStyle), FaceList>>,
+    primaries: RefCell<HashMap<(FontStack, FontStyle), Option<PrimaryFace>>>,
     fallbacks: RefCell<FallbackCache>,
     shaped: RefCell<HashMap<ShapeKey, Rc<ShapedRun>>>,
     glyphs: RefCell<HashMap<GlyphKey, Option<Rc<GlyphBitmap>>>>,
@@ -1485,13 +1558,24 @@ impl FontSet {
         Self {
             source: None,
             web_faces: RefCell::default(),
+            web_font_fetcher: RefCell::default(),
+            has_usable_web_face: Cell::new(None),
             web_face_changes: Cell::new(0),
             stacks: RefCell::default(),
+            primaries: RefCell::default(),
             fallbacks: RefCell::default(),
             shaped: RefCell::default(),
             glyphs: RefCell::default(),
             color_glyphs: RefCell::default(),
         }
+    }
+
+    pub(crate) fn set_web_font_fetcher(&self, fetcher: Option<WebFontFetcher>) {
+        *self.web_font_fetcher.borrow_mut() = fetcher;
+    }
+
+    pub(crate) fn web_font_fetcher(&self) -> Option<WebFontFetcher> {
+        self.web_font_fetcher.borrow().clone()
     }
 
     pub fn from_source(source: Rc<dyn FontSource>) -> Self {
@@ -1510,7 +1594,35 @@ impl FontSet {
     }
 
     pub fn is_builtin(&self) -> bool {
-        self.source.is_none() && self.web_faces.borrow().is_empty()
+        if self.source.is_some() {
+            return false;
+        }
+        if let Some(has_usable) = self.has_usable_web_face.get() {
+            return !has_usable;
+        }
+        let faces = self.web_faces.borrow();
+        if faces.is_empty() {
+            self.has_usable_web_face.set(Some(false));
+            return true;
+        }
+        if faces
+            .iter()
+            .any(|web| matches!(web.source, FaceSource::Ready(_)))
+        {
+            self.has_usable_web_face.set(Some(true));
+            return false;
+        }
+        // prefer a face covering space so unused unicode-range subsets stay unloaded
+        let has_usable = faces
+            .iter()
+            .filter(|web| range_contains(&web.ranges, ' '))
+            .any(|web| web.source.resolve().is_some())
+            || faces
+                .iter()
+                .filter(|web| !range_contains(&web.ranges, ' '))
+                .any(|web| web.source.resolve().is_some());
+        self.has_usable_web_face.set(Some(has_usable));
+        !has_usable
     }
 
     // registers a face from an @font-face rule; it is chosen before installed faces, and a
@@ -1523,15 +1635,55 @@ impl FontSet {
         ranges: Vec<(u32, u32)>,
         face: Rc<FontFace>,
     ) {
+        self.push_web_face(
+            family,
+            Some(weights.unwrap_or_else(|| face.weight_range())),
+            italic,
+            ranges,
+            FaceSource::Ready(face),
+        );
+    }
+
+    // registers an @font-face rule whose bytes fetch and parse on first matching glyph
+    pub(crate) fn add_lazy_web_face(
+        &self,
+        family: &str,
+        weights: Option<(u16, u16)>,
+        italic: bool,
+        ranges: Vec<(u32, u32)>,
+        loader: Rc<dyn Fn() -> Option<Rc<FontFace>>>,
+    ) {
+        self.push_web_face(
+            family,
+            weights,
+            italic,
+            ranges,
+            FaceSource::Lazy(Rc::new(LazyWebFace {
+                loader,
+                loaded: std::cell::OnceCell::new(),
+            })),
+        );
+    }
+
+    fn push_web_face(
+        &self,
+        family: &str,
+        weights: Option<(u16, u16)>,
+        italic: bool,
+        ranges: Vec<(u32, u32)>,
+        source: FaceSource,
+    ) {
         self.web_faces.borrow_mut().push(WebFace {
             family: family.to_ascii_lowercase(),
-            weights: weights.unwrap_or_else(|| face.weight_range()),
+            weights,
             italic,
             ranges: ranges.into(),
-            face,
+            source,
         });
+        self.has_usable_web_face.set(None);
         self.web_face_changes.set(self.web_face_changes.get() + 1);
         self.stacks.borrow_mut().clear();
+        self.primaries.borrow_mut().clear();
         self.fallbacks.borrow_mut().clear();
         self.shaped.borrow_mut().clear();
     }
@@ -1539,8 +1691,10 @@ impl FontSet {
     pub(crate) fn clear_web_faces(&self) {
         if !self.web_faces.borrow().is_empty() {
             self.web_faces.borrow_mut().clear();
+            self.has_usable_web_face.set(None);
             self.web_face_changes.set(self.web_face_changes.get() + 1);
             self.stacks.borrow_mut().clear();
+            self.primaries.borrow_mut().clear();
             self.fallbacks.borrow_mut().clear();
             self.shaped.borrow_mut().clear();
             self.glyphs.borrow_mut().clear();
@@ -1870,8 +2024,11 @@ impl FontSet {
         style: FontStyle,
     ) -> Option<ChosenFace> {
         let faces = self.stack_faces(stack, style);
-        if let Some(entry) = faces.iter().find(|entry| entry.covers(character)) {
-            return Some(ChosenFace::new(&entry.face, style, entry.weights));
+        for entry in faces.iter() {
+            if let Some(face) = entry.covers(character) {
+                let weights = entry.weights_for(&face);
+                return Some(ChosenFace::new(&face, style, weights));
+            }
         }
         if !character.is_whitespace()
             && !character.is_control()
@@ -1879,9 +2036,11 @@ impl FontSet {
         {
             return Some(ChosenFace::new(&face, style, face.weight_range()));
         }
-        faces
-            .first()
-            .map(|entry| ChosenFace::new(&entry.face, style, entry.weights))
+        self.primary_entry(stack, style, &faces)
+            .map(|(face, weights)| {
+                let weights = weights.unwrap_or_else(|| face.weight_range());
+                ChosenFace::new(&face, style, weights)
+            })
     }
 
     fn emoji_face(&self, character: char, style: FontStyle) -> Option<ChosenFace> {
@@ -1891,9 +2050,42 @@ impl FontSet {
     }
 
     fn primary(&self, stack: FontStack, style: FontStyle) -> Option<Rc<FontFace>> {
-        self.stack_faces(stack, style)
-            .first()
-            .map(|entry| entry.face.clone())
+        if let Some(cached) = self.primaries.borrow().get(&(stack, style)) {
+            return cached.as_ref().map(|(face, _)| face.clone());
+        }
+        let faces = self.stack_faces(stack, style);
+        self.primary_entry(stack, style, &faces)
+            .map(|(face, _)| face)
+    }
+
+    fn primary_entry(
+        &self,
+        stack: FontStack,
+        style: FontStyle,
+        faces: &[StackFace],
+    ) -> Option<PrimaryFace> {
+        if let Some(cached) = self.primaries.borrow().get(&(stack, style)) {
+            return cached.clone();
+        }
+        let entry = self.primary_from(faces);
+        self.primaries
+            .borrow_mut()
+            .insert((stack, style), entry.clone());
+        entry
+    }
+
+    fn primary_from(&self, faces: &[StackFace]) -> Option<PrimaryFace> {
+        // prefer the first available face covering space so unused unicode-range subsets do not
+        // load solely to answer line metrics
+        faces
+            .iter()
+            .filter(|entry| range_contains(&entry.ranges, ' '))
+            .find_map(|entry| entry.source.resolve().map(|face| (face, entry.weights)))
+            .or_else(|| {
+                faces
+                    .iter()
+                    .find_map(|entry| entry.source.resolve().map(|face| (face, entry.weights)))
+            })
     }
 
     fn fallback(&self, character: char, style: FontStyle) -> Option<Rc<FontFace>> {
@@ -1904,8 +2096,11 @@ impl FontSet {
             .web_faces
             .borrow()
             .iter()
-            .find(|web| web.face.has_glyph(character))
-            .map(|web| web.face.clone())
+            .filter(|web| range_contains(&web.ranges, character))
+            .find_map(|web| {
+                let face = web.source.resolve()?;
+                face.has_glyph(character).then_some(face)
+            })
             .or_else(|| self.source.as_ref()?.fallback(character, style));
         self.fallbacks
             .borrow_mut()
@@ -1926,10 +2121,9 @@ impl FontSet {
         let mut faces: Vec<StackFace> = Vec::new();
         let families = font_stack_families(stack);
         let mut push = |entry: StackFace| {
-            if !faces
-                .iter()
-                .any(|known| Rc::ptr_eq(&known.face, &entry.face) && known.ranges == entry.ranges)
-            {
+            if !faces.iter().any(|known| {
+                known.source.same_source(&entry.source) && known.ranges == entry.ranges
+            }) {
                 faces.push(entry);
             }
         };
@@ -1950,8 +2144,8 @@ impl FontSet {
                 .and_then(|source| source.face(family, style))
             {
                 push(StackFace {
-                    weights: face.weight_range(),
-                    face,
+                    weights: Some(face.weight_range()),
+                    source: FaceSource::Ready(face),
                     ranges: Rc::from([]),
                 });
             }
@@ -1972,7 +2166,7 @@ impl FontSet {
             .filter(|web| web.family == family)
             .collect::<Vec<_>>();
         let distance = |web: &&WebFace| {
-            let (low, high) = web.weights;
+            let (low, high) = web.match_weights();
             let weight = if style.weight < low {
                 low - style.weight
             } else {
@@ -1984,7 +2178,7 @@ impl FontSet {
         matching
             .into_iter()
             .map(|web| StackFace {
-                face: web.face.clone(),
+                source: web.source.clone(),
                 ranges: web.ranges.clone(),
                 weights: web.weights,
             })
@@ -2913,5 +3107,66 @@ mod tests {
             fonts.measure("A", other, 1000.0, FontStyle::NORMAL),
             builtin_advance(1000.0)
         );
+    }
+
+    #[test]
+    fn lazy_web_faces_load_only_matching_unicode_ranges() {
+        let fonts = FontSet::builtin();
+        let latin_loads = Rc::new(Cell::new(0usize));
+        let cyrillic_loads = Rc::new(Cell::new(0usize));
+        let latin_count = latin_loads.clone();
+        let cyrillic_count = cyrillic_loads.clone();
+        fonts.add_lazy_web_face(
+            "Lazy Face",
+            Some((400, 400)),
+            false,
+            vec![(0x0400, 0x04ff)],
+            Rc::new(move || {
+                cyrillic_count.set(cyrillic_count.get() + 1);
+                FontFace::parse(synthetic_font()).ok().map(Rc::new)
+            }),
+        );
+        fonts.add_lazy_web_face(
+            "Lazy Face",
+            Some((400, 400)),
+            false,
+            vec![(0x0000, 0x00ff)],
+            Rc::new(move || {
+                latin_count.set(latin_count.get() + 1);
+                FontFace::parse(synthetic_font()).ok().map(Rc::new)
+            }),
+        );
+        assert_eq!(latin_loads.get(), 0);
+        assert_eq!(cyrillic_loads.get(), 0);
+
+        let stack = intern_font_stack("Lazy Face");
+        assert!((fonts.measure("AA", stack, 100.0, FontStyle::NORMAL) - 120.0).abs() < 0.01);
+        assert_eq!(latin_loads.get(), 1);
+        assert_eq!(cyrillic_loads.get(), 0);
+
+        // line metrics pick the space-covering subset without touching unused ranges
+        let _ = fonts.line_height(stack, 16.0);
+        assert_eq!(latin_loads.get(), 1);
+        assert_eq!(cyrillic_loads.get(), 0);
+    }
+
+    #[test]
+    fn builtin_stays_builtin_when_all_lazy_web_faces_fail_to_load() {
+        let fonts = FontSet::builtin();
+        let attempts = Rc::new(Cell::new(0usize));
+        let count = attempts.clone();
+        fonts.add_lazy_web_face(
+            "Missing Face",
+            Some((400, 400)),
+            false,
+            Vec::new(),
+            Rc::new(move || {
+                count.set(count.get() + 1);
+                None
+            }),
+        );
+        assert!(fonts.is_builtin());
+        assert!(fonts.is_builtin());
+        assert_eq!(attempts.get(), 1);
     }
 }

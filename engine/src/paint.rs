@@ -484,21 +484,59 @@ impl Canvas {
         };
         if unmasked {
             let stride = self.width as usize * 4;
+            let dst_left = (x + col_start as i32) as usize;
+            let dst_right = (x + col_end as i32) as usize;
+            let opaque_color = color.alpha == 255;
+            let color_alpha = u16::from(color.alpha);
+            if !glyph.subpixels {
+                for row in row_start..row_end {
+                    let pixel_y = (y + row as i32) as usize;
+                    let row_pixels = &mut self.pixels[pixel_y * stride..(pixel_y + 1) * stride];
+                    let dst_row = &mut row_pixels.as_chunks_mut::<4>().0[dst_left..dst_right];
+                    let glyph_row = row * glyph.width;
+                    let src_row = &glyph.coverage[glyph_row + col_start..glyph_row + col_end];
+                    if opaque_color {
+                        for (pixel, &raw) in dst_row.iter_mut().zip(src_row.iter()) {
+                            let coverage = gamma[usize::from(raw)];
+                            if coverage != 0 {
+                                blend_rgba(
+                                    pixel,
+                                    Color {
+                                        alpha: coverage,
+                                        ..color
+                                    },
+                                );
+                            }
+                        }
+                    } else {
+                        for (pixel, &raw) in dst_row.iter_mut().zip(src_row.iter()) {
+                            let coverage = gamma[usize::from(raw)];
+                            if coverage != 0 {
+                                let prod = color_alpha * u16::from(coverage);
+                                let alpha = ((prod + 1 + (prod >> 8)) >> 8) as u8;
+                                blend_rgba(pixel, Color { alpha, ..color });
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             for row in row_start..row_end {
                 let pixel_y = (y + row as i32) as usize;
                 let row_pixels = &mut self.pixels[pixel_y * stride..(pixel_y + 1) * stride];
+                let pixels = row_pixels.as_chunks_mut::<4>().0;
                 let glyph_row = row * glyph.width;
                 for column in col_start..col_end {
                     let coverage = gamma[usize::from(coverage_at(glyph_row + column))];
                     if coverage == 0 {
                         continue;
                     }
-                    let alpha = (u32::from(color.alpha) * u32::from(coverage) / 255) as u8;
-                    let at = (x + column as i32) as usize * 4;
-                    let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
-                        .try_into()
-                        .expect("four bytes per pixel");
-                    blend_rgba(pixel, Color { alpha, ..color });
+                    let prod = color_alpha * u16::from(coverage);
+                    let alpha = ((prod + 1 + (prod >> 8)) >> 8) as u8;
+                    blend_rgba(
+                        &mut pixels[(x + column as i32) as usize],
+                        Color { alpha, ..color },
+                    );
                 }
             }
             return;
@@ -714,42 +752,78 @@ impl Canvas {
             }
             _ => None,
         };
-        let mut columns = None;
+        enum BlendLut {
+            Gray(Box<[[u8; 256]; 2]>),
+            Rgba(Box<[[u8; 256]; 4]>),
+        }
+        struct DownColumns {
+            non_zero: Vec<(u32, Color)>,
+            uniform: Option<Color>,
+            stride_step: Option<usize>,
+            blend_lut: Option<BlendLut>,
+        }
+        let mut columns: Option<DownColumns> = None;
+        let whole_all = device.contains_whole_rect(left, top, right, bottom);
+        // rows clear of all four corner curves and half a pixel inside top/bottom share one whole_run
+        let (straight_top, straight_bot, straight_whole) = if whole_all {
+            (0.0, 0.0, None)
+        } else {
+            let top_corner = device.radii[0].1.max(device.radii[1].1).min(device.height);
+            let bot_corner = device.radii[2].1.max(device.radii[3].1).min(device.height);
+            let st = device.y + top_corner.max(0.5);
+            let sb = device.y + device.height - bot_corner.max(0.5);
+            if st < sb {
+                (st, sb, Some(device.whole_run((st + sb) * 0.5, left..right)))
+            } else {
+                (0.0, 0.0, None)
+            }
+        };
         for pixel_y in top..bottom {
             let row = pixel_y as f32 + 0.5;
             // most of a row lies whole inside the shape, where only the paint is asked for
-            let whole = device.whole_run(row, left..right);
-            if unmasked_all {
-                let row_pixels =
-                    &mut self.pixels[pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
-                for pixel_x in (left..whole.start).chain(whole.end..right) {
-                    let center = (pixel_x as f32 + 0.5, row);
-                    let coverage = device.coverage(center);
-                    if coverage <= 0.0 {
-                        continue;
-                    }
-                    let color = paint.pixel_color(steady, center);
-                    if color.alpha == 0 {
-                        continue;
-                    }
-                    let at = pixel_x as usize * 4;
-                    let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
-                        .try_into()
-                        .expect("four bytes per pixel");
-                    blend_rgba(pixel, color.scale_alpha(coverage.min(1.0)));
-                }
+            let whole = if whole_all {
+                left..right
+            } else if let Some(ref straight) = straight_whole
+                && row >= straight_top
+                && row <= straight_bot
+            {
+                straight.clone()
             } else {
-                for pixel_x in (left..whole.start).chain(whole.end..right) {
-                    let center = (pixel_x as f32 + 0.5, row);
-                    let coverage = device.coverage(center);
-                    if coverage <= 0.0 {
-                        continue;
+                device.whole_run(row, left..right)
+            };
+            if whole.start > left || whole.end < right {
+                if unmasked_all {
+                    let row_pixels = &mut self.pixels
+                        [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                    for pixel_x in (left..whole.start).chain(whole.end..right) {
+                        let center = (pixel_x as f32 + 0.5, row);
+                        let coverage = device.coverage(center);
+                        if coverage <= 0.0 {
+                            continue;
+                        }
+                        let color = paint.pixel_color(steady, center);
+                        if color.alpha == 0 {
+                            continue;
+                        }
+                        let at = pixel_x as usize * 4;
+                        let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
+                            .try_into()
+                            .expect("four bytes per pixel");
+                        blend_rgba(pixel, color.scale_alpha(coverage.min(1.0)));
                     }
-                    let color = paint.pixel_color(steady, center);
-                    if color.alpha == 0 {
-                        continue;
+                } else {
+                    for pixel_x in (left..whole.start).chain(whole.end..right) {
+                        let center = (pixel_x as f32 + 0.5, row);
+                        let coverage = device.coverage(center);
+                        if coverage <= 0.0 {
+                            continue;
+                        }
+                        let color = paint.pixel_color(steady, center);
+                        if color.alpha == 0 {
+                            continue;
+                        }
+                        self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage.min(1.0)));
                     }
-                    self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage.min(1.0)));
                 }
             }
             let color_at = |pixel_x: u32| paint.color_at((pixel_x as f32 + 0.5, row));
@@ -828,7 +902,12 @@ impl Canvas {
                     if !paint.covers_row(row) {
                         continue;
                     }
-                    let (non_zero, uniform) = columns.get_or_insert_with(|| {
+                    let DownColumns {
+                        non_zero,
+                        uniform,
+                        stride_step,
+                        blend_lut,
+                    } = columns.get_or_insert_with(|| {
                         let non_zero: Vec<(u32, Color)> = (left..right)
                             .filter_map(|px| {
                                 let color = color_at(px);
@@ -841,7 +920,50 @@ impl Canvas {
                                 .all(|&(_, color)| color == first)
                                 .then_some(first)
                         });
-                        (non_zero, uniform)
+                        // detect constant horizontal stride (e.g. repeating 90deg stripe gradients)
+                        let stride_step = (uniform.is_some() && non_zero.len() >= 2)
+                            .then(|| {
+                                let step = non_zero[1].0 - non_zero[0].0;
+                                (step > 0
+                                    && non_zero
+                                        .windows(2)
+                                        .all(|pair| pair[1].0 - pair[0].0 == step))
+                                .then_some(step as usize)
+                            })
+                            .flatten();
+                        // precompute exact 256-entry blend tables when blending many strided pixels
+                        let blend_lut = uniform.and_then(|color| {
+                            let rows = (bottom - pixel_y) as usize;
+                            if color.alpha == 255 || non_zero.len().saturating_mul(rows) < 256 {
+                                return None;
+                            }
+                            let alpha = u16::from(color.alpha);
+                            let inverse = 255 - alpha;
+                            let make_lut = |src: u16| -> [u8; 256] {
+                                std::array::from_fn(|dst| {
+                                    let sum = src + dst as u16 * inverse;
+                                    ((sum + 1 + (sum >> 8)) >> 8) as u8
+                                })
+                            };
+                            let a_lut = make_lut(alpha * 255);
+                            if color.red == color.green && color.green == color.blue {
+                                let rgb_lut = make_lut(u16::from(color.red) * alpha);
+                                Some(BlendLut::Gray(Box::new([rgb_lut, a_lut])))
+                            } else {
+                                Some(BlendLut::Rgba(Box::new([
+                                    make_lut(u16::from(color.red) * alpha),
+                                    make_lut(u16::from(color.green) * alpha),
+                                    make_lut(u16::from(color.blue) * alpha),
+                                    a_lut,
+                                ])))
+                            }
+                        });
+                        DownColumns {
+                            non_zero,
+                            uniform,
+                            stride_step,
+                            blend_lut,
+                        }
                     });
                     if non_zero.is_empty() || whole.is_empty() {
                         continue;
@@ -872,41 +994,109 @@ impl Canvas {
                     if !active.is_empty() {
                         let row_pixels = &mut self.pixels
                             [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                        let pixels = row_pixels.as_chunks_mut::<4>().0;
                         if let Some(color) = *uniform {
                             if color.alpha == 255 {
                                 let rgba = [color.red, color.green, color.blue, 255];
-                                for &(pixel_x, _) in active {
-                                    let at = pixel_x as usize * 4;
-                                    row_pixels[at..at + 4].copy_from_slice(&rgba);
+                                if let Some(step) = *stride_step {
+                                    let first_x = active[0].0 as usize;
+                                    let last_x = active[active.len() - 1].0 as usize;
+                                    for pixel in pixels[first_x..=last_x].iter_mut().step_by(step) {
+                                        *pixel = rgba;
+                                    }
+                                } else {
+                                    for &(pixel_x, _) in active {
+                                        pixels[pixel_x as usize] = rgba;
+                                    }
+                                }
+                            } else if let Some(lut) = blend_lut.as_ref() {
+                                match lut {
+                                    BlendLut::Gray(tables) => {
+                                        let [rgb, a] = &**tables;
+                                        if let Some(step) = *stride_step {
+                                            let first_x = active[0].0 as usize;
+                                            let last_x = active[active.len() - 1].0 as usize;
+                                            for pixel in
+                                                pixels[first_x..=last_x].iter_mut().step_by(step)
+                                            {
+                                                pixel[0] = rgb[usize::from(pixel[0])];
+                                                pixel[1] = rgb[usize::from(pixel[1])];
+                                                pixel[2] = rgb[usize::from(pixel[2])];
+                                                pixel[3] = a[usize::from(pixel[3])];
+                                            }
+                                        } else {
+                                            for &(pixel_x, _) in active {
+                                                let pixel = &mut pixels[pixel_x as usize];
+                                                pixel[0] = rgb[usize::from(pixel[0])];
+                                                pixel[1] = rgb[usize::from(pixel[1])];
+                                                pixel[2] = rgb[usize::from(pixel[2])];
+                                                pixel[3] = a[usize::from(pixel[3])];
+                                            }
+                                        }
+                                    }
+                                    BlendLut::Rgba(tables) => {
+                                        let [r, g, b, a] = &**tables;
+                                        if let Some(step) = *stride_step {
+                                            let first_x = active[0].0 as usize;
+                                            let last_x = active[active.len() - 1].0 as usize;
+                                            for pixel in
+                                                pixels[first_x..=last_x].iter_mut().step_by(step)
+                                            {
+                                                pixel[0] = r[usize::from(pixel[0])];
+                                                pixel[1] = g[usize::from(pixel[1])];
+                                                pixel[2] = b[usize::from(pixel[2])];
+                                                pixel[3] = a[usize::from(pixel[3])];
+                                            }
+                                        } else {
+                                            for &(pixel_x, _) in active {
+                                                let pixel = &mut pixels[pixel_x as usize];
+                                                pixel[0] = r[usize::from(pixel[0])];
+                                                pixel[1] = g[usize::from(pixel[1])];
+                                                pixel[2] = b[usize::from(pixel[2])];
+                                                pixel[3] = a[usize::from(pixel[3])];
+                                            }
+                                        }
+                                    }
                                 }
                             } else {
-                                let alpha = color.alpha as u32;
+                                let alpha = u16::from(color.alpha);
                                 let inverse = 255 - alpha;
                                 let (sr, sg, sb, sa) = (
-                                    color.red as u32 * alpha,
-                                    color.green as u32 * alpha,
-                                    color.blue as u32 * alpha,
+                                    u16::from(color.red) * alpha,
+                                    u16::from(color.green) * alpha,
+                                    u16::from(color.blue) * alpha,
                                     alpha * 255,
                                 );
-                                for &(pixel_x, _) in active {
-                                    let at = pixel_x as usize * 4;
-                                    row_pixels[at] =
-                                        ((sr + row_pixels[at] as u32 * inverse) / 255) as u8;
-                                    row_pixels[at + 1] =
-                                        ((sg + row_pixels[at + 1] as u32 * inverse) / 255) as u8;
-                                    row_pixels[at + 2] =
-                                        ((sb + row_pixels[at + 2] as u32 * inverse) / 255) as u8;
-                                    row_pixels[at + 3] =
-                                        ((sa + row_pixels[at + 3] as u32 * inverse) / 255) as u8;
+                                if let Some(step) = *stride_step {
+                                    let first_x = active[0].0 as usize;
+                                    let last_x = active[active.len() - 1].0 as usize;
+                                    for pixel in pixels[first_x..=last_x].iter_mut().step_by(step) {
+                                        let r = sr + u16::from(pixel[0]) * inverse;
+                                        let g = sg + u16::from(pixel[1]) * inverse;
+                                        let b = sb + u16::from(pixel[2]) * inverse;
+                                        let a = sa + u16::from(pixel[3]) * inverse;
+                                        pixel[0] = ((r + 1 + (r >> 8)) >> 8) as u8;
+                                        pixel[1] = ((g + 1 + (g >> 8)) >> 8) as u8;
+                                        pixel[2] = ((b + 1 + (b >> 8)) >> 8) as u8;
+                                        pixel[3] = ((a + 1 + (a >> 8)) >> 8) as u8;
+                                    }
+                                } else {
+                                    for &(pixel_x, _) in active {
+                                        let pixel = &mut pixels[pixel_x as usize];
+                                        let r = sr + u16::from(pixel[0]) * inverse;
+                                        let g = sg + u16::from(pixel[1]) * inverse;
+                                        let b = sb + u16::from(pixel[2]) * inverse;
+                                        let a = sa + u16::from(pixel[3]) * inverse;
+                                        pixel[0] = ((r + 1 + (r >> 8)) >> 8) as u8;
+                                        pixel[1] = ((g + 1 + (g >> 8)) >> 8) as u8;
+                                        pixel[2] = ((b + 1 + (b >> 8)) >> 8) as u8;
+                                        pixel[3] = ((a + 1 + (a >> 8)) >> 8) as u8;
+                                    }
                                 }
                             }
                         } else {
                             for &(pixel_x, color) in active {
-                                let at = pixel_x as usize * 4;
-                                let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
-                                    .try_into()
-                                    .expect("four bytes per pixel");
-                                blend_rgba(pixel, color);
+                                blend_rgba(&mut pixels[pixel_x as usize], color);
                             }
                         }
                     }
@@ -1104,7 +1294,31 @@ impl Canvas {
             .ceil()
             .clamp(0.0, self.height as f32) as u32;
         let [left, top, right, bottom] = narrow([left, top, right, bottom], clip);
+        if left >= right || top >= bottom {
+            return;
+        }
+        // a clip strictly inside the padding box touches no border pixels
+        if hollow && inner.contains_whole_rect(left, top, right, bottom) {
+            return;
+        }
+        let mut drawn = (0..4).filter(|&side| widths[side] > 0.0);
+        let Some(first_side) = drawn.next() else {
+            return;
+        };
+        let first_color = sides.colors[first_side];
+        let uniform_solid = (sides.styles[first_side] == BorderStyle::Solid
+            && drawn.all(|side| {
+                sides.styles[side] == BorderStyle::Solid && sides.colors[side] == first_color
+            }))
+        .then_some(first_color);
+        if let Some(color) = uniform_solid
+            && color.alpha == 0
+        {
+            return;
+        }
         let _profile = crate::profile::scope("paint: border");
+        let unmasked_all = self.masks_cover_rect(left, top, right, bottom);
+        let stride = self.width as usize * 4;
         for pixel_y in top..bottom {
             let row = pixel_y as f32 + 0.5;
             // the ring leaves out what lies whole inside the inner shape
@@ -1113,6 +1327,43 @@ impl Canvas {
             } else {
                 left..left
             };
+            if inside.start <= left && inside.end >= right {
+                continue;
+            }
+            if let Some(color) = uniform_solid {
+                if unmasked_all {
+                    let row_pixels = &mut self.pixels
+                        [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                    let pixels = row_pixels.as_chunks_mut::<4>().0;
+                    for pixel_x in (left..inside.start).chain(inside.end..right) {
+                        let center = (pixel_x as f32 + 0.5, row);
+                        let mut coverage = outer.coverage(center);
+                        if hollow {
+                            coverage *= 1.0 - inner.coverage(center);
+                        }
+                        if coverage <= 0.0 {
+                            continue;
+                        }
+                        blend_rgba(
+                            &mut pixels[pixel_x as usize],
+                            color.scale_alpha(coverage.min(1.0)),
+                        );
+                    }
+                } else {
+                    for pixel_x in (left..inside.start).chain(inside.end..right) {
+                        let center = (pixel_x as f32 + 0.5, row);
+                        let mut coverage = outer.coverage(center);
+                        if hollow {
+                            coverage *= 1.0 - inner.coverage(center);
+                        }
+                        if coverage <= 0.0 {
+                            continue;
+                        }
+                        self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage.min(1.0)));
+                    }
+                }
+                continue;
+            }
             for pixel_x in (left..inside.start).chain(inside.end..right) {
                 let center = (pixel_x as f32 + 0.5, row);
                 let mut coverage = outer.coverage(center);
@@ -1425,11 +1676,68 @@ impl Canvas {
         } else {
             [0.0; 4]
         };
+        if !inset && frame.contains_whole_rect(left, top, right, bottom) {
+            return;
+        }
+        if inset && sigma < 0.5 && shape.contains_whole_rect(left, top, right, bottom) {
+            return;
+        }
+        if inset
+            && hollow[0] < hollow[2]
+            && hollow[1] < hollow[3]
+            && left as f32 >= hollow[0]
+            && right as f32 <= hollow[2]
+            && top as f32 >= hollow[1]
+            && bottom as f32 <= hollow[3]
+        {
+            return;
+        }
         let frame_square = frame.is_square();
         let frame_touch_x = narrow_axis(left..right, frame.x, frame.width);
         let shape_touch_x = narrow_axis(left..right, shape.x, shape.width);
         let unmasked_all = self.masks_cover_rect(left, top, right, bottom);
         let stride = self.width as usize * 4;
+        // rows clear of all four corner curves share one frame whole_run
+        let (frame_st, frame_sb, straight_frame_whole) = {
+            let top_c = frame.radii[0].1.max(frame.radii[1].1).min(frame.height);
+            let bot_c = frame.radii[2].1.max(frame.radii[3].1).min(frame.height);
+            let st = frame.y + top_c.max(0.5);
+            let sb = frame.y + frame.height - bot_c.max(0.5);
+            if st < sb {
+                (st, sb, Some(frame.whole_run((st + sb) * 0.5, left..right)))
+            } else {
+                (0.0, 0.0, None)
+            }
+        };
+        let shape_square = shape.is_square();
+        let (sharp_st, sharp_sb, straight_sharp_whole) = if !shape_square && sigma < 0.5 {
+            let top_c = shape.radii[0].1.max(shape.radii[1].1).min(shape.height);
+            let bot_c = shape.radii[2].1.max(shape.radii[3].1).min(shape.height);
+            let st = shape.y + top_c.max(0.5);
+            let sb = shape.y + shape.height - bot_c.max(0.5);
+            if st < sb {
+                (st, sb, Some(shape.whole_run((st + sb) * 0.5, left..right)))
+            } else {
+                (0.0, 0.0, None)
+            }
+        } else {
+            (0.0, 0.0, None)
+        };
+        // straight-sided rows clear of corners and blur reach share identical rounded blur rows
+        let shape_mid_y = shape.y + shape.height / 2.0;
+        let rounded_straight_limit = if !shape_square && sigma >= 0.5 {
+            let max_r = shape
+                .radii
+                .iter()
+                .fold(0.0_f32, |most, &(rx, ry)| most.max((rx + ry) / 2.0))
+                .min(shape.width / 2.0)
+                .min(shape.height / 2.0);
+            shape.height / 2.0 - max_r - 3.0 * sigma
+        } else {
+            -1.0
+        };
+        let mut straight_blurred_top: Option<BlurredRow> = None;
+        let mut straight_blurred_bot: Option<BlurredRow> = None;
         let mut blurred = Blurred::new(shape, sigma, left..right);
         for pixel_y in top..bottom {
             let row = pixel_y as f32;
@@ -1447,25 +1755,15 @@ impl Canvas {
             if inset && frame_y_outside {
                 continue;
             }
-            let blurred_row = blurred.row(y);
-            if !inset {
-                match blurred_row {
-                    BlurredRow::Square(down) if down <= 0.0 => continue,
-                    BlurredRow::Sharp {
-                        y_outside: true, ..
-                    } => continue,
-                    _ => {}
-                }
-            }
             let frame_whole = if frame_y_outside {
                 left..left
+            } else if let Some(ref straight) = straight_frame_whole
+                && y >= frame_st
+                && y <= frame_sb
+            {
+                straight.clone()
             } else {
                 frame.whole_run(y, left..right)
-            };
-            let frame_touch = if frame_y_outside {
-                left..left
-            } else {
-                frame_touch_x.clone()
             };
             let skipped = if inset {
                 if row >= hollow[1] && row + 1.0 <= hollow[3] && hollow[0] < hollow[2] {
@@ -1475,6 +1773,48 @@ impl Canvas {
                 }
             } else {
                 frame_whole.clone()
+            };
+            // skip per-row blur math when the whole clipped span hides inside frame or hollow
+            if skipped.start <= left && skipped.end >= right {
+                continue;
+            }
+            let blurred_row = if let Some(ref straight) = straight_sharp_whole
+                && y >= sharp_st
+                && y <= sharp_sb
+            {
+                BlurredRow::Sharp {
+                    y,
+                    y_outside: false,
+                    whole: straight.clone(),
+                }
+            } else if rounded_straight_limit > 0.0
+                && (y - shape_mid_y).abs() < rounded_straight_limit
+            {
+                if y - shape_mid_y > 0.0 {
+                    straight_blurred_bot
+                        .get_or_insert_with(|| blurred.row(y))
+                        .clone()
+                } else {
+                    straight_blurred_top
+                        .get_or_insert_with(|| blurred.row(y))
+                        .clone()
+                }
+            } else {
+                blurred.row(y)
+            };
+            if !inset {
+                match blurred_row {
+                    BlurredRow::Square(down) if down <= 0.0 => continue,
+                    BlurredRow::Sharp {
+                        y_outside: true, ..
+                    } => continue,
+                    _ => {}
+                }
+            }
+            let frame_touch = if frame_y_outside {
+                left..left
+            } else {
+                frame_touch_x.clone()
             };
             let settled: [(std::ops::Range<u32>, f32); 2] = match &blurred_row {
                 BlurredRow::Square(down) => [(blurred.square_settled.clone(), *down), (0..0, 0.0)],
@@ -1748,23 +2088,10 @@ impl Canvas {
             color.scale_alpha(coverage)
         };
         let index = ((y * self.width + x) * 4) as usize;
-        if color.alpha == 255 {
-            self.pixels[index] = color.red;
-            self.pixels[index + 1] = color.green;
-            self.pixels[index + 2] = color.blue;
-            self.pixels[index + 3] = 255;
-            return;
-        }
-        let alpha = color.alpha as u32;
-        let inverse = 255 - alpha;
-        self.pixels[index] =
-            ((color.red as u32 * alpha + self.pixels[index] as u32 * inverse) / 255) as u8;
-        self.pixels[index + 1] =
-            ((color.green as u32 * alpha + self.pixels[index + 1] as u32 * inverse) / 255) as u8;
-        self.pixels[index + 2] =
-            ((color.blue as u32 * alpha + self.pixels[index + 2] as u32 * inverse) / 255) as u8;
-        self.pixels[index + 3] =
-            ((alpha * 255 + self.pixels[index + 3] as u32 * inverse) / 255) as u8;
+        let pixel: &mut [u8; 4] = (&mut self.pixels[index..index + 4])
+            .try_into()
+            .expect("four bytes per pixel");
+        blend_rgba(pixel, color);
     }
 
     // a transparent surface the size of this one, cleared only inside the bounds that will be
@@ -1948,6 +2275,11 @@ pub(crate) fn forget_layers() {
         pool.clear();
         pool.shrink_to_fit();
     });
+    SVG_RASTERS.with(|rasters| {
+        let mut rasters = rasters.borrow_mut();
+        rasters.entries.clear();
+        rasters.entries.shrink_to_fit();
+    });
 }
 // a transformed subtree larger than this renders at reduced resolution instead of failing
 const MAX_TRANSFORM_LAYER_PIXELS: f32 = 16_000_000.0;
@@ -1956,17 +2288,22 @@ thread_local! {
     static LAYER_BUFFERS: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[inline(always)]
 fn blend_rgba(pixel: &mut [u8; 4], color: Color) {
     if color.alpha == 255 {
         *pixel = [color.red, color.green, color.blue, 255];
         return;
     }
-    let alpha = color.alpha as u32;
+    let alpha = u16::from(color.alpha);
     let inverse = 255 - alpha;
-    pixel[0] = ((color.red as u32 * alpha + pixel[0] as u32 * inverse) / 255) as u8;
-    pixel[1] = ((color.green as u32 * alpha + pixel[1] as u32 * inverse) / 255) as u8;
-    pixel[2] = ((color.blue as u32 * alpha + pixel[2] as u32 * inverse) / 255) as u8;
-    pixel[3] = ((alpha * 255 + pixel[3] as u32 * inverse) / 255) as u8;
+    let r = u16::from(color.red) * alpha + u16::from(pixel[0]) * inverse;
+    let g = u16::from(color.green) * alpha + u16::from(pixel[1]) * inverse;
+    let b = u16::from(color.blue) * alpha + u16::from(pixel[2]) * inverse;
+    let a = alpha * 255 + u16::from(pixel[3]) * inverse;
+    pixel[0] = ((r + 1 + (r >> 8)) >> 8) as u8;
+    pixel[1] = ((g + 1 + (g >> 8)) >> 8) as u8;
+    pixel[2] = ((b + 1 + (b >> 8)) >> 8) as u8;
+    pixel[3] = ((a + 1 + (a >> 8)) >> 8) as u8;
 }
 
 fn fill_solid_span(row: &mut [u8], color: Color) {
@@ -1976,19 +2313,23 @@ fn fill_solid_span(row: &mut [u8], color: Color) {
             .fill([color.red, color.green, color.blue, 255]);
         return;
     }
-    let alpha = color.alpha as u32;
+    let alpha = u16::from(color.alpha);
     let inverse = 255 - alpha;
     let (sr, sg, sb, sa) = (
-        color.red as u32 * alpha,
-        color.green as u32 * alpha,
-        color.blue as u32 * alpha,
+        u16::from(color.red) * alpha,
+        u16::from(color.green) * alpha,
+        u16::from(color.blue) * alpha,
         alpha * 255,
     );
     for pixel in row.as_chunks_mut::<4>().0 {
-        pixel[0] = ((sr + pixel[0] as u32 * inverse) / 255) as u8;
-        pixel[1] = ((sg + pixel[1] as u32 * inverse) / 255) as u8;
-        pixel[2] = ((sb + pixel[2] as u32 * inverse) / 255) as u8;
-        pixel[3] = ((sa + pixel[3] as u32 * inverse) / 255) as u8;
+        let r = sr + u16::from(pixel[0]) * inverse;
+        let g = sg + u16::from(pixel[1]) * inverse;
+        let b = sb + u16::from(pixel[2]) * inverse;
+        let a = sa + u16::from(pixel[3]) * inverse;
+        pixel[0] = ((r + 1 + (r >> 8)) >> 8) as u8;
+        pixel[1] = ((g + 1 + (g >> 8)) >> 8) as u8;
+        pixel[2] = ((b + 1 + (b >> 8)) >> 8) as u8;
+        pixel[3] = ((a + 1 + (a >> 8)) >> 8) as u8;
     }
 }
 
@@ -2937,6 +3278,7 @@ struct Blurred {
     across: Vec<Option<(u32, f32)>>,
 }
 
+#[derive(Clone)]
 enum BlurredRow {
     // a square shape's coverage down, at the row's height
     Square(f32),
@@ -2949,6 +3291,7 @@ enum BlurredRow {
     Rounded([BlurredHalf; 2], f32),
 }
 
+#[derive(Clone)]
 struct BlurredHalf {
     // the reach and the weight of each of the four rows summed
     samples: [(f32, f32); 4],
@@ -3784,65 +4127,69 @@ fn ink(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Option<Rect> {
 // edges and keeps slivers a pixel wide, so the paint reaches a margin past the area and the
 // margin's earlier pixels go back afterwards, one pixel wider since the margin's own edges
 // can round outward
-pub(crate) fn repaint(
-    canvas: &mut Canvas,
-    document: &LayoutDocument,
-    canvases: &[ImageLayer],
+const REPAINT_MARGIN: u32 = 2;
+
+fn prepare_repaint_region(
+    canvas: &Canvas,
     area: Rect,
-) {
-    let _profile = crate::profile::scope("paint: repaint");
-    const MARGIN: u32 = 2;
-    let Some(kept) = DeviceBounds::of(canvas, area, None) else {
-        return;
-    };
+) -> Option<(DeviceBounds, Rect, DeviceBounds)> {
+    let kept = DeviceBounds::of(canvas, area, None)?;
     let scale = canvas.scale;
     let painted = Rect {
-        x: (kept.left as f32 - MARGIN as f32) / scale,
-        y: (kept.top as f32 - MARGIN as f32) / scale,
-        width: (kept.right - kept.left + 2 * MARGIN) as f32 / scale,
-        height: (kept.bottom - kept.top + 2 * MARGIN) as f32 / scale,
+        x: (kept.left as f32 - REPAINT_MARGIN as f32) / scale,
+        y: (kept.top as f32 - REPAINT_MARGIN as f32) / scale,
+        width: (kept.right - kept.left + 2 * REPAINT_MARGIN) as f32 / scale,
+        height: (kept.bottom - kept.top + 2 * REPAINT_MARGIN) as f32 / scale,
     };
     let reach = DeviceBounds {
-        left: kept.left.saturating_sub(MARGIN + 1),
-        top: kept.top.saturating_sub(MARGIN + 1),
-        right: (kept.right + MARGIN + 1).min(canvas.width),
-        bottom: (kept.bottom + MARGIN + 1).min(canvas.height),
+        left: kept.left.saturating_sub(REPAINT_MARGIN + 1),
+        top: kept.top.saturating_sub(REPAINT_MARGIN + 1),
+        right: (kept.right + REPAINT_MARGIN + 1).min(canvas.width),
+        bottom: (kept.bottom + REPAINT_MARGIN + 1).min(canvas.height),
     };
+    Some((kept, painted, reach))
+}
+
+fn save_region_pixels(canvas: &Canvas, reach: DeviceBounds) -> Vec<u8> {
     let stride = canvas.bytes_per_row();
-    let line = |row: usize| {
-        row * stride + reach.left as usize * 4..row * stride + reach.right as usize * 4
-    };
-    let mut saved = Vec::with_capacity(line(0).len() * (reach.bottom - reach.top) as usize);
+    let row_bytes = (reach.right - reach.left) as usize * 4;
+    let mut saved = Vec::with_capacity(row_bytes * (reach.bottom - reach.top) as usize);
     for row in reach.top as usize..reach.bottom as usize {
-        saved.extend_from_slice(&canvas.pixels[line(row)]);
+        let start = row * stride + reach.left as usize * 4;
+        saved.extend_from_slice(&canvas.pixels[start..start + row_bytes]);
     }
-    let kept_box = [kept.left, kept.top, kept.right, kept.bottom];
-    let before = canvas.planes.clone();
-    if let Some(planes) = &mut canvas.planes {
-        planes.retain(|plane| !overlaps(plane.bounds, kept_box));
-    }
+    saved
+}
+
+fn clear_repaint_area(canvas: &mut Canvas, kept: DeviceBounds, painted: Rect) {
     let base = canvas.background;
     if base.alpha > 0 {
         canvas.fill_rect(painted.x, painted.y, painted.width, painted.height, base);
     } else {
-        let columns = kept.left.saturating_sub(MARGIN) as usize * 4
-            ..(kept.right + MARGIN).min(canvas.width) as usize * 4;
-        for row in kept.top.saturating_sub(MARGIN)..(kept.bottom + MARGIN).min(canvas.height) {
+        let stride = canvas.bytes_per_row();
+        let columns = kept.left.saturating_sub(REPAINT_MARGIN) as usize * 4
+            ..(kept.right + REPAINT_MARGIN).min(canvas.width) as usize * 4;
+        for row in kept.top.saturating_sub(REPAINT_MARGIN)
+            ..(kept.bottom + REPAINT_MARGIN).min(canvas.height)
+        {
             let start = row as usize * stride;
             canvas.pixels[start + columns.start..start + columns.end].fill(0);
         }
     }
-    let layers = canvases
-        .iter()
-        .chain(&document.images)
-        .cloned()
-        .collect::<Vec<_>>();
-    paint_document(canvas, document, &layers, Some(painted));
+}
+
+fn restore_region_margin(
+    canvas: &mut Canvas,
+    kept: DeviceBounds,
+    reach: DeviceBounds,
+    saved: &[u8],
+) {
+    let stride = canvas.bytes_per_row();
+    let row_bytes = (reach.right - reach.left) as usize * 4;
     let inner = (kept.left - reach.left) as usize * 4..(kept.right - reach.left) as usize * 4;
-    for (row, before) in
-        (reach.top as usize..reach.bottom as usize).zip(saved.chunks(line(0).len()))
-    {
-        let after = &mut canvas.pixels[line(row)];
+    for (row, before) in (reach.top as usize..reach.bottom as usize).zip(saved.chunks(row_bytes)) {
+        let start = row * stride + reach.left as usize * 4;
+        let after = &mut canvas.pixels[start..start + row_bytes];
         if (kept.top as usize..kept.bottom as usize).contains(&row) {
             after[..inner.start].copy_from_slice(&before[..inner.start]);
             after[inner.end..].copy_from_slice(&before[inner.end..]);
@@ -3850,6 +4197,44 @@ pub(crate) fn repaint(
             after.copy_from_slice(before);
         }
     }
+}
+
+pub(crate) fn repaint(
+    canvas: &mut Canvas,
+    document: &LayoutDocument,
+    canvases: &[ImageLayer],
+    area: Rect,
+) {
+    let layers = canvases
+        .iter()
+        .chain(&document.images)
+        .cloned()
+        .collect::<Vec<_>>();
+    repaint_with_layers(canvas, document, canvases, &layers, area);
+}
+
+fn repaint_with_layers(
+    canvas: &mut Canvas,
+    document: &LayoutDocument,
+    canvases: &[ImageLayer],
+    layers: &[ImageLayer],
+    area: Rect,
+) {
+    let _profile = crate::profile::scope("paint: repaint");
+    let Some((kept, painted, reach)) = prepare_repaint_region(canvas, area) else {
+        return;
+    };
+    let scale = canvas.scale;
+    let saved = save_region_pixels(canvas, reach);
+    let kept_box = [kept.left, kept.top, kept.right, kept.bottom];
+    let before = canvas.planes.clone();
+    if let Some(planes) = &mut canvas.planes {
+        planes.retain(|plane| !overlaps(plane.bounds, kept_box));
+    }
+    let base = canvas.background;
+    clear_repaint_area(canvas, kept, painted);
+    paint_document(canvas, document, layers, Some(painted));
+    restore_region_margin(canvas, kept, reach, &saved);
     if let Some(before) = before {
         match settled_planes(&before, canvas.planes.take().unwrap_or_default(), kept_box) {
             Some(planes) => canvas.planes = Some(planes),
@@ -3899,9 +4284,58 @@ pub(crate) fn repaint_areas(
     let shown = canvas.revision.id;
     let mut boxes = Boxes::default();
     let _extents = memoize_extents();
+    let layers = canvases
+        .iter()
+        .chain(&document.images)
+        .cloned()
+        .collect::<Vec<_>>();
+    // when multiple damage areas have mutually disjoint margin bands and no video planes,
+    // walk the layout tree once while culling each subtree against the individual rects
+    if areas.len() > 1 && areas.len() <= Region::LIMIT && canvas.planes.is_none() {
+        let regions: Vec<(DeviceBounds, Rect, DeviceBounds)> = areas
+            .iter()
+            .filter_map(|&area| prepare_repaint_region(canvas, area))
+            .collect();
+        if regions.is_empty() {
+            return;
+        }
+        let disjoint = regions.len() > 1
+            && regions.iter().enumerate().all(|(index, (_, _, first))| {
+                regions[index + 1..].iter().all(|(_, _, second)| {
+                    first.right <= second.left
+                        || second.right <= first.left
+                        || first.bottom <= second.top
+                        || second.bottom <= first.top
+                })
+            });
+        if disjoint {
+            let _profile = crate::profile::scope("paint: repaint");
+            let saved: Vec<Vec<u8>> = regions
+                .iter()
+                .map(|&(_, _, reach)| save_region_pixels(canvas, reach))
+                .collect();
+            let mut painted_rects = ClipList::default();
+            for &(kept, painted, _) in &regions {
+                clear_repaint_area(canvas, kept, painted);
+                painted_rects.push(painted);
+                boxes.push([kept.left, kept.top, kept.right, kept.bottom]);
+            }
+            paint_document_multi(canvas, document, &layers, painted_rects.as_slice());
+            for (&(kept, _, reach), before) in regions.iter().zip(&saved) {
+                restore_region_margin(canvas, kept, reach, before);
+            }
+            if boxes.count > 0 {
+                canvas.revision = Revision {
+                    id: next_revision(),
+                    changed: Some((shown, boxes)),
+                };
+            }
+            return;
+        }
+    }
     for &area in areas {
         let last = canvas.revision.id;
-        repaint(canvas, document, canvases, area);
+        repaint_with_layers(canvas, document, canvases, &layers, area);
         match canvas.revision.changed {
             _ if canvas.revision.id == last => {}
             Some((_, repainted)) => repainted.iter().for_each(|next| boxes.push(next)),
@@ -4345,6 +4779,52 @@ fn settled_planes(before: &[Plane], found: Vec<Plane>, kept: [u32; 4]) -> Option
     (!overlapping).then_some(planes)
 }
 
+// inline list of active damage clip rectangles for single-pass multi-rect repaints
+#[derive(Clone, Copy, Default)]
+struct ClipList {
+    rects: [Rect; Region::LIMIT],
+    count: usize,
+}
+
+impl ClipList {
+    fn push(&mut self, rect: Rect) {
+        if self.count < self.rects.len() {
+            self.rects[self.count] = rect;
+            self.count += 1;
+        }
+    }
+
+    fn as_slice(&self) -> &[Rect] {
+        &self.rects[..self.count]
+    }
+}
+
+fn narrow_clips(layout_box: &LayoutBox, ancestor_offset: (f32, f32), clips: &[Rect]) -> ClipList {
+    let mut out = ClipList::default();
+    let Some(box_ink) = ink(layout_box, ancestor_offset) else {
+        for &clip in clips {
+            out.push(clip);
+        }
+        return out;
+    };
+    for &clip in clips {
+        if intersect_clip(Some(clip), box_ink).is_some() {
+            out.push(clip);
+        }
+    }
+    out
+}
+
+fn intersect_clips(clips: &[Rect], bounds: Rect) -> ClipList {
+    let mut out = ClipList::default();
+    for &clip in clips {
+        if let Some(hit) = intersect_clip(Some(clip), bounds) {
+            out.push(hit);
+        }
+    }
+    out
+}
+
 fn paint_document(
     canvas: &mut Canvas,
     document: &LayoutDocument,
@@ -4372,6 +4852,340 @@ fn paint_document(
         clip,
         (0.0, 0.0),
     );
+}
+
+fn paint_document_multi(
+    canvas: &mut Canvas,
+    document: &LayoutDocument,
+    images: &[ImageLayer],
+    clips: &[Rect],
+) {
+    let _profile = crate::profile::scope("paint: document");
+    let _extents = memoize_extents();
+    if let Some(root) = canvas_background(&document.root) {
+        let viewport = Shape::square(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: document.viewport.width,
+            height: document.viewport.height,
+        });
+        for &clip in clips {
+            paint_backgrounds(
+                canvas,
+                root,
+                &[],
+                viewport,
+                viewport,
+                root.opacity,
+                Some(clip),
+            );
+        }
+    }
+    paint_context_multi(
+        canvas,
+        &document.root,
+        images,
+        &document.prose_selections,
+        clips,
+        (0.0, 0.0),
+    );
+}
+
+fn paint_context_multi(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    images: &[ImageLayer],
+    prose_selections: &[ProseSpan],
+    clips: &[Rect],
+    ancestor_offset: (f32, f32),
+) {
+    let opacity = layout_box.opacity;
+    if opacity <= 0.0 {
+        return;
+    }
+    let active = narrow_clips(layout_box, ancestor_offset, clips);
+    match active.as_slice() {
+        [] => return,
+        [only] => {
+            paint_context(
+                canvas,
+                layout_box,
+                images,
+                prose_selections,
+                Some(*only),
+                ancestor_offset,
+            );
+            return;
+        }
+        _ => {}
+    }
+    if layout_box.transform.is_some()
+        || !layout_box.filters.own.is_empty()
+        || !layout_box.filters.backdrop.is_empty()
+        || layout_box.clip_path.is_some()
+        || !layout_box.masks.is_empty()
+        || (opacity < 1.0 && !fades_without_layer(layout_box))
+    {
+        for &clip in active.as_slice() {
+            paint_context(
+                canvas,
+                layout_box,
+                images,
+                prose_selections,
+                Some(clip),
+                ancestor_offset,
+            );
+        }
+        return;
+    }
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    let rect = visual_rect_for(layout_box, ancestor_offset);
+    for &clip in active.as_slice() {
+        paint_box_surface(
+            canvas,
+            layout_box,
+            images,
+            Some(clip),
+            offset,
+            rect,
+            opacity,
+        );
+    }
+    let content_clips = if layout_box.overflow.clips() || layout_box.is_document() {
+        intersect_clips(
+            active.as_slice(),
+            translate_rect(overflow_clip_rect(layout_box), offset),
+        )
+    } else {
+        active
+    };
+    let mask = overflow_mask(canvas, layout_box, rect);
+    if let Some(mask) = mask {
+        canvas.push_mask(mask);
+    }
+    let opaque = canvas.opaque;
+    canvas.opaque &=
+        !scrolls_in_own_layer(canvas, layout_box) && !floats_in_own_layer(canvas, layout_box);
+    let mut contexts = stacking_context_entries(layout_box, None, ancestor_offset);
+    contexts.sort_by_key(|entry| (entry.z_index, entry.order));
+    for entry in contexts.iter().filter(|entry| entry.z_index < 0) {
+        paint_context_entry_multi(canvas, entry, images, prose_selections, active.as_slice());
+    }
+    if !content_clips.as_slice().is_empty() {
+        let box_selections = prose_selections_for_box(layout_box, prose_selections);
+        for &clip in content_clips.as_slice() {
+            paint_inline_fragments(canvas, layout_box, images, Some(clip), offset);
+            paint_box_text(canvas, layout_box, Some(clip), offset, &box_selections);
+        }
+        paint_non_context_children_multi(
+            canvas,
+            layout_box,
+            images,
+            prose_selections,
+            content_clips.as_slice(),
+            offset,
+        );
+    }
+    for entry in contexts.iter().filter(|entry| entry.z_index >= 0) {
+        paint_context_entry_multi(canvas, entry, images, prose_selections, active.as_slice());
+    }
+    canvas.opaque = opaque;
+    if mask.is_some() {
+        canvas.pop_mask();
+    }
+    for &clip in active.as_slice() {
+        paint_scrollbars(canvas, layout_box, images, (offset, opacity), Some(clip));
+        paint_outline(canvas, layout_box, rect, opacity, Some(clip));
+    }
+}
+
+fn paint_context_entry_multi(
+    canvas: &mut Canvas,
+    entry: &StackingContextEntry<'_>,
+    images: &[ImageLayer],
+    prose_selections: &[ProseSpan],
+    clips: &[Rect],
+) {
+    let clipped = match entry.clip {
+        Some(bounds) => intersect_clips(clips, bounds),
+        None => {
+            let mut all = ClipList::default();
+            for &clip in clips {
+                all.push(clip);
+            }
+            all
+        }
+    };
+    let active = narrow_clips(entry.layout, entry.ancestor_offset, clipped.as_slice());
+    let active = active.as_slice();
+    if active.is_empty() {
+        return;
+    }
+    let masks = entry
+        .clippers
+        .iter()
+        .filter_map(|&(clipper, offset)| {
+            overflow_mask(canvas, clipper, visual_rect_for(clipper, offset))
+        })
+        .collect::<Vec<_>>();
+    for &mask in &masks {
+        canvas.push_mask(mask);
+    }
+    let opaque = canvas.opaque;
+    canvas.opaque &= !entry
+        .clippers
+        .iter()
+        .any(|&(clipper, _)| scrolls_in_own_layer(canvas, clipper));
+    if active.len() == 1 {
+        let clip = Some(active[0]);
+        if entry.layout.creates_stacking_context {
+            paint_context(
+                canvas,
+                entry.layout,
+                images,
+                prose_selections,
+                clip,
+                entry.ancestor_offset,
+            );
+        } else {
+            paint_non_context_subtree(
+                canvas,
+                entry.layout,
+                images,
+                prose_selections,
+                clip,
+                entry.ancestor_offset,
+            );
+        }
+    } else if entry.layout.creates_stacking_context {
+        paint_context_multi(
+            canvas,
+            entry.layout,
+            images,
+            prose_selections,
+            active,
+            entry.ancestor_offset,
+        );
+    } else {
+        paint_non_context_subtree_multi(
+            canvas,
+            entry.layout,
+            images,
+            prose_selections,
+            active,
+            entry.ancestor_offset,
+        );
+    }
+    canvas.opaque = opaque;
+    for _ in &masks {
+        canvas.pop_mask();
+    }
+}
+
+fn paint_non_context_children_multi(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    images: &[ImageLayer],
+    prose_selections: &[ProseSpan],
+    clips: &[Rect],
+    ancestor_offset: (f32, f32),
+) {
+    for_each_paint_order(&layout_box.children, |index| {
+        let child = &layout_box.children[index];
+        if child.creates_stacking_context || child.inline || child.paints_positioned() {
+            return;
+        }
+        paint_non_context_subtree_multi(
+            canvas,
+            child,
+            images,
+            prose_selections,
+            clips,
+            ancestor_offset,
+        );
+    });
+}
+
+fn paint_non_context_subtree_multi(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    images: &[ImageLayer],
+    prose_selections: &[ProseSpan],
+    clips: &[Rect],
+    ancestor_offset: (f32, f32),
+) {
+    let active = narrow_clips(layout_box, ancestor_offset, clips);
+    match active.as_slice() {
+        [] => return,
+        [only] => {
+            paint_non_context_subtree(
+                canvas,
+                layout_box,
+                images,
+                prose_selections,
+                Some(*only),
+                ancestor_offset,
+            );
+            return;
+        }
+        _ => {}
+    }
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    let rect = visual_rect_for(layout_box, ancestor_offset);
+    for &clip in active.as_slice() {
+        paint_box_surface(
+            canvas,
+            layout_box,
+            images,
+            Some(clip),
+            offset,
+            rect,
+            layout_box.opacity,
+        );
+    }
+    let content_clips = if layout_box.overflow.clips() || layout_box.is_document() {
+        intersect_clips(
+            active.as_slice(),
+            translate_rect(overflow_clip_rect(layout_box), offset),
+        )
+    } else {
+        active
+    };
+    let mask = overflow_mask(canvas, layout_box, rect);
+    if let Some(mask) = mask {
+        canvas.push_mask(mask);
+    }
+    let opaque = canvas.opaque;
+    canvas.opaque &= !scrolls_in_own_layer(canvas, layout_box);
+    if !content_clips.as_slice().is_empty() {
+        let box_selections = prose_selections_for_box(layout_box, prose_selections);
+        for &clip in content_clips.as_slice() {
+            paint_inline_fragments(canvas, layout_box, images, Some(clip), offset);
+            paint_box_text(canvas, layout_box, Some(clip), offset, &box_selections);
+        }
+        paint_non_context_children_multi(
+            canvas,
+            layout_box,
+            images,
+            prose_selections,
+            content_clips.as_slice(),
+            offset,
+        );
+    }
+    canvas.opaque = opaque;
+    if mask.is_some() {
+        canvas.pop_mask();
+    }
+    for &clip in active.as_slice() {
+        paint_scrollbars(
+            canvas,
+            layout_box,
+            images,
+            (offset, layout_box.opacity),
+            Some(clip),
+        );
+        paint_outline(canvas, layout_box, rect, layout_box.opacity, Some(clip));
+    }
 }
 
 // the colour the canvas shows where nothing else paints: the root background's, over white
@@ -5068,7 +5882,9 @@ impl SvgRasters {
     // the most pixels one raster may hold, and all of them together, at four bytes each
     const LARGEST: usize = 3_000_000;
     const BUDGET: usize = 6_000_000;
-    // a scene quicker to draw than this is drawn again each time
+    // small icon scenes cost little memory to cache and repeat across table rows
+    const SMALL_PIXELS: f32 = 16_384.0;
+    // a larger scene quicker to draw than this is drawn again each time
     const WORTH: std::time::Duration = std::time::Duration::from_micros(400);
 
     fn find(&mut self, scene: &Rc<crate::svg::Scene>, key: [u32; 5]) -> Option<Rc<Image>> {
@@ -5181,9 +5997,10 @@ fn paint_svg(
         ];
         let kept = SVG_RASTERS.with(|rasters| rasters.borrow_mut().find(scene, key));
         let image = kept.unwrap_or_else(|| {
-            let started = std::time::Instant::now();
+            let small = whole_width * whole_height <= SvgRasters::SMALL_PIXELS;
+            let started = (!small).then(std::time::Instant::now);
             let image = Rc::new(rasterize(whole));
-            if started.elapsed() >= SvgRasters::WORTH {
+            if small || started.is_some_and(|at| at.elapsed() >= SvgRasters::WORTH) {
                 SVG_RASTERS.with(|rasters| rasters.borrow_mut().keep(scene, key, image.clone()));
             }
             image
@@ -5487,6 +6304,9 @@ fn paint_inline_fragments(
     offset: (f32, f32),
 ) {
     for fragment in layout_box.children.iter().filter(|child| child.inline) {
+        if misses(fragment, offset, clip) {
+            continue;
+        }
         let rect = visual_rect_for(fragment, offset);
         paint_box_surface(
             canvas,
@@ -6407,6 +7227,23 @@ fn background_placement(
 }
 
 fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f32, f32)) {
+    if let Some(clip) = clip {
+        let mut bounds = Rect {
+            x: run.x + offset.0,
+            y: run.y + offset.1,
+            width: run.width,
+            height: run.font_size * 1.5,
+        };
+        if let Some(shadow) = run.decoration.shadow {
+            let reach = shadow.blur.max(0.0) * 2.0;
+            let cast = translate_rect(bounds, (shadow.x, shadow.y));
+            bounds = union_rect(bounds, outset_rect(cast, reach));
+        }
+        let overhang = run.font_size + run.decoration.stroke.width.max(0.0);
+        if intersect_clip(Some(clip), outset_rect(bounds, overhang)).is_none() {
+            return;
+        }
+    }
     let _profile = crate::profile::scope("paint: text");
     if let Some(shadow) = run.decoration.shadow
         && shadow.color.alpha > 0
@@ -8879,5 +9716,20 @@ mod tests {
         LAYER_BUFFERS.with(|pool| {
             assert!(pool.borrow().is_empty());
         });
+    }
+
+    #[test]
+    fn fast_div255_blend_matches_exact_division_across_all_byte_products() {
+        for alpha in 0_u16..=255 {
+            let inverse = 255 - alpha;
+            for src in [0_u16, 1, 127, 128, 254, 255] {
+                for dst in [0_u16, 1, 63, 128, 200, 255] {
+                    let sum = src * alpha + dst * inverse;
+                    let fast = ((sum + 1 + (sum >> 8)) >> 8) as u8;
+                    let exact = (sum / 255) as u8;
+                    assert_eq!(fast, exact, "alpha={alpha} src={src} dst={dst}");
+                }
+            }
+        }
     }
 }

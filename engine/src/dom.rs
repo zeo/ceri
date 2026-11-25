@@ -48,19 +48,160 @@ pub struct Element {
     pub attrs: Attributes,
 }
 
+#[inline]
+fn bloom_bits(salt: u64, token: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ salt;
+    for &byte in token.as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (1_u64 << (hash & 63)) | (1_u64 << ((hash >> 6) & 63))
+}
+
+#[inline]
+pub(crate) fn class_bloom_mask(class: &str) -> u64 {
+    bloom_bits(0x9e37_79b9_7f4a_7c15, class)
+}
+
+#[inline]
+pub(crate) fn tag_bloom_mask(tag: &str) -> u64 {
+    bloom_bits(0xbf58_476d_1ce4_e5b9, tag)
+}
+
+#[inline]
+pub(crate) fn id_bloom_mask(id: &str) -> u64 {
+    bloom_bits(0x94d0_49bb_1331_11eb, id)
+}
+
+// cached byte ranges of whitespace-separated tokens inside the "class" attribute value
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ClassSpans {
+    #[default]
+    Empty,
+    One(u32, u32),
+    Many(Box<[(u32, u32)]>),
+}
+
+pub struct Classes<'a> {
+    raw: &'a str,
+    spans: ClassesInner<'a>,
+}
+
+enum ClassesInner<'a> {
+    Empty,
+    One(Option<(u32, u32)>),
+    Many(std::slice::Iter<'a, (u32, u32)>),
+}
+
+impl<'a> Iterator for Classes<'a> {
+    type Item = &'a str;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let (start, end) = match &mut self.spans {
+            ClassesInner::Empty => return None,
+            ClassesInner::One(slot) => slot.take()?,
+            ClassesInner::Many(iter) => *iter.next()?,
+        };
+        Some(&self.raw[start as usize..end as usize])
+    }
+}
+
 // an element's attributes in the order they were set, the order markup, attribute lists and
 // serialization show them in
 #[derive(Clone, Debug, Default, Eq)]
-pub struct Attributes(Vec<(String, String)>);
+pub struct Attributes {
+    entries: Vec<(String, String)>,
+    // 1-based positions of "class" and "id" in entries so selector matching avoids linear scans
+    class_index: Option<std::num::NonZeroU32>,
+    id_index: Option<std::num::NonZeroU32>,
+    class_bloom: u64,
+    class_spans: ClassSpans,
+}
 
 impl Attributes {
     pub fn new() -> Self {
         Self::default()
     }
 
+    fn rebuild_class_cache(&mut self, index: usize) {
+        self.class_index = std::num::NonZeroU32::new((index + 1) as u32);
+        let raw = self.entries[index].1.as_str();
+        let bytes = raw.as_bytes();
+        let mut cursor = 0usize;
+        let mut bloom = 0u64;
+        let mut first: Option<(u32, u32)> = None;
+        let mut many: Option<Vec<(u32, u32)>> = None;
+        while cursor < bytes.len() {
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let start = cursor;
+            while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if start < cursor {
+                let token = &raw[start..cursor];
+                bloom |= class_bloom_mask(token);
+                let span = (start as u32, cursor as u32);
+                if let Some(list) = &mut many {
+                    list.push(span);
+                } else if let Some(prev) = first {
+                    many = Some(vec![prev, span]);
+                } else {
+                    first = Some(span);
+                }
+            }
+        }
+        self.class_bloom = bloom;
+        self.class_spans = match (many, first) {
+            (Some(list), _) => ClassSpans::Many(list.into_boxed_slice()),
+            (None, Some((start, end))) => ClassSpans::One(start, end),
+            (None, None) => ClassSpans::Empty,
+        };
+    }
+
+    #[inline]
+    fn id_value(&self) -> Option<&str> {
+        let index = self.id_index?.get() as usize - 1;
+        Some(self.entries[index].1.as_str())
+    }
+
+    #[inline]
+    fn classes(&self) -> Classes<'_> {
+        let Some(index) = self.class_index else {
+            return Classes {
+                raw: "",
+                spans: ClassesInner::Empty,
+            };
+        };
+        let raw = self.entries[index.get() as usize - 1].1.as_str();
+        let spans = match &self.class_spans {
+            ClassSpans::Empty => ClassesInner::Empty,
+            ClassSpans::One(start, end) => ClassesInner::One(Some((*start, *end))),
+            ClassSpans::Many(list) => ClassesInner::Many(list.iter()),
+        };
+        Classes { raw, spans }
+    }
+
+    #[inline]
+    fn contains_class_token(&self, class: &str) -> bool {
+        let Some(index) = self.class_index else {
+            return false;
+        };
+        let raw = self.entries[index.get() as usize - 1].1.as_str();
+        match &self.class_spans {
+            ClassSpans::Empty => false,
+            ClassSpans::One(start, end) => &raw[*start as usize..*end as usize] == class,
+            ClassSpans::Many(list) => list
+                .iter()
+                .any(|&(start, end)| &raw[start as usize..end as usize] == class),
+        }
+    }
+
     #[inline]
     pub fn get(&self, name: &str) -> Option<&String> {
-        self.0
+        self.entries
             .iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value)
@@ -73,41 +214,80 @@ impl Attributes {
 
     // changes a value where it stands, or adds the attribute last
     pub fn insert(&mut self, name: String, value: String) -> Option<String> {
-        match self.0.iter_mut().find(|(key, _)| *key == name) {
-            Some((_, slot)) => Some(std::mem::replace(slot, value)),
+        let is_class = name == "class";
+        let is_id = !is_class && name == "id";
+        let (index, replaced) = match self.entries.iter_mut().position(|(key, _)| *key == name) {
+            Some(index) => (
+                index,
+                Some(std::mem::replace(&mut self.entries[index].1, value)),
+            ),
             None => {
-                self.0.push((name, value));
-                None
+                let index = self.entries.len();
+                self.entries.push((name, value));
+                (index, None)
             }
+        };
+        if is_class {
+            self.rebuild_class_cache(index);
+        } else if is_id {
+            self.id_index = std::num::NonZeroU32::new((index + 1) as u32);
         }
+        replaced
     }
 
     // keeps a value already set, as a repeated attribute in markup is dropped
     pub fn insert_missing(&mut self, name: String, value: String) {
         if !self.contains_key(&name) {
-            self.0.push((name, value));
+            let is_class = name == "class";
+            let is_id = !is_class && name == "id";
+            let index = self.entries.len();
+            self.entries.push((name, value));
+            if is_class {
+                self.rebuild_class_cache(index);
+            } else if is_id {
+                self.id_index = std::num::NonZeroU32::new((index + 1) as u32);
+            }
         }
     }
 
     pub fn remove(&mut self, name: &str) -> Option<String> {
-        let index = self.0.iter().position(|(key, _)| key == name)?;
-        Some(self.0.remove(index).1)
+        let index = self.entries.iter().position(|(key, _)| key == name)?;
+        let removed = self.entries.remove(index).1;
+        if name == "class" {
+            self.class_index = None;
+            self.class_bloom = 0;
+            self.class_spans = ClassSpans::Empty;
+        } else if let Some(ci) = self.class_index {
+            let pos = ci.get() as usize - 1;
+            if pos > index {
+                self.class_index = std::num::NonZeroU32::new(pos as u32);
+            }
+        }
+        if name == "id" {
+            self.id_index = None;
+        } else if let Some(ii) = self.id_index {
+            let pos = ii.get() as usize - 1;
+            if pos > index {
+                self.id_index = std::num::NonZeroU32::new(pos as u32);
+            }
+        }
+        Some(removed)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.0.iter().map(|(key, value)| (key, value))
+        self.entries.iter().map(|(key, value)| (key, value))
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.0.iter().map(|(key, _)| key)
+        self.entries.iter().map(|(key, _)| key)
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.entries.is_empty()
     }
 }
 
@@ -129,7 +309,7 @@ impl<'a> IntoIterator for &'a Attributes {
     >;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.iter().map(|(key, value)| (key, value))
+        self.entries.iter().map(|(key, value)| (key, value))
     }
 }
 
@@ -138,7 +318,7 @@ impl IntoIterator for Attributes {
     type IntoIter = std::vec::IntoIter<(String, String)>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
+        self.entries.into_iter()
     }
 }
 
@@ -2576,15 +2756,46 @@ impl Element {
             .map(String::as_str)
     }
 
-    pub fn classes(&self) -> impl Iterator<Item = &str> {
-        self.attr("class").unwrap_or("").split_ascii_whitespace()
+    #[inline]
+    pub(crate) fn id_attr(&self) -> Option<&str> {
+        self.attrs.id_value()
+    }
+
+    #[inline]
+    pub(crate) fn class_bloom(&self) -> u64 {
+        self.attrs.class_bloom
+    }
+
+    #[inline]
+    pub(crate) fn self_ancestor_bloom(&self) -> u128 {
+        let tag_and_id =
+            tag_bloom_mask(&self.name) | self.attrs.id_value().map_or(0, id_bloom_mask);
+        u128::from(self.attrs.class_bloom) | (u128::from(tag_and_id) << 64)
+    }
+
+    #[inline]
+    pub fn classes(&self) -> Classes<'_> {
+        self.attrs.classes()
+    }
+
+    #[inline]
+    pub(crate) fn has_class_token_plain(&self, class: &str) -> bool {
+        self.attrs.contains_class_token(class)
+    }
+
+    #[inline]
+    pub(crate) fn has_class_token(&self, class: &str, bloom: u64) -> bool {
+        (self.attrs.class_bloom & bloom) == bloom && self.attrs.contains_class_token(class)
     }
 
     pub fn has_class(&self, class: &str) -> bool {
         let Some(class) = class_token(class) else {
             return false;
         };
-        self.classes().any(|candidate| candidate == class)
+        if self.attrs.class_bloom == 0 {
+            return false;
+        }
+        self.has_class_token(class, class_bloom_mask(class))
     }
 
     pub fn add_class(&mut self, class: &str) -> bool {
@@ -2772,12 +2983,12 @@ fn is_accessibility_hidden(element: &Element) -> bool {
 }
 
 fn class_token(class: &str) -> Option<&str> {
-    let class = class.trim();
-    (!class.is_empty()
-        && !class
-            .chars()
-            .any(|character| character.is_ascii_whitespace()))
-    .then_some(class)
+    let class = if class.is_ascii() {
+        class.trim_ascii()
+    } else {
+        class.trim()
+    };
+    (!class.is_empty() && !class.bytes().any(|byte| byte.is_ascii_whitespace())).then_some(class)
 }
 
 pub(crate) fn is_labelable(element: &Element) -> bool {
@@ -4003,5 +4214,49 @@ mod tests {
         assert_eq!(document.inner_html(stray), "<b></b>");
         assert_eq!(document.node_text_offset(tail), Some(5));
         assert_eq!(document.text_point(7), Some((tail, 2)));
+    }
+
+    #[test]
+    fn class_cache_tracks_attribute_inserts_updates_and_removals() {
+        let mut element = Element::new("div");
+        assert_eq!(element.class_bloom(), 0);
+        assert!(element.classes().next().is_none());
+        assert!(!element.has_class("alpha"));
+
+        element.attrs.insert("data-a".to_string(), "1".to_string());
+        element
+            .attrs
+            .insert("class".to_string(), "  alpha   beta\tgamma ".to_string());
+        element.attrs.insert("id".to_string(), "box1".to_string());
+        assert_eq!(element.id_attr(), Some("box1"));
+        assert_eq!(
+            element.classes().collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma"]
+        );
+        assert!(element.has_class("alpha"));
+        assert!(element.has_class("beta"));
+        assert!(element.has_class_token("gamma", class_bloom_mask("gamma")));
+        assert!(!element.has_class("delta"));
+
+        // removing an earlier attribute shifts cached indices without losing class or id
+        element.attrs.remove("data-a");
+        assert_eq!(element.id_attr(), Some("box1"));
+        assert!(element.has_class("beta"));
+
+        assert!(element.remove_class("beta"));
+        assert_eq!(
+            element.classes().collect::<Vec<_>>(),
+            vec!["alpha", "gamma"]
+        );
+        assert!(!element.has_class("beta"));
+
+        assert!(element.add_class("delta"));
+        assert!(element.has_class("delta"));
+
+        element.attrs.remove("class");
+        assert_eq!(element.class_bloom(), 0);
+        assert!(element.classes().next().is_none());
+        assert!(!element.has_class("alpha"));
+        assert_eq!(element.id_attr(), Some("box1"));
     }
 }

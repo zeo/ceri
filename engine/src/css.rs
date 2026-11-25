@@ -1201,12 +1201,59 @@ fn share_borrowed_cascade(
     cascade
 }
 
+struct AncestorBlooms {
+    document: u64,
+    selector_version: u64,
+    blooms: HashMap<NodeId, u128>,
+}
+
 thread_local! {
     // renewed whenever a style memo begins or ends, as the document and state may differ after
     static STYLE_PASS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STYLE_MEMO: RefCell<Option<StyleMemo>> = const { RefCell::new(None) };
     static CONTENT_MEMO: RefCell<Option<ContentMemo>> = const { RefCell::new(None) };
     static CUSTOM_PROPERTY_PASSES: RefCell<Vec<CustomPropertyPass>> = const { RefCell::new(Vec::new()) };
+    static ANCESTOR_BLOOMS: RefCell<AncestorBlooms> = RefCell::new(AncestorBlooms {
+        document: 0,
+        selector_version: 0,
+        blooms: HashMap::default(),
+    });
+}
+
+fn ancestor_bloom(document: &Document, node: NodeId) -> u128 {
+    let identity = document.identity();
+    let version = document.selector_version();
+    ANCESTOR_BLOOMS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.document != identity || cache.selector_version != version {
+            cache.blooms.clear();
+            cache.document = identity;
+            cache.selector_version = version;
+        }
+        if let Some(&bloom) = cache.blooms.get(&node) {
+            return bloom;
+        }
+        let mut chain = Vec::new();
+        let mut current = node;
+        let mut base = 0_u128;
+        while let Some(parent) = document.parent_element(current) {
+            chain.push((current, parent));
+            if let Some(&cached) = cache.blooms.get(&parent) {
+                base = cached;
+                break;
+            }
+            current = parent;
+        }
+        let mut bloom = base;
+        for (child, parent) in chain.into_iter().rev() {
+            if let Some(element) = document.element(parent) {
+                bloom |= element.self_ancestor_bloom();
+            }
+            cache.blooms.insert(child, bloom);
+        }
+        cache.blooms.entry(node).or_insert(bloom);
+        bloom
+    })
 }
 
 pub(crate) fn forget_custom_property_passes() {
@@ -1214,6 +1261,11 @@ pub(crate) fn forget_custom_property_passes() {
         let mut passes = passes.borrow_mut();
         passes.clear();
         passes.shrink_to_fit();
+    });
+    ANCESTOR_BLOOMS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.blooms.clear();
+        cache.blooms.shrink_to_fit();
     });
 }
 
@@ -2845,147 +2897,124 @@ fn is_root_element(document: &Document, node: NodeId, state: &StyleState) -> boo
     )
 }
 
-// rules bucketed by the rightmost id, class, tag, attribute or :root, so an element only
-// tries plausible rules
-#[derive(Clone, Debug, Default)]
-struct RuleIndex {
-    by_id: HashMap<String, Vec<usize>>,
-    by_class: HashMap<String, Vec<usize>>,
-    by_tag: HashMap<String, Vec<usize>>,
-    by_attr: HashMap<String, Vec<usize>>,
-    root_only: Vec<usize>,
-    universal: Vec<usize>,
+const STATE_FLAG_HOVER: u8 = 1 << 0;
+const STATE_FLAG_FOCUS: u8 = 1 << 1;
+const STATE_FLAG_ACTIVE: u8 = 1 << 2;
+const STATE_FLAG_PART_HOVER: u8 = 1 << 3;
+const SELECTOR_INDEX_MASK: u32 = 0x0fff_ffff;
+const SELECTOR_FLAGS_SHIFT: u32 = 28;
+
+#[inline]
+fn active_state_flags(state: &StyleState) -> u8 {
+    let forced = !state.forced.is_empty();
+    let mut flags = 0_u8;
+    if state.hovered.is_some() || forced {
+        flags |= STATE_FLAG_HOVER;
+    }
+    if state.focused.is_some() || forced {
+        flags |= STATE_FLAG_FOCUS;
+    }
+    if state.active.is_some() || forced {
+        flags |= STATE_FLAG_ACTIVE;
+    }
+    if state.hovered_part.is_some() {
+        flags |= STATE_FLAG_PART_HOVER;
+    }
+    flags
 }
 
-impl RuleIndex {
-    fn build(rules: &[Rule]) -> Self {
-        let positions: Vec<usize> = (0..rules.len()).collect();
-        Self::build_subset(rules, &positions)
+fn subject_state_flags(subject: &CompoundSelector) -> u8 {
+    let mut flags = 0_u8;
+    if subject.part_hover {
+        flags |= STATE_FLAG_PART_HOVER;
     }
-
-    fn build_subset(rules: &[Rule], positions: &[usize]) -> Self {
-        let mut index = Self::default();
-        for &position in positions {
-            let rule = &rules[position];
-            for selector in &rule.selectors {
-                let Some(subject) = selector.parts.last().map(|part| &part.compound) else {
-                    continue;
-                };
-                if let Some(id) = subject.id.as_ref() {
-                    index.by_id.entry(id.clone()).or_default().push(position);
-                } else if let Some(class) = subject.classes.first() {
-                    index
-                        .by_class
-                        .entry(class.clone())
-                        .or_default()
-                        .push(position);
-                } else if let Some(tag) = subject.tag.as_ref() {
-                    index.by_tag.entry(tag.clone()).or_default().push(position);
-                } else if let Some(attribute) = subject.attributes.first() {
-                    let (AttributeSelector::Exists(name) | AttributeSelector::Match { name, .. }) =
-                        attribute;
-                    index
-                        .by_attr
-                        .entry(name.to_ascii_lowercase())
-                        .or_default()
-                        .push(position);
-                } else if subject
-                    .pseudo_classes
-                    .iter()
-                    .any(|class| matches!(class, PseudoClass::Root))
-                {
-                    index.root_only.push(position);
-                } else {
-                    index.universal.push(position);
-                }
+    for pseudo in &subject.pseudo_classes {
+        match pseudo {
+            PseudoClass::Hover => flags |= STATE_FLAG_HOVER,
+            PseudoClass::Focus | PseudoClass::FocusVisible | PseudoClass::FocusWithin => {
+                flags |= STATE_FLAG_FOCUS
             }
+            PseudoClass::Active => flags |= STATE_FLAG_ACTIVE,
+            _ => {}
         }
-        for bucket in index
-            .by_id
-            .values_mut()
-            .chain(index.by_class.values_mut())
-            .chain(index.by_tag.values_mut())
-            .chain(index.by_attr.values_mut())
-            .chain(std::iter::once(&mut index.root_only))
-            .chain(std::iter::once(&mut index.universal))
-        {
-            bucket.sort_unstable();
-            bucket.dedup();
+    }
+    flags
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SelectorEntry {
+    rule: u32,
+    // low 28 bits hold the selector index inside the rule; top 4 bits hold required state flags
+    selector_and_flags: u32,
+    subject_class_bloom: u64,
+    ancestor_bloom: u128,
+}
+
+impl SelectorEntry {
+    #[inline]
+    fn new(
+        rule: usize,
+        selector_index: usize,
+        selector: &Selector,
+        subject: &CompoundSelector,
+    ) -> Self {
+        let flags = u32::from(subject_state_flags(subject)) << SELECTOR_FLAGS_SHIFT;
+        Self {
+            rule: rule as u32,
+            selector_and_flags: (selector_index as u32 & SELECTOR_INDEX_MASK) | flags,
+            subject_class_bloom: subject.class_bloom,
+            ancestor_bloom: selector.ancestor_bloom,
         }
-        index
     }
 
-    fn any_candidate(
-        &self,
-        subject: &Element,
-        is_root: bool,
-        mut check: impl FnMut(usize) -> bool,
+    #[inline]
+    fn selector_index(self) -> usize {
+        (self.selector_and_flags & SELECTOR_INDEX_MASK) as usize
+    }
+
+    #[inline]
+    fn state_flags(self) -> u8 {
+        (self.selector_and_flags >> SELECTOR_FLAGS_SHIFT) as u8
+    }
+
+    #[inline]
+    fn passes_prefilter(
+        self,
+        elem_class_bloom: u64,
+        node_ancestor_bloom: u128,
+        active_flags: u8,
     ) -> bool {
-        if self.universal.iter().any(|&index| check(index)) {
-            return true;
-        }
-        if is_root && self.root_only.iter().any(|&index| check(index)) {
-            return true;
-        }
-        if !self.by_tag.is_empty()
-            && let Some(bucket) = self.by_tag.get(&subject.name)
-            && bucket.iter().any(|&index| check(index))
-        {
-            return true;
-        }
-        if !self.by_id.is_empty()
-            && let Some(id) = subject.attr("id")
-            && let Some(bucket) = self.by_id.get(id)
-            && bucket.iter().any(|&index| check(index))
-        {
-            return true;
-        }
-        if !self.by_class.is_empty() {
-            for class in subject.classes() {
-                if let Some(bucket) = self.by_class.get(class)
-                    && bucket.iter().any(|&index| check(index))
-                {
-                    return true;
-                }
-            }
-        }
-        if !self.by_attr.is_empty() && !subject.attrs.is_empty() {
-            if self.by_attr.len() <= subject.attrs.len() {
-                for (name, bucket) in &self.by_attr {
-                    if subject.attr(name).is_some() && bucket.iter().any(|&index| check(index)) {
-                        return true;
-                    }
-                }
-            } else {
-                for name in subject.attrs.keys() {
-                    let bucket = self.by_attr.get(name.as_str()).or_else(|| {
-                        name.bytes()
-                            .any(|byte| byte.is_ascii_uppercase())
-                            .then(|| self.by_attr.get(&name.to_ascii_lowercase()))
-                            .flatten()
-                    });
-                    if let Some(bucket) = bucket
-                        && bucket.iter().any(|&index| check(index))
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        (elem_class_bloom & self.subject_class_bloom) == self.subject_class_bloom
+            && (node_ancestor_bloom & self.ancestor_bloom) == self.ancestor_bloom
+            && (self.state_flags() & !active_flags) == 0
     }
+}
 
-    // whether any rule could match the element, without building the list
+// selectors bucketed by their rightmost id, rarest class, tag, attribute or :root,
+// partitioned by pseudo-element so normal cascades never visit pseudo-element rules
+#[derive(Clone, Debug, Default)]
+struct BucketSet {
+    by_id: HashMap<String, Vec<SelectorEntry>>,
+    by_class: HashMap<String, Vec<SelectorEntry>>,
+    by_tag: HashMap<String, Vec<SelectorEntry>>,
+    by_attr: HashMap<String, Vec<SelectorEntry>>,
+    root_only: Vec<SelectorEntry>,
+    universal: Vec<SelectorEntry>,
+}
+
+impl BucketSet {
     fn has_candidates(&self, subject: &Element, is_root: bool) -> bool {
         if !self.universal.is_empty()
             || (is_root && !self.root_only.is_empty())
-            || self.by_tag.contains_key(&subject.name)
-            || subject
-                .attr("id")
-                .is_some_and(|id| self.by_id.contains_key(id))
-            || subject
-                .classes()
-                .any(|class| self.by_class.contains_key(class))
+            || (!self.by_tag.is_empty() && self.by_tag.contains_key(&subject.name))
+            || (!self.by_id.is_empty()
+                && subject
+                    .id_attr()
+                    .is_some_and(|id| self.by_id.contains_key(id)))
+            || (!self.by_class.is_empty()
+                && subject
+                    .classes()
+                    .any(|class| self.by_class.contains_key(class)))
         {
             return true;
         }
@@ -3002,39 +3031,111 @@ impl RuleIndex {
         false
     }
 
-    fn fill_candidates(&self, subject: &Element, is_root: bool, candidates: &mut Vec<usize>) {
-        candidates.clear();
-        let mut buckets = 0usize;
-        if !self.universal.is_empty() {
-            candidates.extend_from_slice(&self.universal);
-            buckets += 1;
+    fn any_candidate(
+        &self,
+        subject: &Element,
+        is_root: bool,
+        mut check: impl FnMut(SelectorEntry) -> bool,
+    ) -> bool {
+        if self.universal.iter().any(|&entry| check(entry)) {
+            return true;
         }
-        if is_root && !self.root_only.is_empty() {
-            candidates.extend_from_slice(&self.root_only);
-            buckets += 1;
+        if is_root && self.root_only.iter().any(|&entry| check(entry)) {
+            return true;
         }
-        if let Some(bucket) = self.by_tag.get(&subject.name) {
-            candidates.extend_from_slice(bucket);
-            buckets += 1;
+        if !self.by_tag.is_empty()
+            && let Some(bucket) = self.by_tag.get(&subject.name)
+            && bucket.iter().any(|&entry| check(entry))
+        {
+            return true;
         }
-        if let Some(id) = subject.attr("id")
+        if !self.by_id.is_empty()
+            && let Some(id) = subject.id_attr()
+            && let Some(bucket) = self.by_id.get(id)
+            && bucket.iter().any(|&entry| check(entry))
+        {
+            return true;
+        }
+        if !self.by_class.is_empty() {
+            for class in subject.classes() {
+                if let Some(bucket) = self.by_class.get(class)
+                    && bucket.iter().any(|&entry| check(entry))
+                {
+                    return true;
+                }
+            }
+        }
+        if !self.by_attr.is_empty() && !subject.attrs.is_empty() {
+            if self.by_attr.len() <= subject.attrs.len() {
+                for (name, bucket) in &self.by_attr {
+                    if subject.attr(name).is_some() && bucket.iter().any(|&entry| check(entry)) {
+                        return true;
+                    }
+                }
+            } else {
+                for name in subject.attrs.keys() {
+                    let bucket = self.by_attr.get(name.as_str()).or_else(|| {
+                        name.bytes()
+                            .any(|byte| byte.is_ascii_uppercase())
+                            .then(|| self.by_attr.get(&name.to_ascii_lowercase()))
+                            .flatten()
+                    });
+                    if let Some(bucket) = bucket
+                        && bucket.iter().any(|&entry| check(entry))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn for_each_candidate(
+        &self,
+        subject: &Element,
+        is_root: bool,
+        mut visit: impl FnMut(SelectorEntry),
+    ) {
+        for &entry in &self.universal {
+            visit(entry);
+        }
+        if is_root {
+            for &entry in &self.root_only {
+                visit(entry);
+            }
+        }
+        if !self.by_tag.is_empty()
+            && let Some(bucket) = self.by_tag.get(&subject.name)
+        {
+            for &entry in bucket {
+                visit(entry);
+            }
+        }
+        if !self.by_id.is_empty()
+            && let Some(id) = subject.id_attr()
             && let Some(bucket) = self.by_id.get(id)
         {
-            candidates.extend_from_slice(bucket);
-            buckets += 1;
+            for &entry in bucket {
+                visit(entry);
+            }
         }
-        for class in subject.classes() {
-            if let Some(bucket) = self.by_class.get(class) {
-                candidates.extend_from_slice(bucket);
-                buckets += 1;
+        if !self.by_class.is_empty() {
+            for class in subject.classes() {
+                if let Some(bucket) = self.by_class.get(class) {
+                    for &entry in bucket {
+                        visit(entry);
+                    }
+                }
             }
         }
         if !self.by_attr.is_empty() && !subject.attrs.is_empty() {
             if self.by_attr.len() <= subject.attrs.len() {
                 for (name, bucket) in &self.by_attr {
                     if subject.attr(name).is_some() {
-                        candidates.extend_from_slice(bucket);
-                        buckets += 1;
+                        for &entry in bucket {
+                            visit(entry);
+                        }
                     }
                 }
             } else {
@@ -3046,22 +3147,154 @@ impl RuleIndex {
                             .flatten()
                     });
                     if let Some(bucket) = bucket {
-                        candidates.extend_from_slice(bucket);
-                        buckets += 1;
+                        for &entry in bucket {
+                            visit(entry);
+                        }
                     }
                 }
             }
         }
-        if buckets > 1 {
-            candidates.sort_unstable();
-            candidates.dedup();
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuleIndex {
+    normal: BucketSet,
+    by_pseudo: HashMap<PseudoElement, BucketSet>,
+}
+
+impl RuleIndex {
+    fn build(rules: &[Rule]) -> Self {
+        let positions: Vec<usize> = (0..rules.len()).collect();
+        Self::build_subset(rules, &positions)
+    }
+
+    fn build_subset(rules: &[Rule], positions: &[usize]) -> Self {
+        // count class occurrences on subjects first so multi-class subjects bucket under their rarest class
+        let mut class_counts: HashMap<&str, usize> = HashMap::default();
+        for &position in positions {
+            for selector in &rules[position].selectors {
+                if let Some(subject) = selector.parts.last().map(|part| &part.compound)
+                    && subject.id.is_none()
+                    && subject.classes.len() > 1
+                {
+                    for class in &subject.classes {
+                        *class_counts.entry(class.as_str()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        if !class_counts.is_empty() {
+            for &position in positions {
+                for selector in &rules[position].selectors {
+                    if let Some(subject) = selector.parts.last().map(|part| &part.compound)
+                        && subject.id.is_none()
+                        && subject.classes.len() == 1
+                        && let Some(count) = class_counts.get_mut(subject.classes[0].as_str())
+                    {
+                        *count += 1;
+                    }
+                }
+            }
+        }
+        let mut index = Self::default();
+        for &position in positions {
+            let rule = &rules[position];
+            for (selector_index, selector) in rule.selectors.iter().enumerate() {
+                let Some(subject) = selector.parts.last().map(|part| &part.compound) else {
+                    continue;
+                };
+                let entry = SelectorEntry::new(position, selector_index, selector, subject);
+                let target = match subject.pseudo_element {
+                    None => &mut index.normal,
+                    Some(pseudo) => index.by_pseudo.entry(pseudo).or_default(),
+                };
+                if let Some(id) = subject.id.as_ref() {
+                    target.by_id.entry(id.clone()).or_default().push(entry);
+                } else if !subject.classes.is_empty() {
+                    let chosen = if subject.classes.len() == 1 {
+                        &subject.classes[0]
+                    } else {
+                        subject
+                            .classes
+                            .iter()
+                            .min_by_key(|class| {
+                                class_counts.get(class.as_str()).copied().unwrap_or(0)
+                            })
+                            .unwrap_or(&subject.classes[0])
+                    };
+                    target
+                        .by_class
+                        .entry(chosen.clone())
+                        .or_default()
+                        .push(entry);
+                } else if let Some(tag) = subject.tag.as_ref() {
+                    target.by_tag.entry(tag.clone()).or_default().push(entry);
+                } else if let Some(attribute) = subject.attributes.first() {
+                    let (AttributeSelector::Exists(name) | AttributeSelector::Match { name, .. }) =
+                        attribute;
+                    target
+                        .by_attr
+                        .entry(name.to_ascii_lowercase())
+                        .or_default()
+                        .push(entry);
+                } else if subject
+                    .pseudo_classes
+                    .iter()
+                    .any(|class| matches!(class, PseudoClass::Root))
+                {
+                    target.root_only.push(entry);
+                } else {
+                    target.universal.push(entry);
+                }
+            }
+        }
+        index
+    }
+
+    #[inline]
+    fn buckets(&self, pseudo: Option<PseudoElement>) -> Option<&BucketSet> {
+        match pseudo {
+            None => Some(&self.normal),
+            Some(pseudo) => self.by_pseudo.get(&pseudo),
         }
     }
 
-    fn candidates(&self, subject: &Element, is_root: bool) -> Vec<usize> {
-        let mut candidates = Vec::new();
-        self.fill_candidates(subject, is_root, &mut candidates);
-        candidates
+    fn has_candidates(
+        &self,
+        subject: &Element,
+        pseudo: Option<PseudoElement>,
+        is_root: bool,
+    ) -> bool {
+        self.buckets(pseudo)
+            .is_some_and(|buckets| buckets.has_candidates(subject, is_root))
+    }
+
+    fn any_candidate(
+        &self,
+        subject: &Element,
+        pseudo: Option<PseudoElement>,
+        is_root: bool,
+        check: impl FnMut(SelectorEntry) -> bool,
+    ) -> bool {
+        self.buckets(pseudo)
+            .is_some_and(|buckets| buckets.any_candidate(subject, is_root, check))
+    }
+
+    fn rule_candidates(
+        &self,
+        subject: &Element,
+        pseudo: Option<PseudoElement>,
+        is_root: bool,
+    ) -> Vec<usize> {
+        let Some(buckets) = self.buckets(pseudo) else {
+            return Vec::new();
+        };
+        let mut rules = Vec::new();
+        buckets.for_each_candidate(subject, is_root, |entry| rules.push(entry.rule as usize));
+        rules.sort_unstable();
+        rules.dedup();
+        rules
     }
 }
 
@@ -3953,14 +4186,18 @@ impl Stylesheet {
             return false;
         }
         let is_root = is_root_element(document, node, state);
+        let elem_bloom = element.class_bloom();
+        let ancestors = ancestor_bloom(document, node);
+        let active_flags = active_state_flags(state);
         self.custom_prop_index
-            .any_candidate(element, is_root, |index| {
-                let rule = &self.rules[index];
+            .any_candidate(element, None, is_root, |entry| {
+                if !entry.passes_prefilter(elem_bloom, ancestors, active_flags) {
+                    return false;
+                }
+                let rule = &self.rules[entry.rule as usize];
                 rule.applies(document, node, state)
-                    && rule
-                        .selectors
-                        .iter()
-                        .any(|selector| selector.matches(document, node, None, state))
+                    && rule.selectors[entry.selector_index()]
+                        .matches_checked(document, node, None, state)
             })
     }
 
@@ -4061,29 +4298,47 @@ impl Stylesheet {
         if !self.has_generated_content() {
             return [None, None];
         }
+        let mut check = [true, true];
         if !document.has_shadow_roots() {
             let Some(element) = document.element(node) else {
                 return [None, None];
             };
             let is_root = is_root_element(document, node, state);
-            if !self
-                .generated_content_index
-                .any_candidate(element, is_root, |_| true)
-            {
+            check = [
+                self.generated_content_index.has_candidates(
+                    element,
+                    Some(PseudoElement::Before),
+                    is_root,
+                ),
+                self.generated_content_index.has_candidates(
+                    element,
+                    Some(PseudoElement::After),
+                    is_root,
+                ),
+            ];
+            if !check[0] && !check[1] {
                 return [None, None];
             }
         }
-        [PseudoElement::Before, PseudoElement::After].map(|pseudo| {
-            self.generated_content(StyleContext {
-                document,
-                node,
-                pseudo: Some(pseudo),
-                parent_font_size: 16.0,
-                parent_color: Color::BLACK,
-                parent_weight: FontWeight::NORMAL,
-                parent_text: SharedText::default(),
-                state,
-            })
+        [
+            (check[0], PseudoElement::Before),
+            (check[1], PseudoElement::After),
+        ]
+        .map(|(enabled, pseudo)| {
+            enabled
+                .then(|| {
+                    self.generated_content(StyleContext {
+                        document,
+                        node,
+                        pseudo: Some(pseudo),
+                        parent_font_size: 16.0,
+                        parent_color: Color::BLACK,
+                        parent_weight: FontWeight::NORMAL,
+                        parent_text: SharedText::default(),
+                        state,
+                    })
+                })
+                .flatten()
         })
     }
 
@@ -4110,20 +4365,27 @@ impl Stylesheet {
         if !context.document.has_shadow_roots() {
             let element = context.document.element(context.node)?;
             let is_root = is_root_element(context.document, context.node, context.state);
-            let may_generate =
-                self.generated_content_index
-                    .any_candidate(element, is_root, |index| {
-                        let rule = &self.rules[index];
-                        rule.applies(context.document, context.node, context.state)
-                            && rule.selectors.iter().any(|selector| {
-                                selector.matches(
-                                    context.document,
-                                    context.node,
-                                    context.pseudo,
-                                    context.state,
-                                )
-                            })
-                    });
+            let elem_bloom = element.class_bloom();
+            let ancestors = ancestor_bloom(context.document, context.node);
+            let active_flags = active_state_flags(context.state);
+            let may_generate = self.generated_content_index.any_candidate(
+                element,
+                context.pseudo,
+                is_root,
+                |entry| {
+                    if !entry.passes_prefilter(elem_bloom, ancestors, active_flags) {
+                        return false;
+                    }
+                    let rule = &self.rules[entry.rule as usize];
+                    rule.applies(context.document, context.node, context.state)
+                        && rule.selectors[entry.selector_index()].matches_checked(
+                            context.document,
+                            context.node,
+                            context.pseudo,
+                            context.state,
+                        )
+                },
+            );
             if !may_generate {
                 return None;
             }
@@ -4801,7 +5063,7 @@ impl Stylesheet {
         let is_root = is_root_element(document, node, state);
         with_user_agent_sheet(|ua| {
             for (user_agent, sheet) in [(true, ua), (false, self)] {
-                for position in sheet.index.candidates(element, is_root) {
+                for position in sheet.index.rule_candidates(element, pseudo, is_root) {
                     let Some(rule) = sheet.rules.get(position) else {
                         continue;
                     };
@@ -4885,32 +5147,27 @@ impl Stylesheet {
             host_only,
         } = target;
         let is_root = is_root_element(document, node, state);
-        if !self.index.has_candidates(element, is_root) {
+        let Some(buckets) = self.index.buckets(pseudo) else {
             return;
-        }
-        thread_local! {
-            static CANDIDATES: std::cell::Cell<Vec<usize>> = const { std::cell::Cell::new(Vec::new()) };
-        }
-        let mut candidates = CANDIDATES.with(std::cell::Cell::take);
-        self.index
-            .fill_candidates(element, is_root, &mut candidates);
-        for &position in &candidates {
-            let Some(rule) = self.rules.get(position) else {
-                continue;
-            };
-            if !rule.applies(document, node, state) {
-                continue;
+        };
+        let elem_bloom = element.class_bloom();
+        let ancestors = ancestor_bloom(document, node);
+        let active_flags = active_state_flags(state);
+        buckets.for_each_candidate(element, is_root, |entry| {
+            if !entry.passes_prefilter(elem_bloom, ancestors, active_flags) {
+                return;
             }
-            let Some(specificity) = rule
-                .selectors
-                .iter()
-                .filter(|selector| !host_only || selector.names_host())
-                .filter(|selector| selector.matches(document, node, pseudo, state))
-                .map(Selector::specificity)
-                .max()
-            else {
-                continue;
+            let Some(rule) = self.rules.get(entry.rule as usize) else {
+                return;
             };
+            let selector = &rule.selectors[entry.selector_index()];
+            if (host_only && !selector.names_host())
+                || !rule.applies(document, node, state)
+                || !selector.matches_checked(document, node, pseudo, state)
+            {
+                return;
+            }
+            let specificity = selector.specificity();
             // later declarations in a rule follow earlier ones in the cascade order
             for (position, declaration) in rule.declarations.iter().enumerate() {
                 let candidate = (
@@ -4925,8 +5182,7 @@ impl Stylesheet {
                     values.insert(Cow::Borrowed(declaration.property.as_str()), candidate);
                 }
             }
-        }
-        CANDIDATES.with(|slot| slot.set(candidates));
+        });
     }
 
     fn matched_declarations(
@@ -4983,14 +5239,19 @@ impl Stylesheet {
             return true;
         }
         let is_root = is_root_element(document, node, state);
-        self.motion_index.any_candidate(element, is_root, |index| {
-            let rule = &self.rules[index];
-            rule.applies(document, node, state)
-                && rule
-                    .selectors
-                    .iter()
-                    .any(|selector| selector.matches(document, node, None, state))
-        })
+        let elem_bloom = element.class_bloom();
+        let ancestors = ancestor_bloom(document, node);
+        let active_flags = active_state_flags(state);
+        self.motion_index
+            .any_candidate(element, None, is_root, |entry| {
+                if !entry.passes_prefilter(elem_bloom, ancestors, active_flags) {
+                    return false;
+                }
+                let rule = &self.rules[entry.rule as usize];
+                rule.applies(document, node, state)
+                    && rule.selectors[entry.selector_index()]
+                        .matches_checked(document, node, None, state)
+            })
     }
 
     // whether this sheet or the user agent's styles the pseudo-element
@@ -5038,8 +5299,11 @@ impl Stylesheet {
                             && hover
                                 .id
                                 .as_deref()
-                                .is_none_or(|id| element.attr("id") == Some(id))
-                            && hover.classes.iter().all(|class| element.has_class(class));
+                                .is_none_or(|id| element.id_attr() == Some(id))
+                            && hover
+                                .classes
+                                .iter()
+                                .all(|class| element.has_class_token_plain(class));
                         let root = match document.parent(node) {
                             Some(parent) if !hover.subject => parent,
                             _ => node,
@@ -5162,8 +5426,11 @@ impl Stylesheet {
                             && anchor
                                 .id
                                 .as_deref()
-                                .is_none_or(|id| element.attr("id") == Some(id))
-                            && anchor.classes.iter().all(|class| element.has_class(class))
+                                .is_none_or(|id| element.id_attr() == Some(id))
+                            && anchor
+                                .classes
+                                .iter()
+                                .all(|class| element.has_class_token_plain(class))
                     });
                     let root = document.parent(above).unwrap_or(above);
                     if anchored && !roots.contains(&root) {
@@ -5635,6 +5902,8 @@ struct Declaration {
 #[derive(Clone, Debug)]
 pub(crate) struct Selector {
     parts: Vec<SelectorPart>,
+    ancestor_bloom: u128,
+    specificity: Specificity,
 }
 
 #[derive(Clone, Debug)]
@@ -5656,6 +5925,7 @@ struct CompoundSelector {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
+    class_bloom: u64,
     attributes: Vec<AttributeSelector>,
     pseudo_classes: Vec<PseudoClass>,
     pseudo_element: Option<PseudoElement>,
@@ -5962,7 +6232,22 @@ impl Selector {
         if parts.is_empty() || combinator.is_some() {
             return Err(format!("selector has no final compound: {source}"));
         }
-        Ok(Self { parts })
+        let ancestor_bloom = compute_ancestor_bloom(&parts);
+        let specificity = parts
+            .iter()
+            .fold(Specificity(0, 0, 0), |specificity, part| {
+                let part_specificity = part.compound.specificity();
+                Specificity(
+                    specificity.0 + part_specificity.0,
+                    specificity.1 + part_specificity.1,
+                    specificity.2 + part_specificity.2,
+                )
+            });
+        Ok(Self {
+            parts,
+            ancestor_bloom,
+            specificity,
+        })
     }
 
     // a forgiving list, as :is() and :where() take it: parts that do not parse drop out
@@ -5982,6 +6267,21 @@ impl Selector {
     }
 
     pub(crate) fn matches(
+        &self,
+        document: &Document,
+        node: NodeId,
+        pseudo: Option<PseudoElement>,
+        state: &StyleState,
+    ) -> bool {
+        if self.ancestor_bloom != 0
+            && (ancestor_bloom(document, node) & self.ancestor_bloom) != self.ancestor_bloom
+        {
+            return false;
+        }
+        self.matches_checked(document, node, pseudo, state)
+    }
+
+    fn matches_checked(
         &self,
         document: &Document,
         node: NodeId,
@@ -6061,18 +6361,38 @@ impl Selector {
             .is_some_and(|part| part.compound.names_host())
     }
 
+    #[inline]
     fn specificity(&self) -> Specificity {
-        self.parts
-            .iter()
-            .fold(Specificity(0, 0, 0), |specificity, part| {
-                let part_specificity = part.compound.specificity();
-                Specificity(
-                    specificity.0 + part_specificity.0,
-                    specificity.1 + part_specificity.1,
-                    specificity.2 + part_specificity.2,
-                )
-            })
+        self.specificity
     }
+}
+
+fn compute_ancestor_bloom(parts: &[SelectorPart]) -> u128 {
+    let mut bloom = 0_u128;
+    let mut index = parts.len().saturating_sub(1);
+    while index > 0 {
+        match parts[index].combinator {
+            Some(Combinator::Child | Combinator::Descendant) => {
+                let compound = &parts[index - 1].compound;
+                // :host jumps across a shadow boundary that document.parent_element does not cross
+                if compound.names_host() {
+                    break;
+                }
+                bloom |= u128::from(compound.class_bloom);
+                let mut tag_and_id = 0_u64;
+                if let Some(tag) = compound.tag.as_deref() {
+                    tag_and_id |= crate::dom::tag_bloom_mask(tag);
+                }
+                if let Some(id) = compound.id.as_deref() {
+                    tag_and_id |= crate::dom::id_bloom_mask(id);
+                }
+                bloom |= u128::from(tag_and_id) << 64;
+                index -= 1;
+            }
+            _ => break,
+        }
+    }
+    bloom
 }
 
 // the keys a compound's matching reads from attributes; a pseudo-class that is not structural
@@ -6225,11 +6545,15 @@ impl CompoundSelector {
         state: &StyleState,
     ) -> bool {
         self.tag.as_deref().is_none_or(|tag| tag == element.name)
+            && (element.class_bloom() & self.class_bloom) == self.class_bloom
             && self
                 .id
                 .as_deref()
-                .is_none_or(|id| element.attr("id") == Some(id))
-            && self.classes.iter().all(|class| element.has_class(class))
+                .is_none_or(|id| element.id_attr() == Some(id))
+            && self
+                .classes
+                .iter()
+                .all(|class| element.has_class_token_plain(class))
             && self
                 .attributes
                 .iter()
@@ -6517,6 +6841,7 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
         tag: None,
         id: None,
         classes: Vec::new(),
+        class_bloom: 0,
         attributes: Vec::new(),
         pseudo_classes: Vec::new(),
         pseudo_element: None,
@@ -6531,7 +6856,9 @@ fn parse_compound_selector(source: &str, cursor: &mut usize) -> Result<CompoundS
             }
             b'.' => {
                 *cursor += 1;
-                selector.classes.push(parse_selector_name(source, cursor)?);
+                let class = parse_selector_name(source, cursor)?;
+                selector.class_bloom |= crate::dom::class_bloom_mask(&class);
+                selector.classes.push(class);
             }
             b':' => {
                 *cursor += 1;
