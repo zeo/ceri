@@ -397,11 +397,9 @@ impl StreamFunction {
                 trace_pipe(p, tracer);
                 tracer.trace_abort_signal(sig);
             }
-            Self::Collected(c, _) => {
-                if tracer.visit_rc(c) {
-                    trace_reader(&c.reader, tracer);
-                    tracer.trace_promise(&c.result);
-                }
+            Self::Collected(c, _) if tracer.visit_rc(c) => {
+                trace_reader(&c.reader, tracer);
+                tracer.trace_promise(&c.result);
             }
             _ => {}
         }

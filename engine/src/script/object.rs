@@ -990,14 +990,13 @@ impl JsObject {
                         return Some(hit);
                     }
                 }
-                IcEntry::Missing { receiver, proto } => {
+                IcEntry::Missing { receiver, proto }
                     if std::ptr::eq(receiver.as_ptr(), shape_ptr)
                         && !matches!(self.class, ObjectClass::String(_))
                         && !self.orphan
-                        && Self::check_missing_proto(&self.prototype, proto.as_deref())
-                    {
-                        return Some(IcGetHit::Missing);
-                    }
+                        && Self::check_missing_proto(&self.prototype, proto.as_deref()) =>
+                {
+                    return Some(IcGetHit::Missing);
                 }
                 _ => {}
             }
