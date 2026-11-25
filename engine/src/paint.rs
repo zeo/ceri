@@ -1013,47 +1013,163 @@ impl Canvas {
                                 match lut {
                                     BlendLut::Gray(tables) => {
                                         let [rgb, a] = &**tables;
+                                        let first_x = active[0].0 as usize;
+                                        let mut last_in = u32::from_ne_bytes(pixels[first_x]);
+                                        let mut last_out = [
+                                            rgb[usize::from(pixels[first_x][0])],
+                                            rgb[usize::from(pixels[first_x][1])],
+                                            rgb[usize::from(pixels[first_x][2])],
+                                            a[usize::from(pixels[first_x][3])],
+                                        ];
                                         if let Some(step) = *stride_step {
-                                            let first_x = active[0].0 as usize;
                                             let last_x = active[active.len() - 1].0 as usize;
-                                            for pixel in
-                                                pixels[first_x..=last_x].iter_mut().step_by(step)
-                                            {
-                                                pixel[0] = rgb[usize::from(pixel[0])];
-                                                pixel[1] = rgb[usize::from(pixel[1])];
-                                                pixel[2] = rgb[usize::from(pixel[2])];
-                                                pixel[3] = a[usize::from(pixel[3])];
+                                            let span = &mut pixels[first_x..=last_x];
+                                            if step == 3 {
+                                                let (chunks, rem) = span.as_chunks_mut::<3>();
+                                                for chunk in chunks {
+                                                    let pixel = &mut chunk[0];
+                                                    let current = u32::from_ne_bytes(*pixel);
+                                                    if current == last_in {
+                                                        *pixel = last_out;
+                                                    } else {
+                                                        last_in = current;
+                                                        last_out = [
+                                                            rgb[usize::from(pixel[0])],
+                                                            rgb[usize::from(pixel[1])],
+                                                            rgb[usize::from(pixel[2])],
+                                                            a[usize::from(pixel[3])],
+                                                        ];
+                                                        *pixel = last_out;
+                                                    }
+                                                }
+                                                if let Some(pixel) = rem.first_mut() {
+                                                    let current = u32::from_ne_bytes(*pixel);
+                                                    if current == last_in {
+                                                        *pixel = last_out;
+                                                    } else {
+                                                        *pixel = [
+                                                            rgb[usize::from(pixel[0])],
+                                                            rgb[usize::from(pixel[1])],
+                                                            rgb[usize::from(pixel[2])],
+                                                            a[usize::from(pixel[3])],
+                                                        ];
+                                                    }
+                                                }
+                                            } else {
+                                                for chunk in span.chunks_mut(step) {
+                                                    let pixel = &mut chunk[0];
+                                                    let current = u32::from_ne_bytes(*pixel);
+                                                    if current == last_in {
+                                                        *pixel = last_out;
+                                                    } else {
+                                                        last_in = current;
+                                                        last_out = [
+                                                            rgb[usize::from(pixel[0])],
+                                                            rgb[usize::from(pixel[1])],
+                                                            rgb[usize::from(pixel[2])],
+                                                            a[usize::from(pixel[3])],
+                                                        ];
+                                                        *pixel = last_out;
+                                                    }
+                                                }
                                             }
                                         } else {
                                             for &(pixel_x, _) in active {
                                                 let pixel = &mut pixels[pixel_x as usize];
-                                                pixel[0] = rgb[usize::from(pixel[0])];
-                                                pixel[1] = rgb[usize::from(pixel[1])];
-                                                pixel[2] = rgb[usize::from(pixel[2])];
-                                                pixel[3] = a[usize::from(pixel[3])];
+                                                let current = u32::from_ne_bytes(*pixel);
+                                                if current == last_in {
+                                                    *pixel = last_out;
+                                                } else {
+                                                    last_in = current;
+                                                    last_out = [
+                                                        rgb[usize::from(pixel[0])],
+                                                        rgb[usize::from(pixel[1])],
+                                                        rgb[usize::from(pixel[2])],
+                                                        a[usize::from(pixel[3])],
+                                                    ];
+                                                    *pixel = last_out;
+                                                }
                                             }
                                         }
                                     }
                                     BlendLut::Rgba(tables) => {
                                         let [r, g, b, a] = &**tables;
+                                        let first_x = active[0].0 as usize;
+                                        let mut last_in = u32::from_ne_bytes(pixels[first_x]);
+                                        let mut last_out = [
+                                            r[usize::from(pixels[first_x][0])],
+                                            g[usize::from(pixels[first_x][1])],
+                                            b[usize::from(pixels[first_x][2])],
+                                            a[usize::from(pixels[first_x][3])],
+                                        ];
                                         if let Some(step) = *stride_step {
-                                            let first_x = active[0].0 as usize;
                                             let last_x = active[active.len() - 1].0 as usize;
-                                            for pixel in
-                                                pixels[first_x..=last_x].iter_mut().step_by(step)
-                                            {
-                                                pixel[0] = r[usize::from(pixel[0])];
-                                                pixel[1] = g[usize::from(pixel[1])];
-                                                pixel[2] = b[usize::from(pixel[2])];
-                                                pixel[3] = a[usize::from(pixel[3])];
+                                            let span = &mut pixels[first_x..=last_x];
+                                            if step == 3 {
+                                                let (chunks, rem) = span.as_chunks_mut::<3>();
+                                                for chunk in chunks {
+                                                    let pixel = &mut chunk[0];
+                                                    let current = u32::from_ne_bytes(*pixel);
+                                                    if current == last_in {
+                                                        *pixel = last_out;
+                                                    } else {
+                                                        last_in = current;
+                                                        last_out = [
+                                                            r[usize::from(pixel[0])],
+                                                            g[usize::from(pixel[1])],
+                                                            b[usize::from(pixel[2])],
+                                                            a[usize::from(pixel[3])],
+                                                        ];
+                                                        *pixel = last_out;
+                                                    }
+                                                }
+                                                if let Some(pixel) = rem.first_mut() {
+                                                    let current = u32::from_ne_bytes(*pixel);
+                                                    if current == last_in {
+                                                        *pixel = last_out;
+                                                    } else {
+                                                        *pixel = [
+                                                            r[usize::from(pixel[0])],
+                                                            g[usize::from(pixel[1])],
+                                                            b[usize::from(pixel[2])],
+                                                            a[usize::from(pixel[3])],
+                                                        ];
+                                                    }
+                                                }
+                                            } else {
+                                                for chunk in span.chunks_mut(step) {
+                                                    let pixel = &mut chunk[0];
+                                                    let current = u32::from_ne_bytes(*pixel);
+                                                    if current == last_in {
+                                                        *pixel = last_out;
+                                                    } else {
+                                                        last_in = current;
+                                                        last_out = [
+                                                            r[usize::from(pixel[0])],
+                                                            g[usize::from(pixel[1])],
+                                                            b[usize::from(pixel[2])],
+                                                            a[usize::from(pixel[3])],
+                                                        ];
+                                                        *pixel = last_out;
+                                                    }
+                                                }
                                             }
                                         } else {
                                             for &(pixel_x, _) in active {
                                                 let pixel = &mut pixels[pixel_x as usize];
-                                                pixel[0] = r[usize::from(pixel[0])];
-                                                pixel[1] = g[usize::from(pixel[1])];
-                                                pixel[2] = b[usize::from(pixel[2])];
-                                                pixel[3] = a[usize::from(pixel[3])];
+                                                let current = u32::from_ne_bytes(*pixel);
+                                                if current == last_in {
+                                                    *pixel = last_out;
+                                                } else {
+                                                    last_in = current;
+                                                    last_out = [
+                                                        r[usize::from(pixel[0])],
+                                                        g[usize::from(pixel[1])],
+                                                        b[usize::from(pixel[2])],
+                                                        a[usize::from(pixel[3])],
+                                                    ];
+                                                    *pixel = last_out;
+                                                }
                                             }
                                         }
                                     }
@@ -1319,13 +1435,31 @@ impl Canvas {
         let _profile = crate::profile::scope("paint: border");
         let unmasked_all = self.masks_cover_rect(left, top, right, bottom);
         let stride = self.width as usize * 4;
+        let (inner_st, inner_sb, straight_inner_whole) = if hollow {
+            let top_c = inner.radii[0].1.max(inner.radii[1].1).min(inner.height);
+            let bot_c = inner.radii[2].1.max(inner.radii[3].1).min(inner.height);
+            let st = inner.y + top_c.max(0.5);
+            let sb = inner.y + inner.height - bot_c.max(0.5);
+            if st < sb {
+                (st, sb, Some(inner.whole_run((st + sb) * 0.5, left..right)))
+            } else {
+                (0.0, 0.0, None)
+            }
+        } else {
+            (0.0, 0.0, None)
+        };
         for pixel_y in top..bottom {
             let row = pixel_y as f32 + 0.5;
             // the ring leaves out what lies whole inside the inner shape
-            let inside = if hollow {
-                inner.whole_run(row, left..right)
-            } else {
+            let inside = if !hollow {
                 left..left
+            } else if let Some(ref straight) = straight_inner_whole
+                && row >= inner_st
+                && row <= inner_sb
+            {
+                straight.clone()
+            } else {
+                inner.whole_run(row, left..right)
             };
             if inside.start <= left && inside.end >= right {
                 continue;
@@ -1710,6 +1844,95 @@ impl Canvas {
             }
         };
         let shape_square = shape.is_square();
+        // small rounded blurred shadows (e.g. repeated live status glows) share identical alpha masks
+        if !shape_square
+            && sigma >= 0.5
+            && shape.x.fract() == 0.0
+            && shape.y.fract() == 0.0
+            && frame.x.fract() == 0.0
+            && frame.y.fract() == 0.0
+        {
+            let reach_left = reach.x.floor() as i32;
+            let reach_top = reach.y.floor() as i32;
+            let reach_right = (reach.x + reach.width).ceil() as i32;
+            let reach_bottom = (reach.y + reach.height).ceil() as i32;
+            let mask_w = (reach_right - reach_left).max(0) as u32;
+            let mask_h = (reach_bottom - reach_top).max(0) as u32;
+            if mask_w > 0
+                && mask_h > 0
+                && u64::from(mask_w) * u64::from(mask_h) <= ShadowMasks::MAX_MASK_PIXELS
+                && i32::try_from(left).is_ok_and(|l| l >= reach_left)
+                && i32::try_from(top).is_ok_and(|t| t >= reach_top)
+                && i32::try_from(right).is_ok_and(|r| r <= reach_right)
+                && i32::try_from(bottom).is_ok_and(|b| b <= reach_bottom)
+            {
+                let local_shape = Shape {
+                    x: shape.x - reach_left as f32,
+                    y: shape.y - reach_top as f32,
+                    ..shape
+                };
+                let local_frame = Shape {
+                    x: frame.x - reach_left as f32,
+                    y: frame.y - reach_top as f32,
+                    ..frame
+                };
+                let key = shadow_mask_key(
+                    local_shape,
+                    local_frame,
+                    sigma,
+                    inset,
+                    color.alpha,
+                    mask_w,
+                    mask_h,
+                );
+                let mask = SHADOW_MASKS
+                    .with(|cache| cache.borrow_mut().find(&key))
+                    .unwrap_or_else(|| {
+                        let rendered = render_shadow_mask(
+                            local_shape,
+                            local_frame,
+                            sigma,
+                            inset,
+                            color.alpha,
+                            mask_w,
+                            mask_h,
+                        );
+                        SHADOW_MASKS.with(|cache| cache.borrow_mut().insert(key, rendered.clone()));
+                        rendered
+                    });
+                let mw = mask_w as usize;
+                let sx = (left as i32 - reach_left) as usize;
+                let count = (right - left) as usize;
+                if unmasked_all {
+                    for pixel_y in top..bottom {
+                        let sy = (pixel_y as i32 - reach_top) as usize;
+                        let src = &mask[sy * mw + sx..sy * mw + sx + count];
+                        let row_start = pixel_y as usize * stride + left as usize * 4;
+                        let dst = &mut self.pixels[row_start..row_start + count * 4];
+                        for (pixel, &alpha) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                            if alpha != 0 {
+                                blend_rgba(pixel, Color { alpha, ..color });
+                            }
+                        }
+                    }
+                } else {
+                    for pixel_y in top..bottom {
+                        let sy = (pixel_y as i32 - reach_top) as usize;
+                        let src = &mask[sy * mw + sx..sy * mw + sx + count];
+                        for (offset, &alpha) in src.iter().enumerate() {
+                            if alpha != 0 {
+                                self.blend_pixel(
+                                    left + offset as u32,
+                                    pixel_y,
+                                    Color { alpha, ..color },
+                                );
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
         let (sharp_st, sharp_sb, straight_sharp_whole) = if !shape_square && sigma < 0.5 {
             let top_c = shape.radii[0].1.max(shape.radii[1].1).min(shape.height);
             let bot_c = shape.radii[2].1.max(shape.radii[3].1).min(shape.height);
@@ -2160,20 +2383,39 @@ impl Canvas {
     // draws a premultiplied layer aligned to this surface over it, inside the bounds, at the
     // given group opacity
     fn composite(&mut self, layer: Canvas, bounds: DeviceBounds, opacity: f32) {
+        self.composite_pixels(
+            &layer.pixels,
+            layer.width,
+            layer.height,
+            layer.shift,
+            bounds,
+            opacity,
+        );
+        recycle_layer(layer.pixels);
+    }
+
+    fn composite_pixels(
+        &mut self,
+        pixels: &[u8],
+        layer_width: u32,
+        layer_height: u32,
+        layer_shift: (f32, f32),
+        bounds: DeviceBounds,
+        opacity: f32,
+    ) {
         let factor = (opacity.clamp(0.0, 1.0) * 256.0).round() as u32;
         let stride = self.width as usize * 4;
-        let layer_stride = layer.width as usize * 4;
+        let layer_stride = layer_width as usize * 4;
         let origin = |from: f32, to: f32| ((from - to) * self.scale).round() as i64;
         let origin = (
-            origin(layer.shift.0, self.shift.0),
-            origin(layer.shift.1, self.shift.1),
+            origin(layer_shift.0, self.shift.0),
+            origin(layer_shift.1, self.shift.1),
         );
         let left = i64::from(bounds.left).max(origin.0);
-        let right = i64::from(bounds.right).min(origin.0 + i64::from(layer.width));
+        let right = i64::from(bounds.right).min(origin.0 + i64::from(layer_width));
         let top = i64::from(bounds.top).max(origin.1);
-        let bottom = i64::from(bounds.bottom).min(origin.1 + i64::from(layer.height));
+        let bottom = i64::from(bounds.bottom).min(origin.1 + i64::from(layer_height));
         if right <= left || bottom <= top {
-            recycle_layer(layer.pixels);
             return;
         }
         let bounds = DeviceBounds {
@@ -2186,7 +2428,7 @@ impl Canvas {
             self.masks_cover_rect(bounds.left, bounds.top, bounds.right, bounds.bottom);
         let first = (top - origin.1) as usize * layer_stride + (left - origin.0) as usize * 4;
         for (row, source_row) in
-            (bounds.top..bounds.bottom).zip(layer.pixels[first..].chunks(layer_stride))
+            (bounds.top..bounds.bottom).zip(pixels[first..].chunks(layer_stride))
         {
             let unmasked = if unmasked_all {
                 bounds.left..bounds.right
@@ -2220,7 +2462,6 @@ impl Canvas {
                 }
             }
         }
-        recycle_layer(layer.pixels);
     }
 }
 
@@ -2279,6 +2520,18 @@ pub(crate) fn forget_layers() {
         let mut rasters = rasters.borrow_mut();
         rasters.entries.clear();
         rasters.entries.shrink_to_fit();
+    });
+    TEXT_SHADOWS.with(|shadows| {
+        let mut shadows = shadows.borrow_mut();
+        shadows.entries.clear();
+        shadows.entries.shrink_to_fit();
+        shadows.bytes = 0;
+    });
+    SHADOW_MASKS.with(|masks| {
+        let mut masks = masks.borrow_mut();
+        masks.entries.clear();
+        masks.entries.shrink_to_fit();
+        masks.bytes = 0;
     });
 }
 // a transformed subtree larger than this renders at reduced resolution instead of failing
@@ -3495,8 +3748,186 @@ impl Blurred {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct ShadowMaskKey {
+    dims: [u32; 2],
+    inset: bool,
+    color_alpha: u8,
+    floats: [u32; 25],
+}
+
+struct ShadowMaskEntry {
+    key: ShadowMaskKey,
+    alpha: Rc<[u8]>,
+    used: u64,
+}
+
+#[derive(Default)]
+struct ShadowMasks {
+    entries: Vec<ShadowMaskEntry>,
+    bytes: usize,
+    clock: u64,
+}
+
+impl ShadowMasks {
+    const MAX_MASK_PIXELS: u64 = 4096;
+    const MAX_ENTRIES: usize = 64;
+    const MAX_BYTES: usize = 256 * 1024;
+
+    fn find(&mut self, key: &ShadowMaskKey) -> Option<Rc<[u8]>> {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self.entries.iter_mut().find(|entry| entry.key == *key)?;
+        entry.used = clock;
+        Some(entry.alpha.clone())
+    }
+
+    fn insert(&mut self, key: ShadowMaskKey, alpha: Rc<[u8]>) {
+        while self.entries.len() >= Self::MAX_ENTRIES
+            || self.bytes.saturating_add(alpha.len()) > Self::MAX_BYTES
+        {
+            let Some(oldest) = (0..self.entries.len()).min_by_key(|&i| self.entries[i].used) else {
+                break;
+            };
+            self.bytes -= self.entries.swap_remove(oldest).alpha.len();
+        }
+        self.bytes += alpha.len();
+        self.clock += 1;
+        self.entries.push(ShadowMaskEntry {
+            key,
+            alpha,
+            used: self.clock,
+        });
+    }
+}
+
+thread_local! {
+    static SHADOW_MASKS: RefCell<ShadowMasks> = RefCell::new(ShadowMasks::default());
+}
+
+fn shadow_mask_key(
+    shape: Shape,
+    frame: Shape,
+    sigma: f32,
+    inset: bool,
+    color_alpha: u8,
+    width: u32,
+    height: u32,
+) -> ShadowMaskKey {
+    ShadowMaskKey {
+        dims: [width, height],
+        inset,
+        color_alpha,
+        floats: [
+            shape.x,
+            shape.y,
+            shape.width,
+            shape.height,
+            shape.radii[0].0,
+            shape.radii[0].1,
+            shape.radii[1].0,
+            shape.radii[1].1,
+            shape.radii[2].0,
+            shape.radii[2].1,
+            shape.radii[3].0,
+            shape.radii[3].1,
+            frame.x,
+            frame.y,
+            frame.width,
+            frame.height,
+            frame.radii[0].0,
+            frame.radii[0].1,
+            frame.radii[1].0,
+            frame.radii[1].1,
+            frame.radii[2].0,
+            frame.radii[2].1,
+            frame.radii[3].0,
+            frame.radii[3].1,
+            sigma,
+        ]
+        .map(f32::to_bits),
+    }
+}
+
+fn render_shadow_mask(
+    shape: Shape,
+    frame: Shape,
+    sigma: f32,
+    inset: bool,
+    color_alpha: u8,
+    width: u32,
+    height: u32,
+) -> Rc<[u8]> {
+    let mut out = vec![0_u8; width as usize * height as usize];
+    let frame_square = frame.is_square();
+    let frame_touch_x = narrow_axis(0..width, frame.x, frame.width);
+    let mut blurred = Blurred::new(shape, sigma, 0..width);
+    let scale_color = Color::rgba(0, 0, 0, color_alpha);
+    for pixel_y in 0..height {
+        let y = pixel_y as f32 + 0.5;
+        let frame_y_cov = if frame_square {
+            blurred_axis(frame.y, frame.height, y, 0.0)
+        } else {
+            1.0
+        };
+        let frame_y_outside = if frame_square {
+            frame_y_cov <= 0.0
+        } else {
+            frame.y - y >= 0.5 || y - frame.y - frame.height >= 0.5
+        };
+        if inset && frame_y_outside {
+            continue;
+        }
+        let frame_whole = if frame_y_outside {
+            0..0
+        } else {
+            frame.whole_run(y, 0..width)
+        };
+        if !inset && frame_whole.start == 0 && frame_whole.end >= width {
+            continue;
+        }
+        let blurred_row = blurred.row(y);
+        let (row_start, row_end) = if inset {
+            (frame_touch_x.start, frame_touch_x.end)
+        } else {
+            (0, width)
+        };
+        let row_base = pixel_y as usize * width as usize;
+        for px in row_start..row_end {
+            if !inset && frame_whole.contains(&px) {
+                continue;
+            }
+            let x = px as f32 + 0.5;
+            let inside = if frame_y_outside {
+                0.0
+            } else if frame_whole.contains(&px) {
+                1.0
+            } else if frame_square {
+                frame_y_cov * blurred_axis(frame.x, frame.width, x, 0.0)
+            } else if frame.x - x >= 0.5 || x - frame.x - frame.width >= 0.5 {
+                0.0
+            } else {
+                frame.coverage((x, y))
+            };
+            let shade = if inset { inside } else { 1.0 - inside };
+            if shade <= 0.0 {
+                continue;
+            }
+            let covered = blurred.at(&blurred_row, px);
+            let alpha = shade * if inset { 1.0 - covered } else { covered };
+            if alpha > 0.0 {
+                out[row_base + px as usize] = scale_color.scale_alpha(alpha.min(1.0)).alpha;
+            }
+        }
+    }
+    Rc::from(out)
+}
+
 // abramowitz and stegun 7.1.26, within 1.5e-7
 fn erf(x: f32) -> f32 {
+    if x.abs() >= 5.0 {
+        return 1.0_f32.copysign(x);
+    }
     let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
     let poly = t
         * (0.254_829_6
@@ -4825,14 +5256,326 @@ fn intersect_clips(clips: &[Rect], bounds: Rect) -> ClipList {
     out
 }
 
-fn paint_document(
+struct Occluder {
+    target: *const LayoutBox,
+    path: Vec<*const LayoutBox>,
+    rect: DeviceBounds,
+}
+
+#[derive(Clone, Copy)]
+struct OcclusionSkip<'a> {
+    target: *const LayoutBox,
+    path: &'a [*const LayoutBox],
+}
+
+fn can_use_occlusion(canvas: &Canvas, document: &LayoutDocument) -> bool {
+    !document.root.has_backdrop_filter
+        && canvas.planes.is_none()
+        && canvas.masks.is_empty()
+        && canvas.shift == (0.0, 0.0)
+        && canvas.nudge == (0.0, 0.0)
+}
+
+fn box_has_opaque_background(layout_box: &LayoutBox, surface: Shape) -> bool {
+    if layout_box.background.alpha == 255 {
+        return true;
+    }
+    surface.width > 0.0
+        && surface.height > 0.0
+        && layout_box.backgrounds.iter().any(|layer| {
+            layer.size == crate::css::BackgroundSize::Auto
+                && layer.repeat.x
+                && layer.repeat.y
+                && matches!(
+                    &layer.image,
+                    LayerImage::Gradient(gradient)
+                        if !gradient.stops.is_empty()
+                            && gradient.stops.iter().all(|stop| stop.color.alpha == 255)
+                )
+        })
+}
+
+fn safe_opaque_rect(
+    outer_device: Shape,
+    clip_bounds: DeviceBounds,
+    masks: &[Shape],
+) -> Option<DeviceBounds> {
+    let clamp = |l: f32, t: f32, r: f32, b: f32| -> Option<DeviceBounds> {
+        let left = (l.ceil().max(0.0) as u32).max(clip_bounds.left);
+        let top = (t.ceil().max(0.0) as u32).max(clip_bounds.top);
+        let right = (r.floor().max(0.0) as u32).min(clip_bounds.right);
+        let bottom = (b.floor().max(0.0) as u32).min(clip_bounds.bottom);
+        if left >= right || top >= bottom {
+            return None;
+        }
+        if !outer_device.contains_whole_rect(left, top, right, bottom) {
+            return None;
+        }
+        if !masks
+            .iter()
+            .all(|mask| mask.contains_whole_rect(left, top, right, bottom))
+        {
+            return None;
+        }
+        Some(DeviceBounds {
+            left,
+            top,
+            right,
+            bottom,
+        })
+    };
+    let (x0, y0) = (outer_device.x, outer_device.y);
+    let (x1, y1) = (x0 + outer_device.width, y0 + outer_device.height);
+    if outer_device.is_square() {
+        return clamp(x0, y0, x1, y1);
+    }
+    let rx_left = outer_device.radii[0].0.max(outer_device.radii[3].0);
+    let rx_right = outer_device.radii[1].0.max(outer_device.radii[2].0);
+    let ry_top = outer_device.radii[0].1.max(outer_device.radii[1].1);
+    let ry_bot = outer_device.radii[2].1.max(outer_device.radii[3].1);
+    let area =
+        |rect: DeviceBounds| u64::from(rect.right - rect.left) * u64::from(rect.bottom - rect.top);
+    let vertical = clamp(x0, y0 + ry_top, x1, y1 - ry_bot);
+    let horizontal = clamp(x0 + rx_left, y0, x1 - rx_right, y1);
+    match (vertical, horizontal) {
+        (Some(a), Some(b)) => Some(if area(a) >= area(b) { a } else { b }),
+        (a, b) => a.or(b),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_occluder_walk(
+    canvas: &Canvas,
+    layout_box: &LayoutBox,
+    clip: Rect,
+    clip_bounds: DeviceBounds,
+    ancestor_offset: (f32, f32),
+    is_context: bool,
+    stack: &mut Vec<*const LayoutBox>,
+    masks: &mut Vec<Shape>,
+    best: &mut Option<(Occluder, u64)>,
+) {
+    if layout_box.opacity < 1.0
+        || layout_box.transform.is_some()
+        || !layout_box.filters.own.is_empty()
+        || !layout_box.filters.backdrop.is_empty()
+        || !layout_box.masks.is_empty()
+        || layout_box.clip_path.is_some()
+    {
+        return;
+    }
+    let Some(box_ink) = ink(layout_box, ancestor_offset) else {
+        return;
+    };
+    let Some(hit) = intersect_clip(Some(clip), box_ink) else {
+        return;
+    };
+    // prune any subtree whose clipped extent cannot beat the best occluder found so far
+    if let Some((_, best_area)) = *best {
+        let hit_w = (hit.width * canvas.scale).ceil().max(0.0) as u64 + 1;
+        let hit_h = (hit.height * canvas.scale).ceil().max(0.0) as u64 + 1;
+        if hit_w.saturating_mul(hit_h) < best_area {
+            return;
+        }
+    }
+    let ptr = layout_box as *const LayoutBox;
+    stack.push(ptr);
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    let rect = visual_rect_for(layout_box, ancestor_offset);
+    if layout_box.visible
+        && !layout_box.background_clip_text
+        && !layout_box.is_document()
+        && !matches!(layout_box.tag.as_str(), "html" | "body")
+    {
+        let outer = Shape::from_rect(canvas.snap_rect(rect), layout_box.radii);
+        let surface = outer.inset(layout_box.border.widths);
+        if box_has_opaque_background(layout_box, surface) {
+            let outer_device = canvas.device_shape(outer);
+            if let Some(occ) = safe_opaque_rect(outer_device, clip_bounds, masks) {
+                let area = u64::from(occ.right - occ.left) * u64::from(occ.bottom - occ.top);
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, best_area)| area >= *best_area)
+                {
+                    *best = Some((
+                        Occluder {
+                            target: ptr,
+                            path: stack.clone(),
+                            rect: occ,
+                        },
+                        area,
+                    ));
+                }
+            }
+        }
+    }
+    let masks_before = masks.len();
+    let content_clip = if layout_box.overflow.clips() || layout_box.is_document() {
+        let overflow_rect = translate_rect(overflow_clip_rect(layout_box), offset);
+        if layout_box.overflow.clips() {
+            masks.push(canvas.device_shape(Shape::square(overflow_rect)));
+        }
+        intersect_clip(Some(clip), overflow_rect)
+    } else {
+        Some(clip)
+    };
+    if let Some(mask) = overflow_mask(canvas, layout_box, rect) {
+        masks.push(canvas.device_shape(mask));
+    }
+    let visit_non_context_children =
+        |stack: &mut Vec<*const LayoutBox>,
+         masks: &mut Vec<Shape>,
+         best: &mut Option<(Occluder, u64)>| {
+            let Some(child_clip) = content_clip else {
+                return;
+            };
+            for_each_paint_order(&layout_box.children, |index| {
+                let child = &layout_box.children[index];
+                if child.creates_stacking_context || child.inline || child.paints_positioned() {
+                    return;
+                }
+                find_occluder_walk(
+                    canvas,
+                    child,
+                    child_clip,
+                    clip_bounds,
+                    offset,
+                    false,
+                    stack,
+                    masks,
+                    best,
+                );
+            });
+        };
+    if is_context {
+        let mut contexts = stacking_context_entries(layout_box, Some(clip), ancestor_offset);
+        contexts.sort_by_key(|entry| (entry.z_index, entry.order));
+        let visit_entry = |entry: &StackingContextEntry<'_>,
+                           stack: &mut Vec<*const LayoutBox>,
+                           masks: &mut Vec<Shape>,
+                           best: &mut Option<(Occluder, u64)>| {
+            let Some(entry_clip) = entry.clip else {
+                return;
+            };
+            if entry_clip.width <= 0.0 || entry_clip.height <= 0.0 {
+                return;
+            }
+            let entry_masks_before = masks.len();
+            for &(clipper, clipper_offset) in &entry.clippers {
+                if clipper.opacity < 1.0
+                    || clipper.transform.is_some()
+                    || !clipper.filters.own.is_empty()
+                    || !clipper.filters.backdrop.is_empty()
+                    || !clipper.masks.is_empty()
+                    || clipper.clip_path.is_some()
+                {
+                    masks.truncate(entry_masks_before);
+                    return;
+                }
+                let clipper_visual = visual_offset_for(clipper, clipper_offset);
+                let clipper_rect = visual_rect_for(clipper, clipper_offset);
+                masks.push(canvas.device_shape(Shape::square(translate_rect(
+                    overflow_clip_rect(clipper),
+                    clipper_visual,
+                ))));
+                if let Some(mask) = overflow_mask(canvas, clipper, clipper_rect) {
+                    masks.push(canvas.device_shape(mask));
+                }
+            }
+            find_occluder_walk(
+                canvas,
+                entry.layout,
+                entry_clip,
+                clip_bounds,
+                entry.ancestor_offset,
+                entry.layout.creates_stacking_context,
+                stack,
+                masks,
+                best,
+            );
+            masks.truncate(entry_masks_before);
+        };
+        for entry in contexts.iter().filter(|entry| entry.z_index < 0) {
+            visit_entry(entry, stack, masks, best);
+        }
+        visit_non_context_children(stack, masks, best);
+        for entry in contexts.iter().filter(|entry| entry.z_index >= 0) {
+            visit_entry(entry, stack, masks, best);
+        }
+    } else {
+        visit_non_context_children(stack, masks, best);
+    }
+    masks.truncate(masks_before);
+    stack.pop();
+}
+
+fn find_occluder(
+    canvas: &Canvas,
+    root: &LayoutBox,
+    clip: Rect,
+    clip_bounds: DeviceBounds,
+) -> Option<Occluder> {
+    let mut stack = Vec::with_capacity(16);
+    let mut masks = Vec::with_capacity(8);
+    let mut best = None;
+    find_occluder_walk(
+        canvas,
+        root,
+        clip,
+        clip_bounds,
+        (0.0, 0.0),
+        true,
+        &mut stack,
+        &mut masks,
+        &mut best,
+    );
+    best.map(|(occluder, _)| occluder)
+}
+
+fn covers_bounds(outer: DeviceBounds, inner: DeviceBounds) -> bool {
+    outer.left <= inner.left
+        && outer.top <= inner.top
+        && outer.right >= inner.right
+        && outer.bottom >= inner.bottom
+}
+
+fn device_rect_to_layout(bounds: DeviceBounds, scale: f32) -> Rect {
+    Rect {
+        x: bounds.left as f32 / scale,
+        y: bounds.top as f32 / scale,
+        width: (bounds.right - bounds.left) as f32 / scale,
+        height: (bounds.bottom - bounds.top) as f32 / scale,
+    }
+}
+
+fn split_outer_strips(outer: DeviceBounds, inner: DeviceBounds, scale: f32) -> [Option<Rect>; 4] {
+    let strip = |left: u32, top: u32, right: u32, bottom: u32| {
+        (left < right && top < bottom).then(|| {
+            device_rect_to_layout(
+                DeviceBounds {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                },
+                scale,
+            )
+        })
+    };
+    [
+        strip(outer.left, outer.top, outer.right, inner.top),
+        strip(outer.left, inner.bottom, outer.right, outer.bottom),
+        strip(outer.left, inner.top, inner.left, inner.bottom),
+        strip(inner.right, inner.top, outer.right, inner.bottom),
+    ]
+}
+
+fn paint_document_unoccluded(
     canvas: &mut Canvas,
     document: &LayoutDocument,
     images: &[ImageLayer],
     clip: Option<Rect>,
 ) {
-    let _profile = crate::profile::scope("paint: document");
-    let _extents = memoize_extents();
     // the root background paints the whole canvas, as CSS backgrounds require; its images
     // stay with the root box
     if let Some(root) = canvas_background(&document.root) {
@@ -4854,6 +5597,72 @@ fn paint_document(
     );
 }
 
+fn paint_document_from_occluder(
+    canvas: &mut Canvas,
+    document: &LayoutDocument,
+    images: &[ImageLayer],
+    clip: Rect,
+    occluder: &Occluder,
+) {
+    let mut skip = Some(OcclusionSkip {
+        target: occluder.target,
+        path: &occluder.path,
+    });
+    paint_context(
+        canvas,
+        &document.root,
+        images,
+        &document.prose_selections,
+        Some(clip),
+        (0.0, 0.0),
+        &mut skip,
+    );
+    debug_assert!(skip.is_none());
+}
+
+fn paint_document(
+    canvas: &mut Canvas,
+    document: &LayoutDocument,
+    images: &[ImageLayer],
+    clip: Option<Rect>,
+) {
+    let _profile = crate::profile::scope("paint: document");
+    let _extents = memoize_extents();
+    if can_use_occlusion(canvas, document) {
+        let query_clip = clip.unwrap_or(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: document.viewport.width,
+            height: document.viewport.height,
+        });
+        if let Some(clip_bounds) = DeviceBounds::of(canvas, query_clip, None)
+            && let Some(occluder) = find_occluder(canvas, &document.root, query_clip, clip_bounds)
+        {
+            if covers_bounds(occluder.rect, clip_bounds) {
+                paint_document_from_occluder(canvas, document, images, query_clip, &occluder);
+                return;
+            }
+            let clip_area = u64::from(clip_bounds.right - clip_bounds.left)
+                * u64::from(clip_bounds.bottom - clip_bounds.top);
+            let occ_area = u64::from(occluder.rect.right - occluder.rect.left)
+                * u64::from(occluder.rect.bottom - occluder.rect.top);
+            let exact_scale = canvas.scale == 1.0 || canvas.scale == 2.0 || canvas.scale == 4.0;
+            if exact_scale && occ_area >= 16_384 && occ_area * 2 >= clip_area {
+                let core = device_rect_to_layout(occluder.rect, canvas.scale);
+                paint_document_from_occluder(canvas, document, images, core, &occluder);
+                for strip in split_outer_strips(clip_bounds, occluder.rect, canvas.scale)
+                    .into_iter()
+                    .flatten()
+                {
+                    paint_document_unoccluded(canvas, document, images, Some(strip));
+                }
+                return;
+            }
+        }
+    }
+    paint_document_unoccluded(canvas, document, images, clip);
+}
+
 fn paint_document_multi(
     canvas: &mut Canvas,
     document: &LayoutDocument,
@@ -4862,6 +5671,73 @@ fn paint_document_multi(
 ) {
     let _profile = crate::profile::scope("paint: document");
     let _extents = memoize_extents();
+    if can_use_occlusion(canvas, document) {
+        let mut normal_clips = ClipList::default();
+        let mut occluded: Vec<(Rect, Occluder)> = Vec::new();
+        let exact_scale = canvas.scale == 1.0 || canvas.scale == 2.0 || canvas.scale == 4.0;
+        for &clip in clips {
+            if let Some(clip_bounds) = DeviceBounds::of(canvas, clip, None)
+                && let Some(occluder) = find_occluder(canvas, &document.root, clip, clip_bounds)
+            {
+                if covers_bounds(occluder.rect, clip_bounds) {
+                    occluded.push((clip, occluder));
+                    continue;
+                }
+                let clip_area = u64::from(clip_bounds.right - clip_bounds.left)
+                    * u64::from(clip_bounds.bottom - clip_bounds.top);
+                let occ_area = u64::from(occluder.rect.right - occluder.rect.left)
+                    * u64::from(occluder.rect.bottom - occluder.rect.top);
+                if exact_scale && occ_area >= 16_384 && occ_area * 2 >= clip_area {
+                    let strips = split_outer_strips(clip_bounds, occluder.rect, canvas.scale);
+                    let strip_count = strips.iter().filter(|strip| strip.is_some()).count();
+                    if normal_clips.count + strip_count <= Region::LIMIT {
+                        let core = device_rect_to_layout(occluder.rect, canvas.scale);
+                        occluded.push((core, occluder));
+                        for strip in strips.into_iter().flatten() {
+                            normal_clips.push(strip);
+                        }
+                        continue;
+                    }
+                }
+            }
+            normal_clips.push(clip);
+        }
+        if !occluded.is_empty() {
+            if !normal_clips.as_slice().is_empty() {
+                if let Some(root) = canvas_background(&document.root) {
+                    let viewport = Shape::square(Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: document.viewport.width,
+                        height: document.viewport.height,
+                    });
+                    for &clip in normal_clips.as_slice() {
+                        paint_backgrounds(
+                            canvas,
+                            root,
+                            &[],
+                            viewport,
+                            viewport,
+                            root.opacity,
+                            Some(clip),
+                        );
+                    }
+                }
+                paint_context_multi(
+                    canvas,
+                    &document.root,
+                    images,
+                    &document.prose_selections,
+                    normal_clips.as_slice(),
+                    (0.0, 0.0),
+                );
+            }
+            for (clip, occluder) in &occluded {
+                paint_document_from_occluder(canvas, document, images, *clip, occluder);
+            }
+            return;
+        }
+    }
     if let Some(root) = canvas_background(&document.root) {
         let viewport = Shape::square(Rect {
             x: 0.0,
@@ -4914,6 +5790,7 @@ fn paint_context_multi(
                 prose_selections,
                 Some(*only),
                 ancestor_offset,
+                &mut None,
             );
             return;
         }
@@ -4934,6 +5811,7 @@ fn paint_context_multi(
                 prose_selections,
                 Some(clip),
                 ancestor_offset,
+                &mut None,
             );
         }
         return;
@@ -5046,6 +5924,7 @@ fn paint_context_entry_multi(
                 prose_selections,
                 clip,
                 entry.ancestor_offset,
+                &mut None,
             );
         } else {
             paint_non_context_subtree(
@@ -5055,6 +5934,7 @@ fn paint_context_entry_multi(
                 prose_selections,
                 clip,
                 entry.ancestor_offset,
+                &mut None,
             );
         }
     } else if entry.layout.creates_stacking_context {
@@ -5125,6 +6005,7 @@ fn paint_non_context_subtree_multi(
                 prose_selections,
                 Some(*only),
                 ancestor_offset,
+                &mut None,
             );
             return;
         }
@@ -5274,6 +6155,7 @@ fn paint_box(
         prose_selections,
         clip,
         ancestor_offset,
+        &mut None,
     );
 }
 
@@ -5284,7 +6166,16 @@ fn paint_context(
     prose_selections: &[ProseSpan],
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
+    skip: &mut Option<OcclusionSkip<'_>>,
 ) {
+    if let Some(guard) = *skip {
+        let ptr = layout_box as *const LayoutBox;
+        if ptr == guard.target {
+            *skip = None;
+        } else if !guard.path.contains(&ptr) {
+            return;
+        }
+    }
     let opacity = layout_box.opacity;
     if opacity <= 0.0 || misses(layout_box, ancestor_offset, clip) {
         return;
@@ -5326,6 +6217,7 @@ fn paint_context(
                     ancestor_offset,
                     opacity,
                 },
+                &mut None,
             );
             (canvas.shift, canvas.nudge) = saved;
             return;
@@ -5348,19 +6240,22 @@ fn paint_context(
                 ancestor_offset,
                 opacity: 1.0,
             },
+            &mut None,
         );
         // the filter acts in the box's own space, before the transform
         filter_layer(&mut layer, &layout_box.filters.own);
         canvas.composite_transformed(layer, &full, clip, opacity);
         return;
     }
-    paint_backdrop(
-        canvas,
-        layout_box,
-        visual_rect_for(layout_box, ancestor_offset),
-        clip,
-        opacity,
-    );
+    if skip.is_none() {
+        paint_backdrop(
+            canvas,
+            layout_box,
+            visual_rect_for(layout_box, ancestor_offset),
+            clip,
+            opacity,
+        );
+    }
     if !layout_box.filters.own.is_empty() {
         paint_filtered(
             canvas,
@@ -5378,6 +6273,7 @@ fn paint_context(
                         ancestor_offset,
                         opacity: 1.0,
                     },
+                    &mut None,
                 );
             },
         );
@@ -5406,6 +6302,7 @@ fn paint_context(
                 ancestor_offset,
                 opacity: 1.0,
             },
+            &mut None,
         );
         canvas.composite(layer, bounds, opacity);
         return;
@@ -5420,6 +6317,7 @@ fn paint_context(
             ancestor_offset,
             opacity,
         },
+        skip,
     );
 }
 
@@ -5516,7 +6414,12 @@ struct ContextPaint<'a> {
     opacity: f32,
 }
 
-fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: ContextPaint<'_>) {
+fn paint_context_contents(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    paint: ContextPaint<'_>,
+    skip: &mut Option<OcclusionSkip<'_>>,
+) {
     let ContextPaint {
         images,
         prose_selections,
@@ -5526,17 +6429,29 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     } = paint;
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let rect = visual_rect_for(layout_box, ancestor_offset);
-    // a clip-path cuts everything the box paints, its shadow and outline included
-    if let Some(region) = &layout_box.clip_path {
-        if region.is_empty() {
-            return;
+    let skipping_own = skip.is_some();
+    let content_clip = if skipping_own {
+        if layout_box.overflow.clips() || layout_box.is_document() {
+            Some(
+                intersect_clip(clip, translate_rect(overflow_clip_rect(layout_box), offset))
+                    .unwrap_or_default(),
+            )
+        } else {
+            clip
         }
-        canvas.push_clip_path(region, (rect.x, rect.y));
-    }
-    if !layout_box.masks.is_empty() {
-        canvas.push_image_mask(layout_box, images, rect);
-    }
-    let content_clip = paint_box_surface(canvas, layout_box, images, clip, offset, rect, opacity);
+    } else {
+        // a clip-path cuts everything the box paints, its shadow and outline included
+        if let Some(region) = &layout_box.clip_path {
+            if region.is_empty() {
+                return;
+            }
+            canvas.push_clip_path(region, (rect.x, rect.y));
+        }
+        if !layout_box.masks.is_empty() {
+            canvas.push_image_mask(layout_box, images, rect);
+        }
+        paint_box_surface(canvas, layout_box, images, clip, offset, rect, opacity)
+    };
     let mask = overflow_mask(canvas, layout_box, rect);
     if let Some(mask) = mask {
         canvas.push_mask(mask);
@@ -5547,16 +6462,18 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
     let mut contexts = stacking_context_entries(layout_box, clip, ancestor_offset);
     contexts.sort_by_key(|entry| (entry.z_index, entry.order));
     for entry in contexts.iter().filter(|entry| entry.z_index < 0) {
-        paint_context_entry(canvas, entry, images, prose_selections);
+        paint_context_entry(canvas, entry, images, prose_selections, skip);
     }
-    paint_inline_fragments(canvas, layout_box, images, content_clip, offset);
-    paint_box_text(
-        canvas,
-        layout_box,
-        content_clip,
-        offset,
-        &prose_selections_for_box(layout_box, prose_selections),
-    );
+    if skip.is_none() {
+        paint_inline_fragments(canvas, layout_box, images, content_clip, offset);
+        paint_box_text(
+            canvas,
+            layout_box,
+            content_clip,
+            offset,
+            &prose_selections_for_box(layout_box, prose_selections),
+        );
+    }
     paint_non_context_children(
         canvas,
         layout_box,
@@ -5564,21 +6481,26 @@ fn paint_context_contents(canvas: &mut Canvas, layout_box: &LayoutBox, paint: Co
         prose_selections,
         content_clip,
         offset,
+        skip,
     );
     for entry in contexts.iter().filter(|entry| entry.z_index >= 0) {
-        paint_context_entry(canvas, entry, images, prose_selections);
+        paint_context_entry(canvas, entry, images, prose_selections, skip);
     }
     canvas.opaque = opaque;
     if mask.is_some() {
         canvas.pop_mask();
     }
-    paint_scrollbars(canvas, layout_box, images, (offset, opacity), clip);
-    paint_outline(canvas, layout_box, rect, opacity, clip);
-    if !layout_box.masks.is_empty() {
-        canvas.pop_mask();
+    if skip.is_none() {
+        paint_scrollbars(canvas, layout_box, images, (offset, opacity), clip);
+        paint_outline(canvas, layout_box, rect, opacity, clip);
     }
-    if layout_box.clip_path.is_some() {
-        canvas.pop_mask();
+    if !skipping_own {
+        if !layout_box.masks.is_empty() {
+            canvas.pop_mask();
+        }
+        if layout_box.clip_path.is_some() {
+            canvas.pop_mask();
+        }
     }
 }
 
@@ -5620,7 +6542,14 @@ fn paint_context_entry(
     entry: &StackingContextEntry<'_>,
     images: &[ImageLayer],
     prose_selections: &[ProseSpan],
+    skip: &mut Option<OcclusionSkip<'_>>,
 ) {
+    if let Some(guard) = *skip {
+        let ptr = entry.layout as *const LayoutBox;
+        if ptr != guard.target && !guard.path.contains(&ptr) {
+            return;
+        }
+    }
     let masks = entry
         .clippers
         .iter()
@@ -5644,6 +6573,7 @@ fn paint_context_entry(
             prose_selections,
             entry.clip,
             entry.ancestor_offset,
+            skip,
         );
     } else {
         paint_non_context_subtree(
@@ -5653,6 +6583,7 @@ fn paint_context_entry(
             prose_selections,
             entry.clip,
             entry.ancestor_offset,
+            skip,
         );
     }
     canvas.opaque = opaque;
@@ -5668,6 +6599,7 @@ fn paint_non_context_children(
     prose_selections: &[ProseSpan],
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
+    skip: &mut Option<OcclusionSkip<'_>>,
 ) {
     for_each_paint_order(&layout_box.children, |index| {
         let child = &layout_box.children[index];
@@ -5681,6 +6613,7 @@ fn paint_non_context_children(
             prose_selections,
             clip,
             ancestor_offset,
+            skip,
         );
     });
 }
@@ -5692,35 +6625,57 @@ fn paint_non_context_subtree(
     prose_selections: &[ProseSpan],
     clip: Option<Rect>,
     ancestor_offset: (f32, f32),
+    skip: &mut Option<OcclusionSkip<'_>>,
 ) {
+    if let Some(guard) = *skip {
+        let ptr = layout_box as *const LayoutBox;
+        if ptr == guard.target {
+            *skip = None;
+        } else if !guard.path.contains(&ptr) {
+            return;
+        }
+    }
     if misses(layout_box, ancestor_offset, clip) {
         return;
     }
     let offset = visual_offset_for(layout_box, ancestor_offset);
     let rect = visual_rect_for(layout_box, ancestor_offset);
-    let content_clip = paint_box_surface(
-        canvas,
-        layout_box,
-        images,
-        clip,
-        offset,
-        rect,
-        layout_box.opacity,
-    );
+    let content_clip = if skip.is_some() {
+        if layout_box.overflow.clips() || layout_box.is_document() {
+            Some(
+                intersect_clip(clip, translate_rect(overflow_clip_rect(layout_box), offset))
+                    .unwrap_or_default(),
+            )
+        } else {
+            clip
+        }
+    } else {
+        paint_box_surface(
+            canvas,
+            layout_box,
+            images,
+            clip,
+            offset,
+            rect,
+            layout_box.opacity,
+        )
+    };
     let mask = overflow_mask(canvas, layout_box, rect);
     if let Some(mask) = mask {
         canvas.push_mask(mask);
     }
     let opaque = canvas.opaque;
     canvas.opaque &= !scrolls_in_own_layer(canvas, layout_box);
-    paint_inline_fragments(canvas, layout_box, images, content_clip, offset);
-    paint_box_text(
-        canvas,
-        layout_box,
-        content_clip,
-        offset,
-        &prose_selections_for_box(layout_box, prose_selections),
-    );
+    if skip.is_none() {
+        paint_inline_fragments(canvas, layout_box, images, content_clip, offset);
+        paint_box_text(
+            canvas,
+            layout_box,
+            content_clip,
+            offset,
+            &prose_selections_for_box(layout_box, prose_selections),
+        );
+    }
     paint_non_context_children(
         canvas,
         layout_box,
@@ -5728,19 +6683,22 @@ fn paint_non_context_subtree(
         prose_selections,
         content_clip,
         offset,
+        skip,
     );
     canvas.opaque = opaque;
     if mask.is_some() {
         canvas.pop_mask();
     }
-    paint_scrollbars(
-        canvas,
-        layout_box,
-        images,
-        (offset, layout_box.opacity),
-        clip,
-    );
-    paint_outline(canvas, layout_box, rect, layout_box.opacity, clip);
+    if skip.is_none() {
+        paint_scrollbars(
+            canvas,
+            layout_box,
+            images,
+            (offset, layout_box.opacity),
+            clip,
+        );
+        paint_outline(canvas, layout_box, rect, layout_box.opacity, clip);
+    }
 }
 
 fn paint_box_surface(
@@ -6947,6 +7905,34 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
         }
         return;
     }
+    if aligned && plain && !repeat.0 && !repeat.1 {
+        let ox = origin.0 as i64;
+        let oy = origin.1 as i64;
+        let x0 = left.max(ox.max(0) as u32);
+        let x1 = right.min((ox + i64::from(image.width)).max(0) as u32);
+        let y0 = top.max(oy.max(0) as u32);
+        let y1 = bottom.min((oy + i64::from(image.height)).max(0) as u32);
+        if x0 < x1 && y0 < y1 {
+            let stride = canvas.bytes_per_row();
+            let img_stride = image.width as usize;
+            let count = (x1 - x0) as usize;
+            let sx = (i64::from(x0) - ox) as usize;
+            for pixel_y in y0..y1 {
+                let sy = (i64::from(pixel_y) - oy) as usize;
+                let src = &image.pixels[sy * img_stride + sx..sy * img_stride + sx + count];
+                let row_start = pixel_y as usize * stride + x0 as usize * 4;
+                let dst = &mut canvas.pixels[row_start..row_start + count * 4];
+                for (pixel, &color) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                    if color.alpha == 255 {
+                        *pixel = [color.red, color.green, color.blue, 255];
+                    } else if color.alpha != 0 {
+                        blend_rgba(pixel, color);
+                    }
+                }
+            }
+        }
+        return;
+    }
     let columns = (left..right)
         .map(|pixel_x| taps(pixel_x, origin.0, step.0, image.width, repeat.0))
         .collect::<Vec<_>>();
@@ -6958,7 +7944,11 @@ fn paint_image(canvas: &mut Canvas, draw: ImageDraw<'_>) {
             let Some(column) = *column else {
                 continue;
             };
-            let color = blend_taps(image, column, row);
+            let color = if aligned {
+                image.pixel(column.near, row.near)
+            } else {
+                blend_taps(image, column, row)
+            };
             put_image_pixel(canvas, (pixel_x, pixel_y), color, plain, opacity, shape);
         }
     }
@@ -7265,6 +8255,93 @@ fn paint_text(canvas: &mut Canvas, run: &TextRun, clip: Option<Rect>, offset: (f
     }
 }
 
+#[derive(PartialEq)]
+struct TextShadowKey {
+    fonts: (usize, u64),
+    text: String,
+    font_stack: crate::font::FontStack,
+    font: crate::font::FontStyle,
+    color: Color,
+    rtl: bool,
+    dims: [u32; 2],
+    radius: usize,
+    floats: [u32; 5],
+}
+
+struct TextShadowEntry {
+    key: TextShadowKey,
+    pixels: Rc<[u8]>,
+    used: u64,
+}
+
+#[derive(Default)]
+struct TextShadows {
+    entries: Vec<TextShadowEntry>,
+    bytes: usize,
+    clock: u64,
+}
+
+impl TextShadows {
+    const MAX_ENTRIES: usize = 64;
+    const MAX_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_ENTRY_BYTES: usize = 512 * 1024;
+
+    #[allow(clippy::too_many_arguments)]
+    fn find(
+        &mut self,
+        fonts: (usize, u64),
+        text: &str,
+        font_stack: crate::font::FontStack,
+        font: crate::font::FontStyle,
+        color: Color,
+        rtl: bool,
+        dims: [u32; 2],
+        radius: usize,
+        floats: [u32; 5],
+    ) -> Option<Rc<[u8]>> {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self.entries.iter_mut().find(|entry| {
+            entry.key.dims == dims
+                && entry.key.radius == radius
+                && entry.key.color == color
+                && entry.key.floats == floats
+                && entry.key.font_stack == font_stack
+                && entry.key.font == font
+                && entry.key.rtl == rtl
+                && entry.key.fonts == fonts
+                && entry.key.text == text
+        })?;
+        entry.used = clock;
+        Some(entry.pixels.clone())
+    }
+
+    fn insert(&mut self, key: TextShadowKey, pixels: Rc<[u8]>) {
+        if pixels.len() > Self::MAX_ENTRY_BYTES {
+            return;
+        }
+        while self.entries.len() >= Self::MAX_ENTRIES
+            || self.bytes.saturating_add(pixels.len()) > Self::MAX_BYTES
+        {
+            let Some(oldest) = (0..self.entries.len()).min_by_key(|&i| self.entries[i].used) else {
+                break;
+            };
+            self.bytes -= self.entries.swap_remove(oldest).pixels.len();
+        }
+        self.bytes += pixels.len();
+        self.clock += 1;
+        self.entries.push(TextShadowEntry {
+            key,
+            pixels,
+            used: self.clock,
+        });
+    }
+}
+
+thread_local! {
+    static TEXT_SHADOWS: RefCell<TextShadows> = RefCell::new(TextShadows::default());
+}
+
 // a shadow is the run drawn again in the shadow's color, offset, and blurred in a layer of
 // its own when it has a blur radius
 fn paint_text_shadow(
@@ -7274,19 +8351,11 @@ fn paint_text_shadow(
     clip: Option<Rect>,
     offset: (f32, f32),
 ) {
-    let shadowed = TextRun {
-        color: shadow.color,
-        decoration: crate::css::TextDecoration {
-            shadow: None,
-            ..run.decoration
-        },
-        ..run.clone()
-    };
     let at = (offset.0 + shadow.x, offset.1 + shadow.y);
     if shadow.blur <= 0.0 {
-        paint_glyphs(canvas, &shadowed, clip, at, true);
-        if shadowed.decoration.has_lines() {
-            paint_decoration_lines(canvas, &shadowed, clip, at);
+        paint_glyphs_colored(canvas, run, shadow.color, clip, at, true);
+        if run.decoration.has_lines() {
+            paint_decoration_lines_colored(canvas, run, shadow.color, clip, at);
         }
         return;
     }
@@ -7304,13 +8373,79 @@ fn paint_text_shadow(
     ) else {
         return;
     };
-    let mut layer = canvas.layer(whole);
-    paint_glyphs(&mut layer, &shadowed, None, at, true);
-    if shadowed.decoration.has_lines() {
-        paint_decoration_lines(&mut layer, &shadowed, None, at);
-    }
     // three box blurs approach a gaussian with the blur radius as twice its deviation
     let radius = ((shadow.blur / 2.0) * canvas.scale).round().max(1.0) as usize;
+    let width = whole.right - whole.left;
+    let height = whole.bottom - whole.top;
+    let layer_shift = (
+        canvas.shift.0 + whole.left as f32 / canvas.scale,
+        canvas.shift.1 + whole.top as f32 / canvas.scale,
+    );
+    let fonts = crate::font::active_fonts();
+    let cacheable = !run.decoration.has_lines()
+        && !fonts.is_builtin()
+        && (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4)
+            <= TextShadows::MAX_ENTRY_BYTES;
+    if cacheable {
+        let fonts_key = (Rc::as_ptr(&fonts) as usize, fonts.web_face_changes());
+        let scale = canvas.scale;
+        let baseline = layout_units(
+            (run.y + at.1 - layer_shift.1 + fonts.ascent(run.font_stack, run.font_size)) * scale,
+        );
+        let pen = (run.x + at.0 - layer_shift.0) * scale;
+        let floats = [
+            run.font_size.to_bits(),
+            run.letter_spacing.to_bits(),
+            scale.to_bits(),
+            pen.to_bits(),
+            baseline.to_bits(),
+        ];
+        if let Some(cached) = TEXT_SHADOWS.with(|cache| {
+            cache.borrow_mut().find(
+                fonts_key,
+                &run.text,
+                run.font_stack,
+                run.font,
+                shadow.color,
+                run.rtl,
+                [width, height],
+                radius,
+                floats,
+            )
+        }) {
+            canvas.composite_pixels(&cached, width, height, layer_shift, bounds, 1.0);
+            return;
+        }
+        let mut layer = canvas.layer(whole);
+        paint_outline_text_colored(&mut layer, run, shadow.color, None, at, &fonts, true, 0.0);
+        box_blur_passes(&mut layer, radius, 3);
+        let cached: Rc<[u8]> = Rc::from(layer.pixels.as_slice());
+        TEXT_SHADOWS.with(|cache| {
+            cache.borrow_mut().insert(
+                TextShadowKey {
+                    fonts: fonts_key,
+                    text: run.text.clone(),
+                    font_stack: run.font_stack,
+                    font: run.font,
+                    color: shadow.color,
+                    rtl: run.rtl,
+                    dims: [width, height],
+                    radius,
+                    floats,
+                },
+                cached,
+            );
+        });
+        canvas.composite(layer, bounds, 1.0);
+        return;
+    }
+    let mut layer = canvas.layer(whole);
+    paint_glyphs_colored(&mut layer, run, shadow.color, None, at, true);
+    if run.decoration.has_lines() {
+        paint_decoration_lines_colored(&mut layer, run, shadow.color, None, at);
+    }
     box_blur_passes(&mut layer, radius, 3);
     canvas.composite(layer, bounds, 1.0);
 }
@@ -7321,8 +8456,6 @@ fn box_blur_passes(layer: &mut Canvas, radius: usize, passes: usize) {
     if width == 0 || height == 0 || passes == 0 {
         return;
     }
-    let len = layer.pixels.len();
-    let mut buffer = take_layer_buffer(len);
     let window = (radius * 2 + 1) as u32;
     // exact reciprocal division for sum <= 255 * window when window < 4096
     let fast_inv = (window < 4096).then(|| (1_u64 << 32).div_ceil(u64::from(window)));
@@ -7334,83 +8467,222 @@ fn box_blur_passes(layer: &mut Canvas, radius: usize, passes: usize) {
     };
     let initial_h = radius.min(width - 1);
     let initial_v = radius.min(height - 1);
-    let row_stride = width * 4;
-    for _ in 0..passes {
-        for row in 0..height {
-            let base = row * row_stride;
-            let src = &layer.pixels[base..base + row_stride];
-            let dst = &mut buffer[base..base + row_stride];
-            if src.iter().all(|&byte| byte == 0) {
-                dst.fill(0);
-                continue;
-            }
-            let mut sum = [0_u32; 4];
-            for position in 0..=initial_h {
-                let at = position * 4;
-                sum[0] += u32::from(src[at]);
-                sum[1] += u32::from(src[at + 1]);
-                sum[2] += u32::from(src[at + 2]);
-                sum[3] += u32::from(src[at + 3]);
-            }
-            for position in 0..width {
-                let at = position * 4;
-                if (sum[0] | sum[1] | sum[2] | sum[3]) == 0 {
-                    dst[at..at + 4].fill(0);
-                } else {
-                    dst[at] = divide(sum[0]);
-                    dst[at + 1] = divide(sum[1]);
-                    dst[at + 2] = divide(sum[2]);
-                    dst[at + 3] = divide(sum[3]);
+    let pixels = layer.pixels.as_chunks_mut::<4>().0;
+    let mut all_white = true;
+    let mut all_black = true;
+    for p in pixels.iter() {
+        let a = p[3];
+        if p[0] != a || p[1] != a || p[2] != a {
+            all_white = false;
+        }
+        if (p[0] | p[1] | p[2]) != 0 {
+            all_black = false;
+        }
+        if !all_white && !all_black {
+            break;
+        }
+    }
+    if all_white || all_black {
+        // monochrome white (r=g=b=a) and black (r=g=b=0) blur identically across one channel
+        let area = width * height;
+        let mut mono = take_layer_buffer(area);
+        for (dst, src) in mono.iter_mut().zip(pixels.iter()) {
+            *dst = src[3];
+        }
+        let mut temp = take_layer_buffer(area);
+        let mut col_sums = vec![0_u32; width];
+        for _ in 0..passes {
+            let mut active_min = width;
+            let mut active_max = 0_usize;
+            for row in 0..height {
+                let base = row * width;
+                let src = &mono[base..base + width];
+                let dst = &mut temp[base..base + width];
+                if src.iter().all(|&b| b == 0) {
+                    dst.fill(0);
+                    continue;
                 }
-                if position + radius + 1 < width {
-                    let add = (position + radius + 1) * 4;
-                    sum[0] += u32::from(src[add]);
-                    sum[1] += u32::from(src[add + 1]);
-                    sum[2] += u32::from(src[add + 2]);
-                    sum[3] += u32::from(src[add + 3]);
+                let mut sum = 0_u32;
+                for &v in &src[..=initial_h] {
+                    sum += u32::from(v);
+                }
+                for (position, out) in dst.iter_mut().enumerate() {
+                    if sum == 0 {
+                        *out = 0;
+                    } else {
+                        let val = divide(sum);
+                        *out = val;
+                        if val != 0 {
+                            active_min = active_min.min(position);
+                            active_max = active_max.max(position + 1);
+                        }
+                    }
+                    if position + radius + 1 < width {
+                        sum += u32::from(src[position + radius + 1]);
+                    }
+                    if position >= radius {
+                        sum -= u32::from(src[position - radius]);
+                    }
+                }
+            }
+            if active_min >= active_max {
+                mono.fill(0);
+                break;
+            }
+            let active_len = active_max - active_min;
+            let sums = &mut col_sums[..active_len];
+            sums.fill(0);
+            for row in 0..=initial_v {
+                let src = &temp[row * width + active_min..row * width + active_max];
+                for (sum, &v) in sums.iter_mut().zip(src) {
+                    *sum += u32::from(v);
+                }
+            }
+            for position in 0..height {
+                let dst_row = &mut mono[position * width..position * width + width];
+                dst_row[..active_min].fill(0);
+                dst_row[active_max..].fill(0);
+                for (out, &sum) in dst_row[active_min..active_max].iter_mut().zip(sums.iter()) {
+                    *out = if sum == 0 { 0 } else { divide(sum) };
+                }
+                if position + radius + 1 < height {
+                    let add_row = &temp[(position + radius + 1) * width + active_min
+                        ..(position + radius + 1) * width + active_max];
+                    for (sum, &v) in sums.iter_mut().zip(add_row) {
+                        *sum += u32::from(v);
+                    }
                 }
                 if position >= radius {
-                    let sub = (position - radius) * 4;
-                    sum[0] -= u32::from(src[sub]);
-                    sum[1] -= u32::from(src[sub + 1]);
-                    sum[2] -= u32::from(src[sub + 2]);
-                    sum[3] -= u32::from(src[sub + 3]);
+                    let sub_row = &temp[(position - radius) * width + active_min
+                        ..(position - radius) * width + active_max];
+                    for (sum, &v) in sums.iter_mut().zip(sub_row) {
+                        *sum -= u32::from(v);
+                    }
                 }
             }
         }
-        for column in 0..width {
-            let col_base = column * 4;
-            let mut sum = [0_u32; 4];
-            for position in 0..=initial_v {
-                let at = position * row_stride + col_base;
-                sum[0] += u32::from(buffer[at]);
-                sum[1] += u32::from(buffer[at + 1]);
-                sum[2] += u32::from(buffer[at + 2]);
-                sum[3] += u32::from(buffer[at + 3]);
+        if all_white {
+            for (dst, &v) in pixels.iter_mut().zip(&mono) {
+                *dst = [v, v, v, v];
             }
-            for position in 0..height {
-                let at = position * row_stride + col_base;
+        } else {
+            for (dst, &v) in pixels.iter_mut().zip(&mono) {
+                *dst = [0, 0, 0, v];
+            }
+        }
+        recycle_layer(temp);
+        recycle_layer(mono);
+        return;
+    }
+    let len = layer.pixels.len();
+    let mut buffer = take_layer_buffer(len);
+    let mut col_sums = vec![[0_u32; 4]; width];
+    for _ in 0..passes {
+        let mut active_min = width;
+        let mut active_max = 0_usize;
+        {
+            let src_pixels = layer.pixels.as_chunks::<4>().0;
+            let dst_pixels = buffer.as_chunks_mut::<4>().0;
+            for row in 0..height {
+                let base = row * width;
+                let src = &src_pixels[base..base + width];
+                let dst = &mut dst_pixels[base..base + width];
+                if src.iter().all(|&p| p == [0; 4]) {
+                    dst.fill([0; 4]);
+                    continue;
+                }
+                let mut sum = [0_u32; 4];
+                for p in &src[..=initial_h] {
+                    sum[0] += u32::from(p[0]);
+                    sum[1] += u32::from(p[1]);
+                    sum[2] += u32::from(p[2]);
+                    sum[3] += u32::from(p[3]);
+                }
+                for (position, out) in dst.iter_mut().enumerate() {
+                    if (sum[0] | sum[1] | sum[2] | sum[3]) == 0 {
+                        *out = [0; 4];
+                    } else {
+                        let px = [
+                            divide(sum[0]),
+                            divide(sum[1]),
+                            divide(sum[2]),
+                            divide(sum[3]),
+                        ];
+                        *out = px;
+                        if (px[0] | px[1] | px[2] | px[3]) != 0 {
+                            active_min = active_min.min(position);
+                            active_max = active_max.max(position + 1);
+                        }
+                    }
+                    if position + radius + 1 < width {
+                        let p = src[position + radius + 1];
+                        sum[0] += u32::from(p[0]);
+                        sum[1] += u32::from(p[1]);
+                        sum[2] += u32::from(p[2]);
+                        sum[3] += u32::from(p[3]);
+                    }
+                    if position >= radius {
+                        let p = src[position - radius];
+                        sum[0] -= u32::from(p[0]);
+                        sum[1] -= u32::from(p[1]);
+                        sum[2] -= u32::from(p[2]);
+                        sum[3] -= u32::from(p[3]);
+                    }
+                }
+            }
+        }
+        if active_min >= active_max {
+            layer.pixels.fill(0);
+            break;
+        }
+        let src_pixels = buffer.as_chunks::<4>().0;
+        let dst_pixels = layer.pixels.as_chunks_mut::<4>().0;
+        let active_len = active_max - active_min;
+        let sums = &mut col_sums[..active_len];
+        sums.fill([0; 4]);
+        for row in 0..=initial_v {
+            let src = &src_pixels[row * width + active_min..row * width + active_max];
+            for (sum, p) in sums.iter_mut().zip(src) {
+                sum[0] += u32::from(p[0]);
+                sum[1] += u32::from(p[1]);
+                sum[2] += u32::from(p[2]);
+                sum[3] += u32::from(p[3]);
+            }
+        }
+        for position in 0..height {
+            let dst_row = &mut dst_pixels[position * width..position * width + width];
+            dst_row[..active_min].fill([0; 4]);
+            dst_row[active_max..].fill([0; 4]);
+            for (out, sum) in dst_row[active_min..active_max].iter_mut().zip(sums.iter()) {
                 if (sum[0] | sum[1] | sum[2] | sum[3]) == 0 {
-                    layer.pixels[at..at + 4].fill(0);
+                    *out = [0; 4];
                 } else {
-                    layer.pixels[at] = divide(sum[0]);
-                    layer.pixels[at + 1] = divide(sum[1]);
-                    layer.pixels[at + 2] = divide(sum[2]);
-                    layer.pixels[at + 3] = divide(sum[3]);
+                    *out = [
+                        divide(sum[0]),
+                        divide(sum[1]),
+                        divide(sum[2]),
+                        divide(sum[3]),
+                    ];
                 }
-                if position + radius + 1 < height {
-                    let add = (position + radius + 1) * row_stride + col_base;
-                    sum[0] += u32::from(buffer[add]);
-                    sum[1] += u32::from(buffer[add + 1]);
-                    sum[2] += u32::from(buffer[add + 2]);
-                    sum[3] += u32::from(buffer[add + 3]);
+            }
+            if position + radius + 1 < height {
+                let add_row = &src_pixels[(position + radius + 1) * width + active_min
+                    ..(position + radius + 1) * width + active_max];
+                for (sum, p) in sums.iter_mut().zip(add_row) {
+                    sum[0] += u32::from(p[0]);
+                    sum[1] += u32::from(p[1]);
+                    sum[2] += u32::from(p[2]);
+                    sum[3] += u32::from(p[3]);
                 }
-                if position >= radius {
-                    let sub = (position - radius) * row_stride + col_base;
-                    sum[0] -= u32::from(buffer[sub]);
-                    sum[1] -= u32::from(buffer[sub + 1]);
-                    sum[2] -= u32::from(buffer[sub + 2]);
-                    sum[3] -= u32::from(buffer[sub + 3]);
+            }
+            if position >= radius {
+                let sub_row = &src_pixels[(position - radius) * width + active_min
+                    ..(position - radius) * width + active_max];
+                for (sum, p) in sums.iter_mut().zip(sub_row) {
+                    sum[0] -= u32::from(p[0]);
+                    sum[1] -= u32::from(p[1]);
+                    sum[2] -= u32::from(p[2]);
+                    sum[3] -= u32::from(p[3]);
                 }
             }
         }
@@ -7426,13 +8698,23 @@ fn paint_decoration_lines(
     clip: Option<Rect>,
     offset: (f32, f32),
 ) {
+    paint_decoration_lines_colored(canvas, run, run.color, clip, offset);
+}
+
+fn paint_decoration_lines_colored(
+    canvas: &mut Canvas,
+    run: &TextRun,
+    base_color: Color,
+    clip: Option<Rect>,
+    offset: (f32, f32),
+) {
     let fonts = crate::font::active_fonts();
     let decoration = run.decoration;
     let size = run.font_size;
     let ascent = fonts.ascent(run.font_stack, size);
     let baseline = run.y + offset.1 + ascent;
     let thickness = decoration.thickness.unwrap_or((size / 14.0).max(1.0));
-    let color = decoration.color.unwrap_or(run.color);
+    let color = decoration.color.unwrap_or(base_color);
     // a space a run picked up after its last word belongs to the text that follows, so the
     // lines stop at the word
     let trailing = run.text.len() - run.text.trim_end_matches(' ').len();
@@ -7519,9 +8801,20 @@ fn paint_glyphs(
     offset: (f32, f32),
     silhouette: bool,
 ) {
+    paint_glyphs_colored(canvas, run, run.color, clip, offset, silhouette);
+}
+
+fn paint_glyphs_colored(
+    canvas: &mut Canvas,
+    run: &TextRun,
+    color: Color,
+    clip: Option<Rect>,
+    offset: (f32, f32),
+    silhouette: bool,
+) {
     let fonts = crate::font::active_fonts();
     if !fonts.is_builtin() {
-        paint_outline_text(canvas, run, clip, offset, &fonts, silhouette, 0.0);
+        paint_outline_text_colored(canvas, run, color, clip, offset, &fonts, silhouette, 0.0);
         return;
     }
     let cell = text_advance(run.font_size) + run.letter_spacing;
@@ -7543,7 +8836,7 @@ fn paint_glyphs(
                         run.y + row as f32 * pixel + offset.1,
                         width,
                         pixel,
-                        run.color,
+                        color,
                         clip,
                     );
                 }
@@ -7562,6 +8855,22 @@ fn layout_units(device: f32) -> f32 {
 fn paint_outline_text(
     canvas: &mut Canvas,
     run: &TextRun,
+    clip: Option<Rect>,
+    offset: (f32, f32),
+    fonts: &crate::font::FontSet,
+    silhouette: bool,
+    stroke: f32,
+) {
+    paint_outline_text_colored(
+        canvas, run, run.color, clip, offset, fonts, silhouette, stroke,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_outline_text_colored(
+    canvas: &mut Canvas,
+    run: &TextRun,
+    color: Color,
     clip: Option<Rect>,
     offset: (f32, f32),
     fonts: &crate::font::FontSet,
@@ -7612,14 +8921,14 @@ fn paint_outline_text(
         let colored = if stroke > 0.0 {
             None
         } else {
-            fonts.color_glyph(face, glyph.glyph, device_size, x, run.color)
+            fonts.color_glyph(face, glyph.glyph, device_size, x, color)
         };
         if let Some(colored) = colored {
             canvas.blend_color_glyph(
                 x.floor() as i32 + colored.left,
                 baseline.round() as i32 + colored.top,
                 &colored,
-                run.color,
+                color,
                 silhouette,
                 device_clip,
             );
@@ -7630,7 +8939,7 @@ fn paint_outline_text(
                 x.floor() as i32 + bitmap.left,
                 baseline.round() as i32 + bitmap.top,
                 &bitmap,
-                run.color,
+                color,
                 device_clip,
                 device_size <= 48.0,
             );
@@ -9730,6 +11039,144 @@ mod tests {
                     assert_eq!(fast, exact, "alpha={alpha} src={src} dst={dst}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn box_blur_monochrome_and_color_paths_match_reference() {
+        fn reference_blur(
+            pixels: &mut [u8],
+            width: usize,
+            height: usize,
+            radius: usize,
+            passes: usize,
+        ) {
+            let window = (radius * 2 + 1) as u32;
+            let mut buf = vec![0_u8; pixels.len()];
+            for _ in 0..passes {
+                for y in 0..height {
+                    for x in 0..width {
+                        let mut sum = [0_u32; 4];
+                        let x0 = x.saturating_sub(radius);
+                        let x1 = (x + radius).min(width - 1);
+                        for sx in x0..=x1 {
+                            let at = (y * width + sx) * 4;
+                            for c in 0..4 {
+                                sum[c] += u32::from(pixels[at + c]);
+                            }
+                        }
+                        let dst = (y * width + x) * 4;
+                        for c in 0..4 {
+                            buf[dst + c] = (sum[c] / window) as u8;
+                        }
+                    }
+                }
+                for y in 0..height {
+                    for x in 0..width {
+                        let mut sum = [0_u32; 4];
+                        let y0 = y.saturating_sub(radius);
+                        let y1 = (y + radius).min(height - 1);
+                        for sy in y0..=y1 {
+                            let at = (sy * width + x) * 4;
+                            for c in 0..4 {
+                                sum[c] += u32::from(buf[at + c]);
+                            }
+                        }
+                        let dst = (y * width + x) * 4;
+                        for c in 0..4 {
+                            pixels[dst + c] = (sum[c] / window) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        let (width, height) = (37_u32, 23_u32);
+        for mode in [0_u8, 1, 2] {
+            let mut layer = Canvas::transparent(
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f32,
+                    height: height as f32,
+                },
+                1.0,
+            );
+            for y in 4..18 {
+                for x in 7..29 {
+                    let v = (((x * 19 + y * 31) % 251) + 1) as u8;
+                    let at = (y * width as usize + x) * 4;
+                    layer.pixels[at..at + 4].copy_from_slice(&match mode {
+                        0 => [v, v, v, v],
+                        1 => [0, 0, 0, v],
+                        _ => [v / 2, v / 3, v, v],
+                    });
+                }
+            }
+            let mut expected = layer.pixels.clone();
+            reference_blur(&mut expected, width as usize, height as usize, 4, 3);
+            box_blur_passes(&mut layer, 4, 3);
+            assert_eq!(layer.pixels, expected, "mode={mode}");
+        }
+    }
+
+    #[test]
+    fn occlusion_culling_matches_unoccluded_paint_bit_exact() {
+        let html = r#"<!doctype html><html><head><style>
+            body { margin: 0; background: linear-gradient(180deg, #112233, #334455); }
+            .app { position: relative; width: 320px; height: 240px;
+                   background: repeating-linear-gradient(90deg, rgba(255,255,255,0.08) 0 1px, transparent 1px 3px); }
+            .panel { position: relative; margin: 16px; width: 260px; height: 190px;
+                     border-radius: 6px; background: linear-gradient(180deg, #191919, #101010); }
+            .inner { padding: 12px; color: #f4f4f4; }
+            .over { position: absolute; top: 8px; right: 8px; width: 40px; height: 40px;
+                    background: rgba(255, 80, 40, 0.5); z-index: 2; }
+        </style></head><body>
+            <div class="app"><div class="panel"><div class="inner">live 127.4</div></div><div class="over"></div></div>
+        </body></html>"#;
+        let doc = crate::dom::Document::parse(html).unwrap();
+        let sheet = crate::css::Stylesheet::parse(
+            "body { margin: 0; background: linear-gradient(180deg, #112233, #334455); }
+            .app { position: relative; width: 320px; height: 240px;
+                   background: repeating-linear-gradient(90deg, rgba(255,255,255,0.08) 0 1px, transparent 1px 3px); }
+            .panel { position: relative; margin: 16px; width: 260px; height: 190px;
+                     border-radius: 6px; background: linear-gradient(180deg, #191919, #101010); }
+            .inner { padding: 12px; color: #f4f4f4; }
+            .over { position: absolute; top: 8px; right: 8px; width: 40px; height: 40px;
+                    background: rgba(255, 80, 40, 0.5); z-index: 2; }",
+        )
+        .unwrap();
+        let layout = crate::layout::layout(
+            &doc,
+            &sheet,
+            Size {
+                width: 320.0,
+                height: 240.0,
+            },
+        );
+        for clip in [
+            None,
+            Some(Rect {
+                x: 24.0,
+                y: 28.0,
+                width: 240.0,
+                height: 160.0,
+            }),
+            Some(Rect {
+                x: 8.0,
+                y: 8.0,
+                width: 280.0,
+                height: 200.0,
+            }),
+        ] {
+            let mut fast = Canvas::scaled(320.0, 240.0, 1.0, BASE);
+            let mut ref_canvas = Canvas::scaled(320.0, 240.0, 1.0, BASE);
+            paint_document(&mut fast, &layout, &[], clip);
+            paint_document_unoccluded(&mut ref_canvas, &layout, &[], clip);
+            assert_eq!(
+                fast.rgba_pixels(),
+                ref_canvas.rgba_pixels(),
+                "clip={clip:?}"
+            );
         }
     }
 }

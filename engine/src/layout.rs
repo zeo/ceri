@@ -3069,6 +3069,35 @@ struct KeptTableRow {
     meta: TableRowMeta,
 }
 
+// inputs that determine a single non-spanning table row's phase 1 metadata and cell widths
+#[derive(Clone, PartialEq)]
+struct TableAutoRowInputs {
+    containing_width: u32,
+    font_size: u32,
+    color: Color,
+    weight: FontWeight,
+    text: SharedText,
+    zero_font: (crate::font::FontStack, crate::font::FontStyle),
+    environment: crate::css::LayoutEnvironment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TableAutoCellMeta {
+    column: usize,
+    columns: usize,
+    min_width: f32,
+    max_width: f32,
+    percent_share: f32,
+    has_explicit_width: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TableAutoRowMeta {
+    meta: TableRowMeta,
+    cells: Rc<[TableAutoCellMeta]>,
+    reads_percent: bool,
+}
+
 #[derive(Default)]
 struct KeptAnswers {
     // none where no answer outlives its pass; the font set is held so its address stays its
@@ -3086,6 +3115,7 @@ struct KeptAnswers {
     // each width with whether it read the width it was measured within, through a percentage
     widths: KeptMap<IntrinsicKey, IntrinsicInputs, (f32, bool)>,
     table_rows: KeptMap<NodeId, TableRowInputs, KeptTableRow>,
+    table_auto_rows: KeptMap<NodeId, TableAutoRowInputs, TableAutoRowMeta>,
 }
 
 thread_local! {
@@ -3157,6 +3187,7 @@ impl Drop for KeptPass {
                 kept.boxes.clear();
                 kept.widths.clear();
                 kept.table_rows.clear();
+                kept.table_auto_rows.clear();
                 return;
             }
             // each kept box holds its whole subtree, so only what recent work used stays: the
@@ -3178,6 +3209,7 @@ impl Drop for KeptPass {
             prune(&mut kept.boxes, works);
             prune(&mut kept.widths, works);
             prune(&mut kept.table_rows, works);
+            prune(&mut kept.table_auto_rows, works);
         });
     }
 }
@@ -3213,6 +3245,7 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
             kept.boxes.clear();
             kept.widths.clear();
             kept.table_rows.clear();
+            kept.table_auto_rows.clear();
             kept.under = under.map(|under| (under, fonts));
         } else if kept.hovered != state.hovered {
             // a pointer move restyles a few subtrees, and with them the chain above each
@@ -3226,11 +3259,13 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
                     kept.boxes.retain(|(node, _), _| !stale.contains(node));
                     kept.widths.retain(|(node, ..), _| !stale.contains(node));
                     kept.table_rows.retain(|node, _| !stale.contains(node));
+                    kept.table_auto_rows.retain(|node, _| !stale.contains(node));
                 }
                 None => {
                     kept.boxes.clear();
                     kept.widths.clear();
                     kept.table_rows.clear();
+                    kept.table_auto_rows.clear();
                 }
             }
         }
@@ -3252,7 +3287,11 @@ fn keep_answers(document: &Document, stylesheet: &Stylesheet, state: &StyleState
 // by reference, as through svg's <use>, can be written anywhere
 fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet: &Stylesheet) {
     use crate::css::SelectorReach;
-    if kept.boxes.is_empty() && kept.widths.is_empty() && kept.table_rows.is_empty() {
+    if kept.boxes.is_empty()
+        && kept.widths.is_empty()
+        && kept.table_rows.is_empty()
+        && kept.table_auto_rows.is_empty()
+    {
         return;
     }
     let written = document.written_since(kept.since);
@@ -3271,6 +3310,7 @@ fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet:
     forget(&mut kept.boxes, |_, kept| kept.refers);
     forget(&mut kept.widths, |_, kept| kept.refers);
     forget(&mut kept.table_rows, |_, kept| kept.refers);
+    forget(&mut kept.table_auto_rows, |_, kept| kept.refers);
     let elements = || {
         written
             .iter()
@@ -3284,6 +3324,7 @@ fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet:
             kept.boxes.clear();
             kept.widths.clear();
             kept.table_rows.clear();
+            kept.table_auto_rows.clear();
             return;
         };
         let mut stale = crate::hashing::HashSet::default();
@@ -3295,6 +3336,7 @@ fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet:
         forget(&mut kept.boxes, |(node, _), _| stale.contains(node));
         forget(&mut kept.widths, |(node, ..), _| stale.contains(node));
         forget(&mut kept.table_rows, |node, _| stale.contains(node));
+        forget(&mut kept.table_auto_rows, |node, _| stale.contains(node));
         reach = SelectorReach::Siblings;
     }
     match reach {
@@ -3305,6 +3347,7 @@ fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet:
                 kept.boxes.clear();
                 kept.widths.clear();
                 kept.table_rows.clear();
+                kept.table_auto_rows.clear();
                 return;
             };
             // deduplicate sibling walks per parent so bulk child writes stay linear
@@ -3336,6 +3379,7 @@ fn drop_reached_answers(kept: &mut KeptAnswers, document: &Document, stylesheet:
             forget(&mut kept.boxes, |(node, _), _| stale.contains(node));
             forget(&mut kept.widths, |(node, ..), _| stale.contains(node));
             forget(&mut kept.table_rows, |node, _| stale.contains(node));
+            forget(&mut kept.table_auto_rows, |node, _| stale.contains(node));
         }
     }
 }
@@ -4841,9 +4885,17 @@ fn text_extents(value: &str, text: &InheritedText, measure: &dyn Fn(&str) -> f32
     };
     let shown = |line: &str| {
         if preserve {
-            measure(line)
-        } else {
+            return measure(line);
+        }
+        let bytes = line.as_bytes();
+        let needs_collapse = bytes.first().is_some_and(u8::is_ascii_whitespace)
+            || bytes.last().is_some_and(u8::is_ascii_whitespace)
+            || bytes.iter().any(|&b| b.is_ascii_whitespace() && b != b' ')
+            || bytes.windows(2).any(|pair| pair == b"  ");
+        if needs_collapse {
             measure(&line.split_ascii_whitespace().collect::<Vec<_>>().join(" "))
+        } else {
+            measure(line)
         }
     };
     let widest = lines.iter().map(|line| shown(line)).fold(0.0, f32::max);
@@ -6682,14 +6734,33 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let environment = crate::css::layout_environment();
     let font_size_bits = font_size.to_bits();
     // fixed-layout tables only inspect row 0 for column widths, so unwritten rows after row 0
-    // reuse their cached column count and border widths without styling their cells
+    // reuse their cached column count and border widths without styling their cells; auto-layout
+    // tables reuse cached per-row metadata and cell intrinsic widths for unwritten rows
     let fixed_meta_eligible =
         style.table_fixed && style.width != Length::Auto && kept_pass.is_some();
+    let auto_meta_eligible =
+        !(style.table_fixed && style.width != Length::Auto) && kept_pass.is_some();
+    let auto_inputs = auto_meta_eligible.then(|| TableAutoRowInputs {
+        containing_width: content_width.to_bits(),
+        font_size: font_size_bits,
+        color: child_parent.color,
+        weight: child_parent.weight,
+        text: child_parent.text.clone(),
+        zero_font,
+        environment,
+    });
+    let auto_anywhere = auto_inputs.as_ref().map(|inputs| TableAutoRowInputs {
+        containing_width: u32::MAX,
+        ..inputs.clone()
+    });
 
     let row_count = rows.len();
     let mut occupied: Vec<Vec<bool>> = vec![Vec::new(); row_count];
     let mut row_has_rowspan = vec![false; row_count];
     let mut row_metas: Vec<Option<TableRowMeta>> = vec![None; row_count];
+    let mut row_auto_cached: Vec<Option<(TableAutoRowMeta, bool)>> = vec![None; row_count];
+    let mut row_cell_ranges: Vec<std::ops::Range<usize>> = vec![0..0; row_count];
+    let mut row_refers = vec![false; row_count];
     let mut skipped_cells = vec![false; row_count];
     let mut cells: Vec<TableCellSlot<'_>> = Vec::new();
     let mut column_count: usize = 0;
@@ -6756,8 +6827,51 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             skipped_cells[row_index] = true;
             continue;
         }
+        if auto_meta_eligible
+            && !row_has_rowspan[row_index]
+            && !row.momentary
+            && row.cells.is_empty()
+            && let Some((row_node, _)) = row.node
+            && let Some((pass, _, works)) = kept_pass
+            && let (Some(inputs), Some(anywhere)) = (&auto_inputs, &auto_anywhere)
+        {
+            let cached_auto = KEPT.with(|kept| {
+                let map = &mut kept.borrow_mut().table_auto_rows;
+                let stands = |since| row_node.document.unwritten_since(row_node.node, since);
+                kept_answer(map, (&row_node.node, inputs), (pass, works), stands)
+                    .or_else(|| kept_answer(map, (&row_node.node, anywhere), (pass, works), stands))
+            });
+            if let Some((auto_meta, earlier)) = cached_auto {
+                let meta = auto_meta.meta;
+                let reads_percent = auto_meta.reads_percent;
+                row_auto_cached[row_index] = Some((auto_meta, earlier));
+                if !cfg!(feature = "recheck") {
+                    column_count = column_count.max(meta.columns);
+                    for (max_border, side_width) in max_borders.iter_mut().zip(meta.all_border_max)
+                    {
+                        *max_border = max_border.max(side_width);
+                    }
+                    if style.border_collapse {
+                        if row_index + 1 < row_count {
+                            ends_at[row_index + 1] =
+                                ends_at[row_index + 1].max(meta.cell_border_tb[1]);
+                        }
+                        if row_index > 0 {
+                            starts_at[row_index] = starts_at[row_index].max(meta.cell_border_tb[0]);
+                        }
+                    }
+                    if reads_percent {
+                        PERCENT_READS.with(|reads| reads.set(reads.get() + 1));
+                    }
+                    row_metas[row_index] = Some(meta);
+                    skipped_cells[row_index] = true;
+                    continue;
+                }
+            }
+        }
         if let Some((row_node, row_style)) = row.node {
             let before_cells = crate::css::moment_reports();
+            let before_refers = crate::svg::reference_reads();
             let row_parent = parent_of(&row_style, &child_parent);
             for cell in row_node.children(&NO_GENERATED_CONTENT) {
                 let Child::Element(cell) = cell else {
@@ -6771,11 +6885,15 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             if crate::css::moment_reports() != before_cells {
                 row.momentary = true;
             }
+            if crate::svg::reference_reads() != before_refers {
+                row_refers[row_index] = true;
+            }
         }
         let group_end = row_groups[row_index..]
             .iter()
             .take_while(|&&group| group == row.group)
             .count();
+        let row_cells_start = cells.len();
         let mut column = 0;
         let mut row_all_border_max = [0.0_f32; 4];
         let mut row_cell_border_tb = [0.0_f32; 2];
@@ -6844,6 +6962,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             });
             column += columns;
         }
+        row_cell_ranges[row_index] = row_cells_start..cells.len();
         let row_columns = column.max(occupied[row_index].len());
         column_count = column_count.max(row_columns);
         let fresh_meta = TableRowMeta {
@@ -6963,22 +7082,118 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 minimum,
             )
         };
+        let mut auto_cells: Vec<TableAutoCellMeta> = Vec::with_capacity(cells.len());
+        for row_index in 0..row_count {
+            if skipped_cells[row_index]
+                && let Some((ref auto_meta, _)) = row_auto_cached[row_index]
+            {
+                auto_cells.extend_from_slice(&auto_meta.cells);
+                continue;
+            }
+            let range = row_cell_ranges[row_index].clone();
+            let can_cache = auto_meta_eligible
+                && !row_has_rowspan[row_index]
+                && rows[row_index].node.is_some()
+                && row_metas[row_index].is_some_and(|meta| !meta.has_rowspan);
+            let (reported, looked_up, percents) = if can_cache {
+                (
+                    crate::css::moment_reports(),
+                    crate::svg::reference_reads(),
+                    PERCENT_READS.with(std::cell::Cell::get),
+                )
+            } else {
+                (0, 0, 0)
+            };
+            let mut row_auto = Vec::with_capacity(range.len());
+            for cell in &cells[range] {
+                let minimum = intrinsic(cell, true);
+                let maximum = intrinsic(cell, false);
+                let percent_share = if cell.columns == 1 && cell.style.width.has_percent() {
+                    let at = |basis: f32| cell.style.width.resolve(basis, font_size).unwrap_or(0.0);
+                    at(1.0) - at(0.0)
+                } else {
+                    0.0
+                };
+                let meta = TableAutoCellMeta {
+                    column: cell.column,
+                    columns: cell.columns,
+                    min_width: minimum,
+                    max_width: maximum,
+                    percent_share,
+                    has_explicit_width: cell.columns == 1 && cell.style.width != Length::Auto,
+                };
+                row_auto.push(meta);
+                auto_cells.push(meta);
+            }
+            if can_cache
+                && let Some((row_node, _)) = rows[row_index].node
+                && let Some((pass, stamp, works)) = kept_pass
+                && let Some(fresh_meta) = row_metas[row_index]
+                && let (Some(inputs), Some(anywhere)) = (&auto_inputs, &auto_anywhere)
+            {
+                let momentary =
+                    rows[row_index].momentary || crate::css::moment_reports() != reported;
+                let refers = row_refers[row_index] || crate::svg::reference_reads() != looked_up;
+                let reads_percent = PERCENT_READS.with(std::cell::Cell::get) != percents;
+                let fresh_auto = TableAutoRowMeta {
+                    meta: fresh_meta,
+                    cells: Rc::from(row_auto),
+                    reads_percent,
+                };
+                if let Some((ref cached, earlier)) = row_auto_cached[row_index] {
+                    assert_eq!(
+                        fresh_auto, *cached,
+                        "kept auto table row metadata went stale for row {row_index}"
+                    );
+                    assert!(
+                        !earlier || !momentary,
+                        "kept auto table row stands for one moment only: {:?}",
+                        row_node.node
+                    );
+                }
+                KEPT.with(|kept| {
+                    let mut kept = kept.borrow_mut();
+                    kept.worked = true;
+                    keep_answer(
+                        &mut kept.table_auto_rows,
+                        row_node.node,
+                        Kept {
+                            inputs: if reads_percent {
+                                inputs.clone()
+                            } else {
+                                anywhere.clone()
+                            },
+                            answer: fresh_auto,
+                            pass,
+                            used: works,
+                            stamp,
+                            momentary,
+                            refers,
+                        },
+                    );
+                });
+            }
+        }
         let mut column_min = vec![0.0_f32; column_count];
         let mut column_max = vec![0.0_f32; column_count];
         // the share of the table a column was given by a cell of its own
         let mut column_share = vec![0.0_f32; column_count];
-        for cell in cells.iter().filter(|cell| cell.columns == 1) {
-            let at = |basis: f32| cell.style.width.resolve(basis, font_size).unwrap_or(0.0);
-            if cell.style.width.has_percent() {
-                column_share[cell.column] = column_share[cell.column].max(at(1.0) - at(0.0));
+        let mut column_sized = vec![false; column_count];
+        for cell in &auto_cells {
+            if cell.columns == 1 {
+                if cell.percent_share > 0.0 {
+                    column_share[cell.column] = column_share[cell.column].max(cell.percent_share);
+                }
+                if cell.has_explicit_width {
+                    column_sized[cell.column] = true;
+                }
             }
         }
-        let mut by_span = (0..cells.len()).collect::<Vec<_>>();
-        by_span.sort_by_key(|index| cells[*index].columns);
+        let mut by_span = (0..auto_cells.len()).collect::<Vec<_>>();
+        by_span.sort_by_key(|index| auto_cells[*index].columns);
         for index in by_span {
-            let cell = &cells[index];
-            let (minimum, maximum) = (intrinsic(cell, true), intrinsic(cell, false));
-            let maximum = maximum.max(minimum);
+            let cell = &auto_cells[index];
+            let (minimum, maximum) = (cell.min_width, cell.max_width.max(cell.min_width));
             let range = cell.column..cell.column + cell.columns;
             let gaps = spacing_x * (cell.columns - 1) as f32;
             let have_min = column_min[range.clone()].iter().sum::<f32>() + gaps;
@@ -7020,11 +7235,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         let count = (0..column_count).filter(open).count().max(1) as f32;
         // room past what every column asks for goes to the columns no cell gave a width,
         // while there are any
-        let sized = |column: usize| {
-            cells.iter().any(|cell| {
-                cell.columns == 1 && cell.column == column && cell.style.width != Length::Auto
-            })
-        };
+        let sized = |column: usize| column_sized[column];
         let unsized_columns = (0..column_count)
             .filter(open)
             .filter(|column| !sized(*column))

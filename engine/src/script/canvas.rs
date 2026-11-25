@@ -923,59 +923,121 @@ impl CanvasContextData {
         let Some(coverage) = coverage else {
             return;
         };
-        // a gradient is laid out in the user space of the moment it paints
-        let back = inverse(self.state.transform);
-        let smooth = self.smoothing_enabled;
+        if coverage.width == 0 || coverage.values.is_empty() {
+            return;
+        }
         let alpha = self.state.alpha;
         let composite = self.state.composite;
-        let clip = self.state.clip.clone();
         let stride = self.bitmap.width as usize;
-        for (index, &value) in coverage.values.iter().enumerate() {
-            let x = coverage.left as usize + index % coverage.width;
-            let y = coverage.top as usize + index / coverage.width;
-            let at = y * stride + x;
-            let reach = clip.as_ref().map_or(255.0, |clip| f32::from(clip[at]));
-            let amount = (f32::from(value) * alpha * reach / 255.0).round() as u32;
-            if amount == 0 {
-                continue;
-            }
-            let premultiplied = match paint {
-                Paint::Color(color) => {
-                    premultiply([color.red, color.green, color.blue, color.alpha])
-                }
-                Paint::Gradient(gradient, _) => {
-                    let Some(back) = back else {
-                        return;
-                    };
-                    let point = crate::svg::map(back, (x as f32 + 0.5, y as f32 + 0.5));
-                    match gradient.borrow().color_at(point) {
-                        Some(color) => {
-                            premultiply([color.red, color.green, color.blue, color.alpha])
+        let left = coverage.left as usize;
+        let top = coverage.top as usize;
+        let width = coverage.width;
+        if let Paint::Color(color) = paint {
+            let premultiplied = premultiply([color.red, color.green, color.blue, color.alpha]);
+            if alpha == 1.0 && self.state.clip.is_none() && composite == Composite::SourceOver {
+                for (row_offset, row_values) in coverage.values.chunks_exact(width).enumerate() {
+                    let row_start = (top + row_offset) * stride + left;
+                    let dst_row = &mut self.bitmap.pixels[row_start..row_start + width];
+                    for (pixel, &value) in dst_row.iter_mut().zip(row_values) {
+                        if value != 0 {
+                            source_over(pixel, scale(premultiplied, u32::from(value)));
                         }
-                        None => continue,
                     }
                 }
-                Paint::Pattern(pattern, _) => {
-                    let Some(back) = back else {
-                        return;
+                self.snapshot = None;
+                return;
+            }
+            let clip = self.state.clip.clone();
+            for (row_offset, row_values) in coverage.values.chunks_exact(width).enumerate() {
+                let y = top + row_offset;
+                let row_start = y * stride + left;
+                for (col_offset, &value) in row_values.iter().enumerate() {
+                    if value == 0 {
+                        continue;
+                    }
+                    let at = row_start + col_offset;
+                    let amount = if let Some(clip) = &clip {
+                        let reach = f32::from(clip[at]);
+                        (f32::from(value) * alpha * reach / 255.0).round() as u32
+                    } else if alpha == 1.0 {
+                        u32::from(value)
+                    } else {
+                        (f32::from(value) * alpha).round() as u32
                     };
-                    match pattern.pixel_at(
-                        crate::svg::map(back, (x as f32 + 0.5, y as f32 + 0.5)),
-                        smooth,
-                    ) {
-                        Some(pixel) => pixel,
-                        None => continue,
+                    if amount == 0 {
+                        continue;
+                    }
+                    let source = scale(premultiplied, amount);
+                    let pixel = &mut self.bitmap.pixels[at];
+                    if composite == Composite::SourceOver {
+                        source_over(pixel, source);
+                    } else {
+                        let unit = |pixel: [u8; 4]| pixel.map(|channel| f32::from(channel) / 255.0);
+                        let blended = composite.blend(unit(source), unit(*pixel));
+                        *pixel =
+                            blended.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8);
                     }
                 }
-            };
-            let source = scale(premultiplied, amount);
-            let pixel = &mut self.bitmap.pixels[at];
-            if composite == Composite::SourceOver {
-                source_over(pixel, source);
-            } else {
-                let unit = |pixel: [u8; 4]| pixel.map(|channel| f32::from(channel) / 255.0);
-                let blended = composite.blend(unit(source), unit(*pixel));
-                *pixel = blended.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+            self.snapshot = None;
+            return;
+        }
+        // a gradient is laid out in the user space of the moment it paints
+        let Some(back) = inverse(self.state.transform) else {
+            return;
+        };
+        let smooth = self.smoothing_enabled;
+        let clip = self.state.clip.clone();
+        for (row_offset, row_values) in coverage.values.chunks_exact(width).enumerate() {
+            let y = top + row_offset;
+            let row_start = y * stride + left;
+            for (col_offset, &value) in row_values.iter().enumerate() {
+                if value == 0 {
+                    continue;
+                }
+                let x = left + col_offset;
+                let at = row_start + col_offset;
+                let amount = if let Some(clip) = &clip {
+                    let reach = f32::from(clip[at]);
+                    (f32::from(value) * alpha * reach / 255.0).round() as u32
+                } else if alpha == 1.0 {
+                    u32::from(value)
+                } else {
+                    (f32::from(value) * alpha).round() as u32
+                };
+                if amount == 0 {
+                    continue;
+                }
+                let premultiplied = match paint {
+                    Paint::Color(_) => unreachable!(),
+                    Paint::Gradient(gradient, _) => {
+                        let point = crate::svg::map(back, (x as f32 + 0.5, y as f32 + 0.5));
+                        match gradient.borrow().color_at(point) {
+                            Some(color) => {
+                                premultiply([color.red, color.green, color.blue, color.alpha])
+                            }
+                            None => continue,
+                        }
+                    }
+                    Paint::Pattern(pattern, _) => {
+                        match pattern.pixel_at(
+                            crate::svg::map(back, (x as f32 + 0.5, y as f32 + 0.5)),
+                            smooth,
+                        ) {
+                            Some(pixel) => pixel,
+                            None => continue,
+                        }
+                    }
+                };
+                let source = scale(premultiplied, amount);
+                let pixel = &mut self.bitmap.pixels[at];
+                if composite == Composite::SourceOver {
+                    source_over(pixel, source);
+                } else {
+                    let unit = |pixel: [u8; 4]| pixel.map(|channel| f32::from(channel) / 255.0);
+                    let blended = composite.blend(unit(source), unit(*pixel));
+                    *pixel = blended.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8);
+                }
             }
         }
         self.snapshot = None;
@@ -1019,10 +1081,6 @@ impl CanvasContextData {
         let Some(back) = inverse(self.state.transform) else {
             return;
         };
-        let user = path
-            .iter()
-            .map(|&segment| map_segment(back, segment))
-            .collect::<Vec<_>>();
         let pen = Pen {
             width: self.state.line_width,
             cap: self.state.cap,
@@ -1031,8 +1089,20 @@ impl CanvasContextData {
             dash: &self.state.dash,
             dash_offset: self.state.dash_offset,
         };
-        let coverage =
-            crate::svg::path_coverage(&user, self.state.transform, Some(pen), false, self.size());
+        let coverage = if self.state.dash.is_empty()
+            && path.len() >= 16
+            && path
+                .iter()
+                .all(|segment| !matches!(segment, Segment::Cubic(..)))
+        {
+            stroke_polyline_coverage(path, back, self.state.transform, pen, self.size())
+        } else {
+            let user = path
+                .iter()
+                .map(|&segment| map_segment(back, segment))
+                .collect::<Vec<_>>();
+            crate::svg::path_coverage(&user, self.state.transform, Some(pen), false, self.size())
+        };
         let paint = self.state.stroke_style.clone();
         self.paint(coverage, &paint);
     }
@@ -2286,21 +2356,33 @@ impl ScriptRuntime {
                     .any(|argument| argument.string_value() == "evenodd");
                 let given = arguments.first().and_then(Self::path_of);
                 let mut context = context.borrow_mut();
-                let path = match given {
-                    Some(ops) => context.path_from(&ops.borrow()),
-                    None => context.path.clone(),
-                };
-                context.fill_path(&path, even_odd);
+                match given {
+                    Some(ops) => {
+                        let path = context.path_from(&ops.borrow());
+                        context.fill_path(&path, even_odd);
+                    }
+                    None => {
+                        let path = std::mem::take(&mut context.path);
+                        context.fill_path(&path, even_odd);
+                        context.path = path;
+                    }
+                }
                 Ok(Value::Undefined)
             }
             "stroke" => {
                 let given = arguments.first().and_then(Self::path_of);
                 let mut context = context.borrow_mut();
-                let path = match given {
-                    Some(ops) => context.path_from(&ops.borrow()),
-                    None => context.path.clone(),
-                };
-                context.stroke_path(&path);
+                match given {
+                    Some(ops) => {
+                        let path = context.path_from(&ops.borrow());
+                        context.stroke_path(&path);
+                    }
+                    None => {
+                        let path = std::mem::take(&mut context.path);
+                        context.stroke_path(&path);
+                        context.path = path;
+                    }
+                }
                 Ok(Value::Undefined)
             }
             "roundRect" => {
@@ -2329,16 +2411,29 @@ impl ScriptRuntime {
                     .get(2)
                     .is_some_and(|rule| rule.string_value() == "evenodd");
                 let mut context = context.borrow_mut();
-                let path = match given {
-                    Some(ops) => context.path_from(&ops.borrow()),
-                    None => context.path.clone(),
+                let inside = match given {
+                    Some(ops) => {
+                        let path = context.path_from(&ops.borrow());
+                        context.hit(
+                            &path,
+                            (point[0], point[1]),
+                            even_odd,
+                            name == "isPointInStroke",
+                        )
+                    }
+                    None => {
+                        let path = std::mem::take(&mut context.path);
+                        let hit = context.hit(
+                            &path,
+                            (point[0], point[1]),
+                            even_odd,
+                            name == "isPointInStroke",
+                        );
+                        context.path = path;
+                        hit
+                    }
                 };
-                Ok(Value::Bool(context.hit(
-                    &path,
-                    (point[0], point[1]),
-                    even_odd,
-                    name == "isPointInStroke",
-                )))
+                Ok(Value::Bool(inside))
             }
             "fillText" | "strokeText" => {
                 let text = arguments
@@ -2388,11 +2483,17 @@ impl ScriptRuntime {
                     .any(|argument| argument.string_value() == "evenodd");
                 let given = arguments.first().and_then(Self::path_of);
                 let mut context = context.borrow_mut();
-                let path = match given {
-                    Some(ops) => context.path_from(&ops.borrow()),
-                    None => context.path.clone(),
-                };
-                context.clip_to(&path, even_odd);
+                match given {
+                    Some(ops) => {
+                        let path = context.path_from(&ops.borrow());
+                        context.clip_to(&path, even_odd);
+                    }
+                    None => {
+                        let path = std::mem::take(&mut context.path);
+                        context.clip_to(&path, even_odd);
+                        context.path = path;
+                    }
+                }
                 Ok(Value::Undefined)
             }
             // an odd count repeats to make a whole pattern, and a negative or unreal length
@@ -3039,6 +3140,331 @@ fn image_data_object(width: u32, height: u32, data: Vec<u8>) -> Value {
     ])
 }
 
+// x-banded polyline stroke rasterizer matching svg::path_coverage without global edge sorting
+fn stroke_polyline_coverage(
+    path: &[Segment],
+    back: Affine,
+    matrix: Affine,
+    pen: Pen<'_>,
+    size: (u32, u32),
+) -> Option<Coverage> {
+    const TOLERANCE: f32 = 0.1;
+    const BAND_WIDTH: usize = 32;
+
+    #[derive(Clone, Copy)]
+    struct SpanLine {
+        top: f32,
+        bottom: f32,
+        x: f32,
+        slope: f32,
+        winding: i32,
+    }
+
+    let mut subpaths: Vec<(Vec<(f32, f32)>, bool)> = Vec::new();
+    let mut points: Vec<(f32, f32)> = Vec::new();
+    for &segment in path {
+        match segment {
+            Segment::Move(point) => {
+                if points.len() > 1 {
+                    subpaths.push((std::mem::take(&mut points), false));
+                }
+                points.clear();
+                points.push(crate::svg::map(back, point));
+            }
+            Segment::Line(point) => points.push(crate::svg::map(back, point)),
+            Segment::Close => {
+                if !points.is_empty() {
+                    subpaths.push((std::mem::take(&mut points), true));
+                }
+            }
+            Segment::Cubic(..) => return None,
+        }
+    }
+    if points.len() > 1 {
+        subpaths.push((points, false));
+    }
+    if subpaths.is_empty() {
+        return None;
+    }
+
+    let unit = |from: (f32, f32), to: (f32, f32)| -> (f32, f32) {
+        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+        let length = dx.hypot(dy);
+        (dx / length, dy / length)
+    };
+    let disc = |center: (f32, f32), radius: f32, steps: usize| -> Vec<(f32, f32)> {
+        (0..steps)
+            .map(|step| {
+                let angle = step as f32 * std::f32::consts::TAU / steps as f32;
+                (
+                    center.0 + radius * angle.cos(),
+                    center.1 + radius * angle.sin(),
+                )
+            })
+            .collect()
+    };
+
+    let scale = matrix[0].hypot(matrix[1]).max(matrix[2].hypot(matrix[3]));
+    let device_radius = pen.width / 2.0 * scale;
+    let disc_steps = if device_radius > TOLERANCE {
+        (std::f32::consts::PI / (1.0 - TOLERANCE / device_radius).acos()).ceil()
+    } else {
+        8.0
+    }
+    .clamp(8.0, 128.0) as usize;
+    let half = pen.width / 2.0;
+    let mut polygons: Vec<Vec<(f32, f32)>> = Vec::with_capacity(path.len() * 2);
+
+    for (mut pts, closed) in subpaths {
+        pts.dedup_by(|a, b| (a.0 - b.0).hypot(a.1 - b.1) < 1e-6);
+        if closed && pts.len() > 1 && pts.first() == pts.last() {
+            pts.pop();
+        }
+        if let &[point] = pts.as_slice() {
+            match pen.cap {
+                LineCap::Butt => {}
+                LineCap::Round => polygons.push(disc(point, half, disc_steps)),
+                LineCap::Square => polygons.push(vec![
+                    (point.0 - half, point.1 - half),
+                    (point.0 + half, point.1 - half),
+                    (point.0 + half, point.1 + half),
+                    (point.0 - half, point.1 + half),
+                ]),
+            }
+            continue;
+        }
+        if pts.len() < 2 {
+            continue;
+        }
+        let count = pts.len();
+        let edge_count = if closed { count } else { count - 1 };
+        for index in 0..edge_count {
+            let (from, to) = (pts[index], pts[(index + 1) % count]);
+            let direction = unit(from, to);
+            let normal = (-direction.1 * half, direction.0 * half);
+            polygons.push(vec![
+                (from.0 + normal.0, from.1 + normal.1),
+                (to.0 + normal.0, to.1 + normal.1),
+                (to.0 - normal.0, to.1 - normal.1),
+                (from.0 - normal.0, from.1 - normal.1),
+            ]);
+        }
+        let joints = if closed { 0..count } else { 1..count - 1 };
+        for index in joints {
+            let vertex = pts[index];
+            let incoming = unit(pts[(index + count - 1) % count], vertex);
+            let outgoing = unit(vertex, pts[(index + 1) % count]);
+            let cross = incoming.0 * outgoing.1 - incoming.1 * outgoing.0;
+            let dot = incoming.0 * outgoing.0 + incoming.1 * outgoing.1;
+            if cross.abs() < 1e-6 && dot > 0.0 {
+                continue;
+            }
+            if pen.join == LineJoin::Round {
+                polygons.push(disc(vertex, half, disc_steps));
+                continue;
+            }
+            let side = if cross > 0.0 { -half } else { half };
+            let first = (vertex.0 - incoming.1 * side, vertex.1 + incoming.0 * side);
+            let second = (vertex.0 - outgoing.1 * side, vertex.1 + outgoing.0 * side);
+            let ratio = 1.0 / ((1.0 + dot) / 2.0).sqrt();
+            if pen.join == LineJoin::Miter && ratio <= pen.miter_limit {
+                let bisector = unit(
+                    vertex,
+                    ((first.0 + second.0) / 2.0, (first.1 + second.1) / 2.0),
+                );
+                let tip = (
+                    vertex.0 + bisector.0 * half * ratio,
+                    vertex.1 + bisector.1 * half * ratio,
+                );
+                polygons.push(vec![vertex, first, tip, second]);
+            } else {
+                polygons.push(vec![vertex, first, second]);
+            }
+        }
+        if !closed {
+            for (point, direction) in [
+                (pts[0], unit(pts[1], pts[0])),
+                (pts[count - 1], unit(pts[count - 2], pts[count - 1])),
+            ] {
+                match pen.cap {
+                    LineCap::Butt => {}
+                    LineCap::Round => polygons.push(disc(point, half, disc_steps)),
+                    LineCap::Square => {
+                        let normal = (-direction.1 * half, direction.0 * half);
+                        let reach = (direction.0 * half, direction.1 * half);
+                        polygons.push(vec![
+                            (point.0 + normal.0, point.1 + normal.1),
+                            (point.0 + normal.0 + reach.0, point.1 + normal.1 + reach.1),
+                            (point.0 - normal.0 + reach.0, point.1 - normal.1 + reach.1),
+                            (point.0 - normal.0, point.1 - normal.1),
+                        ]);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut device_polys: Vec<Vec<(f32, f32)>> = Vec::with_capacity(polygons.len());
+    let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    let mut has_edges = false;
+    for polygon in polygons {
+        if polygon.len() < 3 {
+            continue;
+        }
+        let device: Vec<(f32, f32)> = polygon
+            .into_iter()
+            .map(|point| {
+                let mapped = crate::svg::map(matrix, point);
+                left = left.min(mapped.0);
+                top = top.min(mapped.1);
+                right = right.max(mapped.0);
+                bottom = bottom.max(mapped.1);
+                mapped
+            })
+            .collect();
+        has_edges = true;
+        device_polys.push(device);
+    }
+    if !(has_edges
+        && left.is_finite()
+        && top.is_finite()
+        && right.is_finite()
+        && bottom.is_finite())
+    {
+        return None;
+    }
+    let left = left.floor().max(0.0) as i32;
+    let top = top.floor().max(0.0) as i32;
+    let right = right.ceil().min(size.0 as f32) as i32;
+    let bottom = bottom.ceil().min(size.1 as f32) as i32;
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let width = (right - left) as usize;
+    let height = (bottom - top) as usize;
+    let num_bands = width.div_ceil(BAND_WIDTH);
+    let mut band_lines: Vec<Vec<SpanLine>> = vec![Vec::new(); num_bands];
+    let rows = (top as f32, bottom as f32);
+    let snap = |y: f32| (y * 4.0 + 0.5).floor() / 4.0;
+
+    let mut poly_edges: Vec<crate::font::Segment> = Vec::with_capacity(16);
+    let mut poly_lines: Vec<SpanLine> = Vec::with_capacity(16);
+    for device in &device_polys {
+        poly_edges.clear();
+        crate::font::push_polygon(&mut poly_edges, device);
+        poly_lines.clear();
+        let (mut p_min_x, mut p_max_x) = (f32::MAX, f32::MIN);
+        for &(from, to) in &poly_edges {
+            let (upper, lower, winding) = if from.1 <= to.1 {
+                (from, to, 1)
+            } else {
+                (to, from, -1)
+            };
+            let line_top = snap(upper.1).max(rows.0);
+            let line_bottom = snap(lower.1).min(rows.1);
+            let slope = (lower.0 - upper.0) / (lower.1 - upper.1);
+            if line_top < line_bottom && slope.is_finite() {
+                let x = upper.0 + slope * (line_top - upper.1);
+                let x_end = x + slope * (line_bottom - line_top);
+                p_min_x = p_min_x.min(x.min(x_end));
+                p_max_x = p_max_x.max(x.max(x_end));
+                poly_lines.push(SpanLine {
+                    top: line_top,
+                    bottom: line_bottom,
+                    x,
+                    slope,
+                    winding,
+                });
+            }
+        }
+        if poly_lines.is_empty() || p_max_x < left as f32 || p_min_x >= right as f32 {
+            continue;
+        }
+        let first_band = if p_min_x <= left as f32 {
+            0
+        } else {
+            (((p_min_x - left as f32).floor() as usize) / BAND_WIDTH).min(num_bands - 1)
+        };
+        let last_band = if p_max_x >= right as f32 {
+            num_bands - 1
+        } else {
+            (((p_max_x - left as f32).floor() as usize) / BAND_WIDTH).min(num_bands - 1)
+        };
+        for lines in &mut band_lines[first_band..=last_band] {
+            lines.extend_from_slice(&poly_lines);
+        }
+    }
+
+    let mut all_spans: Vec<crate::font::Segment> = Vec::new();
+    let mut active: Vec<usize> = Vec::new();
+    let mut crossings: Vec<(f32, f32, i32)> = Vec::new();
+    for (band, lines) in band_lines.iter_mut().enumerate() {
+        if lines.is_empty() {
+            continue;
+        }
+        let bx0 = (left + (band * BAND_WIDTH) as i32) as f32;
+        let bx1 = ((left + (band * BAND_WIDTH) as i32) + BAND_WIDTH as i32).min(right) as f32;
+        let is_first = band == 0;
+        let is_last = band + 1 == num_bands;
+        lines.sort_by(|a, b| a.top.total_cmp(&b.top));
+        active.clear();
+        let mut cursor = 0;
+        let mut y = f32::MIN;
+        loop {
+            active.retain(|&idx| lines[idx].bottom > y);
+            if active.is_empty() {
+                if cursor < lines.len() {
+                    y = y.max(lines[cursor].top);
+                } else {
+                    break;
+                }
+            }
+            while cursor < lines.len() && lines[cursor].top <= y {
+                active.push(cursor);
+                cursor += 1;
+            }
+            let below = y + 0.25;
+            crossings.clear();
+            for &idx in &active {
+                let line = lines[idx];
+                let u = line.x + line.slope * (y - line.top);
+                let l = line.x + line.slope * (below - line.top);
+                crossings.push((u, l, line.winding));
+            }
+            crossings.sort_by(|a, b| (a.0 + a.1).total_cmp(&(b.0 + b.1)));
+            let mut winding = 0;
+            for &(upper, lower, turn) in &crossings {
+                let was = winding != 0;
+                winding += turn;
+                let now = winding != 0;
+                if was == now {
+                    continue;
+                }
+                let mid = (upper + lower) * 0.5;
+                let in_band = (is_first || mid >= bx0) && (is_last || mid < bx1);
+                if in_band {
+                    if !was {
+                        all_spans.push(((upper, y), (lower, below)));
+                    } else {
+                        all_spans.push(((lower, below), (upper, y)));
+                    }
+                }
+            }
+            y = below;
+        }
+    }
+
+    let values =
+        crate::font::coverage_grid(&all_spans, (left as f32, top as f32), width, height, false);
+
+    Some(Coverage {
+        left,
+        top,
+        width,
+        values,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3567,5 +3993,61 @@ mod tests {
         assert_eq!(non_negative_integer("  +42px"), Some(42));
         assert_eq!(non_negative_integer("-3"), None);
         assert_eq!(non_negative_integer("3000000000"), None);
+    }
+
+    #[test]
+    fn banded_polyline_stroke_matches_svg_path_coverage_bit_exact() {
+        for (dpr, join, cap) in [
+            (1.0_f32, LineJoin::Miter, LineCap::Butt),
+            (1.5_f32, LineJoin::Round, LineCap::Round),
+            (2.0_f32, LineJoin::Bevel, LineCap::Square),
+        ] {
+            let transform = [dpr, 0.0, 0.0, dpr, 0.0, 0.0];
+            let back = inverse(transform).unwrap();
+            let size = ((240.0 * dpr) as u32, (48.0 * dpr) as u32);
+            let mut path = Vec::with_capacity(300);
+            for i in 0..300 {
+                let x = i as f32 * 0.8 * dpr;
+                let y = (24.0 + ((i as f32 * 0.23).sin() * 14.0) + ((i as f32 * 0.71).cos() * 5.0))
+                    * dpr;
+                if i == 0 {
+                    path.push(Segment::Move((x, y)));
+                } else {
+                    path.push(Segment::Line((x, y)));
+                }
+            }
+            let pen = Pen {
+                width: 1.2,
+                cap,
+                join,
+                miter_limit: 10.0,
+                dash: &[],
+                dash_offset: 0.0,
+            };
+            let user: Vec<Segment> = path.iter().map(|&s| map_segment(back, s)).collect();
+            let expected =
+                crate::svg::path_coverage(&user, transform, Some(pen), false, size).unwrap();
+            let actual = stroke_polyline_coverage(&path, back, transform, pen, size).unwrap();
+            assert_eq!(actual.left, expected.left, "dpr={dpr}");
+            assert_eq!(actual.top, expected.top, "dpr={dpr}");
+            assert_eq!(actual.width, expected.width, "dpr={dpr}");
+            let diffs: Vec<_> = actual
+                .values
+                .iter()
+                .zip(&expected.values)
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .take(10)
+                .map(|(i, (a, b))| {
+                    (
+                        actual.left + (i % actual.width) as i32,
+                        actual.top + (i / actual.width) as i32,
+                        *a,
+                        *b,
+                    )
+                })
+                .collect();
+            assert!(diffs.is_empty(), "dpr={dpr} diffs={diffs:?}");
+        }
     }
 }

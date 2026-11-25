@@ -477,6 +477,8 @@ pub struct Document {
     rules_version: u64,
     // renewed when an inline style attribute mentioning a custom property changes
     custom_style_version: u64,
+    // renewed when any inline style attribute changes, leaving text-only edits untouched
+    inline_style_version: u64,
     // the attribute changes a selector can see, newest last, each with its write stamp, its
     // element and what it changed: "class:name" for a class token, "#id" for an id, "[name]"
     // for an attribute, "*" for anything. bounded, so changes older than the oldest kept
@@ -643,6 +645,7 @@ impl Document {
             selector_version: next_stamp(),
             rules_version: 0,
             custom_style_version: 0,
+            inline_style_version: 0,
             selector_changes: std::collections::VecDeque::new(),
             changes_lost: 0,
             orphans: Vec::new(),
@@ -1002,6 +1005,10 @@ impl Document {
         self.custom_style_version
     }
 
+    pub(crate) fn inline_style_version(&self) -> u64 {
+        self.inline_style_version
+    }
+
     fn note_selector_change(&mut self, id: NodeId, changed: Box<[String]>) {
         const KEPT_CHANGES: usize = 1024;
         if self.selector_changes.len() == KEPT_CHANGES
@@ -1281,6 +1288,9 @@ impl Document {
             let changed = (attribute != "style")
                 .then(|| attribute_change(attribute, old.as_deref(), new_value));
             self.mark_written(id);
+            if attribute == "style" {
+                self.inline_style_version = next_stamp();
+            }
             if custom_style {
                 self.custom_style_version = next_stamp();
             }
@@ -1314,6 +1324,7 @@ impl Document {
             })
             .collect();
         if !self.blocked_styles.is_empty() {
+            self.inline_style_version = next_stamp();
             self.custom_style_version = next_stamp();
         }
         self.content_security_policy = policies;

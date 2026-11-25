@@ -2695,6 +2695,8 @@ pub struct Stylesheet {
     // whether a selector reads text nodes or the style attribute, which change without the
     // document's selector version moving
     reads_unversioned: bool,
+    // whether any rule declaring a custom property reads text nodes or the style attribute
+    custom_props_read_unversioned: bool,
     reach: SelectorReach,
     // what an attribute change must touch for a sibling selector to see it, as the document
     // names its changes
@@ -2888,6 +2890,33 @@ fn generated_content_rules(rules: &[Rule]) -> Vec<usize> {
         })
         .map(|(index, _)| index)
         .collect()
+}
+
+fn root_element(document: &Document) -> Option<NodeId> {
+    let top = document
+        .element_children(document.root())
+        .collect::<Vec<_>>();
+    root_element_from(document, &top)
+}
+
+fn root_element_from(document: &Document, top: &[NodeId]) -> Option<NodeId> {
+    top.iter()
+        .copied()
+        .find(|&node| {
+            document
+                .element(node)
+                .is_some_and(|element| element.name == "html")
+        })
+        .or_else(|| {
+            top.iter().copied().find(|&node| {
+                document.element(node).is_some_and(|element| {
+                    !matches!(
+                        element.name.as_str(),
+                        "head" | "style" | "script" | "link" | "meta" | "title"
+                    )
+                })
+            })
+        })
 }
 
 fn is_root_element(document: &Document, node: NodeId, state: &StyleState) -> bool {
@@ -3793,6 +3822,12 @@ impl Stylesheet {
         let motion_index = RuleIndex::build_subset(&rules, &motion_rules);
         let custom_rules = custom_property_rules(&rules);
         let has_custom_properties = !custom_rules.is_empty();
+        let custom_props_read_unversioned = custom_rules.iter().any(|&index| {
+            rules[index]
+                .selectors
+                .iter()
+                .any(Selector::reads_unversioned)
+        });
         let custom_prop_index = RuleIndex::build_subset(&rules, &custom_rules);
         let content_rules = generated_content_rules(&rules);
         let generated_content_index = RuleIndex::build_subset(&rules, &content_rules);
@@ -3819,6 +3854,7 @@ impl Stylesheet {
             has_anchors: has_anchors(&rules),
             media: media_lists(&rules),
             reads_unversioned: reads_unversioned(&rules),
+            custom_props_read_unversioned,
             reach: selector_reach(&rules),
             sibling_keys: sibling_keys(&rules),
             cascades: RefCell::default(),
@@ -3850,6 +3886,12 @@ impl Stylesheet {
         let motion_index = RuleIndex::build_subset(&rules, &motion_rules);
         let custom_rules = custom_property_rules(&rules);
         let has_custom_properties = !custom_rules.is_empty();
+        let custom_props_read_unversioned = custom_rules.iter().any(|&index| {
+            rules[index]
+                .selectors
+                .iter()
+                .any(Selector::reads_unversioned)
+        });
         let custom_prop_index = RuleIndex::build_subset(&rules, &custom_rules);
         let content_rules = generated_content_rules(&rules);
         let generated_content_index = RuleIndex::build_subset(&rules, &content_rules);
@@ -3877,6 +3919,7 @@ impl Stylesheet {
                 has_anchors: has_anchors(&rules),
                 media: media_lists(&rules),
                 reads_unversioned: reads_unversioned(&rules),
+                custom_props_read_unversioned,
                 reach: selector_reach(&rules),
                 sibling_keys: sibling_keys(&rules),
                 cascades: RefCell::default(),
@@ -3980,7 +4023,7 @@ impl Stylesheet {
     // size it reads, so the last two are kept by the sheet, the document version and the state
     // they read; layout and transition sampling read different states
     pub(crate) fn populate_custom_properties(&self, document: &Document, state: &mut StyleState) {
-        let versioned = self.follows_versions() && !document.has_shadow_roots();
+        let versioned = self.custom_props_follow_versions() && !document.has_shadow_roots();
         let document_key = if !versioned {
             (document.version(), 0)
         } else {
@@ -4201,30 +4244,123 @@ impl Stylesheet {
             })
     }
 
+    // resolves one --* custom property on `node` by walking only `node` and its ancestors,
+    // without running a full-document custom-property pass
+    pub(crate) fn custom_property_value(
+        &self,
+        document: &Document,
+        node: NodeId,
+        name: &str,
+        state: &StyleState,
+    ) -> Option<String> {
+        document.element(node)?;
+        let versioned = self.custom_props_follow_versions() && !document.has_shadow_roots();
+        let document_key = if !versioned {
+            (document.version(), 0)
+        } else {
+            (document.selector_version(), document.custom_style_version())
+        };
+        let doc_id = document.identity();
+        let rules_version = document.rules_version();
+        let state_key = StyleState {
+            clock: 0,
+            transitions: Shared::default(),
+            animation_starts: Shared::default(),
+            custom_properties: Shared::default(),
+            root: None,
+            ..state.clone()
+        };
+        let cached = CUSTOM_PROPERTY_PASSES.with(|passes| {
+            passes
+                .borrow()
+                .iter()
+                .find(|pass| {
+                    pass.sheet == self.identity
+                        && pass.document == doc_id
+                        && pass.rules_version == rules_version
+                        && pass.version == document_key
+                        && pass.state == state_key
+                })
+                .map(|pass| pass.properties.clone())
+        });
+        if let Some(properties) = cached {
+            let mut current = Some(node);
+            while let Some(id) = current {
+                if let Some(map) = properties.get(&id) {
+                    let raw = map.get(name)?;
+                    return resolve_custom_value(raw, map).map(std::borrow::Cow::into_owned);
+                }
+                current = document.parent(id);
+            }
+            return None;
+        }
+        let mut chain = std::iter::once(node)
+            .chain(document.ancestors(node))
+            .filter(|&id| document.element(id).is_some())
+            .collect::<Vec<_>>();
+        chain.reverse();
+        let mut probe_state = state.clone();
+        if probe_state.root.is_none() {
+            probe_state.root = root_element(document);
+        }
+        let shadows = document.has_shadow_roots();
+        let _styles = memoize_styles();
+        let mut collected: Option<BTreeMap<String, String>> = None;
+        for current in chain {
+            let check = shadows
+                || document.element(current).is_some_and(|element| {
+                    self.may_declare_custom_property(document, current, element, &probe_state)
+                });
+            if !check {
+                continue;
+            }
+            for (property, (_, _, value)) in self
+                .cascaded_values(document, current, None, &probe_state)
+                .iter()
+            {
+                if !property.starts_with("--") {
+                    continue;
+                }
+                let properties = collected.get_or_insert_with(BTreeMap::new);
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "initial" => {
+                        properties.remove(property);
+                    }
+                    "inherit" | "unset" => {}
+                    _ => {
+                        properties.insert(property.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        let map = collected?;
+        let raw = map.get(name)?;
+        resolve_custom_value(raw, &map).map(std::borrow::Cow::into_owned)
+    }
+
+    pub(crate) fn resolved_custom_properties(
+        &self,
+        document: &Document,
+        node: NodeId,
+        state: &StyleState,
+    ) -> BTreeMap<String, String> {
+        let Some(map) = inherited_custom_properties(state, document, node) else {
+            return BTreeMap::new();
+        };
+        map.iter()
+            .filter_map(|(name, raw)| {
+                Some((name.clone(), resolve_custom_value(raw, map)?.into_owned()))
+            })
+            .collect()
+    }
+
     fn populate_custom_properties_afresh(&self, document: &Document, state: &mut StyleState) {
         let _profile = crate::profile::scope("style: custom properties");
         state.custom_properties = Shared::default();
         let top = document
             .element_children(document.root())
             .collect::<Vec<_>>();
-        state.root = top
-            .iter()
-            .copied()
-            .find(|&node| {
-                document
-                    .element(node)
-                    .is_some_and(|element| element.name == "html")
-            })
-            .or_else(|| {
-                top.iter().copied().find(|&node| {
-                    document.element(node).is_some_and(|element| {
-                        !matches!(
-                            element.name.as_str(),
-                            "head" | "style" | "script" | "link" | "meta" | "title"
-                        )
-                    })
-                })
-            });
+        state.root = root_element_from(document, &top);
         let inherited = BTreeMap::new();
         let mut custom = HashMap::default();
         // only cascades are asked for here, and they read none of what this pass writes
@@ -5467,6 +5603,11 @@ impl Stylesheet {
     // user agent's sheet beside it
     pub(crate) fn follows_versions(&self) -> bool {
         !self.reads_unversioned && with_user_agent_sheet(|ua| !ua.reads_unversioned)
+    }
+
+    fn custom_props_follow_versions(&self) -> bool {
+        !self.custom_props_read_unversioned
+            && with_user_agent_sheet(|ua| !ua.custom_props_read_unversioned)
     }
 
     pub(crate) fn has_container_queries(&self) -> bool {

@@ -1,9 +1,10 @@
 // what script can measure: element boxes from a layout of the current document, computed
 // style, media queries, the performance timeline and idle callbacks
 
-use super::object::{JsObject, Property, new_object};
+use super::object::{JsObject, ObjectClass, ObjectHandle, Property, Slot, new_object};
 use super::operations::{is_callable, is_primitive, number_to_string, plain_object};
 use super::realm::Native;
+use super::reflect::{ProxyData, key_value, proxy_of};
 use super::*;
 use crate::css::{
     AlignItems, FlexDirection, FontWeight, JustifyContent, Position, Style, StyleState, Stylesheet,
@@ -97,12 +98,23 @@ impl MeasuredLayout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComputedStyleTrap {
+    Get,
+    Set,
+    Has,
+    DeleteProperty,
+    OwnKeys,
+    GetOwnPropertyDescriptor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WindowMethod {
     GetComputedStyle,
     MatchMedia,
     MediaAddListener,
     MediaRemoveListener,
-    PropertyValue,
+    PropertyValue(Option<NodeId>),
+    ComputedStyleTrap(ComputedStyleTrap, NodeId),
     PerformanceNow,
     // a visualViewport getter, by name
     VisualViewport(&'static str),
@@ -788,11 +800,7 @@ impl ScriptRuntime {
         let opacity = asked(["checkOpacity", "opacityProperty"])?;
         let visibility = asked(["checkVisibilityCSS", "visibilityProperty"])?;
         if visibility
-            && self
-                .computed_snapshot(node)
-                .get("visibility")
-                .map(String::as_str)
-                != Some("visible")
+            && self.computed_single_property(node, "visibility").as_deref() != Some("visible")
         {
             return Ok(false);
         }
@@ -806,9 +814,8 @@ impl ScriptRuntime {
             };
             for ancestor in ancestry {
                 if self
-                    .computed_snapshot(ancestor)
-                    .get("opacity")
-                    .map(String::as_str)
+                    .computed_single_property(ancestor, "opacity")
+                    .as_deref()
                     == Some("0")
                 {
                     return Ok(false);
@@ -1243,11 +1250,10 @@ impl ScriptRuntime {
             .stylesheet
             .populate_custom_properties(&document, &mut state);
         // script often reads the computed styles of many elements between two changes, and
-        // each one cascades its ancestors, so the styles worked out stay for the next read
-        let (version, sheet) = (
-            document.version(),
-            crate::navigation::SheetIdentity::of(&inputs.stylesheet),
-        );
+        // each one cascades its ancestors, so the styles worked out stay for the next read;
+        // text-only edits leave selector, style and rule versions unchanged
+        let version = computed_style_version(&inputs.stylesheet, &document);
+        let sheet = crate::navigation::SheetIdentity::of(&inputs.stylesheet);
         let mut kept = self
             .computed_styles
             .take()
@@ -1280,6 +1286,9 @@ impl ScriptRuntime {
                 .filter(|&ancestor| document.element(ancestor).is_some())
                 .map(declared)
                 .collect::<Vec<_>>();
+            let custom = inputs
+                .stylesheet
+                .resolved_custom_properties(&document, node, state);
             let item = document
                 .parent_element(node)
                 .and_then(|parent| inputs.stylesheet.computed_style(&document, parent, state))
@@ -1292,10 +1301,10 @@ impl ScriptRuntime {
                             | crate::Display::InlineGrid
                     )
                 });
-            Some((style, font_size, own, ancestors, item))
+            Some((style, font_size, own, ancestors, custom, item))
         });
         self.computed_styles = Some(kept);
-        let Some((style, font_size, own, ancestors, item)) = worked_out else {
+        let Some((style, font_size, own, ancestors, custom, item)) = worked_out else {
             return values;
         };
         let blockified = item
@@ -1349,6 +1358,9 @@ impl ScriptRuntime {
             values
                 .entry(property.clone())
                 .or_insert_with(|| value.clone());
+        }
+        for (property, value) in custom {
+            values.entry(property).or_insert(value);
         }
         for property in [
             "transition-duration",
@@ -1426,7 +1438,226 @@ impl ScriptRuntime {
         values
     }
 
-    fn computed_style_object(&mut self, node: NodeId) -> Value {
+    fn computed_custom_property(&mut self, node: NodeId, name: &str) -> Option<String> {
+        let inputs = self.layout_inputs.clone()?;
+        self.refresh_stylesheet();
+        if inputs.borrow().stylesheet.has_container_queries() {
+            drop(self.measure());
+        }
+        let inputs = inputs.borrow();
+        let state = self.layout_state(&inputs);
+        let document = self.document.borrow();
+        document.element(node)?;
+        let _environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
+            viewport: Size {
+                width: self.viewport.width,
+                height: self.viewport.height,
+            },
+            root_font_size: 16.0,
+        });
+        inputs
+            .stylesheet
+            .custom_property_value(&document, node, name, &state)
+    }
+
+    fn computed_single_property(&mut self, node: NodeId, property: &str) -> Option<String> {
+        if property.starts_with("--") {
+            return self.computed_custom_property(node, property);
+        }
+        let property = property.to_ascii_lowercase();
+        let property = property.as_str();
+        let inputs = self.layout_inputs.clone()?;
+        self.refresh_stylesheet();
+        if inputs.borrow().stylesheet.has_container_queries() {
+            drop(self.measure());
+        }
+        let inputs = inputs.borrow();
+        let mut state = self.layout_state(&inputs);
+        let document = self.document.borrow();
+        document.element(node)?;
+        let _environment = crate::css::use_layout_environment(crate::css::LayoutEnvironment {
+            viewport: Size {
+                width: self.viewport.width,
+                height: self.viewport.height,
+            },
+            root_font_size: 16.0,
+        });
+        inputs
+            .stylesheet
+            .populate_custom_properties(&document, &mut state);
+        let version = computed_style_version(&inputs.stylesheet, &document);
+        let sheet = crate::navigation::SheetIdentity::of(&inputs.stylesheet);
+        let mut kept = self
+            .computed_styles
+            .take()
+            .filter(|kept| kept.version == version && kept.sheet == sheet && *kept.state == state)
+            .unwrap_or_else(|| KeptComputed {
+                version,
+                sheet,
+                state: Box::new(state),
+                styles: crate::css::KeptStyles::default(),
+            });
+        let KeptComputed { state, styles, .. } = &mut kept;
+        let state: &StyleState = state;
+        let is_computed = COMPUTED.contains(&property);
+        let plain_initial = PLAIN
+            .iter()
+            .find_map(|&(name, initial)| (name == property).then_some(initial));
+        let inherited_initial = INHERITED
+            .iter()
+            .find_map(|&(name, initial)| (name == property).then_some(initial));
+        let needs_own =
+            !is_computed || matches!(property, "justify-content" | "align-items" | "text-align");
+        let needs_ancestors = inherited_initial.is_some() || property == "text-align";
+        let worked_out = crate::css::with_kept_styles(styles, || {
+            let declared = |target: NodeId| {
+                inputs.stylesheet.declared_values(crate::css::StyleContext {
+                    document: &document,
+                    node: target,
+                    pseudo: None,
+                    parent_font_size: 16.0,
+                    parent_color: crate::Color::BLACK,
+                    parent_weight: FontWeight::NORMAL,
+                    parent_text: crate::css::SharedText::default(),
+                    state,
+                })
+            };
+            let own = if needs_own {
+                declared(node)
+            } else {
+                BTreeMap::new()
+            };
+            let ancestors = if needs_ancestors {
+                document
+                    .ancestors(node)
+                    .filter(|&ancestor| document.element(ancestor).is_some())
+                    .map(declared)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if is_computed {
+                let (style, font_size) =
+                    inputs.stylesheet.computed_style(&document, node, state)?;
+                let item = property == "display"
+                    && document
+                        .parent_element(node)
+                        .and_then(|parent| {
+                            inputs.stylesheet.computed_style(&document, parent, state)
+                        })
+                        .is_some_and(|(parent, _)| {
+                            matches!(
+                                parent.display,
+                                crate::Display::Flex
+                                    | crate::Display::InlineFlex
+                                    | crate::Display::Grid
+                                    | crate::Display::InlineGrid
+                            )
+                        });
+                Some((Some((style, font_size)), own, ancestors, item))
+            } else {
+                Some((None, own, ancestors, false))
+            }
+        });
+        self.computed_styles = Some(kept);
+        let (computed_style, own, ancestors, item) = worked_out?;
+        let blockified = if let Some((ref style, _)) = computed_style {
+            item || style.float != crate::css::Float::None
+                || style.position.is_out_of_flow()
+                || document.document_element() == Some(node)
+        } else {
+            false
+        };
+        drop(document);
+        let inherited = |name: &str| {
+            std::iter::once(&own)
+                .chain(&ancestors)
+                .find_map(|values| values.get(name).cloned())
+        };
+        let mut value = if let Some((style, font_size)) = computed_style {
+            let needs_edges = matches!(
+                property,
+                "width"
+                    | "height"
+                    | "margin-top"
+                    | "margin-right"
+                    | "margin-bottom"
+                    | "margin-left"
+                    | "padding-top"
+                    | "padding-right"
+                    | "padding-bottom"
+                    | "padding-left"
+            );
+            let needs_geometry =
+                needs_edges || property.ends_with("-radius") || property.ends_with("-width");
+            let geometry = needs_geometry
+                .then(|| self.node_boxes(node).first().copied())
+                .flatten();
+            let (padding, margin) = if needs_edges {
+                let parent_width = self
+                    .document
+                    .borrow()
+                    .parent_element(node)
+                    .and_then(|parent| self.node_boxes(parent).first().copied())
+                    .map_or(self.viewport.width, |parent| parent.rect.width);
+                (
+                    resolve_edges(style.padding, parent_width, font_size),
+                    resolve_edges(style.margin, parent_width, font_size),
+                )
+            } else {
+                (Default::default(), Default::default())
+            };
+            let computed = ComputedInputs {
+                style: &style,
+                font_size,
+                geometry,
+                padding,
+                margin,
+                inherited: &inherited,
+                own: &own,
+                blockified,
+            };
+            let _fonts =
+                crate::font::use_fonts(inputs.fonts.clone(), self.viewport.device_pixel_ratio);
+            computed_value(property, &computed)
+        } else if let Some(initial) = plain_initial {
+            own.get(property)
+                .cloned()
+                .unwrap_or_else(|| initial.to_string())
+        } else if let Some(initial) = inherited_initial {
+            inherited(property).unwrap_or_else(|| initial.to_string())
+        } else {
+            own.get(property).cloned()?
+        };
+        if matches!(
+            property,
+            "transition-duration" | "transition-delay" | "animation-duration" | "animation-delay"
+        ) {
+            value = seconds_list(&value);
+        }
+        if matches!(
+            property,
+            "background-image" | "list-style-image" | "border-image-source" | "mask-image"
+        ) && let Some(base) = self.base_url.clone()
+        {
+            value = absolute_urls(&value, &base);
+        }
+        if property == "transform" && value != "none" {
+            let geometry = self.node_boxes(node).first().copied();
+            let font_size = self
+                .computed_single_property(node, "font-size")
+                .and_then(|size| size.strip_suffix("px")?.parse::<f32>().ok())
+                .unwrap_or(16.0);
+            let (width, height) =
+                geometry.map_or((0.0, 0.0), |found| (found.rect.width, found.rect.height));
+            if let Some(matrix) = transform_matrix(&value, width, height, font_size) {
+                value = matrix;
+            }
+        }
+        Some(value)
+    }
+
+    fn build_computed_js_object(&mut self, node: NodeId) -> JsObject {
         let values = self.computed_snapshot(node);
         let mut entries = Vec::with_capacity(values.len() * 3 + 2);
         let mut names = Vec::new();
@@ -1448,14 +1679,14 @@ impl ScriptRuntime {
         entries.push((
             "getPropertyValue".to_string(),
             Property::hidden(self.native_function(
-                Native::Window(WindowMethod::PropertyValue),
+                Native::Window(WindowMethod::PropertyValue(None)),
                 "getPropertyValue",
                 1,
             )),
         ));
         // elements read one after another mostly report the same properties, so the object
         // takes the last one's keys whole instead of adding hundreds of them one at a time
-        let object = match &self.computed_style_template {
+        match &self.computed_style_template {
             Some(template) if template.has_keys(entries.iter().map(|(key, _)| key.as_str())) => {
                 JsObject::with_shape_of(
                     template,
@@ -1471,8 +1702,56 @@ impl ScriptRuntime {
                 self.computed_style_template = Some(object.clone());
                 object
             }
-        };
-        Value::Object(new_object(object))
+        }
+    }
+
+    fn ensure_computed_target(&mut self, target: &ObjectHandle, handler: &Value, node: NodeId) {
+        if target.borrow().property("getPropertyValue").is_some() {
+            return;
+        }
+        let populated = self.build_computed_js_object(node);
+        *target.borrow_mut() = populated;
+        // once materialized, clear the proxy traps so all future operations forward natively
+        if let Value::Object(handler) = handler {
+            *handler.borrow_mut() = JsObject::default();
+        }
+    }
+
+    fn computed_style_object(&mut self, node: NodeId) -> Value {
+        let target = Value::Object(new_object(JsObject::default()));
+        let mut handler = JsObject::default();
+        handler.reserve(6);
+        for (name, trap, arity) in [
+            ("get", ComputedStyleTrap::Get, 3),
+            ("set", ComputedStyleTrap::Set, 4),
+            ("has", ComputedStyleTrap::Has, 2),
+            ("deleteProperty", ComputedStyleTrap::DeleteProperty, 2),
+            ("ownKeys", ComputedStyleTrap::OwnKeys, 1),
+            (
+                "getOwnPropertyDescriptor",
+                ComputedStyleTrap::GetOwnPropertyDescriptor,
+                2,
+            ),
+        ] {
+            handler.define(
+                name.to_string(),
+                Property::data(self.native_function(
+                    Native::Window(WindowMethod::ComputedStyleTrap(trap, node)),
+                    name,
+                    arity,
+                )),
+            );
+        }
+        let proxy = Rc::new(ProxyData {
+            target: RefCell::new(Some(target)),
+            handler: RefCell::new(Some(Value::Object(new_object(handler)))),
+            callable: false,
+            constructor: false,
+        });
+        Value::Object(new_object(JsObject::with_prototype(
+            None,
+            ObjectClass::Proxy(proxy),
+        )))
     }
 
     // a media query list from script, kept so a change in the answer fires its change event
@@ -1702,15 +1981,141 @@ impl ScriptRuntime {
                 }
                 Value::Undefined
             }
-            WindowMethod::PropertyValue => {
+            WindowMethod::PropertyValue(lazy_node) => {
                 let name = self.coerce_string(first)?;
+                if let Some(node) = lazy_node
+                    && let Value::Object(object) = &this
+                    && let Some(proxy) = proxy_of(object)
+                    && let Some(Value::Object(target)) = proxy.target.borrow().as_ref()
+                    && target.borrow().property("getPropertyValue").is_none()
+                {
+                    let value = self
+                        .computed_single_property(node, &name)
+                        .unwrap_or_default();
+                    return Ok(Value::String(value.into()));
+                }
+                let lookup = if name.starts_with("--") {
+                    name
+                } else {
+                    name.to_ascii_lowercase()
+                };
                 let value = match &this {
                     Value::Object(object) => {
-                        object.borrow().get(&name.to_ascii_lowercase()).cloned()
+                        if let Some(proxy) = proxy_of(object)
+                            && let Some(Value::Object(target)) = proxy.target.borrow().as_ref()
+                        {
+                            target.borrow().get(&lookup).cloned()
+                        } else {
+                            object.borrow().get(&lookup).cloned()
+                        }
                     }
                     _ => None,
                 };
                 value.unwrap_or_else(|| Value::String("".into()))
+            }
+            WindowMethod::ComputedStyleTrap(trap, node) => {
+                let Value::Object(target) = first else {
+                    return Ok(Value::Undefined);
+                };
+                match trap {
+                    ComputedStyleTrap::Get => {
+                        let key = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                        let receiver = arguments.get(2).cloned().unwrap_or(Value::Undefined);
+                        if target.borrow().property("getPropertyValue").is_none()
+                            && let Value::String(name) = &key
+                        {
+                            let key_str = name.as_str();
+                            if key_str == "getPropertyValue" {
+                                return Ok(self.native_function(
+                                    Native::Window(WindowMethod::PropertyValue(Some(node))),
+                                    "getPropertyValue",
+                                    1,
+                                ));
+                            }
+                            if key_str.starts_with("--") {
+                                return Ok(match self.computed_custom_property(node, key_str) {
+                                    Some(value) => Value::String(value.into()),
+                                    None => Value::Undefined,
+                                });
+                            }
+                            if let Some(css_name) = known_css_property_key(key_str) {
+                                return Ok(match self.computed_single_property(node, &css_name) {
+                                    Some(value) => Value::String(value.into()),
+                                    None => Value::Undefined,
+                                });
+                            }
+                        }
+                        self.ensure_computed_target(&target, &this, node);
+                        let key = match key {
+                            Value::Symbol(symbol) => symbol.to_string(),
+                            other => self.coerce_string(other)?,
+                        };
+                        self.ordinary_get(target, &key, &receiver)?
+                    }
+                    ComputedStyleTrap::Set => {
+                        let key = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                        let value = arguments.get(2).cloned().unwrap_or(Value::Undefined);
+                        let receiver = arguments.get(3).cloned().unwrap_or(Value::Undefined);
+                        self.ensure_computed_target(&target, &this, node);
+                        let key = match key {
+                            Value::Symbol(symbol) => symbol.to_string(),
+                            other => self.coerce_string(other)?,
+                        };
+                        self.ordinary_set(target, &key, value, &receiver, false)?;
+                        Value::Bool(true)
+                    }
+                    ComputedStyleTrap::Has => {
+                        let key = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                        self.ensure_computed_target(&target, &this, node);
+                        let key = match key {
+                            Value::Symbol(symbol) => symbol.to_string(),
+                            other => self.coerce_string(other)?,
+                        };
+                        Value::Bool(self.has_property(&Value::Object(target), &key)?)
+                    }
+                    ComputedStyleTrap::DeleteProperty => {
+                        let key = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                        self.ensure_computed_target(&target, &this, node);
+                        let key = match key {
+                            Value::Symbol(symbol) => symbol.to_string(),
+                            other => self.coerce_string(other)?,
+                        };
+                        Value::Bool(self.delete_property(&Value::Object(target), &key, false)?)
+                    }
+                    ComputedStyleTrap::OwnKeys => {
+                        self.ensure_computed_target(&target, &this, node);
+                        let target_val = Value::Object(target);
+                        let mut keys = self.own_property_keys(&target_val, false)?;
+                        keys.extend(self.own_property_keys(&target_val, true)?);
+                        Self::new_array(keys.into_iter().map(|key| key_value(&key)).collect())
+                    }
+                    ComputedStyleTrap::GetOwnPropertyDescriptor => {
+                        let key = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                        self.ensure_computed_target(&target, &this, node);
+                        let key = match key {
+                            Value::Symbol(symbol) => symbol.to_string(),
+                            other => self.coerce_string(other)?,
+                        };
+                        match self.own_property_of(&Value::Object(target), &key)? {
+                            Some(property) => {
+                                let value = match property.slot {
+                                    Slot::Data(value) => value,
+                                    _ => Value::Undefined,
+                                };
+                                plain_object([
+                                    ("value".to_string(), value),
+                                    ("writable".to_string(), Value::Bool(property.writable)),
+                                    ("enumerable".to_string(), Value::Bool(property.enumerable)),
+                                    (
+                                        "configurable".to_string(),
+                                        Value::Bool(property.configurable),
+                                    ),
+                                ])
+                            }
+                            None => Value::Undefined,
+                        }
+                    }
+                }
             }
             WindowMethod::PerformanceNow => Value::Number(now),
             WindowMethod::VisualViewport(name) => {
@@ -2097,10 +2502,58 @@ fn align_delta(start: f32, size: f32, port: f32, port_size: f32, alignment: &str
     }
 }
 
-// the styles getComputedStyle worked out, kept for the next read while the document version,
+fn computed_style_version(stylesheet: &Stylesheet, document: &Document) -> (u64, u64, u64, u64) {
+    if stylesheet.follows_versions() && !document.has_shadow_roots() {
+        (
+            document.selector_version(),
+            document.custom_style_version(),
+            document.inline_style_version(),
+            document.rules_version(),
+        )
+    } else {
+        (document.version(), 0, 0, document.rules_version())
+    }
+}
+
+fn kebab_case(property: &str) -> String {
+    let mut result = String::with_capacity(property.len() + 4);
+    for ch in property.chars() {
+        if ch.is_ascii_uppercase() {
+            result.push('-');
+            result.push(ch.to_ascii_lowercase());
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+fn known_css_property_key(key: &str) -> Option<String> {
+    if key.is_empty()
+        || key == "length"
+        || key.starts_with("@@")
+        || key.as_bytes()[0].is_ascii_digit()
+    {
+        return None;
+    }
+    let css = if key.bytes().any(|b| b.is_ascii_uppercase()) {
+        if key.contains('-') {
+            return None;
+        }
+        kebab_case(key)
+    } else {
+        key.to_string()
+    };
+    let known = COMPUTED.contains(&css.as_str())
+        || PLAIN.iter().any(|&(name, _)| name == css)
+        || INHERITED.iter().any(|&(name, _)| name == css);
+    known.then_some(css)
+}
+
+// the styles getComputedStyle worked out, kept for the next read while the style versions,
 // sheet and state they were worked out under stand
 pub(super) struct KeptComputed {
-    version: u64,
+    version: (u64, u64, u64, u64),
     sheet: crate::navigation::SheetIdentity,
     state: Box<StyleState>,
     styles: crate::css::KeptStyles,
@@ -2109,6 +2562,11 @@ pub(super) struct KeptComputed {
 #[cfg(test)]
 mod tests {
     use super::css_number;
+    use crate::css::Stylesheet;
+    use crate::dom::Document;
+    use crate::script::{LayoutInputs, ScriptRuntime};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn css_numbers_print_as_percent_g_with_six_digits() {
@@ -2141,6 +2599,81 @@ mod tests {
                 "1.234e-05",
                 "-2.5"
             ]
+        );
+    }
+
+    #[test]
+    fn lazy_computed_style_resolves_custom_properties_and_skips_text_versions() {
+        let css = ":root { --accent: #9e9e9e; --live: var(--accent); } .box { color: rgb(10, 20, 30); --own: 42px; }";
+        let html = format!(
+            "<!doctype html><html><head><style>{css}</style></head><body><div id=\"a\" class=\"box\"><span id=\"t\">100</span></div></body></html>"
+        );
+        let document = Rc::new(RefCell::new(Document::parse(&html).unwrap()));
+        let stylesheet = Rc::new(Stylesheet::parse(css).unwrap());
+        let inputs = Rc::new(RefCell::new(LayoutInputs {
+            stylesheet,
+            sheets: Vec::new(),
+            sheets_version: document.borrow().version(),
+            notes: Vec::new(),
+            fonts: Rc::new(crate::font::FontSet::default()),
+            fonts_stamp: 0,
+            extras: crate::css::StyleState::default(),
+        }));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime.layout_inputs = Some(inputs);
+        runtime
+            .execute(
+                r##"(() => {
+                    const a = document.getElementById("a");
+                    const cs = getComputedStyle(a);
+                    const p1 = cs.getPropertyValue("--live");
+                    const p2 = cs.getPropertyValue("--own");
+                    const col = cs.color;
+                    const ownKeysLen = Object.keys(cs).length;
+                    const hasColor = "color" in cs;
+                    const len = cs.length;
+                    const zero = cs[0];
+                    a.style.setProperty("--accent", "#ffffff");
+                    const p3 = getComputedStyle(a).getPropertyValue("--live");
+                    a.setAttribute("data-out", [p1, p2, col, ownKeysLen > 10, hasColor, len > 10, typeof zero === "string", p3].join("|"));
+                })()"##,
+            )
+            .expect("script should succeed");
+        let out = {
+            let doc = document.borrow();
+            let a = doc.find_element_by_id("a").unwrap();
+            doc.element(a)
+                .unwrap()
+                .attr("data-out")
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            out,
+            "#9e9e9e|42px|rgb(10, 20, 30)|true|true|true|true|#ffffff"
+        );
+        let before = {
+            let doc = document.borrow();
+            (
+                doc.selector_version(),
+                doc.custom_style_version(),
+                doc.inline_style_version(),
+            )
+        };
+        runtime
+            .execute(r#"document.getElementById("t").firstChild.data = "200";"#)
+            .expect("text update should succeed");
+        let after = {
+            let doc = document.borrow();
+            (
+                doc.selector_version(),
+                doc.custom_style_version(),
+                doc.inline_style_version(),
+            )
+        };
+        assert_eq!(
+            before, after,
+            "text-only edit should not bump style versions"
         );
     }
 }
