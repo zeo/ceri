@@ -309,6 +309,7 @@ impl ScriptRuntime {
             Some(trap) => {
                 match self.call_function(trap, Self::proxy_handler(proxy), vec![target])? {
                     Value::Object(prototype) => Ok(Some(prototype)),
+                    Value::Array(array) => Ok(Some(self.array_prototype_wrapper(&array))),
                     Value::Null => Ok(None),
                     _ => Err(self
                         .type_error("proxy getPrototypeOf trap returned neither object nor null")),
@@ -447,10 +448,7 @@ impl ScriptRuntime {
                     None => Value::Undefined,
                 })
             }
-            M::GetPrototypeOf => Ok(self
-                .prototype_of_value(&first)?
-                .map(Value::Object)
-                .unwrap_or(Value::Null)),
+            M::GetPrototypeOf => Ok(Self::prototype_value(self.prototype_of_value(&first)?)),
             M::Has => {
                 let key = self.coerce_key(argument(&arguments, 1))?;
                 Ok(Value::Bool(self.has_property(&first, &key)?))
@@ -520,6 +518,7 @@ impl ScriptRuntime {
             M::SetPrototypeOf => {
                 let prototype = match argument(&arguments, 1) {
                     Value::Object(prototype) => Some(prototype),
+                    Value::Array(array) => Some(self.array_prototype_wrapper(&array)),
                     Value::Null => None,
                     _ => {
                         return Err(

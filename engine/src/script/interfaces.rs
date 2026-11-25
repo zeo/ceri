@@ -1206,6 +1206,7 @@ impl ScriptRuntime {
             Value::Range(range) => Some(range.object.clone()),
             Value::Selection(selection) => Some(selection.object.clone()),
             Value::Promise(promise) => Some(super::promise_object(promise)),
+            Value::Bytes(bytes) => Some(self.buffer_object(bytes)),
             Value::Document => Some(self.node_handle(self.document_node()).object.clone()),
             _ => None,
         }

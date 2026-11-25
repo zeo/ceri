@@ -244,6 +244,8 @@ pub(super) enum ObjectClass {
     Stream(super::streams::StreamHandle),
     // the object of a typed array of this kind, for its named properties and prototype
     TypedArray(super::typed::ElementKind),
+    // wrapper allowing an array value to act as an ordinary object prototype
+    ArrayProto(super::ArrayHandle),
     // what an iterator helper such as map or take hands back
     IteratorHelper(Rc<RefCell<super::iterator_helpers::HelperState>>),
 }
@@ -1070,7 +1072,7 @@ fn class_jit_flags(class: &ObjectClass) -> u8 {
     match class {
         ObjectClass::Ordinary => JIT_FLAG_ORDINARY,
         ObjectClass::Proxy(_) => JIT_FLAG_PROXY | JIT_FLAG_NO_PROTO_IC,
-        ObjectClass::String(_) => JIT_FLAG_NO_PROTO_IC,
+        ObjectClass::String(_) | ObjectClass::ArrayProto(_) => JIT_FLAG_NO_PROTO_IC,
         _ => 0,
     }
 }
@@ -1247,7 +1249,10 @@ impl JsObject {
 
     #[inline]
     pub(super) fn own_data_or_missing(&self, heap: &super::heap::Heap, key: &str) -> Option<Value> {
-        if matches!(self.class, ObjectClass::Proxy(_) | ObjectClass::String(_)) {
+        if matches!(
+            self.class,
+            ObjectClass::Proxy(_) | ObjectClass::String(_) | ObjectClass::ArrayProto(_)
+        ) {
             return None;
         }
         if let Some(index) = self.shape.position(key) {
@@ -1459,7 +1464,10 @@ impl JsObject {
 
     #[inline]
     pub(super) fn ic_get_fast(&self, heap: &super::heap::Heap, ic: &PropIc) -> Option<IcGetHit> {
-        if matches!(self.class, ObjectClass::Proxy(_)) {
+        if matches!(
+            self.class,
+            ObjectClass::Proxy(_) | ObjectClass::ArrayProto(_)
+        ) {
             return None;
         }
         let shape_ptr = Rc::as_ptr(&self.shape);
@@ -1711,7 +1719,7 @@ impl JsObject {
                     && !borrowed.orphan
                     && !matches!(
                         borrowed.class,
-                        ObjectClass::Proxy(_) | ObjectClass::String(_)
+                        ObjectClass::Proxy(_) | ObjectClass::String(_) | ObjectClass::ArrayProto(_)
                     )
                     && guard.shape.matches(Rc::as_ptr(&borrowed.shape))
             }
@@ -1737,7 +1745,7 @@ impl JsObject {
             if borrowed.orphan
                 || matches!(
                     borrowed.class,
-                    ObjectClass::Proxy(_) | ObjectClass::String(_)
+                    ObjectClass::Proxy(_) | ObjectClass::String(_) | ObjectClass::ArrayProto(_)
                 )
                 || !shape.matches(Rc::as_ptr(&borrowed.shape))
             {
@@ -1762,8 +1770,10 @@ impl JsObject {
         index: usize,
     ) -> Option<Value> {
         let holder = unsafe { heap.object_ref(holder)? };
-        if matches!(holder.class, ObjectClass::Proxy(_))
-            || !shape.matches(Rc::as_ptr(&holder.shape))
+        if matches!(
+            holder.class,
+            ObjectClass::Proxy(_) | ObjectClass::ArrayProto(_)
+        ) || !shape.matches(Rc::as_ptr(&holder.shape))
         {
             return None;
         }
@@ -1778,8 +1788,10 @@ impl JsObject {
         index: usize,
     ) -> Option<IcGetHit> {
         let holder = unsafe { heap.object_ref(holder)? };
-        if matches!(holder.class, ObjectClass::Proxy(_))
-            || !shape.matches(Rc::as_ptr(&holder.shape))
+        if matches!(
+            holder.class,
+            ObjectClass::Proxy(_) | ObjectClass::ArrayProto(_)
+        ) || !shape.matches(Rc::as_ptr(&holder.shape))
         {
             return None;
         }
@@ -1809,7 +1821,7 @@ impl JsObject {
             let borrowed = unsafe { heap.object_ref(cursor)? };
             if matches!(
                 borrowed.class,
-                ObjectClass::Proxy(_) | ObjectClass::String(_)
+                ObjectClass::Proxy(_) | ObjectClass::String(_) | ObjectClass::ArrayProto(_)
             ) || !shape.matches(Rc::as_ptr(&borrowed.shape))
             {
                 return None;
@@ -1827,7 +1839,12 @@ impl JsObject {
     }
 
     pub(super) fn record_get_ic(&self, key: &str, ic: &PropIc) {
-        if self.shape.own || matches!(self.class, ObjectClass::Proxy(_)) {
+        if self.shape.own
+            || matches!(
+                self.class,
+                ObjectClass::Proxy(_) | ObjectClass::ArrayProto(_)
+            )
+        {
             return;
         }
         let shape_ptr = Rc::as_ptr(&self.shape);
@@ -1885,7 +1902,10 @@ impl JsObject {
                 return;
             };
             if object.shape.own
-                || matches!(object.class, ObjectClass::Proxy(_) | ObjectClass::String(_))
+                || matches!(
+                    object.class,
+                    ObjectClass::Proxy(_) | ObjectClass::String(_) | ObjectClass::ArrayProto(_)
+                )
             {
                 return;
             }
@@ -2019,7 +2039,9 @@ impl JsObject {
                         && !borrowed.shape.own
                         && !matches!(
                             borrowed.class,
-                            ObjectClass::Proxy(_) | ObjectClass::String(_)
+                            ObjectClass::Proxy(_)
+                                | ObjectClass::String(_)
+                                | ObjectClass::ArrayProto(_)
                         )
                         && !borrowed.contains_key(key))
                     .then(|| {
@@ -2149,6 +2171,12 @@ impl JsObject {
         &self,
         intrinsics: &super::realm::Intrinsics,
     ) -> Option<ObjectHandle> {
+        if let ObjectClass::ArrayProto(array) = &self.class {
+            return match array.borrow().prototype() {
+                None => Some(intrinsics.array_prototype.clone()),
+                Some(prototype) => prototype.clone(),
+            };
+        }
         match &self.prototype {
             Some(prototype) => Some(prototype.clone()),
             None if self.orphan => Some(match &self.class {

@@ -277,6 +277,7 @@ pub(super) enum ResumeMode {
 }
 
 pub(super) enum GeneratorState {
+    SuspendedStart(Box<Frame>),
     Suspended(Box<Frame>),
     Executing,
     Completed,
@@ -284,7 +285,7 @@ pub(super) enum GeneratorState {
 
 impl GeneratorState {
     pub(super) fn trace(&self, tracer: &mut super::heap::Tracer) {
-        if let Self::Suspended(frame) = self {
+        if let Self::SuspendedStart(frame) | Self::Suspended(frame) = self {
             frame.trace(tracer);
         }
     }
@@ -1264,8 +1265,20 @@ impl ScriptRuntime {
                             arguments,
                             false,
                         );
+                        let frame = if closure.code.simple_params {
+                            frame
+                        } else {
+                            match self.run(frame)? {
+                                RunResult::Yield(_, suspended) => *suspended,
+                                RunResult::Return(_) | RunResult::Await(..) => {
+                                    return Err(runtime_error(
+                                        "generator parameter setup did not suspend",
+                                    ));
+                                }
+                            }
+                        };
                         return Ok(Prepared::Done(
-                            self.make_generator(&callee, &closure, frame),
+                            self.make_generator(&callee, &closure, frame)?,
                         ));
                     }
                     if closure.code.is_async {
@@ -1501,6 +1514,7 @@ impl ScriptRuntime {
     ) -> Result<ObjectHandle, ScriptError> {
         match self.get_property(new_target, "prototype")? {
             Value::Object(prototype) => Ok(prototype),
+            Value::Array(array) => Ok(self.array_prototype_wrapper(&array)),
             _ => Ok(self.intrinsics.object_prototype.clone()),
         }
     }
@@ -1667,6 +1681,14 @@ impl ScriptRuntime {
                 }
             }
         } else {
+            {
+                let mut scope = scope.borrow_mut();
+                for (slot, kind) in scope.slots.iter_mut().zip(code.layout.kinds.iter()) {
+                    if *kind == BindingKind::Param {
+                        *slot = Value::Uninitialized;
+                    }
+                }
+            }
             let arguments = Self::new_array(arguments);
             frame.extra_mut().saved_stack.push(arguments);
         }
@@ -2106,6 +2128,43 @@ impl ScriptRuntime {
         Ok(None)
     }
 
+    fn shadowing_loc(
+        &mut self,
+        scope: Option<ScopeRef>,
+        name: &str,
+        depth: u16,
+    ) -> Result<Option<ShadowLoc>, ScriptError> {
+        let mut walk = scope;
+        let mut level = 0u16;
+        while let Some(current) = walk {
+            if depth != GLOBAL && level >= depth {
+                break;
+            }
+            let (object, grown, parent) = {
+                let scope = current.borrow();
+                (
+                    (scope.layout.role == ScopeRole::With).then(|| scope.slots[0].clone()),
+                    scope
+                        .extra
+                        .iter()
+                        .position(|extra| &**extra == name)
+                        .map(|position| scope.layout.names.len() + position),
+                    scope.parent.clone(),
+                )
+            };
+            if let Some(object) = object {
+                if self.with_has(&object, name)? {
+                    return Ok(Some(ShadowLoc::With(object)));
+                }
+            } else if let Some(index) = grown {
+                return Ok(Some(ShadowLoc::Grown(level, index as u16)));
+            }
+            walk = parent;
+            level += 1;
+        }
+        Ok(None)
+    }
+
     // whether a with object answers for a name its @@unscopables leaves alone
     fn with_has(&mut self, object: &Value, key: &str) -> Result<bool, ScriptError> {
         if !self.has_property(object, key)? {
@@ -2523,6 +2582,11 @@ impl ScriptRuntime {
             truncate_stack(&mut self.vm_stack, arg_start);
             reserve_headroom(&mut self.vm_stack, code.max_pushes as usize);
         } else {
+            for (slot, kind) in slots.iter_mut().zip(code.layout.kinds.iter()) {
+                if *kind == BindingKind::Param {
+                    *slot = Value::Uninitialized;
+                }
+            }
             // non-simple parameter lists unpack arguments from an array pushed at stack_base
             let args_vec = if count == 0 {
                 Vec::new()
@@ -2628,13 +2692,31 @@ impl ScriptRuntime {
                         Native::JsonParse if count <= 2 => HotNative::JsonParse,
                         Native::FunctionCall if method => HotNative::FunctionCall,
                         Native::Collection(
-                            m @ (super::collections::CollectionMethod::Get
-                            | super::collections::CollectionMethod::Has
-                            | super::collections::CollectionMethod::Set
-                            | super::collections::CollectionMethod::Add
-                            | super::collections::CollectionMethod::Delete
-                            | super::collections::CollectionMethod::Clear
-                            | super::collections::CollectionMethod::Size),
+                            m @ (super::collections::CollectionMethod::Get(
+                                super::collections::CollectionKind::Map,
+                            )
+                            | super::collections::CollectionMethod::Has(
+                                super::collections::CollectionKind::Map
+                                | super::collections::CollectionKind::Set,
+                            )
+                            | super::collections::CollectionMethod::Set(
+                                super::collections::CollectionKind::Map,
+                            )
+                            | super::collections::CollectionMethod::Add(
+                                super::collections::CollectionKind::Set,
+                            )
+                            | super::collections::CollectionMethod::Delete(
+                                super::collections::CollectionKind::Map
+                                | super::collections::CollectionKind::Set,
+                            )
+                            | super::collections::CollectionMethod::Clear(
+                                super::collections::CollectionKind::Map
+                                | super::collections::CollectionKind::Set,
+                            )
+                            | super::collections::CollectionMethod::Size(
+                                super::collections::CollectionKind::Map
+                                | super::collections::CollectionKind::Set,
+                            )),
                         ) if method && count <= 2 => HotNative::Collection(*m),
                         Native::ObjectGetOwnPropertyDescriptor if count == 2 => {
                             HotNative::ObjectGetOwnPropertyDescriptor
@@ -2807,7 +2889,7 @@ impl ScriptRuntime {
                 Ok(FastNativeCall::Done)
             }
             HotNative::Collection(col_method) => {
-                use super::collections::CollectionMethod as M;
+                use super::collections::{CollectionKind as CK, CollectionMethod as M};
                 let Value::Object(obj) = (unsafe { self.vm_stack.get_unchecked(return_base) })
                 else {
                     return Ok(FastNativeCall::NotHandled);
@@ -2818,20 +2900,30 @@ impl ScriptRuntime {
                 let collection = match (&borrowed.class, col_method) {
                     (
                         ObjectClass::Map(col),
-                        M::Get | M::Has | M::Set | M::Delete | M::Clear | M::Size,
+                        M::Get(CK::Map)
+                        | M::Has(CK::Map)
+                        | M::Set(CK::Map)
+                        | M::Delete(CK::Map)
+                        | M::Clear(CK::Map)
+                        | M::Size(CK::Map),
                     )
-                    | (ObjectClass::Set(col), M::Has | M::Add | M::Delete | M::Clear | M::Size) => {
-                        col.clone()
-                    }
+                    | (
+                        ObjectClass::Set(col),
+                        M::Has(CK::Set)
+                        | M::Add(CK::Set)
+                        | M::Delete(CK::Set)
+                        | M::Clear(CK::Set)
+                        | M::Size(CK::Set),
+                    ) => col.clone(),
                     _ => return Ok(FastNativeCall::NotHandled),
                 };
-                if matches!(col_method, M::Set | M::Add)
+                if matches!(col_method, M::Set(_) | M::Add(_))
                     && collection.borrow().len() >= MAX_RUNTIME_ARRAY_LENGTH
                 {
                     return Ok(FastNativeCall::NotHandled);
                 }
                 let result = match col_method {
-                    M::Get => {
+                    M::Get(_) => {
                         let value = if count == 0 {
                             collection.borrow().get(&Value::Undefined)
                         } else {
@@ -2842,7 +2934,7 @@ impl ScriptRuntime {
                         truncate_stack(&mut self.vm_stack, return_base);
                         value
                     }
-                    M::Has => {
+                    M::Has(_) => {
                         let has = if count == 0 {
                             collection.borrow().has(&Value::Undefined)
                         } else {
@@ -2852,12 +2944,12 @@ impl ScriptRuntime {
                         truncate_stack(&mut self.vm_stack, return_base);
                         Value::Bool(has)
                     }
-                    M::Size => {
+                    M::Size(_) => {
                         let len = collection.borrow().len() as f64;
                         truncate_stack(&mut self.vm_stack, return_base);
                         Value::Number(len)
                     }
-                    M::Delete => {
+                    M::Delete(_) => {
                         let deleted = if count == 0 {
                             collection.borrow_mut().delete(&Value::Undefined)
                         } else {
@@ -2867,12 +2959,12 @@ impl ScriptRuntime {
                         truncate_stack(&mut self.vm_stack, return_base);
                         Value::Bool(deleted)
                     }
-                    M::Clear => {
+                    M::Clear(_) => {
                         collection.borrow_mut().clear();
                         truncate_stack(&mut self.vm_stack, return_base);
                         Value::Undefined
                     }
-                    M::Set | M::Add => {
+                    M::Set(_) | M::Add(_) => {
                         // safety: this and callee are Copy Value::Object; move args out directly
                         let (this_val, key, val) = unsafe {
                             let ptr = self.vm_stack.as_ptr();
@@ -2882,7 +2974,7 @@ impl ScriptRuntime {
                             } else {
                                 Value::Undefined
                             };
-                            let val = if matches!(col_method, M::Set) && count >= 2 {
+                            let val = if matches!(col_method, M::Set(_)) && count >= 2 {
                                 std::ptr::read(ptr.add(arg_start + 1))
                             } else {
                                 if count >= 2 {
@@ -3879,6 +3971,16 @@ impl ScriptRuntime {
                     unsafe { push_unchecked(&mut self.vm_stack, Value::String(type_name(kind))) };
                 }
                 Op::ToIndexKey => {
+                    let len = self.vm_stack.len();
+                    if len >= 2
+                        && matches!(
+                            self.vm_stack[len - 2],
+                            Value::Undefined | Value::Null | Value::Uninitialized
+                        )
+                    {
+                        unsafe { self.frames.get_unchecked_mut(top) }.pc = pc;
+                        return Err(self.type_error("cannot read properties of null or undefined"));
+                    }
                     let keep = match self.vm_stack.last() {
                         Some(Value::String(_)) => true,
                         Some(Value::Number(number)) => {
@@ -6442,7 +6544,22 @@ impl ScriptRuntime {
                 self.vm_stack.push(Value::String(type_name(kind)));
                 Ok(None)
             }
-            Op::ToPropertyKey | Op::ToIndexKey => {
+            Op::ToPropertyKey => {
+                let value = pop_fast(&mut self.vm_stack);
+                let key = self.coerce_key(value)?;
+                self.vm_stack.push(Value::String(key.into()));
+                Ok(None)
+            }
+            Op::ToIndexKey => {
+                let len = self.vm_stack.len();
+                if len >= 2
+                    && matches!(
+                        self.vm_stack[len - 2],
+                        Value::Undefined | Value::Null | Value::Uninitialized
+                    )
+                {
+                    return Err(self.type_error("cannot read properties of null or undefined"));
+                }
                 let value = pop_fast(&mut self.vm_stack);
                 let key = self.coerce_key(value)?;
                 self.vm_stack.push(Value::String(key.into()));
@@ -7528,6 +7645,92 @@ impl ScriptRuntime {
                     },
                 }
             }
+            Op::ResolveBinding { name, depth, index } => {
+                let key = self.frames[top].code.names[name as usize].clone();
+                let scope = self.frames[top].scope.clone();
+                let (binding_ref, value) = match self.shadowing_loc(scope, &key, depth)? {
+                    Some(ShadowLoc::With(object)) => {
+                        let value = self.get_property(&object, &key)?;
+                        (object, value)
+                    }
+                    Some(ShadowLoc::Grown(level, slot)) => {
+                        let value = Self::with_scope_at(&self.frames[top], level, |scope| {
+                            scope.slots[slot as usize].clone()
+                        });
+                        if matches!(value, Value::Uninitialized) {
+                            return Err(self.reference_error(format!(
+                                "cannot access {key} before initialization"
+                            )));
+                        }
+                        let packed = (((slot as u32) << 16) | (level as u32)) as f64;
+                        (
+                            Value::Binding(Rc::new(RefCell::new(Value::Number(packed)))),
+                            value,
+                        )
+                    }
+                    None => {
+                        let value = self.read_fallback(top, name, depth, index)?;
+                        if matches!(value, Value::Uninitialized) {
+                            return Err(self.reference_error(format!(
+                                "cannot access {key} before initialization"
+                            )));
+                        }
+                        (Value::Undefined, value)
+                    }
+                };
+                self.vm_stack.push(binding_ref);
+                self.vm_stack.push(value);
+            }
+            Op::PutBinding {
+                name,
+                depth,
+                index,
+                kind,
+            } => {
+                let key = self.frames[top].code.names[name as usize].clone();
+                let value = self.pop();
+                let binding_ref = self.pop();
+                let strict = self.frames[top].code.strict;
+                match binding_ref {
+                    Value::Undefined => {
+                        if depth == GLOBAL {
+                            self.set_global(&key, value.clone(), strict)?;
+                        } else {
+                            match kind {
+                                BindingKind::Const | BindingKind::Import => {
+                                    return Err(self.type_error(format!(
+                                        "Assignment to constant variable '{key}'"
+                                    )));
+                                }
+                                BindingKind::SelfName if strict => {
+                                    return Err(self.type_error(format!(
+                                        "Assignment to constant variable '{key}'"
+                                    )));
+                                }
+                                BindingKind::SelfName => {}
+                                _ => self.write_local(top, depth, index, name, value.clone())?,
+                            }
+                        }
+                    }
+                    Value::Binding(cell) => {
+                        let packed = match *cell.borrow() {
+                            Value::Number(n) => n as u32,
+                            _ => 0,
+                        };
+                        let level = (packed & 0xffff) as u16;
+                        let slot = (packed >> 16) as usize;
+                        let scope = Self::scope_at(&self.frames[top], level);
+                        scope.borrow_mut().slots[slot] = value.clone();
+                    }
+                    object => {
+                        if strict && !self.has_property(&object, &key)? {
+                            return Err(self.reference_error(format!("{key} is not defined")));
+                        }
+                        self.set_property(&object, &key, value.clone(), strict)?;
+                    }
+                }
+                self.vm_stack.push(value);
+            }
             Op::DeleteName { name, depth } => {
                 let key = self.frames[top].code.names[name as usize].clone();
                 let strict = self.frames[top].code.strict;
@@ -8214,9 +8417,30 @@ impl ScriptRuntime {
                 value.fast_drop();
                 self.vm_stack.push(Value::String(type_name(kind)));
             }
-            Op::ToIndexKey if matches!(self.vm_stack.last(), Some(Value::Number(number)) if *number >= 0.0 && number.fract() == 0.0 && *number < 4_294_967_295.0) =>
-                {}
-            Op::ToPropertyKey | Op::ToIndexKey => {
+            Op::ToIndexKey => {
+                let len = self.vm_stack.len();
+                if len >= 2
+                    && matches!(
+                        self.vm_stack[len - 2],
+                        Value::Undefined | Value::Null | Value::Uninitialized
+                    )
+                {
+                    return Err(self.type_error("cannot read properties of null or undefined"));
+                }
+                let keep = match self.vm_stack.last() {
+                    Some(Value::String(_)) => true,
+                    Some(Value::Number(number)) => {
+                        *number >= 0.0 && number.fract() == 0.0 && *number < 4_294_967_295.0
+                    }
+                    _ => false,
+                };
+                if !keep {
+                    let value = self.pop();
+                    let key = self.coerce_key(value)?;
+                    self.vm_stack.push(Value::String(key.into()));
+                }
+            }
+            Op::ToPropertyKey => {
                 let value = self.pop();
                 let key = self.coerce_key(value)?;
                 self.vm_stack.push(Value::String(key.into()));
@@ -8570,37 +8794,10 @@ impl ScriptRuntime {
                 let value = self.pop();
                 // the yield runs again on resume to receive the sent value
                 self.frames[top].pc -= 1;
-                if self.frames.len() != frame_floor + 1 {
-                    return Err(runtime_error("yield outside a resumable frame"));
-                }
-                let mut frame = self.frames.pop().expect("generator frame");
-                let mut saved = self.vm_stack.split_off(frame.stack_base);
-                truncate_stack(&mut self.vm_stack, frame.return_base);
-                // materialize inline array iterators before suspending so vm_iters stays LIFO
-                for value in &mut saved {
-                    if let Value::ArrayIter(iter_slot) = *value {
-                        let (array, index) = self.vm_iters[iter_slot as usize].clone();
-                        let state = if index == u32::MAX {
-                            VmIterator::Done
-                        } else {
-                            VmIterator::Array {
-                                array,
-                                index: index as usize,
-                            }
-                        };
-                        *value = Value::VmIterator(Rc::new(RefCell::new(state)));
-                    }
-                }
-                self.vm_iters.truncate(frame.iter_base as usize);
-                let handlers = self.vm_handlers.split_off(frame.handler_base as usize);
-                let chains = self.vm_chains.split_off(frame.chain_base as usize);
-                let pending = self.vm_pending.split_off(frame.pending_base as usize);
-                let extra = frame.extra_mut();
-                extra.saved_stack = saved;
-                extra.handlers = handlers;
-                extra.chains = chains;
-                extra.pending = pending;
-                return Ok(Some(RunResult::Yield(value, Box::new(frame))));
+                return self.suspend_frame(frame_floor, value);
+            }
+            Op::SuspendGenerator => {
+                return self.suspend_frame(frame_floor, Value::Uninitialized);
             }
             Op::DelegateCall => {
                 let sent = self.pop();
@@ -9162,33 +9359,88 @@ impl ScriptRuntime {
 
     // ---- generators ----
 
-    fn make_generator(&mut self, function: &Value, closure: &Rc<Closure>, frame: Frame) -> Value {
-        let prototype = match self.get_property(function, "prototype") {
-            Ok(Value::Object(prototype)) => prototype,
-            _ => {
-                if closure.code.is_async {
-                    self.intrinsics.async_generator_prototype.clone()
+    fn suspend_frame(
+        &mut self,
+        frame_floor: usize,
+        value: Value,
+    ) -> Result<Option<RunResult>, ScriptError> {
+        if self.frames.len() != frame_floor + 1 {
+            return Err(runtime_error("yield outside a resumable frame"));
+        }
+        let mut frame = self.frames.pop().expect("generator frame");
+        let mut saved = self.vm_stack.split_off(frame.stack_base);
+        truncate_stack(&mut self.vm_stack, frame.return_base);
+        // materialize inline array iterators before suspending so vm_iters stays LIFO
+        for value in &mut saved {
+            if let Value::ArrayIter(iter_slot) = *value {
+                let (array, index) = self.vm_iters[iter_slot as usize].clone();
+                let state = if index == u32::MAX {
+                    VmIterator::Done
                 } else {
-                    self.intrinsics.generator_prototype.clone()
-                }
+                    VmIterator::Array {
+                        array,
+                        index: index as usize,
+                    }
+                };
+                *value = Value::VmIterator(Rc::new(RefCell::new(state)));
             }
+        }
+        self.vm_iters.truncate(frame.iter_base as usize);
+        let handlers = self.vm_handlers.split_off(frame.handler_base as usize);
+        let chains = self.vm_chains.split_off(frame.chain_base as usize);
+        let pending = self.vm_pending.split_off(frame.pending_base as usize);
+        let extra = frame.extra_mut();
+        extra.saved_stack = saved;
+        extra.handlers = handlers;
+        extra.chains = chains;
+        extra.pending = pending;
+        Ok(Some(RunResult::Yield(value, Box::new(frame))))
+    }
+
+    fn make_generator(
+        &mut self,
+        function: &Value,
+        closure: &Rc<Closure>,
+        frame: Frame,
+    ) -> Result<Value, ScriptError> {
+        let default_proto = if closure.code.is_async {
+            self.intrinsics.async_generator_prototype.clone()
+        } else {
+            self.intrinsics.generator_prototype.clone()
         };
-        if closure.code.is_async {
+        let generator = if closure.code.is_async {
             let data = Rc::new(RefCell::new(AsyncGeneratorData {
-                state: GeneratorState::Suspended(Box::new(frame)),
+                state: GeneratorState::SuspendedStart(Box::new(frame)),
                 queue: VecDeque::new(),
                 awaiting: false,
             }));
-            return Value::Object(new_object(JsObject::with_prototype(
-                Some(prototype),
+            new_object(JsObject::with_prototype(
+                Some(default_proto.clone()),
                 ObjectClass::AsyncGenerator(data),
-            )));
+            ))
+        } else {
+            let state = Rc::new(RefCell::new(GeneratorState::SuspendedStart(Box::new(
+                frame,
+            ))));
+            new_object(JsObject::with_prototype(
+                Some(default_proto.clone()),
+                ObjectClass::Generator(state),
+            ))
+        };
+        // root the generator while reading function.prototype so a getter cannot collect the frame
+        let root_base = self.temp_roots.len();
+        self.temp_roots.push(Value::Object(generator.clone()));
+        let proto_val = self.get_property(function, "prototype");
+        self.temp_roots.truncate(root_base);
+        let prototype = match proto_val? {
+            Value::Object(prototype) => Some(prototype),
+            Value::Array(array) => Some(self.array_prototype_wrapper(&array)),
+            _ => None,
+        };
+        if let Some(prototype) = prototype {
+            generator.borrow_mut().prototype = Some(prototype);
         }
-        let state = Rc::new(RefCell::new(GeneratorState::Suspended(Box::new(frame))));
-        Value::Object(new_object(JsObject::with_prototype(
-            Some(prototype),
-            ObjectClass::Generator(state),
-        )))
+        Ok(Value::Object(generator))
     }
 
     // runs a generator to its next yield; the result is an iterator result object
@@ -9199,7 +9451,7 @@ impl ScriptRuntime {
         value: Value,
     ) -> Result<Value, ScriptError> {
         let current = std::mem::replace(&mut *state.borrow_mut(), GeneratorState::Executing);
-        let mut frame = match current {
+        let (mut frame, started) = match current {
             GeneratorState::Executing => {
                 *state.borrow_mut() = GeneratorState::Executing;
                 return Err(self.type_error("generator is already running"));
@@ -9212,9 +9464,9 @@ impl ScriptRuntime {
                     ResumeMode::Throw => Err(self.throw_value(value)),
                 };
             }
-            GeneratorState::Suspended(frame) => frame,
+            GeneratorState::SuspendedStart(frame) => (frame, false),
+            GeneratorState::Suspended(frame) => (frame, true),
         };
-        let started = frame.pc > frame.code.entry;
         if !started {
             match mode {
                 ResumeMode::Next => {}
@@ -9339,7 +9591,9 @@ impl ScriptRuntime {
         });
         let idle = matches!(
             data.borrow().state,
-            GeneratorState::Suspended(_) | GeneratorState::Completed
+            GeneratorState::SuspendedStart(_)
+                | GeneratorState::Suspended(_)
+                | GeneratorState::Completed
         ) && !data.borrow().awaiting;
         if idle {
             self.async_generator_drain(data)?;
@@ -9356,7 +9610,7 @@ impl ScriptRuntime {
                 return Ok(());
             };
             let state = std::mem::replace(&mut data.borrow_mut().state, GeneratorState::Executing);
-            let frame = match state {
+            let (frame, started) = match state {
                 GeneratorState::Completed => {
                     data.borrow_mut().state = GeneratorState::Completed;
                     match request.mode {
@@ -9384,14 +9638,14 @@ impl ScriptRuntime {
                     continue;
                 }
                 GeneratorState::Executing => return Ok(()),
-                GeneratorState::Suspended(frame) => frame,
+                GeneratorState::SuspendedStart(frame) => (frame, false),
+                GeneratorState::Suspended(frame) => (frame, true),
             };
             data.borrow_mut().queue.push_front(AsyncGeneratorRequest {
                 mode: request.mode,
                 value: Value::Undefined,
                 promise: request.promise.clone(),
             });
-            let started = frame.pc > frame.code.entry;
             let resume = if started {
                 Some((request.mode, request.value))
             } else if request.mode != ResumeMode::Next {
@@ -9555,6 +9809,11 @@ enum Shadow {
     Grown(ScopeRef, usize),
 }
 
+enum ShadowLoc {
+    With(Value),
+    Grown(u16, u16),
+}
+
 // a wrapper so an async resumption can sit inside the Builtin enum
 #[derive(Clone)]
 pub(super) struct AsyncResumeHandle(pub(super) Rc<RefCell<AsyncFunctionData>>);
@@ -9575,4 +9834,59 @@ impl PartialEq for AsyncResumeHandle {
 #[test]
 fn a_scope_keeps_no_room_for_eval_names_until_an_eval_adds_one() {
     assert_eq!(std::mem::size_of::<Scope>(), 48);
+}
+
+#[cfg(test)]
+#[test]
+fn parameter_tdz_sync_generators_compound_assign_and_restricted_props() {
+    let document =
+        crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+    let document = Rc::new(RefCell::new(document));
+    let mut runtime = ScriptRuntime::new(document.clone());
+    runtime
+        .execute(
+            r#"
+            const seen = [];
+            try { (function (a = b, b = 1) {})(); } catch (e) { seen.push(e.name); }
+            seen.push((function (a, b = arguments[0]) { return b; })(7));
+            let genBodyRan = false;
+            function* badGen(a = (() => { throw new RangeError("sync"); })()) { genBodyRan = true; yield a; }
+            try { badGen(); } catch (e) { seen.push(e.name, genBodyRan); }
+            function* okGen(a = 5) { genBodyRan = true; yield a; }
+            const g1 = okGen();
+            seen.push(genBodyRan, g1.return(9).value, genBodyRan);
+            const g2 = okGen();
+            seen.push(g2.next().value, genBodyRan);
+            try { (function (p = eval("var arguments")) {})(); } catch (e) { seen.push(e.name); }
+            seen.push(((p = eval("var arguments = 'ok'")) => arguments)());
+            let keyRead = false;
+            const key = { toString() { keyRead = true; return "k"; } };
+            try { null[key] += 1; } catch (e) { seen.push(e.name, keyRead); }
+            const obj = { x: 10 };
+            with (obj) { x += (delete obj.x, 5); }
+            seen.push(obj.x);
+            const del = { get x() { delete this.x; return 2; } };
+            with (del) {
+                (function () {
+                    "use strict";
+                    try { x += 1; seen.push("ok"); } catch (e) { seen.push(e.name); }
+                })();
+            }
+            const cd = Object.getOwnPropertyDescriptor(Function.prototype, "caller");
+            const ad = Object.getOwnPropertyDescriptor(Function.prototype, "arguments");
+            seen.push(cd.get === cd.set, cd.get === ad.get);
+            function sloppy() { return sloppy.caller; }
+            seen.push(sloppy());
+            try { (function () { "use strict"; }).caller; } catch (e) { seen.push(e.name); }
+            document.getElementById("out").textContent = seen.join("|");
+            "#,
+        )
+        .expect("script should run");
+    let out = document.borrow().find_element_by_id("out").unwrap();
+    assert_eq!(
+        document.borrow().element_text_content(out).as_deref(),
+        Some(
+            "ReferenceError|7|RangeError|false|false|9|false|5|true|SyntaxError|ok|TypeError|false|15|ReferenceError|true|true||TypeError"
+        )
+    );
 }

@@ -59,6 +59,7 @@ pub(super) enum Native {
     FunctionBind,
     FunctionToString,
     FunctionHasInstance,
+    ThrowTypeError,
     SymbolConstructor,
     SymbolFor,
     SymbolKeyFor,
@@ -348,6 +349,9 @@ const HOST_INTERFACES: &[&str] = &[
     "ViewTransition",
 ];
 
+pub(super) type BufferObjectMap =
+    HashMap<usize, (std::rc::Weak<RefCell<ByteBuffer>>, ObjectHandle)>;
+
 pub(super) struct Intrinsics {
     pub(super) object_prototype: ObjectHandle,
     pub(super) function_prototype: ObjectHandle,
@@ -386,7 +390,10 @@ pub(super) struct Intrinsics {
     pub(super) collection_iterator_prototype: ObjectHandle,
     pub(super) date_prototype: ObjectHandle,
     pub(super) typed_prototypes: Vec<ObjectHandle>,
+    pub(super) typed_constructors: Vec<ObjectHandle>,
     pub(super) array_buffer_prototype: ObjectHandle,
+    pub(super) array_buffer_constructor: ObjectHandle,
+    pub(super) buffer_objects: RefCell<BufferObjectMap>,
     pub(super) data_view_prototype: ObjectHandle,
     pub(super) text_encoder_prototype: ObjectHandle,
     pub(super) bigint_prototype: ObjectHandle,
@@ -685,6 +692,40 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
             Property {
                 writable: false,
                 ..Property::hidden(value)
+            },
+        );
+    }
+    let throw_type_error = build.function(Native::ThrowTypeError, "", 0);
+    {
+        let mut obj = throw_type_error.borrow_mut();
+        obj.extensible = false;
+        for (key, value) in [
+            ("length", Value::Number(0.0)),
+            ("name", Value::String(String::new().into())),
+        ] {
+            obj.define(
+                key.to_string(),
+                Property {
+                    slot: Slot::Data(value),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+    }
+    let throw_type_error = Value::Object(throw_type_error);
+    for key in ["caller", "arguments"] {
+        function_prototype.borrow_mut().define(
+            key.to_string(),
+            Property {
+                slot: Slot::accessor(
+                    Some(throw_type_error.clone()),
+                    Some(throw_type_error.clone()),
+                ),
+                enumerable: false,
+                writable: false,
+                configurable: true,
             },
         );
     }
@@ -1129,25 +1170,44 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
 
     let map_prototype = plain(&object_prototype);
     for (key, method, length) in [
-        ("get", C::Get, 1),
-        ("set", C::Set, 2),
-        ("has", C::Has, 1),
-        ("delete", C::Delete, 1),
-        ("clear", C::Clear, 0),
-        ("forEach", C::ForEach, 1),
-        ("keys", C::Iterate(IterationKind::Keys), 0),
-        ("values", C::Iterate(IterationKind::Values), 0),
+        ("get", C::Get(CollectionKind::Map), 1),
+        ("set", C::Set(CollectionKind::Map), 2),
+        ("has", C::Has(CollectionKind::Map), 1),
+        ("delete", C::Delete(CollectionKind::Map), 1),
+        ("clear", C::Clear(CollectionKind::Map), 0),
+        ("forEach", C::ForEach(CollectionKind::Map), 1),
+        (
+            "keys",
+            C::Iterate(CollectionKind::Map, IterationKind::Keys),
+            0,
+        ),
+        (
+            "values",
+            C::Iterate(CollectionKind::Map, IterationKind::Values),
+            0,
+        ),
+        ("getOrInsert", C::GetOrInsert(CollectionKind::Map), 2),
+        (
+            "getOrInsertComputed",
+            C::GetOrInsertComputed(CollectionKind::Map),
+            2,
+        ),
     ] {
         build.method(&map_prototype, key, Native::Collection(method), length);
     }
     let map_entries = Value::Object(build.function(
-        Native::Collection(C::Iterate(IterationKind::Entries)),
+        Native::Collection(C::Iterate(CollectionKind::Map, IterationKind::Entries)),
         "entries",
         0,
     ));
     build.value(&map_prototype, "entries", map_entries.clone());
     build.value(&map_prototype, "@@iterator", map_entries);
-    build.getter(&map_prototype, "size", Native::Collection(C::Size), None);
+    build.getter(
+        &map_prototype,
+        "size",
+        Native::Collection(C::Size(CollectionKind::Map)),
+        None,
+    );
     build.value(&map_prototype, "@@toStringTag", Value::String("Map".into()));
     let map = build.constructor(
         Native::Collection(C::Constructor(CollectionKind::Map)),
@@ -1155,17 +1215,22 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         0,
         &map_prototype,
     );
+    build.getter(&map, "@@species", Native::IteratorSelf, None);
     build.method(&map, "groupBy", Native::Collection(C::GroupBy(true)), 2);
     globals.push(("Map", Value::Object(map)));
 
     let set_prototype = plain(&object_prototype);
     for (key, method, length) in [
-        ("add", C::Add, 1),
-        ("has", C::Has, 1),
-        ("delete", C::Delete, 1),
-        ("clear", C::Clear, 0),
-        ("forEach", C::ForEach, 1),
-        ("entries", C::Iterate(IterationKind::Entries), 0),
+        ("add", C::Add(CollectionKind::Set), 1),
+        ("has", C::Has(CollectionKind::Set), 1),
+        ("delete", C::Delete(CollectionKind::Set), 1),
+        ("clear", C::Clear(CollectionKind::Set), 0),
+        ("forEach", C::ForEach(CollectionKind::Set), 1),
+        (
+            "entries",
+            C::Iterate(CollectionKind::Set, IterationKind::Entries),
+            0,
+        ),
         ("union", C::Union, 1),
         ("intersection", C::Intersection, 1),
         ("difference", C::Difference, 1),
@@ -1177,14 +1242,19 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         build.method(&set_prototype, key, Native::Collection(method), length);
     }
     let set_values = Value::Object(build.function(
-        Native::Collection(C::Iterate(IterationKind::Values)),
+        Native::Collection(C::Iterate(CollectionKind::Set, IterationKind::Values)),
         "values",
         0,
     ));
     build.value(&set_prototype, "values", set_values.clone());
     build.value(&set_prototype, "keys", set_values.clone());
     build.value(&set_prototype, "@@iterator", set_values);
-    build.getter(&set_prototype, "size", Native::Collection(C::Size), None);
+    build.getter(
+        &set_prototype,
+        "size",
+        Native::Collection(C::Size(CollectionKind::Set)),
+        None,
+    );
     build.value(&set_prototype, "@@toStringTag", Value::String("Set".into()));
     let set = build.constructor(
         Native::Collection(C::Constructor(CollectionKind::Set)),
@@ -1192,14 +1262,21 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         0,
         &set_prototype,
     );
+    build.getter(&set, "@@species", Native::IteratorSelf, None);
     globals.push(("Set", Value::Object(set)));
 
     let weak_map_prototype = plain(&object_prototype);
     for (key, method, length) in [
-        ("get", C::Get, 1),
-        ("set", C::Set, 2),
-        ("has", C::Has, 1),
-        ("delete", C::Delete, 1),
+        ("get", C::Get(CollectionKind::WeakMap), 1),
+        ("set", C::Set(CollectionKind::WeakMap), 2),
+        ("has", C::Has(CollectionKind::WeakMap), 1),
+        ("delete", C::Delete(CollectionKind::WeakMap), 1),
+        ("getOrInsert", C::GetOrInsert(CollectionKind::WeakMap), 2),
+        (
+            "getOrInsertComputed",
+            C::GetOrInsertComputed(CollectionKind::WeakMap),
+            2,
+        ),
     ] {
         build.method(&weak_map_prototype, key, Native::Collection(method), length);
     }
@@ -1218,9 +1295,9 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
 
     let weak_set_prototype = plain(&object_prototype);
     for (key, method, length) in [
-        ("add", C::Add, 1),
-        ("has", C::Has, 1),
-        ("delete", C::Delete, 1),
+        ("add", C::Add(CollectionKind::WeakSet), 1),
+        ("has", C::Has(CollectionKind::WeakSet), 1),
+        ("delete", C::Delete(CollectionKind::WeakSet), 1),
     ] {
         build.method(&weak_set_prototype, key, Native::Collection(method), length);
     }
@@ -1344,7 +1421,9 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     );
     build.method(&typed_constructor, "from", Native::Typed(T::From), 1);
     build.method(&typed_constructor, "of", Native::Typed(T::Of), 0);
+    build.getter(&typed_constructor, "@@species", Native::IteratorSelf, None);
     let mut typed_prototypes = Vec::new();
+    let mut typed_constructors = Vec::new();
     for (kind, name) in ELEMENT_KINDS {
         let prototype = plain(&typed_prototype);
         prototype.borrow_mut().define(
@@ -1373,6 +1452,7 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
                 build.method(target, key, Native::Typed(T::Text(method)), length);
             }
         }
+        typed_constructors.push(constructor.clone());
         globals.push((name, Value::Object(constructor)));
         typed_prototypes.push(prototype);
     }
@@ -1396,12 +1476,12 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     ] {
         build.getter(&array_buffer_prototype, key, Native::Typed(member), None);
     }
-    for (key, member) in [
-        ("resize", T::BufferResize),
-        ("transfer", T::BufferTransfer(true)),
-        ("transferToFixedLength", T::BufferTransfer(false)),
+    for (key, member, length) in [
+        ("resize", T::BufferResize, 1),
+        ("transfer", T::BufferTransfer(true), 0),
+        ("transferToFixedLength", T::BufferTransfer(false), 0),
     ] {
-        build.method(&array_buffer_prototype, key, Native::Typed(member), 1);
+        build.method(&array_buffer_prototype, key, Native::Typed(member), length);
     }
     build.value(
         &array_buffer_prototype,
@@ -1415,6 +1495,8 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         &array_buffer_prototype,
     );
     build.method(&array_buffer, "isView", Native::Typed(T::BufferIsView), 1);
+    build.getter(&array_buffer, "@@species", Native::IteratorSelf, None);
+    let array_buffer_constructor = array_buffer.clone();
     globals.push(("ArrayBuffer", Value::Object(array_buffer)));
     let data_view_prototype = plain(&object_prototype);
     for (key, method) in [
@@ -1785,7 +1867,10 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         collection_iterator_prototype,
         date_prototype,
         typed_prototypes,
+        typed_constructors,
         array_buffer_prototype,
+        array_buffer_constructor,
+        buffer_objects: RefCell::new(HashMap::default()),
         data_view_prototype,
         text_encoder_prototype,
         text_decoder_prototype,
@@ -1893,10 +1978,12 @@ impl ScriptRuntime {
         if !script.strict {
             self.check_eval_declarations(&chain, &eval)?;
         }
-        if let Some(target) = chain
-            .iter()
-            .find(|scope| scope.borrow().layout.role == ScopeRole::Var)
-        {
+        if let Some(target) = chain.iter().find(|scope| {
+            matches!(
+                scope.borrow().layout.role,
+                ScopeRole::Var | ScopeRole::Param
+            )
+        }) {
             let mut target = target.borrow_mut();
             for name in eval.grown {
                 target.slots.push(Value::Undefined);
@@ -1920,6 +2007,7 @@ impl ScriptRuntime {
                 continue;
             }
             let var_scope = layout.role == ScopeRole::Var;
+            let param_scope = layout.role == ScopeRole::Param;
             for (name, kind) in layout.names.iter().zip(layout.kinds.iter()) {
                 let lexical = match kind {
                     BindingKind::Let | BindingKind::Const | BindingKind::Class => true,
@@ -1930,7 +2018,7 @@ impl ScriptRuntime {
                     return Err(self.redeclaration(name));
                 }
             }
-            if var_scope {
+            if var_scope || param_scope {
                 return Ok(());
             }
         }
@@ -2058,6 +2146,42 @@ impl ScriptRuntime {
     }
 
     // the own property of any value, as getOwnPropertyDescriptor and hasOwnProperty see it
+    // backing object for arraybuffer expandos and custom prototypes
+    pub(super) fn buffer_object(&self, bytes: &BytesHandle) -> ObjectHandle {
+        let key = Rc::as_ptr(bytes) as usize;
+        {
+            let map = self.intrinsics.buffer_objects.borrow();
+            if let Some((weak, object)) = map.get(&key)
+                && weak
+                    .upgrade()
+                    .is_some_and(|alive| Rc::ptr_eq(&alive, bytes))
+            {
+                return object.clone();
+            }
+        }
+        let object = new_object(JsObject::with_prototype(
+            Some(self.intrinsics.array_buffer_prototype.clone()),
+            ObjectClass::Ordinary,
+        ));
+        let mut map = self.intrinsics.buffer_objects.borrow_mut();
+        if map.len() > 64 {
+            map.retain(|_, (weak, _)| weak.strong_count() > 0);
+        }
+        map.insert(key, (Rc::downgrade(bytes), object.clone()));
+        object
+    }
+
+    pub(super) fn existing_buffer_object(&self, bytes: &BytesHandle) -> Option<ObjectHandle> {
+        let key = Rc::as_ptr(bytes) as usize;
+        let map = self.intrinsics.buffer_objects.borrow();
+        map.get(&key)
+            .filter(|(weak, _)| {
+                weak.upgrade()
+                    .is_some_and(|alive| Rc::ptr_eq(&alive, bytes))
+            })
+            .map(|(_, object)| object.clone())
+    }
+
     pub(super) fn own_property_of(
         &mut self,
         value: &Value,
@@ -2329,7 +2453,17 @@ impl ScriptRuntime {
             }
             return Ok(());
         }
-        let (mut property, present) = self.descriptor_from(descriptor)?;
+        let (property, present) = self.descriptor_from(descriptor)?;
+        self.apply_property_descriptor(target, key, property, present)
+    }
+
+    fn apply_property_descriptor(
+        &mut self,
+        target: &Value,
+        key: String,
+        mut property: Property,
+        present: [bool; 6],
+    ) -> Result<(), ScriptError> {
         let object = match target {
             Value::Object(object) => object.clone(),
             Value::TypedArray(array) => match super::typed::canonical_numeric_index(&key) {
@@ -2467,9 +2601,27 @@ impl ScriptRuntime {
     }
 
     fn define_properties(&mut self, target: &Value, properties: &Value) -> Result<(), ScriptError> {
-        let entries = self.own_enumerable_entries(properties)?;
+        let props = self.coerce_object(properties.clone())?;
+        let entries = self.own_enumerable_entries(&props)?;
+        let mut parsed = Vec::with_capacity(entries.len());
         for (key, descriptor) in entries {
-            self.define_property_value(target, key, &descriptor)?;
+            let (property, present) = self.descriptor_from(&descriptor)?;
+            parsed.push((key, descriptor, property, present));
+        }
+        for (key, descriptor, property, present) in parsed {
+            if let Some(object) = self.wrapper_object(target) {
+                self.apply_property_descriptor(&Value::Object(object), key, property, present)?;
+            } else if let Value::Object(object) = target
+                && let Some(proxy) = super::reflect::proxy_of(object)
+            {
+                if !self.proxy_define(&proxy, &key, &descriptor)? {
+                    return Err(self.type_error(format!(
+                        "'defineProperty' on proxy: trap returned falsish for property '{key}'"
+                    )));
+                }
+            } else {
+                self.apply_property_descriptor(target, key, property, present)?;
+            }
         }
         Ok(())
     }
@@ -2583,6 +2735,7 @@ impl ScriptRuntime {
             Native::ObjectCreate => {
                 let prototype = match &first {
                     Value::Object(prototype) => Some(prototype.clone()),
+                    Value::Array(array) => Some(self.array_prototype_wrapper(array)),
                     Value::Null => None,
                     _ => {
                         return Err(
@@ -2619,10 +2772,7 @@ impl ScriptRuntime {
                 if matches!(first, Value::Undefined | Value::Null) {
                     return Err(self.type_error("Cannot convert undefined or null to object"));
                 }
-                Ok(self
-                    .prototype_of_value(&first)?
-                    .map(Value::Object)
-                    .unwrap_or(Value::Null))
+                Ok(Self::prototype_value(self.prototype_of_value(&first)?))
             }
             Native::ObjectSetPrototypeOf => {
                 if matches!(first, Value::Undefined | Value::Null) {
@@ -2632,6 +2782,7 @@ impl ScriptRuntime {
                 }
                 let prototype = match argument(&arguments, 1) {
                     Value::Object(prototype) => Some(prototype),
+                    Value::Array(array) => Some(self.array_prototype_wrapper(&array)),
                     Value::Null => None,
                     _ => {
                         return Err(
@@ -2827,15 +2978,21 @@ impl ScriptRuntime {
                 Ok(Value::Bool(self.own_property_of(&target, &key)?.is_some()))
             }
             Native::ObjectIsPrototypeOf => {
-                let Value::Object(prototype) = this else {
+                if is_primitive(&first) {
                     return Ok(Value::Bool(false));
+                }
+                let receiver = self.coerce_object(this)?;
+                let target_proto = match receiver {
+                    Value::Object(prototype) => prototype,
+                    Value::Array(array) => self.array_prototype_wrapper(&array),
+                    _ => return Ok(Value::Bool(false)),
                 };
-                let mut current = self.prototype_of(&first);
+                let mut current = self.prototype_of_value(&first)?;
                 while let Some(object) = current {
-                    if ObjectHandle::ptr_eq(&object, &prototype) {
+                    if Self::prototypes_equal(&object, &target_proto) {
                         return Ok(Value::Bool(true));
                     }
-                    current = object.borrow().prototype_or(&self.intrinsics);
+                    current = self.prototype_of_value(&Value::Object(object))?;
                 }
                 Ok(Value::Bool(false))
             }
@@ -2855,18 +3012,21 @@ impl ScriptRuntime {
             Native::ObjectValueOf => self.coerce_object(this),
             Native::ObjectProtoGetter => {
                 let target = self.coerce_object(this)?;
-                Ok(self
-                    .prototype_of(&target)
-                    .map(Value::Object)
-                    .unwrap_or(Value::Null))
+                Ok(Self::prototype_value(self.prototype_of_value(&target)?))
             }
             Native::ObjectProtoSetter => {
-                if let Value::Object(object) = &this {
-                    match first {
-                        Value::Object(prototype) => {
-                            self.set_object_prototype(object, Some(prototype))?
+                let proto = match first {
+                    Value::Object(prototype) => Some(Some(prototype)),
+                    Value::Array(array) => Some(Some(self.array_prototype_wrapper(&array))),
+                    Value::Null => Some(None),
+                    _ => None,
+                };
+                if let Some(prototype) = proto {
+                    match &this {
+                        Value::Object(object) => self.set_object_prototype(object, prototype)?,
+                        Value::Array(array) if !self.set_array_prototype(array, prototype) => {
+                            return Err(self.type_error("#<Array> is not extensible"));
                         }
-                        Value::Null => self.set_object_prototype(object, None)?,
                         _ => {}
                     }
                 }
@@ -2911,9 +3071,9 @@ impl ScriptRuntime {
                             _ => Value::Undefined,
                         });
                     }
-                    target = match self.prototype_of_value(&target)? {
-                        Some(prototype) => Value::Object(prototype),
-                        None => return Ok(Value::Undefined),
+                    target = match Self::prototype_value(self.prototype_of_value(&target)?) {
+                        Value::Null => return Ok(Value::Undefined),
+                        prototype => prototype,
                     };
                 }
             }
@@ -3001,6 +3161,9 @@ impl ScriptRuntime {
             Native::FunctionHasInstance => {
                 Ok(Value::Bool(self.ordinary_has_instance(&this, &first)?))
             }
+            Native::ThrowTypeError => Err(self.type_error(
+                "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
+            )),
             Native::SymbolConstructor => {
                 self.symbol_counter += 1;
                 let key = match first {
@@ -3253,6 +3416,14 @@ impl ScriptRuntime {
                 // the length is read on every step, so the iterator sees pushes and pops
                 let length = match &target {
                     Value::Array(array) => array.borrow().len(),
+                    Value::TypedArray(array) => {
+                        if super::typed::typed_range(&array.borrow()).is_none() {
+                            return Err(self.type_error(
+                                "Cannot iterate over a typed array whose buffer is detached or out of bounds",
+                            ));
+                        }
+                        super::typed::element_count(&array.borrow())
+                    }
                     other => {
                         let length = self.get_property(other, "length")?;
                         let length = self.coerce_number(length)?;
@@ -3786,7 +3957,7 @@ impl ScriptRuntime {
                     arguments,
                     Some(new_target.clone()),
                 )?;
-                // a subclass hands its own prototype to the typed array it constructs
+                // a subclass hands its own prototype to the typed array or buffer it constructs
                 if let (Value::TypedArray(array), Value::Object(_)) = (&made, &new_target)
                     && let Value::Object(prototype) = self.get_property(&new_target, "prototype")?
                     && !self
@@ -3794,6 +3965,13 @@ impl ScriptRuntime {
                         .is_some_and(|current| ObjectHandle::ptr_eq(&current, &prototype))
                 {
                     super::typed_object(array)
+                        .borrow_mut()
+                        .set_prototype(Some(prototype));
+                } else if let (Value::Bytes(bytes), Value::Object(_)) = (&made, &new_target)
+                    && let Value::Object(prototype) = self.get_property(&new_target, "prototype")?
+                    && !ObjectHandle::ptr_eq(&self.intrinsics.array_buffer_prototype, &prototype)
+                {
+                    self.buffer_object(bytes)
                         .borrow_mut()
                         .set_prototype(Some(prototype));
                 }
@@ -3906,28 +4084,49 @@ impl ScriptRuntime {
         if key == "length" {
             // length is a data property that is never enumerable or configurable
             let accessor = present[4] || present[5];
+            if !present[2] {
+                if accessor
+                    || (present[1] && property.configurable)
+                    || (present[0] && property.enumerable)
+                {
+                    return Err(self.type_error("Cannot redefine property: length"));
+                }
+                let fixed = array.borrow().fixed_length()
+                    || array.borrow().integrity() == super::Integrity::Frozen;
+                if fixed && present[3] && property.writable {
+                    return Err(self.type_error("Cannot redefine property: length"));
+                }
+                if present[3] && !property.writable {
+                    array.borrow_mut().extra_mut().fixed_length = true;
+                }
+                return Ok(());
+            }
+            let Slot::Data(value) = property.slot else {
+                unreachable!("data descriptor checked in descriptor_from");
+            };
+            let wanted = self.parse_array_length(value)?;
             if accessor
                 || (present[1] && property.configurable)
                 || (present[0] && property.enumerable)
             {
                 return Err(self.type_error("Cannot redefine property: length"));
             }
-            let fixed = array.borrow().fixed_length()
-                || array.borrow().integrity() == super::Integrity::Frozen;
-            if fixed && present[3] && property.writable {
+            let new_writable = present[3].then_some(property.writable);
+            if !self.apply_array_length(array, wanted, new_writable)? {
                 return Err(self.type_error("Cannot redefine property: length"));
-            }
-            if let Slot::Data(value) = &property.slot
-                && present[2]
-            {
-                set_array_length(array, value.clone())?;
-            }
-            if present[3] && !property.writable {
-                array.borrow_mut().extra_mut().fixed_length = true;
             }
             return Ok(());
         }
         let index = array_index(&key).map(|index| index as usize);
+        if let Some(index) = index
+            && index >= array.borrow().len()
+            && (array.borrow().fixed_length()
+                || array.borrow().integrity() == super::Integrity::Frozen)
+        {
+            return Err(self.type_error(format!(
+                "Cannot define property {key}, the array's length is read-only"
+            )));
+        }
         let current = self.own_property_of(&Value::Array(array.clone()), &key)?;
         let refuse =
             |runtime: &mut Self| runtime.type_error(format!("Cannot redefine property: {key}"));
@@ -4001,6 +4200,9 @@ impl ScriptRuntime {
                             new.set = old.set.clone();
                         }
                     }
+                    (Slot::Accessor { .. }, Slot::Data(_)) if !(present[2] || present[3]) => {
+                        property.slot = current.slot.clone();
+                    }
                     _ => {}
                 }
             }
@@ -4049,7 +4251,7 @@ impl ScriptRuntime {
     ) -> bool {
         let current = self.prototype_of(&Value::Array(array.clone()));
         let same = match (&current, &prototype) {
-            (Some(current), Some(prototype)) => ObjectHandle::ptr_eq(current, prototype),
+            (Some(current), Some(prototype)) => Self::prototypes_equal(current, prototype),
             (None, None) => true,
             _ => false,
         };
@@ -4058,6 +4260,14 @@ impl ScriptRuntime {
         }
         if array.borrow().integrity() != super::Integrity::Open {
             return false;
+        }
+        let mut cursor = prototype.clone();
+        while let Some(link) = cursor {
+            if matches!(&link.borrow().class, ObjectClass::ArrayProto(other) if ArrayHandle::ptr_eq(other, array))
+            {
+                return false;
+            }
+            cursor = link.borrow().prototype_or(&self.intrinsics);
         }
         array.borrow_mut().extra_mut().prototype = Some(prototype);
         true
@@ -4070,7 +4280,7 @@ impl ScriptRuntime {
     ) -> Result<(), ScriptError> {
         if let Some(proxy) = super::reflect::proxy_of(object) {
             let (target, trap) = self.proxy_trap(&proxy, "setPrototypeOf")?;
-            let value = prototype.clone().map(Value::Object).unwrap_or(Value::Null);
+            let value = Self::prototype_value(prototype.clone());
             return match trap {
                 Some(trap) => {
                     let handler = proxy.handler.borrow().clone().unwrap_or(Value::Undefined);
@@ -4090,7 +4300,7 @@ impl ScriptRuntime {
             };
         }
         let unchanged = match (&object.borrow().prototype_or(&self.intrinsics), &prototype) {
-            (Some(current), Some(next)) => ObjectHandle::ptr_eq(current, next),
+            (Some(current), Some(next)) => Self::prototypes_equal(current, next),
             (None, None) => true,
             _ => false,
         };
@@ -4102,7 +4312,7 @@ impl ScriptRuntime {
         }
         let mut current = prototype.clone();
         while let Some(link) = current {
-            if ObjectHandle::ptr_eq(&link, object) {
+            if Self::prototypes_equal(&link, object) {
                 return Err(self.type_error("Cyclic __proto__ value"));
             }
             current = link.borrow().prototype_or(&self.intrinsics);

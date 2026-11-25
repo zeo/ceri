@@ -285,9 +285,10 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn parse_script(mut self) -> Result<Script, ScriptError> {
-        let (body, strict) = self.parse_body_with_directives(true)?;
+        let (body, strict, _) = self.parse_body_with_directives(true)?;
         self.expect_eof()?;
         self.check_declarations(&[body.as_slice()], None, true, false)?;
+        validate_statements(&body)?;
         if using_kind(&body).is_some() {
             return Err(self.error_here("using declarations belong in a block, function or module"));
         }
@@ -318,6 +319,7 @@ impl<'a> Parser<'a> {
                 items.push(ModuleItem::Statement(statement));
             }
         }
+        validate_module(&items)?;
         Ok(Module { items })
     }
 
@@ -325,6 +327,7 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_standalone_expression(mut self) -> Result<Expr, ScriptError> {
         let expression = self.parse_expression(true)?;
         self.expect_eof()?;
+        validate_expression(&expression)?;
         Ok(expression)
     }
 
@@ -492,8 +495,9 @@ impl<'a> Parser<'a> {
 
     fn is_binding_identifier(&mut self) -> Result<bool, ScriptError> {
         Ok(match self.peek_kind()? {
-            TokenKind::Identifier(name) => !self.is_reserved(&name),
-            TokenKind::EscapedIdentifier(_) => true,
+            TokenKind::Identifier(name) | TokenKind::EscapedIdentifier(name) => {
+                !self.is_reserved(&name)
+            }
             _ => false,
         })
     }
@@ -510,11 +514,9 @@ impl<'a> Parser<'a> {
 
     fn parse_binding_identifier(&mut self) -> Result<Name, ScriptError> {
         match self.peek_kind()? {
-            TokenKind::Identifier(name) if !self.is_reserved(&name) => {
-                self.advance()?;
-                Ok(name.into())
-            }
-            TokenKind::EscapedIdentifier(name) => {
+            TokenKind::Identifier(name) | TokenKind::EscapedIdentifier(name)
+                if !self.is_reserved(&name) =>
+            {
                 self.advance()?;
                 Ok(name.into())
             }
@@ -544,10 +546,12 @@ impl<'a> Parser<'a> {
     fn parse_body_with_directives(
         &mut self,
         until_eof: bool,
-    ) -> Result<(Vec<Stmt>, bool), ScriptError> {
+    ) -> Result<(Vec<Stmt>, bool, bool), ScriptError> {
         let mut body = Vec::new();
         let mut strict = self.context.strict;
+        let mut has_use_strict = false;
         let mut in_prologue = true;
+        let mut prologue_strict_error: Option<(usize, &'static str)> = None;
         loop {
             if until_eof && self.at_eof()? || !until_eof && self.is_punct("}")? {
                 break;
@@ -556,14 +560,28 @@ impl<'a> Parser<'a> {
                 if let TokenKind::String(value) = self.peek_kind()? {
                     let start = self.peek()?.start;
                     let end = self.peek()?.end;
+                    let tok_strict_err = self.peek()?.strict_error;
                     let raw = &self.lexer.source()[start..end];
                     let next_ends = matches!(self.peek_punct_at(1)?, Some(";" | "}"))
                         || self.peek_at(1)?.newline_before
                         || self.peek_at(1)?.kind == TokenKind::Eof;
                     if next_ends {
+                        if let Some(msg) = tok_strict_err
+                            && prologue_strict_error.is_none()
+                        {
+                            prologue_strict_error = Some((start, msg));
+                        }
                         if raw == "'use strict'" || raw == "\"use strict\"" {
                             strict = true;
+                            has_use_strict = true;
                             self.context.strict = true;
+                            if let Some((offset, msg)) = prologue_strict_error {
+                                return Err(ScriptError {
+                                    offset,
+                                    message: msg.to_string(),
+                                    name: "SyntaxError".to_string(),
+                                });
+                            }
                         }
                         let _ = value;
                     } else {
@@ -575,7 +593,7 @@ impl<'a> Parser<'a> {
             }
             self.parse_list_item(&mut body)?;
         }
-        Ok((body, strict))
+        Ok((body, strict, has_use_strict))
     }
 
     fn parse_list_item(&mut self, body: &mut Vec<Stmt>) -> Result<(), ScriptError> {
@@ -766,13 +784,12 @@ impl<'a> Parser<'a> {
         let next = self.peek_at(at)?;
         let binding = !next.newline_before
             && match &next.kind {
-                TokenKind::Identifier(name) => {
+                TokenKind::Identifier(name) | TokenKind::EscapedIdentifier(name) => {
                     (!RESERVED.contains(&name.as_str())
                         || matches!(name.as_str(), "yield" | "await"))
                         && name != "let"
                         && !(for_head && name == "of")
                 }
-                TokenKind::EscapedIdentifier(_) => true,
                 _ => false,
             };
         Ok(binding.then_some(asynchronous))
@@ -785,11 +802,10 @@ impl<'a> Parser<'a> {
         }
         Ok(match self.peek_at(1)?.kind.clone() {
             TokenKind::Punct("[" | "{") => true,
-            TokenKind::Identifier(name) => {
+            TokenKind::Identifier(name) | TokenKind::EscapedIdentifier(name) => {
                 !(RESERVED.contains(&name.as_str()) && name != "yield" && name != "let")
                     || name == "await"
             }
-            TokenKind::EscapedIdentifier(_) => true,
             _ => false,
         })
     }
@@ -821,6 +837,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_statement(&mut self) -> Result<Stmt, ScriptError> {
+        self.parse_statement_in(false)
+    }
+
+    fn parse_statement_in(&mut self, allow_sloppy_function: bool) -> Result<Stmt, ScriptError> {
         let kind = self.peek_kind()?;
         match kind {
             TokenKind::Punct("{") => {
@@ -951,28 +971,48 @@ impl<'a> Parser<'a> {
                     })
                 }
                 "function" => {
-                    // sloppy code may declare a function as an if body
+                    if !allow_sloppy_function
+                        || self.context.strict
+                        || matches!(self.peek_punct_at(1)?, Some("*"))
+                    {
+                        return Err(self.error_here("a function declaration cannot appear here"));
+                    }
                     let start = self.offset()?;
                     self.advance()?;
                     Ok(Stmt::Function(
                         self.parse_function_declaration(start, false)?,
                     ))
                 }
+                "async" if self.is_word_at(1, "function")? && !self.peek_at(1)?.newline_before => {
+                    Err(self.error_here("an async function declaration cannot appear here"))
+                }
                 "class" | "const" => {
                     Err(self.error_here(format!("a {word} declaration cannot appear here")))
                 }
-                _ if self.is_let_declaration()? => {
+                "let"
+                    if matches!(self.peek_punct_at(1)?, Some("["))
+                        || (!self.peek_at(1)?.newline_before && self.is_let_declaration()?) =>
+                {
                     Err(self.error_here("a let declaration cannot appear here"))
                 }
                 _ if matches!(self.peek_punct_at(1)?, Some(":")) && !self.is_reserved(&word) => {
                     let label: Name = word.into();
                     self.advance()?;
                     self.advance()?;
-                    let body = Box::new(self.parse_statement()?);
+                    let body = Box::new(self.parse_statement_in(!self.context.strict)?);
                     Ok(Stmt::Labeled { label, body })
                 }
                 _ => self.parse_expression_statement(),
             },
+            TokenKind::EscapedIdentifier(word)
+                if matches!(self.peek_punct_at(1)?, Some(":")) && !self.is_reserved(&word) =>
+            {
+                let label: Name = word.into();
+                self.advance()?;
+                self.advance()?;
+                let body = Box::new(self.parse_statement_in(!self.context.strict)?);
+                Ok(Stmt::Labeled { label, body })
+            }
             _ => self.parse_expression_statement(),
         }
     }
@@ -1001,9 +1041,10 @@ impl<'a> Parser<'a> {
         self.expect_punct("(")?;
         let test = self.parse_expression(true)?;
         self.expect_punct(")")?;
-        let consequent = Box::new(self.parse_statement()?);
+        let allow_fun = !self.context.strict;
+        let consequent = Box::new(self.parse_statement_in(allow_fun)?);
         let alternate = if self.eat_word("else")? {
-            Some(Box::new(self.parse_statement()?))
+            Some(Box::new(self.parse_statement_in(allow_fun)?))
         } else {
             None
         };
@@ -1393,6 +1434,18 @@ impl<'a> Parser<'a> {
                                 self.to_pattern(value, offset)?,
                             ));
                         }
+                        ObjectProperty::CoverInit(name, default) => {
+                            if self.context.strict && (&*name == "eval" || &*name == "arguments") {
+                                return Err(invalid());
+                            }
+                            patterns.push((
+                                PropertyKey::Static(name.clone()),
+                                Pattern::Default {
+                                    target: Box::new(Pattern::Identifier(name)),
+                                    default: Box::new(default),
+                                },
+                            ));
+                        }
                         ObjectProperty::Spread(value) if index + 1 == count => {
                             rest = Some(Box::new(self.to_pattern(value, offset)?));
                         }
@@ -1512,8 +1565,9 @@ impl<'a> Parser<'a> {
         }
         // a single identifier parameter: x => ...
         let single = match self.peek_at(lookahead)?.kind.clone() {
-            TokenKind::Identifier(name) => !self.is_reserved(&name),
-            TokenKind::EscapedIdentifier(_) => true,
+            TokenKind::Identifier(name) | TokenKind::EscapedIdentifier(name) => {
+                !self.is_reserved(&name) && !(is_async && name == "await")
+            }
             _ => false,
         };
         if single
@@ -1523,7 +1577,13 @@ impl<'a> Parser<'a> {
             if is_async {
                 self.advance()?;
             }
-            let name = self.parse_declared_identifier()?;
+            let saved_async = self.context.in_async;
+            if is_async {
+                self.context.in_async = true;
+            }
+            let name = self.parse_declared_identifier();
+            self.context.in_async = saved_async;
+            let name = name?;
             self.advance()?;
             let outer_eval = self.eval_context.take();
             return Ok(Some(self.parse_arrow_body(
@@ -1579,17 +1639,19 @@ impl<'a> Parser<'a> {
         self.context.in_generator = false;
         self.context.in_function = true;
         let body = if self.eat_punct("{")? {
-            let (body, strict) = self.parse_body_with_directives(false)?;
+            let (body, strict, has_use_strict) = self.parse_body_with_directives(false)?;
             self.expect_punct("}")?;
+            self.check_function_params(None, &params, &rest, has_use_strict)?;
             self.check_declarations(
                 &[body.as_slice()],
                 Some((params.as_slice(), rest.as_ref())),
                 true,
-                false,
+                true,
             )?;
             self.context.strict = strict;
             with_using(body)
         } else {
+            self.check_declarations(&[], Some((params.as_slice(), rest.as_ref())), true, true)?;
             vec![
                 Stmt::Position(self.offset()?),
                 Stmt::Return(Some(self.parse_assignment(allow_in)?)),
@@ -2059,6 +2121,15 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(&mut self) -> Result<Expr, ScriptError> {
         let token = self.peek()?.clone();
+        if self.context.strict
+            && let Some(message) = token.strict_error
+        {
+            return Err(ScriptError {
+                offset: token.start,
+                message: message.to_string(),
+                name: "SyntaxError".to_string(),
+            });
+        }
         match token.kind {
             TokenKind::Number(value) => {
                 self.advance()?;
@@ -2152,6 +2223,9 @@ impl<'a> Parser<'a> {
                 }
             },
             TokenKind::EscapedIdentifier(word) => {
+                if self.is_reserved(&word) {
+                    return Err(self.error_here(format!("unexpected escaped keyword {word}")));
+                }
                 self.advance()?;
                 Ok(Expr::Identifier(word.into()))
             }
@@ -2185,7 +2259,17 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_property_key(&mut self, allow_private: bool) -> Result<PropertyKey, ScriptError> {
-        match self.peek_kind()? {
+        let token = self.peek()?.clone();
+        if self.context.strict
+            && let Some(message) = token.strict_error
+        {
+            return Err(ScriptError {
+                offset: token.start,
+                message: message.to_string(),
+                name: "SyntaxError".to_string(),
+            });
+        }
+        match token.kind {
             TokenKind::Identifier(name) | TokenKind::EscapedIdentifier(name) => {
                 self.advance()?;
                 Ok(PropertyKey::Static(name.into()))
@@ -2262,7 +2346,10 @@ impl<'a> Parser<'a> {
                 let (is_async, is_generator, accessor) = self.parse_method_prefix()?;
                 let shorthand_name = match self.peek_kind()? {
                     TokenKind::Identifier(name) | TokenKind::EscapedIdentifier(name)
-                        if !is_async && !is_generator && accessor.is_none() =>
+                        if !is_async
+                            && !is_generator
+                            && accessor.is_none()
+                            && !self.is_reserved(&name) =>
                     {
                         Some(name)
                     }
@@ -2273,17 +2360,15 @@ impl<'a> Parser<'a> {
                 {
                     self.advance()?;
                     let name: Name = name.into();
-                    let value = if self.eat_punct("=")? {
-                        // only valid when the literal turns out to be a destructuring target
-                        Expr::Assign {
-                            operator: AssignOperator::Assign,
-                            target: Box::new(Pattern::Identifier(name.clone())),
-                            value: Box::new(self.parse_assignment(true)?),
-                        }
+                    if self.eat_punct("=")? {
+                        let default = self.parse_assignment(true)?;
+                        properties.push(ObjectProperty::CoverInit(name, default));
                     } else {
-                        Expr::Identifier(name.clone())
-                    };
-                    properties.push(ObjectProperty::Value(PropertyKey::Static(name), value));
+                        properties.push(ObjectProperty::Value(
+                            PropertyKey::Static(name.clone()),
+                            Expr::Identifier(name),
+                        ));
+                    }
                 } else {
                     let key = self.parse_property_key(false)?;
                     if is_async || is_generator || accessor.is_some() || self.is_punct("(")? {
@@ -2318,6 +2403,47 @@ impl<'a> Parser<'a> {
     }
 
     // ---- functions and classes ----
+
+    fn check_function_params(
+        &mut self,
+        name: Option<&Name>,
+        params: &[Pattern],
+        rest: &Option<Pattern>,
+        has_use_strict: bool,
+    ) -> Result<(), ScriptError> {
+        if !has_use_strict {
+            return Ok(());
+        }
+        if !is_simple_parameter_list(params, rest) {
+            return Err(self.error_here(
+                "illegal 'use strict' directive in function with non-simple parameter list",
+            ));
+        }
+        let invalid_strict = |ident: &str| {
+            ident == "eval"
+                || ident == "arguments"
+                || ident == "yield"
+                || STRICT_RESERVED.contains(&ident)
+        };
+        if let Some(name) = name
+            && invalid_strict(name)
+        {
+            return Err(self.error_here(format!("cannot name function {name} in strict mode")));
+        }
+        let mut bound = Vec::new();
+        for param in params {
+            bound_names(param, &mut bound);
+        }
+        if let Some(rest) = rest {
+            bound_names(rest, &mut bound);
+        }
+        for ident in bound {
+            if invalid_strict(&ident) {
+                return Err(self.error_here(format!("cannot declare {ident} in strict mode")));
+            }
+        }
+        Ok(())
+    }
 
     fn key_name(key: &PropertyKey) -> Option<Name> {
         match key {
@@ -2354,13 +2480,16 @@ impl<'a> Parser<'a> {
         self.context.allow_super_call = super_call;
         let (params, rest) = self.parse_formal_parameters()?;
         self.expect_punct("{")?;
-        let (body, strict) = self.parse_body_with_directives(false)?;
+        let (body, strict, has_use_strict) = self.parse_body_with_directives(false)?;
         self.expect_punct("}")?;
+        self.check_function_params(name.as_ref(), &params, &rest, has_use_strict)?;
+        let no_dups =
+            strict || !is_simple_parameter_list(&params, &rest) || kind != FunctionKind::Normal;
         self.check_declarations(
             &[body.as_slice()],
             Some((params.as_slice(), rest.as_ref())),
             true,
-            false,
+            no_dups,
         )?;
         let body = with_using(body);
         self.context = saved;
@@ -2820,6 +2949,360 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn is_simple_parameter_list(params: &[Pattern], rest: &Option<Pattern>) -> bool {
+    rest.is_none()
+        && params
+            .iter()
+            .all(|param| matches!(param, Pattern::Identifier(_)))
+}
+
+fn syntax_error(message: &str) -> ScriptError {
+    ScriptError {
+        offset: 0,
+        message: message.to_string(),
+        name: "SyntaxError".to_string(),
+    }
+}
+
+fn validate_module(items: &[ModuleItem]) -> Result<(), ScriptError> {
+    for item in items {
+        match item {
+            ModuleItem::Statement(stmt) => validate_statement(stmt)?,
+            ModuleItem::Export(ExportDeclaration::Declaration(stmt))
+            | ModuleItem::Export(ExportDeclaration::Default {
+                statement: stmt, ..
+            }) => {
+                validate_statement(stmt)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_statements(stmts: &[Stmt]) -> Result<(), ScriptError> {
+    for stmt in stmts {
+        validate_statement(stmt)?;
+    }
+    Ok(())
+}
+
+fn validate_statement(stmt: &Stmt) -> Result<(), ScriptError> {
+    match stmt {
+        Stmt::Position(_) | Stmt::Empty | Stmt::Debugger | Stmt::Break(_) | Stmt::Continue(_) => {
+            Ok(())
+        }
+        Stmt::Block(stmts) => validate_statements(stmts),
+        Stmt::Expression(expr) | Stmt::Throw(expr) => validate_expression(expr),
+        Stmt::Return(expr) => expr.as_ref().map_or(Ok(()), validate_expression),
+        Stmt::Declaration { declarators, .. } => {
+            for d in declarators {
+                validate_pattern(&d.target)?;
+                if let Some(init) = &d.init {
+                    validate_expression(init)?;
+                }
+            }
+            Ok(())
+        }
+        Stmt::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            validate_expression(test)?;
+            validate_statement(consequent)?;
+            if let Some(alt) = alternate {
+                validate_statement(alt)?;
+            }
+            Ok(())
+        }
+        Stmt::While { test, body } | Stmt::DoWhile { test, body } => {
+            validate_expression(test)?;
+            validate_statement(body)
+        }
+        Stmt::With { object, body } => {
+            validate_expression(object)?;
+            validate_statement(body)
+        }
+        Stmt::Labeled { body, .. } => validate_statement(body),
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            validate_expression(discriminant)?;
+            for case in cases {
+                if let Some(test) = &case.test {
+                    validate_expression(test)?;
+                }
+                validate_statements(&case.body)?;
+            }
+            Ok(())
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            validate_statements(block)?;
+            if let Some(handler) = handler {
+                if let Some(param) = &handler.param {
+                    validate_pattern(param)?;
+                }
+                validate_statements(&handler.body)?;
+            }
+            if let Some(fin) = finalizer {
+                validate_statements(fin)?;
+            }
+            Ok(())
+        }
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            if let Some(init) = init {
+                match init {
+                    ForInit::Declaration { declarators, .. } => {
+                        for d in declarators {
+                            validate_pattern(&d.target)?;
+                            if let Some(init) = &d.init {
+                                validate_expression(init)?;
+                            }
+                        }
+                    }
+                    ForInit::Expression(expr) => validate_expression(expr)?,
+                }
+            }
+            if let Some(test) = test {
+                validate_expression(test)?;
+            }
+            if let Some(update) = update {
+                validate_expression(update)?;
+            }
+            validate_statement(body)
+        }
+        Stmt::ForIn { left, right, body }
+        | Stmt::ForOf {
+            left, right, body, ..
+        } => {
+            match left {
+                ForHead::Declaration { target, .. } | ForHead::Target(target) => {
+                    validate_pattern(target)?;
+                }
+            }
+            validate_expression(right)?;
+            validate_statement(body)
+        }
+        Stmt::Function(function) => validate_function(function),
+        Stmt::Class(class) => validate_class(class),
+    }
+}
+
+fn validate_function(function: &FunctionNode) -> Result<(), ScriptError> {
+    for param in &function.params {
+        validate_pattern(param)?;
+    }
+    if let Some(rest) = &function.rest {
+        validate_pattern(rest)?;
+    }
+    validate_statements(&function.body)
+}
+
+fn validate_class(class: &ClassNode) -> Result<(), ScriptError> {
+    if let Some(superclass) = &class.superclass {
+        validate_expression(superclass)?;
+    }
+    if let Some(ctor) = &class.constructor {
+        validate_function(ctor)?;
+    }
+    for member in &class.members {
+        if let PropertyKey::Computed(key) = &member.key {
+            validate_expression(key)?;
+        }
+        if let Some(func) = &member.function {
+            validate_function(func)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_pattern(pattern: &Pattern) -> Result<(), ScriptError> {
+    match pattern {
+        Pattern::Identifier(_) => Ok(()),
+        Pattern::Expression(expr) => validate_expression(expr),
+        Pattern::Object { properties, rest } => {
+            for (key, value) in properties {
+                if let PropertyKey::Computed(key) = key {
+                    validate_expression(key)?;
+                }
+                validate_pattern(value)?;
+            }
+            if let Some(rest) = rest {
+                validate_pattern(rest)?;
+            }
+            Ok(())
+        }
+        Pattern::Array { elements, rest } => {
+            for elem in elements.iter().flatten() {
+                validate_pattern(elem)?;
+            }
+            if let Some(rest) = rest {
+                validate_pattern(rest)?;
+            }
+            Ok(())
+        }
+        Pattern::Default { target, default } => {
+            validate_pattern(target)?;
+            validate_expression(default)
+        }
+    }
+}
+
+fn validate_expression(expr: &Expr) -> Result<(), ScriptError> {
+    match expr {
+        Expr::Number(_)
+        | Expr::BigInt(_)
+        | Expr::String(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Regex { .. }
+        | Expr::This
+        | Expr::NewTarget
+        | Expr::ImportMeta
+        | Expr::Identifier(_) => Ok(()),
+        Expr::Template { expressions, .. } => {
+            for e in expressions {
+                validate_expression(e)?;
+            }
+            Ok(())
+        }
+        Expr::TaggedTemplate {
+            tag, expressions, ..
+        } => {
+            validate_expression(tag)?;
+            for e in expressions {
+                validate_expression(e)?;
+            }
+            Ok(())
+        }
+        Expr::Array(elements) => {
+            for elem in elements {
+                match elem {
+                    ArrayElement::Hole => {}
+                    ArrayElement::Item(e) | ArrayElement::Spread(e) => validate_expression(e)?,
+                }
+            }
+            Ok(())
+        }
+        Expr::Object(properties) => {
+            let mut proto_count = 0usize;
+            for prop in properties {
+                match prop {
+                    ObjectProperty::CoverInit(..) => {
+                        return Err(syntax_error("invalid shorthand property initializer"));
+                    }
+                    ObjectProperty::Prototype(value) => {
+                        proto_count += 1;
+                        if proto_count > 1 {
+                            return Err(syntax_error(
+                                "duplicate __proto__ fields are not allowed in object literals",
+                            ));
+                        }
+                        validate_expression(value)?;
+                    }
+                    ObjectProperty::Value(key, value) => {
+                        if let PropertyKey::Computed(k) = key {
+                            validate_expression(k)?;
+                        }
+                        validate_expression(value)?;
+                    }
+                    ObjectProperty::Method { key, function, .. } => {
+                        if let PropertyKey::Computed(k) = key {
+                            validate_expression(k)?;
+                        }
+                        validate_function(function)?;
+                    }
+                    ObjectProperty::Spread(value) => validate_expression(value)?,
+                }
+            }
+            Ok(())
+        }
+        Expr::Function(function) => validate_function(function),
+        Expr::Class(class) => validate_class(class),
+        Expr::Member { object, .. }
+        | Expr::PrivateMember { object, .. }
+        | Expr::PrivateIn { object, .. } => validate_expression(object),
+        Expr::Index { object, index, .. } => {
+            validate_expression(object)?;
+            validate_expression(index)
+        }
+        Expr::SuperMember(key) => {
+            if let PropertyKey::Computed(k) = key {
+                validate_expression(k)?;
+            }
+            Ok(())
+        }
+        Expr::Call {
+            callee, arguments, ..
+        }
+        | Expr::New { callee, arguments } => {
+            validate_expression(callee)?;
+            for arg in arguments {
+                match arg {
+                    Argument::Value(e) | Argument::Spread(e) => validate_expression(e)?,
+                }
+            }
+            Ok(())
+        }
+        Expr::SuperCall(arguments) => {
+            for arg in arguments {
+                match arg {
+                    Argument::Value(e) | Argument::Spread(e) => validate_expression(e)?,
+                }
+            }
+            Ok(())
+        }
+        Expr::Unary { argument, .. }
+        | Expr::Await(argument)
+        | Expr::OptionalChain(argument)
+        | Expr::Update {
+            target: argument, ..
+        } => validate_expression(argument),
+        Expr::Yield { argument, .. } => argument.as_deref().map_or(Ok(()), validate_expression),
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            validate_expression(left)?;
+            validate_expression(right)
+        }
+        Expr::Assign { target, value, .. } => {
+            validate_pattern(target)?;
+            validate_expression(value)
+        }
+        Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            validate_expression(test)?;
+            validate_expression(consequent)?;
+            validate_expression(alternate)
+        }
+        Expr::Sequence(items) | Expr::Disposal(_, items) => {
+            for e in items {
+                validate_expression(e)?;
+            }
+            Ok(())
+        }
+        Expr::DynamicImport { specifier, options } => {
+            validate_expression(specifier)?;
+            if let Some(opt) = options {
+                validate_expression(opt)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 pub(super) fn parse_script(source: &str) -> Result<Script, ScriptError> {
     let mut parser = Parser::new(source);
     parser.context.in_function = false;
@@ -3122,5 +3605,24 @@ mod tests {
             .expect("function source");
         assert_eq!(function.params.len(), 2);
         assert_eq!(function.length(), 1);
+    }
+
+    #[test]
+    fn early_errors_match_spec_for_escapes_strict_params_and_literals() {
+        fails("var \\u0069f = 1;");
+        fails("function f(a = 1) { 'use strict'; }");
+        fails("function f(a, a) { 'use strict'; }");
+        fails("const f = (a, a) => a;");
+        fails("({ __proto__: null, __proto__: {} })");
+        fails("({ a = 1 })");
+        fails("if (true) function* g() {}");
+        fails("if (true) async function f() {}");
+        fails("if (true) let [a] = [1];");
+        fails("'use strict'; 010;");
+        fails("'use strict'; '\\1';");
+        fails("0_1");
+        assert!(parse_script("({ a = 1 } = {})").is_ok());
+        assert!(parse_script("({ __proto__: null, ['__proto__']: 1 })").is_ok());
+        assert!(parse_script("if (true) function f() {}").is_ok());
     }
 }

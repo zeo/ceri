@@ -468,6 +468,280 @@ impl ScriptRuntime {
         Ok(callback)
     }
 
+    fn array_like_length(&mut self, value: &Value) -> Result<u64, ScriptError> {
+        let length = self.get_property(value, "length")?;
+        let number = self.coerce_number(length)?;
+        if number.is_nan() || number <= 0.0 {
+            Ok(0)
+        } else if number.is_infinite() {
+            Ok(9_007_199_254_740_991)
+        } else {
+            Ok((number.trunc() as u64).min(9_007_199_254_740_991))
+        }
+    }
+
+    fn is_concat_spreadable(&mut self, value: &Value) -> Result<bool, ScriptError> {
+        if super::operations::is_primitive(value) {
+            return Ok(false);
+        }
+        let spreadable = self.get_property(value, "@@isConcatSpreadable")?;
+        if !matches!(spreadable, Value::Undefined) {
+            return Ok(spreadable.truthy());
+        }
+        self.is_array(value)
+    }
+
+    // collects sorted integer keys in [min..max) on a non-proxy object + prototype chain
+    // returns none if a proxy is present so callers fall back to dense iteration
+    fn sparse_indices(&self, object: &Value, min: u64, max: u64) -> Option<Vec<u64>> {
+        let Value::Object(start) = object else {
+            return None;
+        };
+        let mut indices = Vec::new();
+        let mut current = Some(start.clone());
+        while let Some(obj) = current {
+            let borrowed = obj.borrow();
+            match &borrowed.class {
+                ObjectClass::Proxy(_) => return None,
+                ObjectClass::String(text) => {
+                    let len = super::strings::utf16_length(text) as u64;
+                    let upper = len.min(max);
+                    if min < upper {
+                        indices.extend(min..upper);
+                    }
+                }
+                ObjectClass::ArrayProto(array) => {
+                    let ab = array.borrow();
+                    for (idx, val) in ab.iter().enumerate() {
+                        let k = idx as u64;
+                        if k >= min && k < max && !matches!(val, Value::Uninitialized) {
+                            indices.push(k);
+                        }
+                    }
+                    for (name, _) in ab.properties() {
+                        if let Some(k) = super::object::array_index(name).map(u64::from)
+                            && k >= min
+                            && k < max
+                        {
+                            indices.push(k);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for key in borrowed.ordered_keys() {
+                if let Some(k) = super::object::array_index(&key).map(u64::from) {
+                    if k >= min && k < max {
+                        indices.push(k);
+                    }
+                } else if let Ok(k) = key.parse::<u64>()
+                    && k < 9_007_199_254_740_991
+                    && k.to_string() == key
+                    && k >= min
+                    && k < max
+                {
+                    indices.push(k);
+                }
+            }
+            current = borrowed.prototype_or(&self.intrinsics);
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        Some(indices)
+    }
+
+    fn call_array_callback_generic(
+        &mut self,
+        method: ArrayMethod,
+        this: Value,
+        arguments: &[Value],
+        name: &str,
+    ) -> Result<Value, ScriptError> {
+        use ArrayMethod as M;
+        let object = self.coerce_object(this)?;
+        let length_u64 = self.array_like_length(&object)?;
+        let callback = self.callback(arguments, name)?;
+        if matches!(method, M::Map) && length_u64 > u32::MAX as u64 {
+            return Err(self.range_error("Invalid array length"));
+        }
+        let receiver = argument(arguments, 1);
+        let skip_holes = !matches!(method, M::Find | M::FindIndex);
+        let mut mapped = Vec::new();
+        if skip_holes
+            && length_u64 > 4096
+            && let Some(indices) = self.sparse_indices(&object, 0, length_u64)
+        {
+            if matches!(method, M::Map) {
+                check_length(length_u64 as usize)?;
+                mapped.resize(length_u64 as usize, Value::Uninitialized);
+            }
+            let mut cursor = 0u64;
+            let mut list = indices;
+            let mut pos = 0usize;
+            while pos < list.len() {
+                let index = list[pos];
+                pos += 1;
+                if index < cursor || index >= length_u64 {
+                    continue;
+                }
+                cursor = index + 1;
+                let key = index.to_string();
+                if !self.has_property(&object, &key)? {
+                    continue;
+                }
+                let value = self.get_property(&object, &key)?;
+                let result = self.call_function(
+                    callback.clone(),
+                    receiver.clone(),
+                    vec![value.clone(), Value::Number(index as f64), object.clone()],
+                )?;
+                match method {
+                    M::Map => mapped[index as usize] = result,
+                    M::Filter if result.truthy() => mapped.push(value),
+                    M::Some if result.truthy() => return Ok(Value::Bool(true)),
+                    M::Every if !result.truthy() => return Ok(Value::Bool(false)),
+                    _ => {}
+                }
+                if let Some(updated) = self.sparse_indices(&object, cursor, length_u64) {
+                    list = updated;
+                    pos = 0;
+                }
+            }
+            return Ok(match method {
+                M::Map | M::Filter => self.array_species(&object, mapped, false)?,
+                M::Some => Value::Bool(false),
+                M::Every => Value::Bool(true),
+                M::FindIndex => Value::Number(-1.0),
+                _ => Value::Undefined,
+            });
+        }
+        let length = length_u64.min(MAX_RUNTIME_ARRAY_LENGTH as u64) as usize;
+        for index in 0..length {
+            let key = index.to_string();
+            if skip_holes && !self.has_property(&object, &key)? {
+                if matches!(method, M::Map) {
+                    mapped.push(Value::Uninitialized);
+                }
+                continue;
+            }
+            let value = self.get_property(&object, &key)?;
+            let result = self.call_function(
+                callback.clone(),
+                receiver.clone(),
+                vec![value.clone(), Value::Number(index as f64), object.clone()],
+            )?;
+            match method {
+                M::Map => mapped.push(result),
+                M::Filter if result.truthy() => mapped.push(value),
+                M::Some if result.truthy() => return Ok(Value::Bool(true)),
+                M::Every if !result.truthy() => return Ok(Value::Bool(false)),
+                M::Find if result.truthy() => return Ok(value),
+                M::FindIndex if result.truthy() => return Ok(Value::Number(index as f64)),
+                _ => {}
+            }
+        }
+        Ok(match method {
+            M::Map | M::Filter => self.array_species(&object, mapped, false)?,
+            M::Some => Value::Bool(false),
+            M::Every => Value::Bool(true),
+            M::FindIndex => Value::Number(-1.0),
+            _ => Value::Undefined,
+        })
+    }
+
+    fn call_array_reduce_generic(
+        &mut self,
+        forward: bool,
+        this: Value,
+        arguments: &[Value],
+        name: &str,
+    ) -> Result<Value, ScriptError> {
+        let object = self.coerce_object(this)?;
+        let length_u64 = self.array_like_length(&object)?;
+        let callback = self.callback(arguments, name)?;
+        let mut accumulator = if arguments.len() >= 2 {
+            Some(arguments[1].clone())
+        } else {
+            None
+        };
+        if length_u64 > 4096
+            && let Some(mut indices) = self.sparse_indices(&object, 0, length_u64)
+        {
+            if !forward {
+                indices.reverse();
+            }
+            let mut pos = 0usize;
+            while pos < indices.len() {
+                let index = indices[pos];
+                pos += 1;
+                let key = index.to_string();
+                if !self.has_property(&object, &key)? {
+                    continue;
+                }
+                let value = self.get_property(&object, &key)?;
+                match accumulator.take() {
+                    None => accumulator = Some(value),
+                    Some(acc) => {
+                        let next = self.call_function(
+                            callback.clone(),
+                            Value::Undefined,
+                            vec![acc, value, Value::Number(index as f64), object.clone()],
+                        )?;
+                        accumulator = Some(next);
+                        let range = if forward {
+                            (index + 1, length_u64)
+                        } else {
+                            (0, index)
+                        };
+                        if let Some(mut updated) = self.sparse_indices(&object, range.0, range.1) {
+                            if !forward {
+                                updated.reverse();
+                            }
+                            indices = updated;
+                            pos = 0;
+                        }
+                    }
+                }
+            }
+            return accumulator
+                .ok_or_else(|| self.type_error("Reduce of empty array with no initial value"));
+        }
+        let length = length_u64.min(MAX_RUNTIME_ARRAY_LENGTH as u64) as usize;
+        let mut step = 0usize;
+        while accumulator.is_none() {
+            if step >= length {
+                return Err(self.type_error("Reduce of empty array with no initial value"));
+            }
+            let index = if forward { step } else { length - 1 - step };
+            step += 1;
+            let key = index.to_string();
+            if self.has_property(&object, &key)? {
+                accumulator = Some(self.get_property(&object, &key)?);
+            }
+        }
+        let mut accumulator = accumulator.unwrap_or(Value::Undefined);
+        while step < length {
+            let index = if forward { step } else { length - 1 - step };
+            step += 1;
+            let key = index.to_string();
+            if !self.has_property(&object, &key)? {
+                continue;
+            }
+            let value = self.get_property(&object, &key)?;
+            accumulator = self.call_function(
+                callback.clone(),
+                Value::Undefined,
+                vec![
+                    accumulator,
+                    value,
+                    Value::Number(index as f64),
+                    object.clone(),
+                ],
+            )?;
+        }
+        Ok(accumulator)
+    }
+
     fn integer(&mut self, value: Value, default: f64) -> Result<f64, ScriptError> {
         if matches!(value, Value::Undefined) {
             return Ok(default);
@@ -518,15 +792,16 @@ impl ScriptRuntime {
         }
         match method {
             M::ForEach | M::Map | M::Filter | M::Some | M::Every | M::Find | M::FindIndex => {
+                if !matches!(this, Value::Array(_)) {
+                    return self.call_array_callback_generic(method, this, arguments, name);
+                }
                 let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
                 let (values, object, length) = if let Value::Array(array) = &this {
                     let len = unsafe { heap.array_ref(array) }
                         .map_or_else(|| array.borrow().len(), |a| a.len());
                     (Vec::new(), this.clone(), len)
                 } else {
-                    let (values, object) = self.callback_receiver(&this, name)?;
-                    let len = values.len();
-                    (values, object, len)
+                    unreachable!("checked above")
                 };
                 let callback = self.callback_fast(heap, arguments, name)?;
                 if length == 0 {
@@ -565,9 +840,8 @@ impl ScriptRuntime {
                             match unsafe { (&*heap_ptr).array_ref(array) } {
                                 Some(data) => {
                                     if index >= data.len() {
-                                        break;
-                                    }
-                                    if param_count == 0
+                                        Value::Uninitialized
+                                    } else if param_count == 0
                                         && !keep_value
                                         && !matches!(data.values[index], Value::Uninitialized)
                                     {
@@ -579,9 +853,10 @@ impl ScriptRuntime {
                                 None => {
                                     let borrowed = array.borrow();
                                     if index >= borrowed.len() {
-                                        break;
+                                        Value::Uninitialized
+                                    } else {
+                                        borrowed[index].clone()
                                     }
-                                    borrowed[index].clone()
                                 }
                             }
                         } else {
@@ -655,16 +930,18 @@ impl ScriptRuntime {
                         match unsafe { heap.array_ref(array) } {
                             Some(data) => {
                                 if index >= data.len() {
-                                    break;
+                                    Value::Uninitialized
+                                } else {
+                                    data.values[index].clone()
                                 }
-                                data.values[index].clone()
                             }
                             None => {
                                 let borrowed = array.borrow();
                                 if index >= borrowed.len() {
-                                    break;
+                                    Value::Uninitialized
+                                } else {
+                                    borrowed[index].clone()
                                 }
-                                borrowed[index].clone()
                             }
                         }
                     } else {
@@ -722,15 +999,21 @@ impl ScriptRuntime {
                 })
             }
             M::Reduce | M::ReduceRight => {
+                if !matches!(this, Value::Array(_)) {
+                    return self.call_array_reduce_generic(
+                        matches!(method, M::Reduce),
+                        this,
+                        arguments,
+                        name,
+                    );
+                }
                 let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
                 let (values, object, length) = if let Value::Array(array) = &this {
                     let len = unsafe { heap.array_ref(array) }
                         .map_or_else(|| array.borrow().len(), |a| a.len());
                     (Vec::new(), this.clone(), len)
                 } else {
-                    let (values, object) = self.callback_receiver(&this, name)?;
-                    let len = values.len();
-                    (values, object, len)
+                    unreachable!("checked above")
                 };
                 let callback = self.callback_fast(heap, arguments, name)?;
                 let forward = matches!(method, M::Reduce);
@@ -947,12 +1230,36 @@ impl ScriptRuntime {
             | M::Sort
             | M::ToSorted => unreachable!(),
             M::FindLast | M::FindLastIndex => {
+                if !matches!(this, Value::Array(_)) {
+                    let object = self.coerce_object(this)?;
+                    let length =
+                        self.array_like_length(&object)?
+                            .min(MAX_RUNTIME_ARRAY_LENGTH as u64) as usize;
+                    let callback = self.callback(&arguments, name)?;
+                    let receiver = argument(&arguments, 1);
+                    for index in (0..length).rev() {
+                        let value = self.get_property(&object, &index.to_string())?;
+                        let result = self.call_function(
+                            callback.clone(),
+                            receiver.clone(),
+                            vec![value.clone(), Value::Number(index as f64), object.clone()],
+                        )?;
+                        if result.truthy() {
+                            return Ok(match method {
+                                M::FindLast => value,
+                                _ => Value::Number(index as f64),
+                            });
+                        }
+                    }
+                    return Ok(match method {
+                        M::FindLast => Value::Undefined,
+                        _ => Value::Number(-1.0),
+                    });
+                }
                 let (values, object, length) = if let Value::Array(array) = &this {
                     (Vec::new(), this.clone(), array.borrow().len())
                 } else {
-                    let (values, object) = self.callback_receiver(&this, name)?;
-                    let len = values.len();
-                    (values, object, len)
+                    unreachable!("checked above")
                 };
                 let callback = self.callback(&arguments, name)?;
                 let receiver = argument(&arguments, 1);
@@ -978,6 +1285,105 @@ impl ScriptRuntime {
                 })
             }
             M::Includes | M::IndexOf | M::LastIndexOf => {
+                if !matches!(this, Value::Array(_)) {
+                    let object = self.coerce_object(this)?;
+                    let length_u64 = self.array_like_length(&object)?;
+                    if length_u64 == 0 {
+                        return Ok(match method {
+                            M::Includes => Value::Bool(false),
+                            _ => Value::Number(-1.0),
+                        });
+                    }
+                    let target = argument(&arguments, 0);
+                    if matches!(method, M::LastIndexOf) {
+                        let start = if arguments.len() >= 2 {
+                            let from = self.integer(arguments[1].clone(), 0.0)?;
+                            if from < 0.0 {
+                                length_u64 as f64 + from
+                            } else {
+                                from.min(length_u64 as f64 - 1.0)
+                            }
+                        } else {
+                            length_u64 as f64 - 1.0
+                        };
+                        if start < 0.0 {
+                            return Ok(Value::Number(-1.0));
+                        }
+                        let start_u64 = start as u64;
+                        if start_u64 > 4096
+                            && let Some(mut indices) =
+                                self.sparse_indices(&object, 0, start_u64 + 1)
+                        {
+                            indices.reverse();
+                            for index in indices {
+                                let key = index.to_string();
+                                if self.has_property(&object, &key)? {
+                                    let value = self.get_property(&object, &key)?;
+                                    if strict_equals(&value, &target) {
+                                        return Ok(Value::Number(index as f64));
+                                    }
+                                }
+                            }
+                            return Ok(Value::Number(-1.0));
+                        }
+                        let start_usize = start_u64.min(MAX_RUNTIME_ARRAY_LENGTH as u64) as usize;
+                        for index in (0..=start_usize).rev() {
+                            let key = index.to_string();
+                            if self.has_property(&object, &key)? {
+                                let value = self.get_property(&object, &key)?;
+                                if strict_equals(&value, &target) {
+                                    return Ok(Value::Number(index as f64));
+                                }
+                            }
+                        }
+                        return Ok(Value::Number(-1.0));
+                    }
+                    let from = self.integer(argument(&arguments, 1), 0.0)?;
+                    let start_f = if from < 0.0 {
+                        (length_u64 as f64 + from).max(0.0)
+                    } else {
+                        from.min(length_u64 as f64)
+                    };
+                    let start_u64 = start_f as u64;
+                    if !matches!(method, M::Includes)
+                        && length_u64.saturating_sub(start_u64) > 4096
+                        && let Some(indices) = self.sparse_indices(&object, start_u64, length_u64)
+                    {
+                        for index in indices {
+                            let key = index.to_string();
+                            if self.has_property(&object, &key)? {
+                                let value = self.get_property(&object, &key)?;
+                                if strict_equals(&value, &target) {
+                                    return Ok(Value::Number(index as f64));
+                                }
+                            }
+                        }
+                        return Ok(Value::Number(-1.0));
+                    }
+                    let length = length_u64.min(MAX_RUNTIME_ARRAY_LENGTH as u64) as usize;
+                    let start = start_u64.min(length as u64) as usize;
+                    for index in start..length {
+                        let key = index.to_string();
+                        if !matches!(method, M::Includes) && !self.has_property(&object, &key)? {
+                            continue;
+                        }
+                        let value = self.get_property(&object, &key)?;
+                        let found = match method {
+                            M::Includes => same_value_zero(&value, &target),
+                            _ => strict_equals(&value, &target),
+                        };
+                        if found {
+                            return Ok(match method {
+                                M::Includes => Value::Bool(true),
+                                _ => Value::Number(index as f64),
+                            });
+                        }
+                    }
+                    return Ok(match method {
+                        M::Includes => Value::Bool(false),
+                        _ => Value::Number(-1.0),
+                    });
+                }
                 let mut values = self.receiver_values(&this, name)?;
                 // an index nothing was put at is searched as what a prototype has there
                 for (index, value) in values.iter_mut().enumerate() {
@@ -1052,6 +1458,16 @@ impl ScriptRuntime {
                 }
             }
             M::At => {
+                if !matches!(this, Value::Array(_)) {
+                    let object = self.coerce_object(this)?;
+                    let length = self.array_like_length(&object)? as f64;
+                    let index = self.integer(argument(&arguments, 0), 0.0)?;
+                    let k = if index < 0.0 { length + index } else { index };
+                    if k < 0.0 || k >= length {
+                        return Ok(Value::Undefined);
+                    }
+                    return self.get_property(&object, &(k as u64).to_string());
+                }
                 let values = self.receiver_values(&this, name)?;
                 let index = self.integer(argument(&arguments, 0), 0.0)?;
                 let index = if index < 0.0 {
@@ -1065,17 +1481,110 @@ impl ScriptRuntime {
                 Ok(values[index as usize].clone().filled())
             }
             M::Concat => {
-                let mut result = self.receiver_values(&this, name)?;
-                for value in arguments {
-                    match value {
-                        Value::Array(array) => result.extend(array.borrow().iter().cloned()),
-                        value => result.push(value),
+                let object = self.coerce_object(this)?;
+                let mut result = Vec::new();
+                let mut items = Vec::with_capacity(arguments.len() + 1);
+                items.push(object.clone());
+                items.extend(arguments);
+                for item in items {
+                    if self.is_concat_spreadable(&item)? {
+                        if let Value::Array(array) = &item
+                            && array.borrow().properties().is_empty()
+                        {
+                            let len = array.borrow().len();
+                            check_length(result.len().saturating_add(len))?;
+                            for index in 0..len {
+                                let value = array.borrow()[index].clone();
+                                if matches!(value, Value::Uninitialized)
+                                    && self.holds(&item, &index.to_string())
+                                {
+                                    result
+                                        .push(self.get_index(&item, Value::Number(index as f64))?);
+                                } else {
+                                    result.push(value);
+                                }
+                            }
+                        } else if let Value::TypedArray(array) = &item {
+                            let len_u64 = self.array_like_length(&item)?;
+                            if (result.len() as u64).saturating_add(len_u64) > 9_007_199_254_740_991
+                            {
+                                return Err(self.type_error("Array length exceeded"));
+                            }
+                            let len = len_u64.min(MAX_RUNTIME_ARRAY_LENGTH as u64) as usize;
+                            check_length(result.len().saturating_add(len))?;
+                            let borrowed = array.borrow();
+                            let count = super::typed::element_count(&borrowed);
+                            let present = len.min(count);
+                            for index in 0..present {
+                                result.push(
+                                    super::typed::read_element(&borrowed, index)
+                                        .unwrap_or(Value::Undefined),
+                                );
+                            }
+                            drop(borrowed);
+                            for index in present..len {
+                                let key = index.to_string();
+                                if self.has_property(&item, &key)? {
+                                    result.push(self.get_property(&item, &key)?);
+                                } else {
+                                    result.push(Value::Uninitialized);
+                                }
+                            }
+                        } else {
+                            let len = self.array_like_length(&item)?;
+                            if (result.len() as u64).saturating_add(len) > 9_007_199_254_740_991 {
+                                return Err(self.type_error("Array length exceeded"));
+                            }
+                            let len = len.min(MAX_RUNTIME_ARRAY_LENGTH as u64) as usize;
+                            check_length(result.len().saturating_add(len))?;
+                            for index in 0..len {
+                                let key = index.to_string();
+                                if self.has_property(&item, &key)? {
+                                    result.push(self.get_property(&item, &key)?);
+                                } else {
+                                    result.push(Value::Uninitialized);
+                                }
+                            }
+                        }
+                    } else {
+                        check_length(result.len().saturating_add(1))?;
+                        result.push(item);
                     }
-                    check_length(result.len())?;
                 }
-                self.array_species(&this, result, true)
+                self.array_species(&object, result, true)
             }
             M::Slice => {
+                if !matches!(this, Value::Array(_)) {
+                    let object = self.coerce_object(this)?;
+                    let length_u64 = self.array_like_length(&object)?;
+                    let length = length_u64.min(MAX_RUNTIME_ARRAY_LENGTH as u64) as usize;
+                    let start = self.integer(argument(&arguments, 0), 0.0)?;
+                    let end = self.integer(argument(&arguments, 1), length as f64)?;
+                    let start = relative(start, length);
+                    let end = relative(end, length);
+                    let count = end.saturating_sub(start);
+                    check_length(count)?;
+                    let mut picked = Vec::with_capacity(count);
+                    if let Value::TypedArray(array) = &object {
+                        let borrowed = array.borrow();
+                        for index in start..end {
+                            picked.push(
+                                super::typed::read_element(&borrowed, index)
+                                    .unwrap_or(Value::Uninitialized),
+                            );
+                        }
+                    } else {
+                        for index in start..end {
+                            let key = index.to_string();
+                            if self.has_property(&object, &key)? {
+                                picked.push(self.get_property(&object, &key)?);
+                            } else {
+                                picked.push(Value::Uninitialized);
+                            }
+                        }
+                    }
+                    return self.array_species(&object, picked, true);
+                }
                 let values = self.receiver_values(&this, name)?;
                 let length = values.len();
                 let start = self.integer(argument(&arguments, 0), 0.0)?;
@@ -1594,6 +2103,51 @@ mod tests {
                 "true|true|6|true|true|false|false|TypeError|TypeError|TypeError|TypeError|1,2|7|\
                  TypeError|TypeError|TypeError|5,2|2|true|false|hi|false|true|12|2|true|false|true|TypeError|20|30|10,20|0,1|true|2|TypeError|TypeError"
             )
+        );
+    }
+
+    #[test]
+    fn array_prototypes_length_and_generic_methods_follow_spec() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [];
+                const proto = [10, 20];
+                proto.tag = "p";
+                const child = Object.create(proto);
+                seen.push(Object.getPrototypeOf(child) === proto, child[1], child.tag, proto.isPrototypeOf(child));
+                const keys = [];
+                for (const k in proto) keys.push(k);
+                seen.push(keys.join());
+                const arr = [1, 2, 3];
+                Object.defineProperty(arr, 1, { configurable: false });
+                try { arr.length = -1; } catch (e) { seen.push(e.name); }
+                arr.length = 0;
+                seen.push(arr.length, arr[1]);
+                const target = {};
+                try {
+                    Object.defineProperties(target, { a: { value: 1 }, b: 42 });
+                } catch (e) {
+                    seen.push(e.name, "a" in target);
+                }
+                const like = { length: 2, 0: "x", 1: "y" };
+                const mapped = Array.prototype.map.call(like, (v, i, o) => {
+                    if (i === 0) o[1] = "z";
+                    return v + i;
+                });
+                seen.push(mapped.join());
+                document.getElementById("out").textContent = seen.join("|");
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some("true|20|p|true|0,1,tag|RangeError|2|2|TypeError|false|x0,z1")
         );
     }
 }

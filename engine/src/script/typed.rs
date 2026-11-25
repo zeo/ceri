@@ -468,6 +468,66 @@ impl ScriptRuntime {
         Ok(Rc::new(RefCell::new(vec![0; bytes].into())))
     }
 
+    fn species_constructor(
+        &mut self,
+        object: &Value,
+        default: super::object::ObjectHandle,
+    ) -> Result<Value, ScriptError> {
+        let constructor = self.get_property(object, "constructor")?;
+        if matches!(constructor, Value::Undefined) {
+            return Ok(Value::Object(default));
+        }
+        if super::operations::is_primitive(&constructor) {
+            return Err(self.type_error("constructor property is not an object"));
+        }
+        let species = self.get_property(&constructor, "@@species")?;
+        if matches!(species, Value::Undefined | Value::Null) {
+            return Ok(Value::Object(default));
+        }
+        if !Self::is_constructor(&species) {
+            return Err(self.type_error("Symbol.species is not a constructor"));
+        }
+        Ok(species)
+    }
+
+    fn typed_array_create(
+        &mut self,
+        constructor: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, ScriptError> {
+        let made = self.construct(constructor, arguments.clone(), None)?;
+        let ta = self.valid_typed(&made)?;
+        if arguments.len() == 1
+            && let Value::Number(expected) = arguments[0]
+            && (element_count(&ta.borrow()) as f64) < expected
+        {
+            return Err(self.type_error("Derived TypedArray constructor created too small array"));
+        }
+        Ok(made)
+    }
+
+    fn typed_array_species_create(
+        &mut self,
+        exemplar: &Value,
+        kind: ElementKind,
+        arguments: Vec<Value>,
+    ) -> Result<Value, ScriptError> {
+        let index = ELEMENT_KINDS
+            .iter()
+            .position(|(candidate, _)| *candidate == kind)
+            .unwrap_or(0);
+        let default = self.intrinsics.typed_constructors[index].clone();
+        let constructor = self.species_constructor(exemplar, default)?;
+        let made = self.typed_array_create(constructor, arguments)?;
+        if let Value::TypedArray(ta) = &made
+            && ta.borrow().kind.is_bigint() != kind.is_bigint()
+        {
+            return Err(self
+                .type_error("Derived TypedArray constructor returned incompatible content type"));
+        }
+        Ok(made)
+    }
+
     // a typed array of a kind filled from a list of numbers
     fn typed_from_values(
         &mut self,
@@ -699,21 +759,17 @@ impl ScriptRuntime {
                 };
                 let begin = relative(if begin.is_nan() { 0.0 } else { begin }, count);
                 let end = relative(if end.is_nan() { 0.0 } else { end }, count).max(begin);
-                let start = start + begin * kind.size();
-                if follows {
-                    if start > buffer.borrow().len() {
-                        return Err(
-                            self.range_error("Start offset is outside the bounds of the buffer")
-                        );
-                    }
-                } else if start + (end - begin) * kind.size() > buffer.borrow().len() {
-                    return Err(self.range_error("Invalid typed array length"));
-                }
-                let view = new_typed(kind, buffer, start, start + (end - begin) * kind.size());
-                if let (true, Value::TypedArray(view)) = (follows, &view) {
-                    view.borrow_mut().tracking = true;
-                }
-                Ok(view)
+                let byte_offset = start + begin * kind.size();
+                let args = if follows {
+                    vec![Value::Bytes(buffer), Value::Number(byte_offset as f64)]
+                } else {
+                    vec![
+                        Value::Bytes(buffer),
+                        Value::Number(byte_offset as f64),
+                        Value::Number((end - begin) as f64),
+                    ]
+                };
+                self.typed_array_species_create(&this, kind, args)
             }
             M::Values | M::Keys | M::Entries => {
                 self.valid_typed(&this)?;
@@ -735,27 +791,224 @@ impl ScriptRuntime {
             }
             M::Read(array_method) => {
                 let array = self.valid_typed(&this)?;
-                let copy = Self::new_array(elements(&array.borrow()));
-                self.call_array_method(array_method, copy, arguments)
+                let len = element_count(&array.borrow());
+                match array_method {
+                    ArrayMethod::ForEach
+                    | ArrayMethod::Every
+                    | ArrayMethod::Some
+                    | ArrayMethod::Find
+                    | ArrayMethod::FindIndex => {
+                        let callback = argument(&arguments, 0);
+                        if !is_callable(&callback) {
+                            return Err(self.type_error("TypedArray callback is not a function"));
+                        }
+                        let this_arg = argument(&arguments, 1);
+                        for index in 0..len {
+                            let value =
+                                read_element(&array.borrow(), index).unwrap_or(Value::Undefined);
+                            let result = self.call_function(
+                                callback.clone(),
+                                this_arg.clone(),
+                                vec![value.clone(), Value::Number(index as f64), this.clone()],
+                            )?;
+                            match array_method {
+                                ArrayMethod::Every if !result.truthy() => {
+                                    return Ok(Value::Bool(false));
+                                }
+                                ArrayMethod::Some if result.truthy() => {
+                                    return Ok(Value::Bool(true));
+                                }
+                                ArrayMethod::Find if result.truthy() => return Ok(value),
+                                ArrayMethod::FindIndex if result.truthy() => {
+                                    return Ok(Value::Number(index as f64));
+                                }
+                                _ => {}
+                            }
+                        }
+                        Ok(match array_method {
+                            ArrayMethod::Every => Value::Bool(true),
+                            ArrayMethod::Some => Value::Bool(false),
+                            ArrayMethod::FindIndex => Value::Number(-1.0),
+                            _ => Value::Undefined,
+                        })
+                    }
+                    ArrayMethod::FindLast | ArrayMethod::FindLastIndex => {
+                        let callback = argument(&arguments, 0);
+                        if !is_callable(&callback) {
+                            return Err(self.type_error("TypedArray callback is not a function"));
+                        }
+                        let this_arg = argument(&arguments, 1);
+                        for index in (0..len).rev() {
+                            let value =
+                                read_element(&array.borrow(), index).unwrap_or(Value::Undefined);
+                            let result = self.call_function(
+                                callback.clone(),
+                                this_arg.clone(),
+                                vec![value.clone(), Value::Number(index as f64), this.clone()],
+                            )?;
+                            if result.truthy() {
+                                return Ok(match array_method {
+                                    ArrayMethod::FindLast => value,
+                                    _ => Value::Number(index as f64),
+                                });
+                            }
+                        }
+                        Ok(match array_method {
+                            ArrayMethod::FindLast => Value::Undefined,
+                            _ => Value::Number(-1.0),
+                        })
+                    }
+                    ArrayMethod::Reduce | ArrayMethod::ReduceRight => {
+                        let callback = argument(&arguments, 0);
+                        if !is_callable(&callback) {
+                            return Err(self.type_error("TypedArray callback is not a function"));
+                        }
+                        let forward = matches!(array_method, ArrayMethod::Reduce);
+                        let mut step = 0usize;
+                        let mut accumulator = if arguments.len() >= 2 {
+                            arguments[1].clone()
+                        } else {
+                            if len == 0 {
+                                return Err(
+                                    self.type_error("Reduce of empty array with no initial value")
+                                );
+                            }
+                            let first_idx = if forward { 0 } else { len - 1 };
+                            step = 1;
+                            read_element(&array.borrow(), first_idx).unwrap_or(Value::Undefined)
+                        };
+                        while step < len {
+                            let index = if forward { step } else { len - 1 - step };
+                            step += 1;
+                            let value =
+                                read_element(&array.borrow(), index).unwrap_or(Value::Undefined);
+                            accumulator = self.call_function(
+                                callback.clone(),
+                                Value::Undefined,
+                                vec![
+                                    accumulator,
+                                    value,
+                                    Value::Number(index as f64),
+                                    this.clone(),
+                                ],
+                            )?;
+                        }
+                        Ok(accumulator)
+                    }
+                    _ => {
+                        let copy = Self::new_array(elements(&array.borrow()));
+                        self.call_array_method(array_method, copy, arguments)
+                    }
+                }
             }
             M::Derive(array_method) => {
                 let array = self.valid_typed(&this)?;
                 let kind = array.borrow().kind;
-                let copy = Self::new_array(elements(&array.borrow()));
-                // numbers sort numerically in typed arrays
-                let arguments = if matches!(array_method, ArrayMethod::ToSorted)
-                    && matches!(first, Value::Undefined)
-                {
-                    vec![self.numeric_comparator()]
-                } else {
-                    arguments
-                };
-                let result = self.call_array_method(array_method, copy, arguments)?;
-                let values = match result {
-                    Value::Array(values) => values.borrow().to_vec(),
-                    other => vec![other],
-                };
-                self.typed_from_values(kind, values)
+                match array_method {
+                    ArrayMethod::Filter => {
+                        let len = element_count(&array.borrow());
+                        let callback = argument(&arguments, 0);
+                        if !is_callable(&callback) {
+                            return Err(self.type_error("TypedArray callback is not a function"));
+                        }
+                        let this_arg = argument(&arguments, 1);
+                        let mut kept = Vec::new();
+                        for index in 0..len {
+                            let value =
+                                read_element(&array.borrow(), index).unwrap_or(Value::Undefined);
+                            let selected = self
+                                .call_function(
+                                    callback.clone(),
+                                    this_arg.clone(),
+                                    vec![value.clone(), Value::Number(index as f64), this.clone()],
+                                )?
+                                .truthy();
+                            if selected {
+                                kept.push(value);
+                            }
+                        }
+                        let result = self.typed_array_species_create(
+                            &this,
+                            kind,
+                            vec![Value::Number(kept.len() as f64)],
+                        )?;
+                        for (index, value) in kept.into_iter().enumerate() {
+                            self.set_index(&result, Value::Number(index as f64), value, true)?;
+                        }
+                        Ok(result)
+                    }
+                    ArrayMethod::Map => {
+                        let len = element_count(&array.borrow());
+                        let callback = argument(&arguments, 0);
+                        if !is_callable(&callback) {
+                            return Err(self.type_error("TypedArray callback is not a function"));
+                        }
+                        let this_arg = argument(&arguments, 1);
+                        let result = self.typed_array_species_create(
+                            &this,
+                            kind,
+                            vec![Value::Number(len as f64)],
+                        )?;
+                        for index in 0..len {
+                            let value =
+                                read_element(&array.borrow(), index).unwrap_or(Value::Undefined);
+                            let mapped = self.call_function(
+                                callback.clone(),
+                                this_arg.clone(),
+                                vec![value, Value::Number(index as f64), this.clone()],
+                            )?;
+                            self.set_index(&result, Value::Number(index as f64), mapped, true)?;
+                        }
+                        Ok(result)
+                    }
+                    ArrayMethod::Slice => {
+                        let len = element_count(&array.borrow());
+                        let start = match first {
+                            Value::Undefined => 0.0,
+                            value => self.coerce_number(value)?.trunc(),
+                        };
+                        let end = match argument(&arguments, 1) {
+                            Value::Undefined => len as f64,
+                            value => self.coerce_number(value)?.trunc(),
+                        };
+                        let start = relative(if start.is_nan() { 0.0 } else { start }, len);
+                        let end = relative(if end.is_nan() { 0.0 } else { end }, len);
+                        let count = end.saturating_sub(start);
+                        let result = self.typed_array_species_create(
+                            &this,
+                            kind,
+                            vec![Value::Number(count as f64)],
+                        )?;
+                        if count > 0 {
+                            self.valid_typed(&this)?;
+                            let current_len = element_count(&array.borrow());
+                            let copy_end = end.min(current_len);
+                            for offset in 0..copy_end.saturating_sub(start) {
+                                let value = read_element(&array.borrow(), start + offset)
+                                    .unwrap_or(Value::Undefined);
+                                self.set_index(&result, Value::Number(offset as f64), value, true)?;
+                            }
+                        }
+                        Ok(result)
+                    }
+                    _ => {
+                        let copy = Self::new_array(elements(&array.borrow()));
+                        // numbers sort numerically in typed arrays
+                        let arguments = if matches!(array_method, ArrayMethod::ToSorted)
+                            && matches!(first, Value::Undefined)
+                        {
+                            vec![self.numeric_comparator()]
+                        } else {
+                            arguments
+                        };
+                        let result = self.call_array_method(array_method, copy, arguments)?;
+                        let values = match result {
+                            Value::Array(values) => values.borrow().to_vec(),
+                            other => vec![other],
+                        };
+                        self.typed_from_values(kind, values)
+                    }
+                }
             }
             M::Mutate(array_method) => {
                 let array = self.valid_typed(&this)?;
@@ -904,9 +1157,35 @@ impl ScriptRuntime {
                 };
                 let start = relative(if start.is_nan() { 0.0 } else { start }, length);
                 let end = relative(if end.is_nan() { 0.0 } else { end }, length).max(start);
-                let end = end.min(bytes.borrow().len());
-                let copy = bytes.borrow().get(start..end).unwrap_or_default().to_vec();
-                Ok(Value::Bytes(Rc::new(RefCell::new(copy.into()))))
+                let new_len = end - start;
+                let ctor = self
+                    .species_constructor(&this, self.intrinsics.array_buffer_constructor.clone())?;
+                let made = self.construct(ctor, vec![Value::Number(new_len as f64)], None)?;
+                let Value::Bytes(new_bytes) = &made else {
+                    return Err(
+                        self.type_error("ArrayBuffer species did not return an ArrayBuffer")
+                    );
+                };
+                if new_bytes.borrow().detached {
+                    return Err(self.type_error("ArrayBuffer species returned a detached buffer"));
+                }
+                if Rc::ptr_eq(new_bytes, bytes) {
+                    return Err(self.type_error("ArrayBuffer species returned the same buffer"));
+                }
+                if new_bytes.borrow().len() < new_len {
+                    return Err(self.type_error("ArrayBuffer species returned too small buffer"));
+                }
+                if bytes.borrow().detached {
+                    return Err(self.type_error("Cannot slice a detached ArrayBuffer"));
+                }
+                let src = bytes.borrow();
+                let copy_end = end.min(src.len());
+                let copy_len = copy_end.saturating_sub(start);
+                if copy_len > 0 {
+                    new_bytes.borrow_mut()[..copy_len]
+                        .copy_from_slice(&src[start..start + copy_len]);
+                }
+                Ok(made)
             }
             M::ViewConstructor => {
                 if new_target.is_none() {
@@ -1156,6 +1435,41 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(out).as_deref(),
             Some("kept|42|true|6||0,1,label|false|false|21|TypeError")
+        );
+    }
+
+    #[test]
+    fn typed_arrays_and_buffers_follow_species_expandos_and_live_callbacks() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [];
+                class MyBuf extends ArrayBuffer {}
+                const mb = new MyBuf(8);
+                mb.tag = "ok";
+                seen.push(mb instanceof MyBuf, mb.tag, mb.slice(0, 4) instanceof MyBuf);
+                seen.push(ArrayBuffer.prototype.transfer.length, ArrayBuffer.prototype.transferToFixedLength.length);
+                const ta = new Uint8Array([1, 2, 3, 4]);
+                ta.constructor = { [Symbol.species]: Uint16Array };
+                const mapped = ta.map(function (v, i, arr) {
+                    if (i === 0) arr[1] = 20;
+                    return v + 1;
+                });
+                seen.push(mapped instanceof Uint16Array, mapped.join(), ta.slice(1) instanceof Uint16Array);
+                const sub = ta.subarray(2, 3);
+                seen.push(sub instanceof Uint16Array, sub.length);
+                document.getElementById("out").textContent = seen.join("|");
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some("true|ok|true|0|0|true|2,21,4,5|true|true|1")
         );
     }
 }

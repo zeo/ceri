@@ -1854,6 +1854,7 @@ impl Tracer {
             | ObjectClass::Sheet(_)
             | ObjectClass::Segmenter(_)
             | ObjectClass::TypedArray(_) => {}
+            ObjectClass::ArrayProto(array) => self.mark_array(array.clone()),
             ObjectClass::Function(closure) => self.trace_closure(closure),
             ObjectClass::Bound(bound) => {
                 self.trace_value(&bound.target);
@@ -2021,6 +2022,17 @@ impl ScriptRuntime {
         heap.arrays.push_pinned(&mut tracer.arrays);
         heap.scopes.push_pinned(&mut tracer.scopes);
         self.trace_roots(&mut tracer);
+        {
+            let mut buffer_objects = self.intrinsics.buffer_objects.borrow_mut();
+            buffer_objects.retain(|_, (weak, object)| {
+                if weak.strong_count() > 0 {
+                    tracer.mark_object(object.clone());
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         tracer.drain();
         tracer.ephemeron_fixpoint();
         let weak_maps = std::mem::take(&mut tracer.weak_maps);

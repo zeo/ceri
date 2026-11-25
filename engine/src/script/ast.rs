@@ -226,6 +226,8 @@ pub(super) enum ObjectProperty {
     Spread(Expr),
     // "__proto__: value" sets the prototype of the new object
     Prototype(Expr),
+    // shorthand "{ a = expr }", valid only when converted to a destructuring pattern
+    CoverInit(Name, Expr),
 }
 
 #[derive(Clone, Debug, PartialEq)]

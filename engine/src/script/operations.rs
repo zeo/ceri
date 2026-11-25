@@ -931,17 +931,129 @@ impl ScriptRuntime {
         if is_primitive(value) {
             return Ok(false);
         }
-        let Value::Object(prototype) = self.get_property(constructor, "prototype")? else {
-            return Err(self.type_error("Function has non-object prototype in instanceof check"));
+        let target_proto = match self.get_property(constructor, "prototype")? {
+            Value::Object(prototype) => prototype,
+            Value::Array(array) => self.array_prototype_wrapper(&array),
+            _ => {
+                return Err(
+                    self.type_error("Function has non-object prototype in instanceof check")
+                );
+            }
         };
         let mut current = self.prototype_of_value(value)?;
         while let Some(object) = current {
-            if ObjectHandle::ptr_eq(&object, &prototype) {
+            if Self::prototypes_equal(&object, &target_proto) {
                 return Ok(true);
             }
             current = self.prototype_of_value(&Value::Object(object))?;
         }
         Ok(false)
+    }
+
+    pub(super) fn array_prototype_wrapper(&self, array: &ArrayHandle) -> ObjectHandle {
+        new_object(JsObject::with_prototype(
+            None,
+            ObjectClass::ArrayProto(array.clone()),
+        ))
+    }
+
+    pub(super) fn prototype_value(prototype: Option<ObjectHandle>) -> Value {
+        let Some(object) = prototype else {
+            return Value::Null;
+        };
+        let array = match &object.borrow().class {
+            ObjectClass::ArrayProto(array) => Some(array.clone()),
+            _ => None,
+        };
+        match array {
+            Some(array) => Value::Array(array),
+            None => Value::Object(object),
+        }
+    }
+
+    pub(super) fn prototypes_equal(a: &ObjectHandle, b: &ObjectHandle) -> bool {
+        if ObjectHandle::ptr_eq(a, b) {
+            return true;
+        }
+        matches!(
+            (&a.borrow().class, &b.borrow().class),
+            (ObjectClass::ArrayProto(x), ObjectClass::ArrayProto(y)) if ArrayHandle::ptr_eq(x, y)
+        )
+    }
+
+    pub(super) fn parse_array_length(&mut self, value: Value) -> Result<u32, ScriptError> {
+        let uint_len = to_uint32_number(self.coerce_number(value.clone())?);
+        let number_len = self.coerce_number(value)?;
+        if !same_value_zero(
+            &Value::Number(f64::from(uint_len)),
+            &Value::Number(number_len),
+        ) {
+            return Err(self.range_error("Invalid array length"));
+        }
+        Ok(uint_len)
+    }
+
+    // returns false if refused by read-only length or non-configurable element
+    pub(super) fn apply_array_length(
+        &mut self,
+        array: &ArrayHandle,
+        wanted: u32,
+        new_writable: Option<bool>,
+    ) -> Result<bool, ScriptError> {
+        let (old_len, integrity, fixed) = {
+            let borrowed = array.borrow();
+            (
+                borrowed.len(),
+                borrowed.integrity(),
+                borrowed.fixed_length(),
+            )
+        };
+        let writable = !fixed && integrity != super::Integrity::Frozen;
+        if !writable {
+            return Ok(new_writable != Some(true) && (wanted as usize) == old_len);
+        }
+        let wanted = wanted as usize;
+        if wanted > MAX_RUNTIME_ARRAY_LENGTH {
+            return Err(self.range_error("Invalid array length"));
+        }
+        let make_readonly = new_writable == Some(false);
+        if wanted >= old_len {
+            let mut borrowed = array.borrow_mut();
+            borrowed.resize(wanted, Value::Uninitialized);
+            if make_readonly {
+                borrowed.extra_mut().fixed_length = true;
+            }
+            return Ok(true);
+        }
+        let mut borrowed = array.borrow_mut();
+        let mut kept: Option<usize> = borrowed
+            .properties()
+            .iter()
+            .filter(|(name, property)| {
+                (!property.configurable || integrity >= super::Integrity::Sealed)
+                    && array_index(name).is_some_and(|index| index as usize >= wanted)
+            })
+            .filter_map(|(name, _)| array_index(name).map(|index| index as usize))
+            .max();
+        if integrity >= super::Integrity::Sealed {
+            for index in (wanted..old_len).rev() {
+                if !matches!(borrowed[index], Value::Uninitialized) {
+                    kept = Some(kept.map_or(index, |prev| prev.max(index)));
+                    break;
+                }
+            }
+        }
+        let final_len = kept.map_or(wanted, |index| index + 1);
+        if let Some(extra) = borrowed.extra.as_mut() {
+            extra.properties.retain(|(name, _)| {
+                array_index(name).is_none_or(|index| (index as usize) < final_len)
+            });
+        }
+        borrowed.resize(final_len, Value::Uninitialized);
+        if make_readonly {
+            borrowed.extra_mut().fixed_length = true;
+        }
+        Ok(kept.is_none())
     }
 
     // [[GetPrototypeOf]], consulting a proxy's trap
@@ -1009,7 +1121,10 @@ impl ScriptRuntime {
                     .unwrap_or(0);
                 intrinsics.typed_prototypes[index].clone()
             }
-            Value::Bytes(_) => intrinsics.array_buffer_prototype.clone(),
+            Value::Bytes(bytes) => match self.existing_buffer_object(bytes) {
+                Some(object) => return object.borrow().prototype_or(&self.intrinsics),
+                None => intrinsics.array_buffer_prototype.clone(),
+            },
             Value::Navigator => intrinsics.hosts["Navigator"].clone(),
             Value::History(_) => intrinsics.hosts["History"].clone(),
             Value::FileList(_) => intrinsics.hosts["FileList"].clone(),
@@ -1032,6 +1147,12 @@ impl ScriptRuntime {
                 let object = self
                     .wrapper_object(value)
                     .expect("nodes and events have wrappers");
+                self.ordinary_get(object, key, value)
+            }
+            Value::Bytes(bytes) => {
+                let object = self
+                    .existing_buffer_object(bytes)
+                    .unwrap_or_else(|| self.intrinsics.array_buffer_prototype.clone());
                 self.ordinary_get(object, key, value)
             }
             Value::Undefined | Value::Null | Value::Uninitialized => Err(self.type_error(format!(
@@ -1154,6 +1275,12 @@ impl ScriptRuntime {
                     .expect("nodes and events have wrappers");
                 self.ordinary_get_tail(object, key, value)
             }
+            Value::Bytes(bytes) => {
+                let object = self
+                    .existing_buffer_object(bytes)
+                    .unwrap_or_else(|| self.intrinsics.array_buffer_prototype.clone());
+                self.ordinary_get_tail(object, key, value)
+            }
             Value::Binding(cell) | Value::ConstBinding(cell) => {
                 let inner = cell.borrow().clone();
                 self.get_property_tail(&inner, key)
@@ -1211,20 +1338,45 @@ impl ScriptRuntime {
             }
             let found = {
                 let borrowed = current.borrow();
-                match borrowed.property(key) {
-                    Some(property) => match property.slot {
-                        Slot::Data(value) => Found::Data(value.resolve()),
-                        Slot::Accessor(accessors) => Found::Getter(accessors.get.clone()),
-                    },
-                    None => match exotic_own(&borrowed, key) {
-                        Some(value) => Found::Data(value),
-                        None => Found::Next(borrowed.prototype_or(&self.intrinsics)),
-                    },
+                if let ObjectClass::ArrayProto(array) = &borrowed.class {
+                    let array_borrowed = array.borrow();
+                    if let Some(property) = array_borrowed.own(key) {
+                        match &property.slot {
+                            Slot::Data(value) => Found::Data(value.resolve()),
+                            Slot::Accessor(accessors) => Found::Getter(accessors.get.clone()),
+                        }
+                    } else if key == "length" {
+                        Found::Data(Value::Number(array_borrowed.len() as f64))
+                    } else if let Some(index) = array_index(key)
+                        && let Some(value) = array_borrowed.get(index as usize)
+                        && !matches!(value, Value::Uninitialized)
+                    {
+                        Found::Data(value.clone())
+                    } else {
+                        Found::Next(borrowed.prototype_or(&self.intrinsics))
+                    }
+                } else {
+                    match borrowed.property(key) {
+                        Some(property) => match property.slot {
+                            Slot::Data(value) => Found::Data(value.resolve()),
+                            Slot::Accessor(accessors) => Found::Getter(accessors.get.clone()),
+                        },
+                        None => match exotic_own(&borrowed, key) {
+                            Some(value) => Found::Data(value),
+                            None => Found::Next(borrowed.prototype_or(&self.intrinsics)),
+                        },
+                    }
                 }
             };
             match found {
                 Found::Data(value) => return Ok(GetOutcome::Value(value)),
                 Found::Getter(Some(getter)) => {
+                    if (key == "caller" || key == "arguments")
+                        && is_throw_type_error(&getter)
+                        && is_sloppy_normal_function(receiver)
+                    {
+                        return Ok(GetOutcome::Value(Value::Null));
+                    }
                     return Ok(GetOutcome::Call {
                         callee: getter,
                         this: receiver.clone(),
@@ -1252,7 +1404,8 @@ impl ScriptRuntime {
             | Value::Event(_)
             | Value::Range(_)
             | Value::Selection(_)
-            | Value::Promise(_) => {
+            | Value::Promise(_)
+            | Value::Bytes(_) => {
                 let object = self
                     .wrapper_object(target)
                     .expect("nodes and events have wrappers");
@@ -1288,8 +1441,26 @@ impl ScriptRuntime {
                 None if super::typed::canonical_numeric_index(key).is_some() => Ok(()),
                 None => self.ordinary_set(super::typed_object(array), key, value, target, strict),
             },
+            Value::Array(array) if key == "length" => {
+                let wanted = self.parse_array_length(value)?;
+                if !self.apply_array_length(array, wanted, None)? && strict {
+                    return Err(self.type_error(
+                        "Cannot assign to read only property 'length' of object '[object Array]'",
+                    ));
+                }
+                Ok(())
+            }
             Value::Array(array) if key != "length" => {
                 if self.array_property_set(array, key, value.clone(), strict)? {
+                    return Ok(());
+                }
+                let present_elem = array_index(key).is_some_and(|index| {
+                    array
+                        .borrow()
+                        .get(index as usize)
+                        .is_some_and(|v| !matches!(v, Value::Uninitialized))
+                });
+                if !present_elem && self.array_inherited_set(target, key, &value, strict)? {
                     return Ok(());
                 }
                 if let Some(index) = array_index(key) {
@@ -1326,6 +1497,67 @@ impl ScriptRuntime {
             Some((_, property)) => property.slot = Slot::Data(value),
             None => properties.push((key.to_string(), Property::data(value))),
         }
+    }
+
+    // returns true if a prototype accessor or read-only data property handled the set
+    fn array_inherited_set(
+        &mut self,
+        receiver: &Value,
+        key: &str,
+        value: &Value,
+        strict: bool,
+    ) -> Result<bool, ScriptError> {
+        let mut current = self.prototype_of(receiver);
+        while let Some(proto) = current {
+            if let Some(proxy) = super::reflect::proxy_of(&proto) {
+                self.proxy_set(&proxy, key, value.clone(), receiver, strict)?;
+                return Ok(true);
+            }
+            enum Found {
+                Accessor(Option<Value>),
+                ReadOnly,
+                Writable,
+                Next(Option<ObjectHandle>),
+            }
+            let found = {
+                let borrowed = proto.borrow();
+                match borrowed.property(key) {
+                    Some(property) => match property.slot {
+                        Slot::Accessor(accessors) => Found::Accessor(accessors.set.clone()),
+                        Slot::Data(_) if !property.writable => Found::ReadOnly,
+                        Slot::Data(_) => Found::Writable,
+                    },
+                    None => Found::Next(borrowed.prototype_or(&self.intrinsics)),
+                }
+            };
+            match found {
+                Found::Accessor(Some(setter)) => {
+                    self.call_function(setter, receiver.clone(), vec![value.clone()])?;
+                    return Ok(true);
+                }
+                Found::Accessor(None) => {
+                    if strict {
+                        return Err(self.type_error(format!(
+                            "Cannot set property {} of [object Array] which has only a getter",
+                            display_key(key)
+                        )));
+                    }
+                    return Ok(true);
+                }
+                Found::ReadOnly => {
+                    if strict {
+                        return Err(self.type_error(format!(
+                            "Cannot assign to read only property '{}' of object '[object Array]'",
+                            display_key(key)
+                        )));
+                    }
+                    return Ok(true);
+                }
+                Found::Writable => return Ok(false),
+                Found::Next(next) => current = next,
+            }
+        }
+        Ok(false)
     }
 
     // what an array's own property list holds for a key, read as a get would: a getter runs
@@ -1422,17 +1654,53 @@ impl ScriptRuntime {
             }
             let found = {
                 let borrowed = current.borrow();
-                match borrowed.property(key) {
-                    Some(property) => match property.slot {
-                        Slot::Accessor(accessors) => Found::Accessor(accessors.set.clone()),
-                        Slot::Data(_) if !property.writable => Found::ReadOnly,
-                        Slot::Data(_) => Found::Writable,
-                    },
-                    None => {
-                        if exotic_own(&borrowed, key).is_some() {
+                if let ObjectClass::ArrayProto(array) = &borrowed.class {
+                    let array_borrowed = array.borrow();
+                    if let Some(property) = array_borrowed.own(key) {
+                        match &property.slot {
+                            Slot::Accessor(accessors) => Found::Accessor(accessors.set.clone()),
+                            Slot::Data(_)
+                                if !property.writable
+                                    || array_borrowed.integrity() == super::Integrity::Frozen =>
+                            {
+                                Found::ReadOnly
+                            }
+                            Slot::Data(_) => Found::Writable,
+                        }
+                    } else if key == "length" {
+                        if array_borrowed.fixed_length()
+                            || array_borrowed.integrity() == super::Integrity::Frozen
+                        {
                             Found::ReadOnly
                         } else {
-                            Found::Next(borrowed.prototype_or(&self.intrinsics))
+                            Found::Writable
+                        }
+                    } else if let Some(index) = array_index(key)
+                        && array_borrowed
+                            .get(index as usize)
+                            .is_some_and(|v| !matches!(v, Value::Uninitialized))
+                    {
+                        if array_borrowed.integrity() == super::Integrity::Frozen {
+                            Found::ReadOnly
+                        } else {
+                            Found::Writable
+                        }
+                    } else {
+                        Found::Next(borrowed.prototype_or(&self.intrinsics))
+                    }
+                } else {
+                    match borrowed.property(key) {
+                        Some(property) => match property.slot {
+                            Slot::Accessor(accessors) => Found::Accessor(accessors.set.clone()),
+                            Slot::Data(_) if !property.writable => Found::ReadOnly,
+                            Slot::Data(_) => Found::Writable,
+                        },
+                        None => {
+                            if exotic_own(&borrowed, key).is_some() {
+                                Found::ReadOnly
+                            } else {
+                                Found::Next(borrowed.prototype_or(&self.intrinsics))
+                            }
                         }
                     }
                 }
@@ -1440,6 +1708,13 @@ impl ScriptRuntime {
             match found {
                 Found::Accessor(setter) => {
                     return match setter {
+                        Some(setter)
+                            if (key == "caller" || key == "arguments")
+                                && is_throw_type_error(&setter)
+                                && is_sloppy_normal_function(receiver) =>
+                        {
+                            Ok(())
+                        }
                         Some(setter) => self
                             .call_function(setter, receiver.clone(), vec![value])
                             .map(|_| ()),
@@ -1580,6 +1855,15 @@ impl ScriptRuntime {
                 _ => {}
             }
         }
+        if matches!(
+            object,
+            Value::Undefined | Value::Null | Value::Uninitialized
+        ) {
+            return Err(self.type_error(format!(
+                "Cannot read properties of {}",
+                object.string_value()
+            )));
+        }
         let key = self.coerce_key(key)?;
         self.get_property_tail(object, &key)
     }
@@ -1591,6 +1875,15 @@ impl ScriptRuntime {
         value: Value,
         strict: bool,
     ) -> Result<(), ScriptError> {
+        if matches!(
+            object,
+            Value::Undefined | Value::Null | Value::Uninitialized
+        ) {
+            return Err(self.type_error(format!(
+                "Cannot set properties of {}",
+                object.string_value()
+            )));
+        }
         if let Value::Number(number) = key
             && number >= 0.0
             && number.fract() == 0.0
@@ -1750,12 +2043,34 @@ impl ScriptRuntime {
                         return self.proxy_has(&proxy, key);
                     }
                     let borrowed = object.borrow();
+                    if let ObjectClass::ArrayProto(array) = &borrowed.class {
+                        let array_borrowed = array.borrow();
+                        let has_own = key == "length"
+                            || array_borrowed.own(key).is_some()
+                            || array_index(key).is_some_and(|index| {
+                                array_borrowed
+                                    .get(index as usize)
+                                    .is_some_and(|v| !matches!(v, Value::Uninitialized))
+                            });
+                        if has_own {
+                            return Ok(true);
+                        }
+                        current = borrowed.prototype_or(&self.intrinsics);
+                        continue;
+                    }
                     if borrowed.contains_key(key) || exotic_own(&borrowed, key).is_some() {
                         return Ok(true);
                     }
                     current = borrowed.prototype_or(&self.intrinsics);
                 }
                 Ok(false)
+            }
+            Value::TypedArray(array) => {
+                if let Some(number) = super::typed::canonical_numeric_index(key) {
+                    return Ok(super::typed::valid_index(&array.borrow(), number).is_some());
+                }
+                let object = super::typed_object(array);
+                self.has_property(&Value::Object(object), key)
             }
             Value::Array(array) => {
                 if key == "length" || array.borrow().own(key).is_some() {
@@ -1791,7 +2106,19 @@ impl ScriptRuntime {
         let mut current = self.prototype_of(target);
         while let Some(object) = current {
             let borrowed = object.borrow();
-            if borrowed.contains_key(key) {
+            if let ObjectClass::ArrayProto(array) = &borrowed.class {
+                let array_borrowed = array.borrow();
+                if key == "length"
+                    || array_borrowed.own(key).is_some()
+                    || array_index(key).is_some_and(|index| {
+                        array_borrowed
+                            .get(index as usize)
+                            .is_some_and(|v| !matches!(v, Value::Uninitialized))
+                    })
+                {
+                    return true;
+                }
+            } else if borrowed.contains_key(key) {
                 return true;
             }
             current = borrowed.prototype_or(&self.intrinsics);
@@ -2097,7 +2424,11 @@ impl ScriptRuntime {
                 let mut walk = object.borrow().prototype_or(&self.intrinsics);
                 while let Some(proto) = walk {
                     let borrowed = proto.borrow();
-                    if borrowed.has_enumerable() || matches!(borrowed.class, ObjectClass::String(_))
+                    if borrowed.has_enumerable()
+                        || matches!(
+                            borrowed.class,
+                            ObjectClass::String(_) | ObjectClass::ArrayProto(_)
+                        )
                     {
                         proto_has_enumerable = true;
                         break;
@@ -2120,6 +2451,40 @@ impl ScriptRuntime {
                 let mut current = Some(object.clone());
                 while let Some(object) = current {
                     let borrowed = object.borrow();
+                    if let ObjectClass::ArrayProto(array) = &borrowed.class {
+                        Self::collect_array_for_in_keys(array, &mut seen, &mut keys);
+                        current = borrowed.prototype_or(&self.intrinsics);
+                        continue;
+                    }
+                    if let ObjectClass::String(text) = &borrowed.class {
+                        for index in 0..super::strings::utf16_length(text) {
+                            let key = index.to_string();
+                            if seen.insert(key.clone()) {
+                                keys.push(key);
+                            }
+                        }
+                    }
+                    borrowed.visit_for_in_keys(|key, enumerable| {
+                        if seen.insert(key.to_string()) && enumerable {
+                            keys.push(key.to_string());
+                        }
+                    });
+                    current = borrowed.prototype_or(&self.intrinsics);
+                }
+                Ok(keys)
+            }
+            Value::Array(array) => {
+                let mut seen = HashSet::default();
+                let mut keys = Vec::new();
+                Self::collect_array_for_in_keys(array, &mut seen, &mut keys);
+                let mut current = self.prototype_of(value);
+                while let Some(object) = current {
+                    let borrowed = object.borrow();
+                    if let ObjectClass::ArrayProto(proto_array) = &borrowed.class {
+                        Self::collect_array_for_in_keys(proto_array, &mut seen, &mut keys);
+                        current = borrowed.prototype_or(&self.intrinsics);
+                        continue;
+                    }
                     if let ObjectClass::String(text) = &borrowed.class {
                         for index in 0..super::strings::utf16_length(text) {
                             let key = index.to_string();
@@ -2142,6 +2507,43 @@ impl ScriptRuntime {
                 .into_iter()
                 .map(|(key, _)| key)
                 .collect()),
+        }
+    }
+
+    fn collect_array_for_in_keys(
+        array: &ArrayHandle,
+        seen: &mut HashSet<String>,
+        keys: &mut Vec<String>,
+    ) {
+        let borrowed = array.borrow();
+        let mut indices: Vec<(u32, String, bool)> = Vec::new();
+        for (index, value) in borrowed.iter().enumerate() {
+            if !matches!(value, Value::Uninitialized) {
+                indices.push((index as u32, index.to_string(), true));
+            }
+        }
+        let mut strings: Vec<(String, bool)> = Vec::new();
+        for (name, property) in borrowed.properties() {
+            if super::object::is_symbol_key(name) || super::object::is_private_key(name) {
+                continue;
+            }
+            if let Some(index) = array_index(name) {
+                indices.push((index, name.clone(), property.enumerable));
+            } else {
+                strings.push((name.clone(), property.enumerable));
+            }
+        }
+        indices.sort_unstable_by_key(|(index, _, _)| *index);
+        for (_, key, enumerable) in indices {
+            if seen.insert(key.clone()) && enumerable {
+                keys.push(key);
+            }
+        }
+        seen.insert("length".to_string());
+        for (key, enumerable) in strings {
+            if seen.insert(key.clone()) && enumerable {
+                keys.push(key);
+            }
         }
     }
 
@@ -2891,6 +3293,30 @@ fn host_iterable_values(value: &Value) -> Option<Vec<Value>> {
             .collect(),
         _ => return None,
     })
+}
+
+fn is_throw_type_error(value: &Value) -> bool {
+    let Value::Object(object) = value else {
+        return false;
+    };
+    matches!(
+        &object.borrow().class,
+        ObjectClass::Native(native) if matches!(native.as_ref(), super::realm::Native::ThrowTypeError)
+    )
+}
+
+fn is_sloppy_normal_function(value: &Value) -> bool {
+    let Value::Object(object) = value else {
+        return false;
+    };
+    matches!(
+        &object.borrow().class,
+        ObjectClass::Function(closure)
+            if !closure.code.strict
+                && closure.code.kind == super::ast::FunctionKind::Normal
+                && !closure.code.is_async
+                && !closure.code.is_generator
+    )
 }
 
 #[cfg(test)]

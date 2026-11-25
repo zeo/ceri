@@ -279,7 +279,22 @@ pub(super) enum Op {
         scopes: u16,
     },
     Return,
+    // resolves a shadowable or with-scoped identifier once: [] -> [binding_ref, value]
+    ResolveBinding {
+        name: u32,
+        depth: u16,
+        index: u16,
+    },
+    // writes to a binding captured by resolve binding: [binding_ref, value] -> [value]
+    PutBinding {
+        name: u32,
+        depth: u16,
+        index: u16,
+        kind: BindingKind,
+    },
     Yield,
+    // suspends a generator after synchronous parameter instantiation before entering the body
+    SuspendGenerator,
     YieldDelegating,
     DelegateStep(u32),
     // async yield*: [iterator sent] -> [iterator promise] calling next, throw or return
@@ -499,6 +514,8 @@ pub(super) enum ScopeRole {
     Block,
     // a function's variable environment
     Var,
+    // a function's parameter environment when parameter expressions separate it from the body
+    Param,
     // a catch clause's parameters
     Catch,
     // a with statement's object, in the one slot
@@ -688,6 +705,8 @@ impl FunctionState {
                 | Op::CloneScope
                 | Op::GetName { .. }
                 | Op::SetName { .. }
+                | Op::ResolveBinding { .. }
+                | Op::PutBinding { .. }
                 | Op::DeleteName { .. }
                 | Op::TypeofName { .. }
                 | Op::CalleeName { .. } => {
@@ -1211,7 +1230,7 @@ impl Compiler {
     ) -> Result<EvalCode, ScriptError> {
         let target = caller
             .iter()
-            .position(|scope| scope.layout.role == ScopeRole::Var)
+            .position(|scope| matches!(scope.layout.role, ScopeRole::Var | ScopeRole::Param))
             .map(|position| caller.len() - 1 - position);
         let mut state = FunctionState::new(false, target.is_none(), script.strict);
         state.eval_code = true;
@@ -1704,6 +1723,8 @@ impl Compiler {
                     }
                     Op::GetName { .. }
                     | Op::SetName { .. }
+                    | Op::ResolveBinding { .. }
+                    | Op::PutBinding { .. }
                     | Op::TypeofName { .. }
                     | Op::DeleteName { .. }
                     | Op::CalleeName { .. }
@@ -1739,6 +1760,8 @@ impl Compiler {
                     | Op::CallEvalSpread
                     | Op::GetName { .. }
                     | Op::SetName { .. }
+                    | Op::ResolveBinding { .. }
+                    | Op::PutBinding { .. }
                     | Op::TypeofName { .. }
                     | Op::DeleteName { .. }
                     | Op::CalleeName { .. }
@@ -3352,10 +3375,22 @@ impl Compiler {
             self_scope = Some(outer.layout());
             state.scopes.push(outer);
         }
+        // with parameter expressions the body's vars live in a variable
+        // environment of their own over the parameters, so closures made in the
+        // parameter list never see them, as the function instantiation steps give
+        let has_param_expressions = function
+            .params
+            .iter()
+            .chain(function.rest.as_ref())
+            .any(contains_expression);
         // a direct eval in a sloppy function may grow its variable environment
         let grows = !state.strict && function.eval_context.is_some();
         let mut scope = ScopeInfo::new(ScopeKind::Function, true);
-        scope.role = ScopeRole::Var;
+        scope.role = if has_param_expressions {
+            ScopeRole::Param
+        } else {
+            ScopeRole::Var
+        };
         scope.grows = grows;
         state.scopes.push(scope);
         self.functions.push(state);
@@ -3368,40 +3403,57 @@ impl Compiler {
         for _ in 0..4 {
             self.emit(Op::Nop);
         }
-        // with parameter expressions the body's vars live in a variable
-        // environment of their own over the parameters, so closures made in the
-        // parameter list never see them, as the function instantiation steps give
-        let has_param_expressions = function
-            .params
-            .iter()
-            .chain(function.rest.as_ref())
-            .any(contains_expression);
         let simple_params = function.rest.is_none()
             && function
                 .params
                 .iter()
                 .all(|param| matches!(param, Pattern::Identifier(_)));
         let mut param_slots = Vec::new();
+        let mut param_names = Vec::new();
         if simple_params {
             for param in &function.params {
                 if let Pattern::Identifier(name) = param {
+                    param_names.push(name.clone());
                     param_slots.push(Some(self.declare(name, BindingKind::Param)));
                 }
             }
         } else {
-            // the VM leaves every argument as an array on the stack for destructuring
-            let mut names = Vec::new();
+            // declare parameter slots first so defaults see tdz for later params
             for param in &function.params {
-                bound_names(param, &mut names);
+                bound_names(param, &mut param_names);
             }
             if let Some(rest) = &function.rest {
-                bound_names(rest, &mut names);
+                bound_names(rest, &mut param_names);
             }
-            for name in names {
+            for name in &param_names {
                 // parameters stay in the function scope under the body's own
                 let index = self.state().function_scope_index();
-                self.state().scopes[index].declare(name, BindingKind::Param);
+                self.state().scopes[index].declare(name.clone(), BindingKind::Param);
             }
+        }
+        let body_declares_arguments = !has_param_expressions
+            && (block_functions(&function.body)
+                .iter()
+                .any(|f| f.name.as_deref() == Some("arguments"))
+                || lexical_declarations(&function.body)
+                    .iter()
+                    .any(|(name, _)| &**name == "arguments"));
+        if !is_arrow
+            && (function.eval_context.is_some()
+                || function_uses_arguments(&function.body, &function.params))
+            && !param_names.iter().any(|name| &**name == "arguments")
+            && !body_declares_arguments
+            && self
+                .resolve("arguments")
+                .is_none_or(|(depth, _, _)| depth > 0)
+        {
+            // declare arguments before compiling defaults so parameter expressions can read it
+            let index = self.state().function_scope_index();
+            let slot = self.state().scopes[index].declare("arguments".into(), BindingKind::Var);
+            self.state().arguments_slot = Some(slot);
+        }
+        if !simple_params {
+            // the VM leaves every argument as an array on the stack for destructuring
             self.emit(Op::ArgumentsIterator);
             for param in &function.params {
                 self.emit(Op::IterValue);
@@ -3421,20 +3473,10 @@ impl Compiler {
                 scope.grows = grows;
             }
         }
-        if !is_arrow
-            && (function.eval_context.is_some()
-                || function_uses_arguments(&function.body, &function.params))
-            && self
-                .resolve("arguments")
-                .is_none_or(|(depth, _, _)| depth > 0)
-        {
-            // the arguments object is written to the frame's own scope, whatever
-            // environment the body's vars moved to
-            let index = self.state().function_scope_index();
-            let slot = self.state().scopes[index].declare("arguments".into(), BindingKind::Var);
-            self.state().arguments_slot = Some(slot);
-        }
         self.declare_function_body(&function.body)?;
+        if function.is_generator && !simple_params {
+            self.emit(Op::SuspendGenerator);
+        }
         self.compile_statements(&function.body)?;
         // the body's variable environment only grows here, after every declaration
         // has taken its slot
@@ -4224,6 +4266,9 @@ impl Compiler {
                     self.compile_expression(value)?;
                     self.emit(Op::SetPrototype);
                 }
+                ObjectProperty::CoverInit(..) => {
+                    return Err(error("invalid shorthand property initializer"));
+                }
             }
         }
         Ok(())
@@ -4362,8 +4407,24 @@ impl Compiler {
     fn compile_reference_load(&mut self, target: &Expr) -> Result<RefKind, ScriptError> {
         Ok(match target {
             Expr::Identifier(name) => {
-                self.compile_get_name(name)?;
-                RefKind::Name(name.clone())
+                if self.shadowable(name) || !self.with_objects(name).is_empty() {
+                    let (depth, index, kind) = self.fallback(name);
+                    let name_idx = self.name(name);
+                    self.emit(Op::ResolveBinding {
+                        name: name_idx,
+                        depth,
+                        index,
+                    });
+                    RefKind::Binding {
+                        name: name_idx,
+                        depth,
+                        index,
+                        kind,
+                    }
+                } else {
+                    self.compile_get_name(name)?;
+                    RefKind::Name(name.clone())
+                }
             }
             Expr::Member {
                 object, property, ..
@@ -4424,6 +4485,19 @@ impl Compiler {
     fn compile_reference_store(&mut self, kind: &RefKind) -> Result<(), ScriptError> {
         match kind {
             RefKind::Name(name) => self.compile_set_name(name, false)?,
+            RefKind::Binding {
+                name,
+                depth,
+                index,
+                kind,
+            } => {
+                self.emit(Op::PutBinding {
+                    name: *name,
+                    depth: *depth,
+                    index: *index,
+                    kind: *kind,
+                });
+            }
             RefKind::Member(name) => {
                 self.emit(Op::SetProp { name: *name, ic: 0 });
             }
@@ -4495,10 +4569,28 @@ impl Compiler {
                     let Pattern::Identifier(name) = target else {
                         return Err(error("invalid compound assignment"));
                     };
-                    self.compile_get_name(name)?;
-                    self.compile_expression(value)?;
-                    self.emit(Op::Binary(binary));
-                    self.compile_set_name(name, false)?;
+                    if self.shadowable(name) || !self.with_objects(name).is_empty() {
+                        let (depth, index, kind) = self.fallback(name);
+                        let name_idx = self.name(name);
+                        self.emit(Op::ResolveBinding {
+                            name: name_idx,
+                            depth,
+                            index,
+                        });
+                        self.compile_expression(value)?;
+                        self.emit(Op::Binary(binary));
+                        self.emit(Op::PutBinding {
+                            name: name_idx,
+                            depth,
+                            index,
+                            kind,
+                        });
+                    } else {
+                        self.compile_get_name(name)?;
+                        self.compile_expression(value)?;
+                        self.emit(Op::Binary(binary));
+                        self.compile_set_name(name, false)?;
+                    }
                     return Ok(());
                 };
                 let kind = self.compile_reference_load(expression)?;
@@ -4529,7 +4621,7 @@ impl Compiler {
                 // the short circuit leaves the reference parts under the kept value
                 match kind {
                     RefKind::Name(_) => {}
-                    RefKind::Member(_) => {
+                    RefKind::Member(_) | RefKind::Binding { .. } => {
                         self.emit(Op::Swap);
                         self.emit(Op::Pop);
                     }
@@ -4592,7 +4684,7 @@ impl Compiler {
         // postfix keeps the old value: stash it below the reference parts
         let parts = match kind {
             RefKind::Name(_) => 0,
-            RefKind::Member(_) => 1,
+            RefKind::Member(_) | RefKind::Binding { .. } => 1,
             RefKind::Index | RefKind::Private | RefKind::Super(_) => 2,
             RefKind::SuperIndex => 3,
         };
@@ -4631,6 +4723,12 @@ enum Lexical {
 
 enum RefKind {
     Name(Name),
+    Binding {
+        name: u32,
+        depth: u16,
+        index: u16,
+        kind: BindingKind,
+    },
     Member(u32),
     Index,
     Private,
@@ -4876,9 +4974,9 @@ fn walk_expression(expression: &Expr, visit: &mut dyn FnMut(&Expr)) {
                         }
                         children.push(value);
                     }
-                    ObjectProperty::Spread(value) | ObjectProperty::Prototype(value) => {
-                        children.push(value)
-                    }
+                    ObjectProperty::Spread(value)
+                    | ObjectProperty::Prototype(value)
+                    | ObjectProperty::CoverInit(_, value) => children.push(value),
                     ObjectProperty::Method { key, .. } => {
                         if let PropertyKey::Computed(key) = key {
                             children.push(key);
@@ -5063,6 +5161,8 @@ fn captures_scope_at(code: &Code, target_depth: u16) -> bool {
             | Op::CallEvalSpread
             | Op::GetName { .. }
             | Op::SetName { .. }
+            | Op::ResolveBinding { .. }
+            | Op::PutBinding { .. }
             | Op::TypeofName { .. }
             | Op::DeleteName { .. }
             | Op::CalleeName { .. } => return true,
@@ -5370,6 +5470,7 @@ fn op_max_push(op: Op) -> u32 {
         Op::Dup3 | Op::GetRegMethod { .. } | Op::GetLocalMethod { .. } => 3,
         Op::Dup2
         | Op::CalleeName { .. }
+        | Op::ResolveBinding { .. }
         | Op::Class { .. }
         | Op::WithHas(_)
         | Op::GetRegProp { .. }

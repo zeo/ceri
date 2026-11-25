@@ -2,7 +2,7 @@
 // SameValueZero identity, tombstones so live iterators see later additions and skip
 // deletions, and weak keys that are pruned once their object is gone
 
-use super::object::{JsObject, ObjectClass, ObjectHandle, new_object};
+use super::object::{JsObject, ObjectClass, ObjectHandle, SYMBOL_PREFIX, new_object};
 use super::operations::{is_callable, is_primitive};
 use super::*;
 use crate::hashing::HashMap;
@@ -341,15 +341,17 @@ impl Drop for Cursor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CollectionMethod {
     Constructor(CollectionKind),
-    Get,
-    Set,
-    Add,
-    Has,
-    Delete,
-    Clear,
-    Size,
-    ForEach,
-    Iterate(IterationKind),
+    Get(CollectionKind),
+    Set(CollectionKind),
+    Add(CollectionKind),
+    Has(CollectionKind),
+    Delete(CollectionKind),
+    Clear(CollectionKind),
+    Size(CollectionKind),
+    ForEach(CollectionKind),
+    Iterate(CollectionKind, IterationKind),
+    GetOrInsert(CollectionKind),
+    GetOrInsertComputed(CollectionKind),
     CursorNext,
     GroupBy(bool),
     Union,
@@ -416,24 +418,24 @@ impl ScriptRuntime {
         )))
     }
 
-    fn collection_entry(this: &Value) -> Option<(CollectionKind, Rc<RefCell<Collection>>)> {
-        let Value::Object(object) = this else {
-            return None;
-        };
-        match &object.borrow().class {
-            ObjectClass::Map(collection) => Some((CollectionKind::Map, collection.clone())),
-            ObjectClass::Set(collection) => Some((CollectionKind::Set, collection.clone())),
-            ObjectClass::WeakMap(collection) => Some((CollectionKind::WeakMap, collection.clone())),
-            ObjectClass::WeakSet(collection) => Some((CollectionKind::WeakSet, collection.clone())),
-            _ => None,
-        }
-    }
-
     fn check_weak_key(&mut self, key: &Value) -> Result<(), ScriptError> {
-        if is_primitive(key) && !matches!(key, Value::Symbol(_)) {
-            return Err(self.type_error("Invalid value used as weak collection key"));
+        match key {
+            Value::Symbol(sym) => {
+                if sym
+                    .strip_prefix(SYMBOL_PREFIX)
+                    .is_some_and(|rest| rest.starts_with("for:"))
+                {
+                    return Err(
+                        self.type_error("Registered symbol not allowed as weak collection key")
+                    );
+                }
+                Ok(())
+            }
+            other if is_primitive(other) => {
+                Err(self.type_error("Invalid value used as weak collection key"))
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     pub(super) fn new_collection(
@@ -499,34 +501,81 @@ impl ScriptRuntime {
         }
     }
 
-    // a set-like argument for the set algebra methods: its size, has and keys
-    fn set_like_values(&mut self, other: &Value) -> Result<Vec<Value>, ScriptError> {
-        if let Value::Object(object) = other {
-            let class = object.borrow().class.clone();
-            if let ObjectClass::Set(collection) | ObjectClass::Map(collection) = class {
-                return Ok(collection
-                    .borrow()
-                    .values()
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect());
-            }
+    // read size, has, and keys from a set-like record
+    fn get_set_record(&mut self, other: &Value) -> Result<(Value, f64, Value, Value), ScriptError> {
+        if is_primitive(other) {
+            return Err(self.type_error("The argument must be a Set-like object"));
+        }
+        let raw_size = self.get_property(other, "size")?;
+        let num_size = self.coerce_number(raw_size)?;
+        if num_size.is_nan() {
+            return Err(self.type_error("Set-like size must be a number"));
+        }
+        let int_size = if num_size.is_infinite() {
+            num_size
+        } else {
+            num_size.trunc()
+        };
+        if int_size < 0.0 {
+            return Err(self.range_error("Set-like size must be non-negative"));
+        }
+        let has = self.get_property(other, "has")?;
+        if !is_callable(&has) {
+            return Err(self.type_error("Set-like has must be callable"));
         }
         let keys = self.get_property(other, "keys")?;
         if !is_callable(&keys) {
-            return Err(self.type_error("The argument must be set-like"));
+            return Err(self.type_error("Set-like keys must be callable"));
         }
-        let iterator = self.call_function(keys, other.clone(), Vec::new())?;
+        Ok((other.clone(), int_size, has, keys))
+    }
+
+    fn get_keys_iterator(
+        &mut self,
+        set_obj: &Value,
+        keys_fn: &Value,
+    ) -> Result<(Value, Value), ScriptError> {
+        let iterator = self.call_function(keys_fn.clone(), set_obj.clone(), Vec::new())?;
+        if is_primitive(&iterator) {
+            return Err(self.type_error("Iterator result is not an object"));
+        }
         let next = self.get_property(&iterator, "next")?;
-        let mut values = Vec::new();
-        loop {
-            let result = self.call_function(next.clone(), iterator.clone(), Vec::new())?;
-            if self.get_property(&result, "done")?.truthy() {
-                break;
-            }
-            values.push(self.get_property(&result, "value")?);
+        Ok((iterator, next))
+    }
+
+    fn close_keys_iterator(&mut self, iterator: &Value) -> Result<(), ScriptError> {
+        let method = self.get_property(iterator, "return")?;
+        if matches!(method, Value::Undefined | Value::Null) {
+            return Ok(());
         }
-        Ok(values)
+        let result = self.call_function(method, iterator.clone(), Vec::new())?;
+        if is_primitive(&result) {
+            return Err(self.type_error("iterator result is not an object"));
+        }
+        Ok(())
+    }
+
+    fn step_keys_iterator(
+        &mut self,
+        iterator: &Value,
+        next_fn: &Value,
+    ) -> Result<Option<Value>, ScriptError> {
+        let result = self.call_function(next_fn.clone(), iterator.clone(), Vec::new())?;
+        if is_primitive(&result) {
+            return Err(self.type_error("Iterator result is not an object"));
+        }
+        if self.get_property(&result, "done")?.truthy() {
+            return Ok(None);
+        }
+        Ok(Some(self.get_property(&result, "value")?))
+    }
+
+    fn copy_set_entries(source: &Rc<RefCell<Collection>>, target: &Rc<RefCell<Collection>>) {
+        let items = source.borrow().values();
+        let mut table = target.borrow_mut();
+        for (key, _) in items {
+            table.set(key, Value::Undefined);
+        }
     }
 
     pub(super) fn call_collection(
@@ -580,29 +629,43 @@ impl ScriptRuntime {
                 })?;
                 Ok(object)
             }
-            M::Get
-            | M::Set
-            | M::Add
-            | M::Has
-            | M::Delete
-            | M::Clear
-            | M::Size
-            | M::ForEach
-            | M::Iterate(_) => {
-                let Some((kind, collection)) = Self::collection_entry(&this) else {
-                    return Err(self.type_error(format!(
-                        "collection method {method:?} called on incompatible receiver"
-                    )));
+            M::Get(kind)
+            | M::Set(kind)
+            | M::Add(kind)
+            | M::Has(kind)
+            | M::Delete(kind)
+            | M::Clear(kind)
+            | M::Size(kind)
+            | M::ForEach(kind)
+            | M::Iterate(kind, _)
+            | M::GetOrInsert(kind)
+            | M::GetOrInsertComputed(kind) => {
+                let name = match method {
+                    M::Get(_) => "get",
+                    M::Set(_) => "set",
+                    M::Add(_) => "add",
+                    M::Has(_) => "has",
+                    M::Delete(_) => "delete",
+                    M::Clear(_) => "clear",
+                    M::Size(_) => "size",
+                    M::ForEach(_) => "forEach",
+                    M::Iterate(_, IterationKind::Keys) => "keys",
+                    M::Iterate(_, IterationKind::Values) => "values",
+                    M::Iterate(_, IterationKind::Entries) => "entries",
+                    M::GetOrInsert(_) => "getOrInsert",
+                    M::GetOrInsertComputed(_) => "getOrInsertComputed",
+                    _ => unreachable!("handled above"),
                 };
+                let collection = self.collection_of(&this, kind, name)?;
                 let weak = matches!(kind, CollectionKind::WeakMap | CollectionKind::WeakSet);
                 match method {
-                    M::Get => Ok(collection.borrow().get(&first).unwrap_or(Value::Undefined)),
-                    M::Has => Ok(Value::Bool(collection.borrow().has(&first))),
-                    M::Set | M::Add => {
+                    M::Get(_) => Ok(collection.borrow().get(&first).unwrap_or(Value::Undefined)),
+                    M::Has(_) => Ok(Value::Bool(collection.borrow().has(&first))),
+                    M::Set(_) | M::Add(_) => {
                         if weak {
                             self.check_weak_key(&first)?;
                         }
-                        let value = if matches!(method, M::Set) {
+                        let value = if matches!(method, M::Set(_)) {
                             argument(&arguments, 1)
                         } else {
                             Value::Undefined
@@ -615,13 +678,13 @@ impl ScriptRuntime {
                         collection.borrow_mut().set(first, value);
                         Ok(this)
                     }
-                    M::Delete => Ok(Value::Bool(collection.borrow_mut().delete(&first))),
-                    M::Clear => {
+                    M::Delete(_) => Ok(Value::Bool(collection.borrow_mut().delete(&first))),
+                    M::Clear(_) => {
                         collection.borrow_mut().clear();
                         Ok(Value::Undefined)
                     }
-                    M::Size => Ok(Value::Number(collection.borrow().len() as f64)),
-                    M::ForEach => {
+                    M::Size(_) => Ok(Value::Number(collection.borrow().len() as f64)),
+                    M::ForEach(_) => {
                         if !is_callable(&first) {
                             return Err(self.type_error("forEach callback is not a function"));
                         }
@@ -643,11 +706,62 @@ impl ScriptRuntime {
                         }
                         Ok(Value::Undefined)
                     }
-                    M::Iterate(iteration) => Ok(self.cursor_value(Cursor::new(
+                    M::Iterate(_, iteration) => Ok(self.cursor_value(Cursor::new(
                         collection,
                         iteration,
                         kind == CollectionKind::Set,
                     ))),
+                    M::GetOrInsert(_) => {
+                        if weak {
+                            self.check_weak_key(&first)?;
+                        }
+                        let key = match first {
+                            Value::Number(n) if n == 0.0 && n.is_sign_negative() => {
+                                Value::Number(0.0)
+                            }
+                            other => other,
+                        };
+                        if let Some(existing) = collection.borrow().get(&key) {
+                            return Ok(existing);
+                        }
+                        let value = argument(&arguments, 1);
+                        if collection.borrow().len() >= MAX_RUNTIME_ARRAY_LENGTH {
+                            return Err(
+                                self.range_error("collection exceeds the deterministic size limit")
+                            );
+                        }
+                        collection.borrow_mut().set(key, value.clone());
+                        Ok(value)
+                    }
+                    M::GetOrInsertComputed(_) => {
+                        if weak {
+                            self.check_weak_key(&first)?;
+                        }
+                        let callback = argument(&arguments, 1);
+                        if !is_callable(&callback) {
+                            return Err(
+                                self.type_error("getOrInsertComputed callback is not a function")
+                            );
+                        }
+                        let key = match first {
+                            Value::Number(n) if n == 0.0 && n.is_sign_negative() => {
+                                Value::Number(0.0)
+                            }
+                            other => other,
+                        };
+                        if let Some(existing) = collection.borrow().get(&key) {
+                            return Ok(existing);
+                        }
+                        let value =
+                            self.call_function(callback, Value::Undefined, vec![key.clone()])?;
+                        if collection.borrow().len() >= MAX_RUNTIME_ARRAY_LENGTH {
+                            return Err(
+                                self.range_error("collection exceeds the deterministic size limit")
+                            );
+                        }
+                        collection.borrow_mut().set(key, value.clone());
+                        Ok(value)
+                    }
                     _ => unreachable!("handled above"),
                 }
             }
@@ -720,56 +834,169 @@ impl ScriptRuntime {
             | M::IsDisjointFrom => {
                 let collection =
                     self.collection_of(&this, CollectionKind::Set, &format!("{method:?}"))?;
-                let others = self.set_like_values(&first)?;
-                let mine: Vec<Value> = collection
-                    .borrow()
-                    .values()
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect();
-                let other_ids: std::collections::HashSet<KeyId> =
-                    others.iter().map(key_id).collect();
-                let my_ids: std::collections::HashSet<KeyId> = mine.iter().map(key_id).collect();
-                let result: Vec<Value> = match method {
-                    M::Union => mine
-                        .iter()
-                        .cloned()
-                        .chain(
-                            others
-                                .iter()
-                                .filter(|value| !my_ids.contains(&key_id(value)))
-                                .cloned(),
-                        )
-                        .collect(),
-                    M::Intersection => mine
-                        .iter()
-                        .filter(|value| other_ids.contains(&key_id(value)))
-                        .cloned()
-                        .collect(),
-                    M::Difference => mine
-                        .iter()
-                        .filter(|value| !other_ids.contains(&key_id(value)))
-                        .cloned()
-                        .collect(),
-                    M::SymmetricDifference => mine
-                        .iter()
-                        .filter(|value| !other_ids.contains(&key_id(value)))
-                        .chain(
-                            others
-                                .iter()
-                                .filter(|value| !my_ids.contains(&key_id(value))),
-                        )
-                        .cloned()
-                        .collect(),
-                    M::IsSubsetOf => return Ok(Value::Bool(my_ids.is_subset(&other_ids))),
-                    M::IsSupersetOf => return Ok(Value::Bool(other_ids.is_subset(&my_ids))),
-                    _ => return Ok(Value::Bool(my_ids.is_disjoint(&other_ids))),
-                };
-                let (set, table) = self.new_collection(CollectionKind::Set, None);
-                for value in result {
-                    table.borrow_mut().set(value, Value::Undefined);
+                let (other_obj, other_size, other_has, other_keys) = self.get_set_record(&first)?;
+                match method {
+                    M::Union => {
+                        let (iter, next) = self.get_keys_iterator(&other_obj, &other_keys)?;
+                        let (set, result) = self.new_collection(CollectionKind::Set, None);
+                        Self::copy_set_entries(&collection, &result);
+                        while let Some(value) = self.step_keys_iterator(&iter, &next)? {
+                            result.borrow_mut().set(value, Value::Undefined);
+                        }
+                        Ok(set)
+                    }
+                    M::Intersection => {
+                        let (set, result) = self.new_collection(CollectionKind::Set, None);
+                        let this_size = collection.borrow().len() as f64;
+                        if this_size <= other_size {
+                            let mut cursor =
+                                Cursor::new(collection.clone(), IterationKind::Values, true);
+                            loop {
+                                let found = cursor.collection.borrow().entry_at(cursor.position);
+                                let Some((index, elem, _)) = found else {
+                                    break;
+                                };
+                                cursor.position = index + 1;
+                                let in_other = self
+                                    .call_function(
+                                        other_has.clone(),
+                                        other_obj.clone(),
+                                        vec![elem.clone()],
+                                    )?
+                                    .truthy();
+                                if in_other
+                                    && collection.borrow().has(&elem)
+                                    && !result.borrow().has(&elem)
+                                {
+                                    result.borrow_mut().set(elem, Value::Undefined);
+                                }
+                            }
+                        } else {
+                            let (iter, next) = self.get_keys_iterator(&other_obj, &other_keys)?;
+                            while let Some(value) = self.step_keys_iterator(&iter, &next)? {
+                                if collection.borrow().has(&value) && !result.borrow().has(&value) {
+                                    result.borrow_mut().set(value, Value::Undefined);
+                                }
+                            }
+                        }
+                        Ok(set)
+                    }
+                    M::Difference => {
+                        let (set, result) = self.new_collection(CollectionKind::Set, None);
+                        Self::copy_set_entries(&collection, &result);
+                        let this_size = collection.borrow().len() as f64;
+                        if this_size <= other_size {
+                            let mut cursor =
+                                Cursor::new(result.clone(), IterationKind::Values, true);
+                            loop {
+                                let found = cursor.collection.borrow().entry_at(cursor.position);
+                                let Some((index, elem, _)) = found else {
+                                    break;
+                                };
+                                cursor.position = index + 1;
+                                let in_other = self
+                                    .call_function(
+                                        other_has.clone(),
+                                        other_obj.clone(),
+                                        vec![elem.clone()],
+                                    )?
+                                    .truthy();
+                                if in_other {
+                                    result.borrow_mut().delete(&elem);
+                                }
+                            }
+                        } else {
+                            let (iter, next) = self.get_keys_iterator(&other_obj, &other_keys)?;
+                            while let Some(value) = self.step_keys_iterator(&iter, &next)? {
+                                result.borrow_mut().delete(&value);
+                            }
+                        }
+                        Ok(set)
+                    }
+                    M::SymmetricDifference => {
+                        let (iter, next) = self.get_keys_iterator(&other_obj, &other_keys)?;
+                        let (set, result) = self.new_collection(CollectionKind::Set, None);
+                        Self::copy_set_entries(&collection, &result);
+                        while let Some(value) = self.step_keys_iterator(&iter, &next)? {
+                            let in_result = result.borrow().has(&value);
+                            if collection.borrow().has(&value) {
+                                if in_result {
+                                    result.borrow_mut().delete(&value);
+                                }
+                            } else if !in_result {
+                                result.borrow_mut().set(value, Value::Undefined);
+                            }
+                        }
+                        Ok(set)
+                    }
+                    M::IsSubsetOf => {
+                        if (collection.borrow().len() as f64) > other_size {
+                            return Ok(Value::Bool(false));
+                        }
+                        let mut cursor =
+                            Cursor::new(collection.clone(), IterationKind::Values, true);
+                        loop {
+                            let found = cursor.collection.borrow().entry_at(cursor.position);
+                            let Some((index, elem, _)) = found else {
+                                break;
+                            };
+                            cursor.position = index + 1;
+                            let in_other = self
+                                .call_function(other_has.clone(), other_obj.clone(), vec![elem])?
+                                .truthy();
+                            if !in_other {
+                                return Ok(Value::Bool(false));
+                            }
+                        }
+                        Ok(Value::Bool(true))
+                    }
+                    M::IsSupersetOf => {
+                        if (collection.borrow().len() as f64) < other_size {
+                            return Ok(Value::Bool(false));
+                        }
+                        let (iter, next) = self.get_keys_iterator(&other_obj, &other_keys)?;
+                        while let Some(value) = self.step_keys_iterator(&iter, &next)? {
+                            if !collection.borrow().has(&value) {
+                                self.close_keys_iterator(&iter)?;
+                                return Ok(Value::Bool(false));
+                            }
+                        }
+                        Ok(Value::Bool(true))
+                    }
+                    M::IsDisjointFrom => {
+                        if (collection.borrow().len() as f64) <= other_size {
+                            let mut cursor =
+                                Cursor::new(collection.clone(), IterationKind::Values, true);
+                            loop {
+                                let found = cursor.collection.borrow().entry_at(cursor.position);
+                                let Some((index, elem, _)) = found else {
+                                    break;
+                                };
+                                cursor.position = index + 1;
+                                let in_other = self
+                                    .call_function(
+                                        other_has.clone(),
+                                        other_obj.clone(),
+                                        vec![elem],
+                                    )?
+                                    .truthy();
+                                if in_other {
+                                    return Ok(Value::Bool(false));
+                                }
+                            }
+                        } else {
+                            let (iter, next) = self.get_keys_iterator(&other_obj, &other_keys)?;
+                            while let Some(value) = self.step_keys_iterator(&iter, &next)? {
+                                if collection.borrow().has(&value) {
+                                    self.close_keys_iterator(&iter)?;
+                                    return Ok(Value::Bool(false));
+                                }
+                            }
+                        }
+                        Ok(Value::Bool(true))
+                    }
+                    _ => unreachable!("handled above"),
                 }
-                Ok(set)
             }
             M::WeakRefConstructor => {
                 if new_target.is_none() {
@@ -895,5 +1122,60 @@ impl ScriptRuntime {
         for (cleanup, held) in due {
             self.schedule_callback(cleanup, vec![held]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collections_enforce_brand_checks_weak_symbols_and_set_methods() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [];
+                for (const fn of [
+                    () => Map.prototype.get.call({}, "a"),
+                    () => Set.prototype.has.call({}, 1),
+                    () => WeakMap.prototype.get.call({}, {}),
+                    () => WeakSet.prototype.has.call({}, {}),
+                ]) {
+                    try { fn(); seen.push("ok"); } catch (e) { seen.push(e.name); }
+                }
+                const wm = new WeakMap();
+                const sym = Symbol("k");
+                wm.set(sym, 42);
+                seen.push(wm.get(sym));
+                try { wm.set(Symbol.for("reg"), 1); seen.push("ok"); } catch (e) { seen.push(e.name); }
+                const m = new Map([["a", 1]]);
+                seen.push(m.getOrInsert("a", 9), m.getOrInsert("b", 2), m.getOrInsertComputed("c", (k) => k + "!"));
+                let closed = false;
+                const setLike = {
+                    size: 1,
+                    has() { return false; },
+                    keys() {
+                        let i = 0;
+                        return {
+                            next() { return i++ === 0 ? { value: 2, done: false } : { value: undefined, done: true }; },
+                            return() { closed = true; return { done: true }; }
+                        };
+                    }
+                };
+                const a = new Set([1, 2]);
+                seen.push([...a.union(setLike)].join(), a.isDisjointFrom(setLike), closed);
+                document.getElementById("out").textContent = seen.join("|");
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some("TypeError|TypeError|TypeError|TypeError|42|TypeError|1|2|c!|1,2|false|true")
+        );
     }
 }

@@ -2310,37 +2310,61 @@ unsafe fn helper_call_native(
                                 }
                             }
                             Native::Collection(
-                                col_m @ (super::collections::CollectionMethod::Get
-                                | super::collections::CollectionMethod::Has
-                                | super::collections::CollectionMethod::Set
-                                | super::collections::CollectionMethod::Add
-                                | super::collections::CollectionMethod::Delete
-                                | super::collections::CollectionMethod::Clear
-                                | super::collections::CollectionMethod::Size),
+                                col_m @ (super::collections::CollectionMethod::Get(
+                                    super::collections::CollectionKind::Map,
+                                )
+                                | super::collections::CollectionMethod::Has(
+                                    super::collections::CollectionKind::Map
+                                    | super::collections::CollectionKind::Set,
+                                )
+                                | super::collections::CollectionMethod::Set(
+                                    super::collections::CollectionKind::Map,
+                                )
+                                | super::collections::CollectionMethod::Add(
+                                    super::collections::CollectionKind::Set,
+                                )
+                                | super::collections::CollectionMethod::Delete(
+                                    super::collections::CollectionKind::Map
+                                    | super::collections::CollectionKind::Set,
+                                )
+                                | super::collections::CollectionMethod::Clear(
+                                    super::collections::CollectionKind::Map
+                                    | super::collections::CollectionKind::Set,
+                                )
+                                | super::collections::CollectionMethod::Size(
+                                    super::collections::CollectionKind::Map
+                                    | super::collections::CollectionKind::Set,
+                                )),
                             ) if count_usize <= 2 => {
-                                use super::collections::CollectionMethod as CM;
+                                use super::collections::{
+                                    CollectionKind as CK, CollectionMethod as CM,
+                                };
                                 if let Value::Object(recv_h) = &*stack_ptr.add(return_base)
                                     && let Some(recv_obj) = heap.object_ref(recv_h)
                                 {
                                     let col_opt = match (&recv_obj.class, col_m) {
                                         (
                                             ObjectClass::Map(col),
-                                            CM::Get
-                                            | CM::Has
-                                            | CM::Set
-                                            | CM::Delete
-                                            | CM::Clear
-                                            | CM::Size,
+                                            CM::Get(CK::Map)
+                                            | CM::Has(CK::Map)
+                                            | CM::Set(CK::Map)
+                                            | CM::Delete(CK::Map)
+                                            | CM::Clear(CK::Map)
+                                            | CM::Size(CK::Map),
                                         )
                                         | (
                                             ObjectClass::Set(col),
-                                            CM::Has | CM::Add | CM::Delete | CM::Clear | CM::Size,
+                                            CM::Has(CK::Set)
+                                            | CM::Add(CK::Set)
+                                            | CM::Delete(CK::Set)
+                                            | CM::Clear(CK::Set)
+                                            | CM::Size(CK::Set),
                                         ) => Some(col),
                                         _ => None,
                                     };
                                     if let Some(col) = col_opt {
                                         match col_m {
-                                            CM::Get => {
+                                            CM::Get(_) => {
                                                 if let Ok(map) = col.try_borrow() {
                                                     let res = if count_usize == 0 {
                                                         map.get(&Value::Undefined)
@@ -2363,7 +2387,7 @@ unsafe fn helper_call_native(
                                                     return STATUS_OK;
                                                 }
                                             }
-                                            CM::Has => {
+                                            CM::Has(_) => {
                                                 if let Ok(map) = col.try_borrow() {
                                                     let has = if count_usize == 0 {
                                                         map.has(&Value::Undefined)
@@ -2385,7 +2409,7 @@ unsafe fn helper_call_native(
                                                     return STATUS_OK;
                                                 }
                                             }
-                                            CM::Size => {
+                                            CM::Size(_) => {
                                                 if let Ok(map) = col.try_borrow() {
                                                     let len = map.len() as f64;
                                                     drop(map);
@@ -2403,7 +2427,7 @@ unsafe fn helper_call_native(
                                                     return STATUS_OK;
                                                 }
                                             }
-                                            CM::Delete => {
+                                            CM::Delete(_) => {
                                                 if let Ok(mut map) = col.try_borrow_mut() {
                                                     let deleted = if count_usize == 0 {
                                                         map.delete(&Value::Undefined)
@@ -2425,7 +2449,7 @@ unsafe fn helper_call_native(
                                                     return STATUS_OK;
                                                 }
                                             }
-                                            CM::Clear => {
+                                            CM::Clear(_) => {
                                                 if let Ok(mut map) = col.try_borrow_mut() {
                                                     map.clear();
                                                     drop(map);
@@ -2443,7 +2467,7 @@ unsafe fn helper_call_native(
                                                     return STATUS_OK;
                                                 }
                                             }
-                                            CM::Set | CM::Add => {
+                                            CM::Set(_) | CM::Add(_) => {
                                                 if let Ok(mut map) = col.try_borrow_mut()
                                                     && map.len() < MAX_RUNTIME_ARRAY_LENGTH
                                                 {
@@ -2452,7 +2476,7 @@ unsafe fn helper_call_native(
                                                     } else {
                                                         Value::Undefined
                                                     };
-                                                    let val = if matches!(col_m, CM::Set)
+                                                    let val = if matches!(col_m, CM::Set(_))
                                                         && count_usize >= 2
                                                     {
                                                         std::ptr::read(stack_ptr.add(arg_start + 1))
@@ -5611,6 +5635,11 @@ impl<'a> Compiler<'a> {
             Op::ToIndexKey => {
                 let done = self.asm.label();
                 let slow = self.defer_step_op(op_pc, false, next_label);
+                self.asm.movzx_r_m8(RAX, R_SP, -2 * VAL_SIZE);
+                self.asm.cmp_r8_imm(RAX, VALUE_TAG_UNDEFINED);
+                self.asm.jcc(CC_E, slow);
+                self.asm.cmp_r8_imm(RAX, VALUE_TAG_NULL);
+                self.asm.jcc(CC_E, slow);
                 self.asm.movzx_r_m8(RAX, R_SP, -VAL_SIZE);
                 self.asm.cmp_r8_imm(RAX, VALUE_TAG_STRING);
                 self.asm.jcc(CC_E, done);

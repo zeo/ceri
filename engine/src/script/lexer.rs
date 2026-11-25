@@ -35,6 +35,8 @@ pub(super) struct Token {
     pub(super) end: usize,
     // a line terminator sits between this token and the previous one
     pub(super) newline_before: bool,
+    // strict mode rejects legacy octal literals and escapes even though sloppy mode allows them
+    pub(super) strict_error: Option<&'static str>,
 }
 
 // longest punctuators first, so the scanner always takes the longest match
@@ -163,8 +165,10 @@ impl<'a> Lexer<'a> {
                 start,
                 end: start,
                 newline_before,
+                strict_error: None,
             });
         };
+        let mut strict_error = None;
         let kind = if is_identifier_start(character) || character == '\\' {
             let (name, escaped) = self.scan_identifier_name()?;
             if escaped {
@@ -185,9 +189,13 @@ impl<'a> Lexer<'a> {
                     .peek_char_at(1)
                     .is_some_and(|next| next.is_ascii_digit())
         {
-            self.scan_number()?
+            let (kind, err) = self.scan_number()?;
+            strict_error = err;
+            kind
         } else if character == '"' || character == '\'' {
-            TokenKind::String(self.scan_string(character)?)
+            let (text, err) = self.scan_string(character)?;
+            strict_error = err;
+            TokenKind::String(text)
         } else if character == '`' {
             self.bump();
             self.scan_template_part(start)?
@@ -199,6 +207,7 @@ impl<'a> Lexer<'a> {
             start,
             end: self.position,
             newline_before,
+            strict_error,
         })
     }
 
@@ -242,6 +251,7 @@ impl<'a> Lexer<'a> {
             start,
             end: self.position,
             newline_before: false,
+            strict_error: None,
         })
     }
 
@@ -257,6 +267,7 @@ impl<'a> Lexer<'a> {
             start,
             end: self.position,
             newline_before: false,
+            strict_error: None,
         })
     }
 
@@ -376,7 +387,7 @@ impl<'a> Lexer<'a> {
         Ok(digits)
     }
 
-    fn scan_number(&mut self) -> Result<TokenKind, ScriptError> {
+    fn scan_number(&mut self) -> Result<(TokenKind, Option<&'static str>), ScriptError> {
         let start = self.position;
         let prefix = self.source[self.position..]
             .get(..2)
@@ -388,6 +399,7 @@ impl<'a> Lexer<'a> {
             _ => None,
         };
         let mut integer_digits: Option<(String, u32)> = None;
+        let mut strict_error = None;
         let value = if let Some(radix) = radix {
             self.position += 2;
             let digits = self.scan_digits(radix, start)?;
@@ -403,9 +415,20 @@ impl<'a> Lexer<'a> {
                 .peek_char_at(1)
                 .is_some_and(|next| next.is_ascii_digit())
         {
-            // legacy octal, or decimal when an 8 or 9 appears
+            // legacy octal, or decimal when an 8 or 9 appears; numeric separators are forbidden
             self.bump();
-            let digits = self.scan_digits(10, start)?;
+            let mut digits = String::new();
+            while let Some(character) = self.peek_char() {
+                if character == '_' {
+                    return Err(self.error(start, "invalid numeric separator"));
+                }
+                if !character.is_ascii_digit() {
+                    break;
+                }
+                digits.push(character);
+                self.bump();
+            }
+            strict_error = Some("octal literals are not allowed in strict mode");
             if digits.chars().all(|digit| digit < '8') {
                 digits.chars().fold(0.0_f64, |value, digit| {
                     value * 8.0 + f64::from(digit as u8 - b'0')
@@ -414,6 +437,9 @@ impl<'a> Lexer<'a> {
                 digits.parse::<f64>().unwrap_or(f64::NAN)
             }
         } else {
+            if self.peek_char() == Some('0') && self.peek_char_at(1) == Some('_') {
+                return Err(self.error(start, "invalid numeric separator"));
+            }
             let mut text = self.scan_digits(10, start)?;
             if !matches!(self.peek_char(), Some('.' | 'e' | 'E')) {
                 integer_digits = Some((text.clone(), 10));
@@ -455,20 +481,25 @@ impl<'a> Lexer<'a> {
             }
             let value = super::bigint::BigInt::parse_radix(&digits, radix)
                 .ok_or_else(|| self.error(start, "invalid BigInt literal"))?;
-            return Ok(TokenKind::BigInt(value.to_string_radix(10).into()));
+            return Ok((TokenKind::BigInt(value.to_string_radix(10).into()), None));
         }
         if self.peek_char().is_some_and(is_identifier_start) {
             return Err(self.error(start, "identifier starts right after a number"));
         }
-        Ok(TokenKind::Number(value))
+        Ok((TokenKind::Number(value), strict_error))
     }
 
     // the escape after a backslash; None for a line continuation, Err for a bad escape
-    fn scan_escape(&mut self, start: usize, template: bool) -> Result<Option<char>, ScriptError> {
+    fn scan_escape(
+        &mut self,
+        start: usize,
+        template: bool,
+    ) -> Result<(Option<char>, bool), ScriptError> {
         let Some(character) = self.bump() else {
             return Err(self.error(start, "unterminated escape"));
         };
-        Ok(Some(match character {
+        let mut legacy = false;
+        let decoded = match character {
             'n' => '\n',
             'r' => '\r',
             't' => '\t',
@@ -480,6 +511,7 @@ impl<'a> Lexer<'a> {
                 if template {
                     return Err(self.error(start, "octal escapes are not allowed in templates"));
                 }
+                legacy = true;
                 let mut value = character.to_digit(8).expect("octal digit");
                 let limit = if character <= '3' { 2 } else { 1 };
                 for _ in 0..limit {
@@ -493,8 +525,12 @@ impl<'a> Lexer<'a> {
                 }
                 char::from_u32(value).unwrap_or('\u{fffd}')
             }
-            '8' | '9' if template => {
-                return Err(self.error(start, "invalid escape in template"));
+            '8' | '9' => {
+                if template {
+                    return Err(self.error(start, "invalid escape in template"));
+                }
+                legacy = true;
+                character
             }
             'x' => {
                 let digits = self
@@ -514,27 +550,34 @@ impl<'a> Lexer<'a> {
                 if self.peek_char() == Some('\n') {
                     self.bump();
                 }
-                return Ok(None);
+                return Ok((None, false));
             }
-            '\n' | '\u{2028}' | '\u{2029}' => return Ok(None),
+            '\n' | '\u{2028}' | '\u{2029}' => return Ok((None, false)),
             other => other,
-        }))
+        };
+        Ok((Some(decoded), legacy))
     }
 
-    fn scan_string(&mut self, quote: char) -> Result<String, ScriptError> {
+    fn scan_string(&mut self, quote: char) -> Result<(String, Option<&'static str>), ScriptError> {
         let start = self.position;
         self.bump();
         let mut value = String::new();
+        let mut strict_error = None;
         loop {
             let Some(character) = self.bump() else {
                 return Err(self.error(start, "unterminated string"));
             };
             if character == quote {
-                return Ok(value);
+                return Ok((value, strict_error));
             }
             match character {
                 '\\' => {
-                    if let Some(escaped) = self.scan_escape(start, false)? {
+                    let (escaped, legacy) = self.scan_escape(start, false)?;
+                    if legacy {
+                        strict_error =
+                            Some("octal escape sequences are not allowed in strict mode");
+                    }
+                    if let Some(escaped) = escaped {
                         value.push(escaped);
                     }
                 }
@@ -571,7 +614,7 @@ impl<'a> Lexer<'a> {
                 '\\' => {
                     let escape_start = self.position;
                     match self.scan_escape(start, true) {
-                        Ok(escaped) => {
+                        Ok((escaped, _)) => {
                             if let (Some(text), Some(escaped)) = (cooked.as_mut(), escaped) {
                                 text.push(escaped);
                             }
