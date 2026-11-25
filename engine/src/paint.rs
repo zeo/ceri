@@ -378,19 +378,26 @@ impl Canvas {
         if right <= left || bottom <= top {
             return;
         }
-        // an opaque span is a row copy, which is the hot path for backgrounds and borders
-        if color.alpha == 255 && self.masks.is_empty() {
-            let sample = [color.red, color.green, color.blue, 255];
-            let stride = self.width as usize * 4;
+        let stride = self.width as usize * 4;
+        if self.masks_cover_rect(left, top, right, bottom) {
             for pixel_y in top..bottom {
                 let start = pixel_y as usize * stride + left as usize * 4;
                 let end = pixel_y as usize * stride + right as usize * 4;
-                self.pixels[start..end].as_chunks_mut::<4>().0.fill(sample);
+                fill_solid_span(&mut self.pixels[start..end], color);
             }
             return;
         }
         for pixel_y in top..bottom {
-            for pixel_x in left..right {
+            let unmasked = self.masks_whole_run(pixel_y as f32 + 0.5, left..right);
+            for pixel_x in left..unmasked.start {
+                self.blend_pixel(pixel_x, pixel_y, color);
+            }
+            if !unmasked.is_empty() {
+                let start = pixel_y as usize * stride + unmasked.start as usize * 4;
+                let end = pixel_y as usize * stride + unmasked.end as usize * 4;
+                fill_solid_span(&mut self.pixels[start..end], color);
+            }
+            for pixel_x in unmasked.end..right {
                 self.blend_pixel(pixel_x, pixel_y, color);
             }
         }
@@ -450,6 +457,20 @@ impl Canvas {
             self.blend_subpixels(x, y, glyph, color, clip);
             return;
         }
+        let (min_x, max_x, min_y, max_y) = glyph_bounds(self.width, self.height, clip);
+        let row_start = (min_y - y).clamp(0, glyph.height as i32) as usize;
+        let row_end = (max_y - y).clamp(0, glyph.height as i32) as usize;
+        let col_start = (min_x - x).clamp(0, glyph.width as i32) as usize;
+        let col_end = (max_x - x).clamp(0, glyph.width as i32) as usize;
+        if row_start >= row_end || col_start >= col_end {
+            return;
+        }
+        let unmasked = self.masks_cover_rect(
+            (x + col_start as i32) as u32,
+            (y + row_start as i32) as u32,
+            (x + col_end as i32) as u32,
+            (y + row_end as i32) as u32,
+        );
         let gamma = text_gamma_table(color);
         let coverage_at = |index: usize| {
             if glyph.subpixels {
@@ -460,33 +481,39 @@ impl Canvas {
                 glyph.coverage[index]
             }
         };
-        for row in 0..glyph.height {
-            let pixel_y = y + row as i32;
-            if pixel_y < 0 || pixel_y as u32 >= self.height {
-                continue;
-            }
-            for column in 0..glyph.width {
-                let pixel_x = x + column as i32;
-                if pixel_x < 0 || pixel_x as u32 >= self.width {
-                    continue;
+        if unmasked {
+            let stride = self.width as usize * 4;
+            for row in row_start..row_end {
+                let pixel_y = (y + row as i32) as usize;
+                let row_pixels = &mut self.pixels[pixel_y * stride..(pixel_y + 1) * stride];
+                let glyph_row = row * glyph.width;
+                for column in col_start..col_end {
+                    let coverage = gamma[usize::from(coverage_at(glyph_row + column))];
+                    if coverage == 0 {
+                        continue;
+                    }
+                    let alpha = (u32::from(color.alpha) * u32::from(coverage) / 255) as u8;
+                    let at = (x + column as i32) as usize * 4;
+                    let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
+                        .try_into()
+                        .expect("four bytes per pixel");
+                    blend_rgba(pixel, Color { alpha, ..color });
                 }
-                let coverage = gamma[usize::from(coverage_at(row * glyph.width + column))];
+            }
+            return;
+        }
+        for row in row_start..row_end {
+            let pixel_y = (y + row as i32) as u32;
+            let glyph_row = row * glyph.width;
+            for column in col_start..col_end {
+                let coverage = gamma[usize::from(coverage_at(glyph_row + column))];
                 if coverage == 0 {
                     continue;
                 }
-                if let Some(clip) = clip {
-                    let inside = (pixel_x as f32) >= clip.x.floor()
-                        && (pixel_x as f32) < (clip.x + clip.width).ceil()
-                        && (pixel_y as f32) >= clip.y.floor()
-                        && (pixel_y as f32) < (clip.y + clip.height).ceil();
-                    if !inside {
-                        continue;
-                    }
-                }
                 let alpha = u32::from(color.alpha) * u32::from(coverage) / 255;
                 self.blend_pixel(
-                    pixel_x as u32,
-                    pixel_y as u32,
+                    (x + column as i32) as u32,
+                    pixel_y,
                     Color {
                         alpha: alpha as u8,
                         ..color
@@ -506,19 +533,60 @@ impl Canvas {
         color: Color,
         clip: Option<crate::layout::Rect>,
     ) {
+        let (min_x, max_x, min_y, max_y) = glyph_bounds(self.width, self.height, clip);
+        let row_start = (min_y - y).clamp(0, glyph.height as i32) as usize;
+        let row_end = (max_y - y).clamp(0, glyph.height as i32) as usize;
+        let col_start = (min_x - x).clamp(0, glyph.width as i32) as usize;
+        let col_end = (max_x - x).clamp(0, glyph.width as i32) as usize;
+        if row_start >= row_end || col_start >= col_end {
+            return;
+        }
+        let unmasked = self.masks_cover_rect(
+            (x + col_start as i32) as u32,
+            (y + row_start as i32) as u32,
+            (x + col_end as i32) as u32,
+            (y + row_end as i32) as u32,
+        );
         let tables = [color.red, color.green, color.blue].map(text_gamma);
         let source = [color.red, color.green, color.blue].map(i32::from);
-        for row in 0..glyph.height {
-            let pixel_y = y + row as i32;
-            if pixel_y < 0 || pixel_y as u32 >= self.height {
-                continue;
-            }
-            for column in 0..glyph.width {
-                let pixel_x = x + column as i32;
-                if pixel_x < 0 || pixel_x as u32 >= self.width {
-                    continue;
+        let stride = self.width as usize * 4;
+        if unmasked {
+            let alpha_scale = (color.alpha < 255).then_some(i32::from(color.alpha) + 1);
+            for row in row_start..row_end {
+                let pixel_y = (y + row as i32) as usize;
+                let row_pixels = &mut self.pixels[pixel_y * stride..(pixel_y + 1) * stride];
+                let glyph_row = row * glyph.width;
+                for column in col_start..col_end {
+                    let at = (glyph_row + column) * 3;
+                    let mut masks = [0, 1, 2].map(|channel| {
+                        let five = i32::from(
+                            tables[channel][usize::from(glyph.coverage[at + channel])] >> 3,
+                        );
+                        five + (five >> 4)
+                    });
+                    if masks == [0; 3] {
+                        continue;
+                    }
+                    if let Some(alpha) = alpha_scale {
+                        masks = masks.map(|mask| (mask * alpha) >> 8);
+                    }
+                    let index = (x + column as i32) as usize * 4;
+                    for channel in 0..3 {
+                        let destination = i32::from(row_pixels[index + channel]);
+                        row_pixels[index + channel] = (destination
+                            + (((source[channel] - destination) * masks[channel]) >> 5))
+                            as u8;
+                    }
                 }
-                let at = (row * glyph.width + column) * 3;
+            }
+            return;
+        }
+        for row in row_start..row_end {
+            let pixel_y = (y + row as i32) as u32;
+            let glyph_row = row * glyph.width;
+            for column in col_start..col_end {
+                let pixel_x = (x + column as i32) as u32;
+                let at = (glyph_row + column) * 3;
                 let mut masks = [0, 1, 2].map(|channel| {
                     let five =
                         i32::from(tables[channel][usize::from(glyph.coverage[at + channel])] >> 3);
@@ -527,22 +595,7 @@ impl Canvas {
                 if masks == [0; 3] {
                     continue;
                 }
-                if let Some(clip) = clip {
-                    let inside = (pixel_x as f32) >= clip.x.floor()
-                        && (pixel_x as f32) < (clip.x + clip.width).ceil()
-                        && (pixel_y as f32) >= clip.y.floor()
-                        && (pixel_y as f32) < (clip.y + clip.height).ceil();
-                    if !inside {
-                        continue;
-                    }
-                }
-                let alpha = if self.masks.is_empty() {
-                    color.alpha
-                } else {
-                    color
-                        .scale_alpha(self.mask_at(pixel_x as u32, pixel_y as u32))
-                        .alpha
-                };
+                let alpha = color.scale_alpha(self.mask_at(pixel_x, pixel_y)).alpha;
                 if alpha == 0 {
                     continue;
                 }
@@ -550,7 +603,7 @@ impl Canvas {
                     let alpha = i32::from(alpha) + 1;
                     masks = masks.map(|mask| (mask * alpha) >> 8);
                 }
-                let index = ((pixel_y as u32 * self.width + pixel_x as u32) * 4) as usize;
+                let index = ((pixel_y * self.width + pixel_x) * 4) as usize;
                 for channel in 0..3 {
                     let destination = i32::from(self.pixels[index + channel]);
                     self.pixels[index + channel] = (destination
@@ -644,48 +697,75 @@ impl Canvas {
             .clamp(0.0, self.height as f32) as u32;
         let [left, top, right, bottom] = narrow([left, top, right, bottom], clip);
         let (left, right) = (left.min(self.width), right.min(self.width));
+        let (top, bottom) = (top.min(self.height), bottom.min(self.height));
+        if left >= right || top >= bottom {
+            return;
+        }
+        let unmasked_all = self.masks_cover_rect(left, top, right, bottom);
+        let stride = self.width as usize * 4;
         let steady = paint.steady();
         let mut columns = None;
-        for pixel_y in top.min(self.height)..bottom.min(self.height) {
+        for pixel_y in top..bottom {
             let row = pixel_y as f32 + 0.5;
             // most of a row lies whole inside the shape, where only the paint is asked for
             let whole = device.whole_run(row, left..right);
-            let whole = match clip {
-                Some(clip) => run_where(whole, |pixel| {
-                    clip.coverage((pixel as f32 + 0.5, row)) > 0.0
-                }),
-                None => whole,
-            };
-            for pixel_x in (left..whole.start).chain(whole.end..right) {
-                let center = (pixel_x as f32 + 0.5, row);
-                if let Some(clip) = clip
-                    && clip.coverage(center) <= 0.0
-                {
-                    continue;
+            if unmasked_all {
+                let row_pixels =
+                    &mut self.pixels[pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                for pixel_x in (left..whole.start).chain(whole.end..right) {
+                    let center = (pixel_x as f32 + 0.5, row);
+                    let coverage = device.coverage(center);
+                    if coverage <= 0.0 {
+                        continue;
+                    }
+                    let color = paint.pixel_color(steady, center);
+                    if color.alpha == 0 {
+                        continue;
+                    }
+                    let at = pixel_x as usize * 4;
+                    let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
+                        .try_into()
+                        .expect("four bytes per pixel");
+                    blend_rgba(pixel, color.scale_alpha(coverage.min(1.0)));
                 }
-                let coverage = device.coverage(center);
-                if coverage <= 0.0 {
-                    continue;
+            } else {
+                for pixel_x in (left..whole.start).chain(whole.end..right) {
+                    let center = (pixel_x as f32 + 0.5, row);
+                    let coverage = device.coverage(center);
+                    if coverage <= 0.0 {
+                        continue;
+                    }
+                    let color = paint.pixel_color(steady, center);
+                    if color.alpha == 0 {
+                        continue;
+                    }
+                    self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage.min(1.0)));
                 }
-                let color = paint.pixel_color(steady, center);
-                if color.alpha == 0 {
-                    continue;
-                }
-                self.blend_pixel(pixel_x, pixel_y, color.scale_alpha(coverage.min(1.0)));
             }
             let color_at = |pixel_x: u32| paint.color_at((pixel_x as f32 + 0.5, row));
             match steady {
                 // the row is one color between the first and the last pixel its tile covers
                 Steady::AlongRows => {
                     let drawn = run_where(whole, |pixel_x| color_at(pixel_x).alpha != 0);
+                    if drawn.is_empty() {
+                        continue;
+                    }
                     let color = color_at(drawn.start);
-                    if color.alpha == 255 && self.masks.is_empty() {
-                        let at = pixel_y as usize * self.width as usize * 4;
-                        let sample = [color.red, color.green, color.blue, 255];
+                    let at = pixel_y as usize * stride;
+                    if unmasked_all {
                         let run = at + drawn.start as usize * 4..at + drawn.end as usize * 4;
-                        self.pixels[run].as_chunks_mut::<4>().0.fill(sample);
+                        fill_solid_span(&mut self.pixels[run], color);
                     } else {
-                        for pixel_x in drawn {
+                        let unmasked = self.masks_whole_run(row, drawn.clone());
+                        for pixel_x in drawn.start..unmasked.start {
+                            self.blend_pixel(pixel_x, pixel_y, color);
+                        }
+                        if !unmasked.is_empty() {
+                            let run =
+                                at + unmasked.start as usize * 4..at + unmasked.end as usize * 4;
+                            fill_solid_span(&mut self.pixels[run], color);
+                        }
+                        for pixel_x in unmasked.end..drawn.end {
                             self.blend_pixel(pixel_x, pixel_y, color);
                         }
                     }
@@ -697,18 +777,48 @@ impl Canvas {
                     }
                     let colors = columns
                         .get_or_insert_with(|| (left..right).map(color_at).collect::<Vec<_>>());
-                    for pixel_x in whole {
-                        let color = colors[(pixel_x - left) as usize];
-                        if color.alpha != 0 {
-                            self.blend_pixel(pixel_x, pixel_y, color);
+                    if unmasked_all {
+                        let row_pixels = &mut self.pixels
+                            [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                        for pixel_x in whole {
+                            let color = colors[(pixel_x - left) as usize];
+                            if color.alpha != 0 {
+                                let at = pixel_x as usize * 4;
+                                let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
+                                    .try_into()
+                                    .expect("four bytes per pixel");
+                                blend_rgba(pixel, color);
+                            }
+                        }
+                    } else {
+                        for pixel_x in whole {
+                            let color = colors[(pixel_x - left) as usize];
+                            if color.alpha != 0 {
+                                self.blend_pixel(pixel_x, pixel_y, color);
+                            }
                         }
                     }
                 }
                 Steady::Nowhere => {
-                    for pixel_x in whole {
-                        let color = paint.pixel_color(steady, (pixel_x as f32 + 0.5, row));
-                        if color.alpha != 0 {
-                            self.blend_pixel(pixel_x, pixel_y, color);
+                    if unmasked_all {
+                        let row_pixels = &mut self.pixels
+                            [pixel_y as usize * stride..(pixel_y as usize + 1) * stride];
+                        for pixel_x in whole {
+                            let color = paint.pixel_color(steady, (pixel_x as f32 + 0.5, row));
+                            if color.alpha != 0 {
+                                let at = pixel_x as usize * 4;
+                                let pixel: &mut [u8; 4] = (&mut row_pixels[at..at + 4])
+                                    .try_into()
+                                    .expect("four bytes per pixel");
+                                blend_rgba(pixel, color);
+                            }
+                        }
+                    } else {
+                        for pixel_x in whole {
+                            let color = paint.pixel_color(steady, (pixel_x as f32 + 0.5, row));
+                            if color.alpha != 0 {
+                                self.blend_pixel(pixel_x, pixel_y, color);
+                            }
                         }
                     }
                 }
@@ -742,11 +852,6 @@ impl Canvas {
             };
             for pixel_x in (left..inside.start).chain(inside.end..right) {
                 let center = (pixel_x as f32 + 0.5, row);
-                if let Some(clip) = clip
-                    && clip.coverage(center) <= 0.0
-                {
-                    continue;
-                }
                 let mut coverage = outer.coverage(center);
                 if hollow {
                     coverage *= 1.0 - inner.coverage(center);
@@ -826,11 +931,6 @@ impl Canvas {
         for pixel_y in top..bottom {
             for pixel_x in left..right {
                 let point = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
-                if let Some(clip) = clip
-                    && clip.coverage(point) <= 0.0
-                {
-                    continue;
-                }
                 let t = if length > 0.0 {
                     (((point.0 - start.0) * along.0 + (point.1 - start.1) * along.1) / length)
                         .clamp(0.0, 1.0)
@@ -1046,57 +1146,104 @@ impl Canvas {
             .ceil()
             .clamp(0.0, self.height as f32) as u32;
         let [left, top, right, bottom] = narrow([left, top, right, bottom], clip);
-        // the middle shows no shadow: an inset one fades out a few deviations inside its
-        // shape, and an outer one hides under its frame; corners curve in by under a third
-        // of their radius
-        let (still, margin) = if inset {
-            (shape, 4.0 * sigma + 1.0)
+        if left >= right || top >= bottom {
+            return;
+        }
+        // an inset shadow fades out a few deviations inside its shape; an outer one hides
+        // completely under its frame's whole_run on every row
+        let hollow = if inset {
+            let corner = shape
+                .radii
+                .iter()
+                .fold(0.0_f32, |most, radius| most.max(radius.0).max(radius.1));
+            let margin = 4.0 * sigma + 1.0 + corner * 0.3;
+            [
+                (shape.x + margin).ceil(),
+                (shape.y + margin).ceil(),
+                (shape.x + shape.width - margin).floor(),
+                (shape.y + shape.height - margin).floor(),
+            ]
         } else {
-            (frame, 1.0)
+            [0.0; 4]
         };
-        let corner = still
-            .radii
-            .iter()
-            .fold(0.0_f32, |most, radius| most.max(radius.0).max(radius.1));
-        let margin = margin + corner * 0.3;
-        let hollow = [
-            (still.x + margin).ceil(),
-            (still.y + margin).ceil(),
-            (still.x + still.width - margin).floor(),
-            (still.y + still.height - margin).floor(),
-        ];
-        let mut within = Blurred::new(frame, 0.0, left..right);
+        let frame_square = frame.is_square();
+        let unmasked_all = self.masks_cover_rect(left, top, right, bottom);
+        let stride = self.width as usize * 4;
         let mut blurred = Blurred::new(shape, sigma, left..right);
         for pixel_y in top..bottom {
             let row = pixel_y as f32;
-            let (within_row, blurred_row) = (within.row(row + 0.5), blurred.row(row + 0.5));
-            let skipped = if row >= hollow[1] && row + 1.0 <= hollow[3] && hollow[0] < hollow[2] {
-                hollow[0].max(0.0) as u32..hollow[2].max(0.0) as u32
+            let y = row + 0.5;
+            let frame_y_cov = if frame_square {
+                blurred_axis(frame.y, frame.height, y, 0.0)
             } else {
-                0..0
+                1.0
             };
+            let frame_y_outside = if frame_square {
+                frame_y_cov <= 0.0
+            } else {
+                frame.y - y >= 0.5 || y - frame.y - frame.height >= 0.5
+            };
+            if inset && frame_y_outside {
+                continue;
+            }
+            let frame_whole = if frame_y_outside {
+                left..left
+            } else {
+                frame.whole_run(y, left..right)
+            };
+            let blurred_row = blurred.row(y);
+            let skipped = if inset {
+                if row >= hollow[1] && row + 1.0 <= hollow[3] && hollow[0] < hollow[2] {
+                    hollow[0].max(0.0) as u32..hollow[2].max(0.0) as u32
+                } else {
+                    0..0
+                }
+            } else {
+                frame_whole.clone()
+            };
+            let unmasked = if unmasked_all {
+                left..right
+            } else {
+                self.masks_whole_run(y, left..right)
+            };
+            let row_base = pixel_y as usize * stride;
             let mut pixel_x = left;
             while pixel_x < right {
                 if skipped.contains(&pixel_x) {
                     pixel_x = skipped.end;
                     continue;
                 }
-                let center = (pixel_x as f32 + 0.5, row + 0.5);
+                let px = pixel_x;
+                let x = px as f32 + 0.5;
                 pixel_x += 1;
-                if let Some(clip) = clip
-                    && clip.coverage(center) <= 0.0
-                {
-                    continue;
-                }
-                let inside = within.at(&within_row, pixel_x - 1);
+                let inside = if frame_y_outside {
+                    0.0
+                } else if frame_whole.contains(&px) {
+                    1.0
+                } else if frame_square {
+                    frame_y_cov * blurred_axis(frame.x, frame.width, x, 0.0)
+                } else if frame.x - x >= 0.5 || x - frame.x - frame.width >= 0.5 {
+                    0.0
+                } else {
+                    frame.coverage((x, y))
+                };
                 let shade = if inset { inside } else { 1.0 - inside };
                 if shade <= 0.0 {
                     continue;
                 }
-                let covered = blurred.at(&blurred_row, pixel_x - 1);
+                let covered = blurred.at(&blurred_row, px);
                 let alpha = shade * if inset { 1.0 - covered } else { covered };
                 if alpha > 0.0 {
-                    self.blend_pixel(pixel_x - 1, pixel_y, color.scale_alpha(alpha.min(1.0)));
+                    let drawn = color.scale_alpha(alpha.min(1.0));
+                    if unmasked.contains(&px) {
+                        let at = row_base + px as usize * 4;
+                        let pixel: &mut [u8; 4] = (&mut self.pixels[at..at + 4])
+                            .try_into()
+                            .expect("four bytes per pixel");
+                        blend_rgba(pixel, drawn);
+                    } else {
+                        self.blend_pixel(px, pixel_y, drawn);
+                    }
                 }
             }
         }
@@ -1227,6 +1374,31 @@ impl Canvas {
 
     fn mask_at(&self, x: u32, y: u32) -> f32 {
         mask_coverage(&self.masks, (x as f32 + 0.5, y as f32 + 0.5))
+    }
+
+    fn masks_cover_rect(&self, left: u32, top: u32, right: u32, bottom: u32) -> bool {
+        self.masks.is_empty()
+            || self.masks.iter().all(|mask| match mask {
+                Mask::Rounded(shape) => shape.contains_whole_rect(left, top, right, bottom),
+                _ => false,
+            })
+    }
+
+    fn masks_whole_run(&self, row: f32, pixels: std::ops::Range<u32>) -> std::ops::Range<u32> {
+        if self.masks.is_empty() || pixels.is_empty() {
+            return pixels;
+        }
+        let mut run = pixels;
+        for mask in &self.masks {
+            match mask {
+                Mask::Rounded(shape) => run = shape.whole_run(row, run),
+                _ => return run.start..run.start,
+            }
+            if run.is_empty() {
+                return run;
+            }
+        }
+        run
     }
 
     fn blend_pixel(&mut self, x: u32, y: u32, color: Color) {
@@ -1415,19 +1587,84 @@ thread_local! {
     static LAYER_BUFFERS: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-// keeps a loop to the pixels whose centers can land in a device clip, which feathers half a
-// pixel past its edges
+fn blend_rgba(pixel: &mut [u8; 4], color: Color) {
+    if color.alpha == 255 {
+        *pixel = [color.red, color.green, color.blue, 255];
+        return;
+    }
+    let alpha = color.alpha as u32;
+    let inverse = 255 - alpha;
+    pixel[0] = ((color.red as u32 * alpha + pixel[0] as u32 * inverse) / 255) as u8;
+    pixel[1] = ((color.green as u32 * alpha + pixel[1] as u32 * inverse) / 255) as u8;
+    pixel[2] = ((color.blue as u32 * alpha + pixel[2] as u32 * inverse) / 255) as u8;
+    pixel[3] = ((alpha * 255 + pixel[3] as u32 * inverse) / 255) as u8;
+}
+
+fn fill_solid_span(row: &mut [u8], color: Color) {
+    if color.alpha == 255 {
+        row.as_chunks_mut::<4>()
+            .0
+            .fill([color.red, color.green, color.blue, 255]);
+        return;
+    }
+    let alpha = color.alpha as u32;
+    let inverse = 255 - alpha;
+    let (sr, sg, sb, sa) = (
+        color.red as u32 * alpha,
+        color.green as u32 * alpha,
+        color.blue as u32 * alpha,
+        alpha * 255,
+    );
+    for pixel in row.as_chunks_mut::<4>().0 {
+        pixel[0] = ((sr + pixel[0] as u32 * inverse) / 255) as u8;
+        pixel[1] = ((sg + pixel[1] as u32 * inverse) / 255) as u8;
+        pixel[2] = ((sb + pixel[2] as u32 * inverse) / 255) as u8;
+        pixel[3] = ((sa + pixel[3] as u32 * inverse) / 255) as u8;
+    }
+}
+
+fn glyph_bounds(width: u32, height: u32, clip: Option<Rect>) -> (i32, i32, i32, i32) {
+    let (mut min_x, mut max_x) = (0_i32, width as i32);
+    let (mut min_y, mut max_y) = (0_i32, height as i32);
+    if let Some(clip) = clip {
+        min_x = min_x.max(clip.x.floor().clamp(0.0, width as f32) as i32);
+        max_x = max_x.min((clip.x + clip.width).ceil().clamp(0.0, width as f32) as i32);
+        min_y = min_y.max(clip.y.floor().clamp(0.0, height as f32) as i32);
+        max_y = max_y.min((clip.y + clip.height).ceil().clamp(0.0, height as f32) as i32);
+    }
+    (min_x, max_x, min_y, max_y)
+}
+
+fn narrow_axis(range: std::ops::Range<u32>, origin: f32, length: f32) -> std::ops::Range<u32> {
+    if range.is_empty() {
+        return range;
+    }
+    let holds = |pixel: u32| {
+        let at = pixel as f32 + 0.5;
+        origin - at < 0.5 && at - origin - length < 0.5
+    };
+    let mut start = (origin - 1.0)
+        .floor()
+        .clamp(range.start as f32, range.end as f32) as u32;
+    let mut end = (origin + length + 1.0)
+        .ceil()
+        .clamp(range.start as f32, range.end as f32) as u32;
+    while start < end && !holds(start) {
+        start += 1;
+    }
+    while end > start && !holds(end - 1) {
+        end -= 1;
+    }
+    start..end
+}
+
+// keeps a loop to the exact pixels whose centers have positive coverage under a square device clip
 fn narrow(bounds: [u32; 4], clip: Option<Shape>) -> [u32; 4] {
     let Some(clip) = clip else { return bounds };
-    let near = |edge: f32| (edge - 1.0).floor().max(0.0) as u32;
-    let far = |edge: f32| (edge + 1.0).ceil().max(0.0) as u32;
     let [left, top, right, bottom] = bounds;
-    [
-        left.max(near(clip.x)),
-        top.max(near(clip.y)),
-        right.min(far(clip.x + clip.width)),
-        bottom.min(far(clip.y + clip.height)),
-    ]
+    let xs = narrow_axis(left..right, clip.x, clip.width);
+    let ys = narrow_axis(top..bottom, clip.y, clip.height);
+    [xs.start, ys.start, xs.end, ys.end]
 }
 
 // the pixels from the first to the last that pass a test which holds over one unbroken run
@@ -1757,11 +1994,42 @@ impl Shape {
         (0.5 - self.signed_distance(point)).clamp(0.0, 1.0)
     }
 
+    fn contains_whole_rect(self, left: u32, top: u32, right: u32, bottom: u32) -> bool {
+        if left >= right || top >= bottom {
+            return true;
+        }
+        let (x0, x1) = (left as f32 + 0.5, (right - 1) as f32 + 0.5);
+        let (y0, y1) = (top as f32 + 0.5, (bottom - 1) as f32 + 0.5);
+        if self.x - x0 > -0.5
+            || x1 - self.x - self.width > -0.5
+            || self.y - y0 > -0.5
+            || y1 - self.y - self.height > -0.5
+        {
+            return false;
+        }
+        for (corner, &(rx, ry)) in self.radii.iter().enumerate() {
+            let (rx, ry) = (rx.min(self.width), ry.min(self.height));
+            if rx <= 0.0 || ry <= 0.0 {
+                continue;
+            }
+            let clear = match corner {
+                0 => x0 >= self.x + rx || y0 >= self.y + ry,
+                1 => x1 <= self.x + self.width - rx || y0 >= self.y + ry,
+                2 => x1 <= self.x + self.width - rx || y1 <= self.y + self.height - ry,
+                _ => x0 >= self.x + rx || y1 <= self.y + self.height - ry,
+            };
+            if !clear {
+                return false;
+            }
+        }
+        true
+    }
+
     // the pixels of a row, by the height of their centers, that the shape covers whole: half
     // a pixel inside every edge and clear of the corner curves, by the arithmetic of the
     // signed distance, so coverage there is exactly one
     fn whole_run(self, row: f32, pixels: std::ops::Range<u32>) -> std::ops::Range<u32> {
-        if self.y - row > -0.5 || row - self.y - self.height > -0.5 {
+        if pixels.is_empty() || self.y - row > -0.5 || row - self.y - self.height > -0.5 {
             return pixels.start..pixels.start;
         }
         let bottom = row > self.y + self.height / 2.0;
@@ -1782,7 +2050,7 @@ impl Shape {
             (curve(0), curve(1))
         };
         let middle = self.x + self.width / 2.0;
-        run_where(pixels, |pixel| {
+        let holds = |pixel: u32| {
             let x = pixel as f32 + 0.5;
             self.x - x <= -0.5
                 && x - self.x - self.width <= -0.5
@@ -1791,7 +2059,31 @@ impl Shape {
                 } else {
                     near.is_none_or(|radius| self.x + radius - x <= 0.0)
                 }
-        })
+        };
+        let left_edge = near.map_or(self.x + 0.5, |radius| {
+            (self.x + 0.5).max((self.x + radius).min(middle))
+        });
+        let right_edge = far.map_or(self.x + self.width - 0.5, |radius| {
+            (self.x + self.width - 0.5).min((self.x + self.width - radius).max(middle))
+        });
+        let lo = (left_edge - 0.5)
+            .floor()
+            .clamp(pixels.start as f32, pixels.end as f32) as u32;
+        let hi = (right_edge - 0.5)
+            .ceil()
+            .clamp(pixels.start as f32, pixels.end as f32) as u32;
+        let mut start = lo.saturating_sub(1).max(pixels.start).min(pixels.end);
+        let mut end = hi.saturating_add(2).min(pixels.end);
+        while start < end && !holds(start) {
+            start += 1;
+        }
+        while end > start && !holds(end - 1) {
+            end -= 1;
+        }
+        if start >= end {
+            return pixels.start..pixels.start;
+        }
+        start..end
     }
 
     fn signed_distance(self, point: (f32, f32)) -> f32 {
@@ -2239,6 +2531,7 @@ struct Blurred {
     shape: Shape,
     sigma: f32,
     left: u32,
+    columns: u32,
     // by column: a square shape's coverage across, or a rounded one's span on the rows clear
     // of its corners, with the reach the span was worked out for
     across: Vec<Option<(u32, f32)>>,
@@ -2247,7 +2540,11 @@ struct Blurred {
 enum BlurredRow {
     // a square shape's coverage down, at the row's height
     Square(f32),
-    Sharp(f32),
+    Sharp {
+        y: f32,
+        y_outside: bool,
+        whole: std::ops::Range<u32>,
+    },
     // for the left half and the right, then the step between the four rows summed
     Rounded([BlurredHalf; 2], f32),
 }
@@ -2275,22 +2572,38 @@ fn blurred_axis(start: f32, length: f32, at: f32, sigma: f32) -> f32 {
 
 impl Blurred {
     fn new(shape: Shape, sigma: f32, columns: std::ops::Range<u32>) -> Self {
+        let needs_cache = shape.is_square() || sigma >= 0.5;
         Self {
             shape,
             sigma,
             left: columns.start,
-            across: vec![None; columns.len()],
+            columns: columns.len() as u32,
+            across: if needs_cache {
+                vec![None; columns.len()]
+            } else {
+                Vec::new()
+            },
         }
     }
 
     fn row(&self, y: f32) -> BlurredRow {
         let (shape, sigma) = (self.shape, self.sigma);
-        let columns = self.left..self.left + self.across.len() as u32;
+        let columns = self.left..self.left + self.columns;
         if shape.is_square() {
             return BlurredRow::Square(blurred_axis(shape.y, shape.height, y, sigma));
         }
         if sigma < 0.5 {
-            return BlurredRow::Sharp(y);
+            let y_outside = shape.y - y >= 0.5 || y - shape.y - shape.height >= 0.5;
+            let whole = if y_outside {
+                columns.start..columns.start
+            } else {
+                shape.whole_run(y, columns)
+            };
+            return BlurredRow::Sharp {
+                y,
+                y_outside,
+                whole,
+            };
         }
         let half = (shape.width / 2.0, shape.height / 2.0);
         let local = y - shape.y - half.1;
@@ -2356,9 +2669,9 @@ impl Blurred {
     fn at(&mut self, row: &BlurredRow, pixel_x: u32) -> f32 {
         let (shape, sigma) = (self.shape, self.sigma);
         let x = pixel_x as f32 + 0.5;
-        let kept = &mut self.across[(pixel_x - self.left) as usize];
         match row {
             BlurredRow::Square(down) => {
+                let kept = &mut self.across[(pixel_x - self.left) as usize];
                 let across = match *kept {
                     Some((_, across)) => across,
                     None => {
@@ -2369,7 +2682,19 @@ impl Blurred {
                 };
                 across * down
             }
-            BlurredRow::Sharp(y) => (0.5 - shape.signed_distance((x, *y))).clamp(0.0, 1.0),
+            BlurredRow::Sharp {
+                y,
+                y_outside,
+                whole,
+            } => {
+                if *y_outside || shape.x - x >= 0.5 || x - shape.x - shape.width >= 0.5 {
+                    return 0.0;
+                }
+                if whole.contains(&pixel_x) {
+                    return 1.0;
+                }
+                (0.5 - shape.signed_distance((x, *y))).clamp(0.0, 1.0)
+            }
             BlurredRow::Rounded(halves, step) => {
                 let scale = sigma * std::f32::consts::SQRT_2;
                 let local = x - shape.x - shape.width / 2.0;
@@ -2391,6 +2716,7 @@ impl Blurred {
                         .sum();
                 }
                 let reach = samples[0].0;
+                let kept = &mut self.across[(pixel_x - self.left) as usize];
                 let across = match *kept {
                     Some((known, across)) if known == reach.to_bits() => across,
                     _ => {
@@ -2399,10 +2725,7 @@ impl Blurred {
                         across
                     }
                 };
-                samples
-                    .iter()
-                    .map(|&(_, weight)| across * weight * step)
-                    .sum()
+                across * settled.1
             }
         }
     }
@@ -4631,19 +4954,14 @@ fn paint_cached_backdrop(
         );
         let width = (bounds[2] - bounds[0]) as usize;
         let stride = canvas.bytes_per_row();
-        for pixel_y in top..bottom {
-            let row = pixel_y as f32 + 0.5;
-            let run = run_where(left..right, |pixel| {
-                clip.coverage((pixel as f32 + 0.5, row)) > 0.0
-            });
-            if run.is_empty() {
-                continue;
+        if left < right {
+            let length = (right - left) as usize * 4;
+            for pixel_y in top..bottom {
+                let from =
+                    (pixel_y - bounds[1]) as usize * width * 4 + (left - bounds[0]) as usize * 4;
+                let to = pixel_y as usize * stride + left as usize * 4;
+                canvas.pixels[to..to + length].copy_from_slice(&pixels[from..from + length]);
             }
-            let from =
-                (pixel_y - bounds[1]) as usize * width * 4 + (run.start - bounds[0]) as usize * 4;
-            let to = pixel_y as usize * stride + run.start as usize * 4;
-            let length = run.len() * 4;
-            canvas.pixels[to..to + length].copy_from_slice(&pixels[from..from + length]);
         }
         true
     })
@@ -5905,13 +6223,10 @@ fn paint_outline_text(
         height: clip.height * scale,
     });
     // css turns ligatures off when letters are spaced apart
-    let text = if run.rtl {
-        run.text
-            .chars()
-            .map(crate::bidi::mirrored)
-            .collect::<String>()
+    let text: std::borrow::Cow<'_, str> = if run.rtl {
+        std::borrow::Cow::Owned(run.text.chars().map(crate::bidi::mirrored).collect())
     } else {
-        run.text.clone()
+        std::borrow::Cow::Borrowed(run.text.as_str())
     };
     let shaped = fonts.shape(
         &text,
@@ -7129,6 +7444,7 @@ mod tests {
                 margin: Default::default(),
                 child_shift: (0.0, 0.0),
                 has_child_shift: false,
+                has_sticky: false,
             },
             images: Vec::new(),
             prose_selections: vec![crate::layout::ProseSpan {
@@ -7832,6 +8148,7 @@ mod tests {
                 margin: Default::default(),
                 child_shift: (0.0, 0.0),
                 has_child_shift: false,
+                has_sticky: false,
             },
             images: Vec::new(),
             prose_selections: Vec::new(),
@@ -7995,6 +8312,7 @@ mod tests {
                 margin: Default::default(),
                 child_shift: (0.0, 0.0),
                 has_child_shift: false,
+                has_sticky: false,
             },
             images: Vec::new(),
             prose_selections: Vec::new(),

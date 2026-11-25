@@ -30,6 +30,18 @@ pub(crate) struct LayoutInputs {
     pub(crate) extras: StyleState,
 }
 
+// caches a few single-node lookups before building the full box index map
+enum BoxCache {
+    Small(Vec<(NodeId, Vec<BoxGeometry>)>),
+    Full(HashMap<NodeId, Vec<BoxGeometry>>),
+}
+
+impl Default for BoxCache {
+    fn default() -> Self {
+        Self::Small(Vec::new())
+    }
+}
+
 // a layout of the document as it stood, shared with the frame and indexed lazily on box reads
 pub(super) struct MeasuredLayout {
     version: u64,
@@ -44,17 +56,42 @@ pub(super) struct MeasuredLayout {
     wake_at: Option<u64>,
     // elements whose motion only repaints them, so frame layout keeps repaint_motion active
     motion: Option<std::collections::BTreeSet<NodeId>>,
-    boxes: RefCell<Option<HashMap<NodeId, Vec<BoxGeometry>>>>,
+    boxes: RefCell<BoxCache>,
     layout: Rc<LayoutDocument>,
 }
 
 impl MeasuredLayout {
-    fn boxes(&self) -> std::cell::Ref<'_, HashMap<NodeId, Vec<BoxGeometry>>> {
-        if self.boxes.borrow().is_none() {
-            *self.boxes.borrow_mut() = Some(self.layout.box_index());
+    fn lookup_boxes(&self, node: NodeId) -> Vec<BoxGeometry> {
+        let mut cache = self.boxes.borrow_mut();
+        match &mut *cache {
+            BoxCache::Full(index) => index.get(&node).cloned().unwrap_or_default(),
+            BoxCache::Small(entries) => {
+                if let Some((_, found)) = entries.iter().find(|(id, _)| *id == node) {
+                    return found.clone();
+                }
+                if entries.len() < 8 {
+                    let found = self.layout.find_node_boxes(node);
+                    entries.push((node, found.clone()));
+                    return found;
+                }
+                let index = self.layout.box_index();
+                let found = index.get(&node).cloned().unwrap_or_default();
+                *cache = BoxCache::Full(index);
+                found
+            }
         }
-        std::cell::Ref::map(self.boxes.borrow(), |boxes| {
-            boxes.as_ref().expect("box index was just built")
+    }
+
+    fn boxes(&self) -> std::cell::Ref<'_, HashMap<NodeId, Vec<BoxGeometry>>> {
+        {
+            let mut cache = self.boxes.borrow_mut();
+            if matches!(*cache, BoxCache::Small(_)) {
+                *cache = BoxCache::Full(self.layout.box_index());
+            }
+        }
+        std::cell::Ref::map(self.boxes.borrow(), |cache| match cache {
+            BoxCache::Full(index) => index,
+            BoxCache::Small(_) => unreachable!("box index was just built"),
         })
     }
 }
@@ -549,7 +586,7 @@ impl ScriptRuntime {
                 wake_at,
                 motion,
                 state,
-                boxes: RefCell::new(None),
+                boxes: RefCell::new(BoxCache::default()),
                 layout: Rc::new(layout),
             });
         }
@@ -607,7 +644,7 @@ impl ScriptRuntime {
             wake_at,
             motion,
             state,
-            boxes: RefCell::new(None),
+            boxes: RefCell::new(BoxCache::default()),
             layout,
         });
     }
@@ -638,9 +675,9 @@ impl ScriptRuntime {
         let Some(measured) = self.measure() else {
             return Vec::new();
         };
-        let index = measured.boxes();
-        if let Some(boxes) = index.get(&node) {
-            return boxes.clone();
+        let found = measured.lookup_boxes(node);
+        if !found.is_empty() {
+            return found;
         }
         // an inline element has no box of its own: it is the text and boxes inside it, one
         // rectangle per line
@@ -648,6 +685,7 @@ impl ScriptRuntime {
         if document.element(node).is_none() {
             return Vec::new();
         }
+        let index = measured.boxes();
         let mut lines: Vec<BoxGeometry> = Vec::new();
         for part in document
             .descendants(node)

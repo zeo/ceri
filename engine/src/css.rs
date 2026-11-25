@@ -835,7 +835,7 @@ pub(crate) fn restore_animation_wake(wake: Option<u64>) {
 }
 
 // everything a cascade reads besides the element, so a layout pass computes each style once
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 struct StyleInputs {
     stylesheet: *const Stylesheet,
     document: *const Document,
@@ -845,12 +845,66 @@ struct StyleInputs {
     zero_font: (crate::font::FontStack, crate::font::FontStyle),
 }
 
+// inputs that uniquely determine a pure style computed from a shared cascade
+#[derive(PartialEq)]
+struct CascadeStyleKey {
+    stylesheet: *const Stylesheet,
+    state: *const StyleState,
+    cascade: *const Cascade,
+    custom_properties: *const BTreeMap<String, String>,
+    default_display: Display,
+    default_tag: u8,
+    hidden: bool,
+    color_scheme: ColorScheme,
+    reduced_motion: bool,
+    parent: (f32, Color, FontWeight, InheritedText),
+    environment: LayoutEnvironment,
+    zero_font: (crate::font::FontStack, crate::font::FontStyle),
+}
+
+impl CascadeStyleKey {
+    fn hash_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = crate::hashing::Fast::default();
+        (self.cascade as usize).hash(&mut hasher);
+        (self.custom_properties as usize).hash(&mut hasher);
+        std::mem::discriminant(&self.default_display).hash(&mut hasher);
+        self.default_tag.hash(&mut hasher);
+        self.hidden.hash(&mut hasher);
+        (self.parent.0 + 0.0).to_bits().hash(&mut hasher);
+        let color = self.parent.1;
+        [color.red, color.green, color.blue, color.alpha].hash(&mut hasher);
+        self.parent.2.0.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+fn default_tag_kind(name: &str) -> u8 {
+    match name {
+        "td" | "th" | "tr" | "tbody" | "thead" | "tfoot" => 1,
+        "body" => 2,
+        "table" => 3,
+        _ => 0,
+    }
+}
+
+fn has_node_transition(state: &StyleState, node: NodeId) -> bool {
+    if state.transitions.is_empty() || state.reduced_motion {
+        return false;
+    }
+    let range = (node, AnimatableProperty::All)..=(node, AnimatableProperty::Perspective);
+    state.transitions.range(range).next().is_some()
+}
+
 // a style worked out under some inputs, with when it next changes and whether it moves
 type MemoizedStyle = (StyleInputs, Rc<Style>, Option<u64>, bool);
+type CascadeStyleEntry = (CascadeStyleKey, Rc<Cascade>, Rc<Style>);
 
 #[derive(Default)]
 struct StyleMemo {
     entries: HashMap<(NodeId, Option<PseudoElement>), Vec<MemoizedStyle>>,
+    // keeps the Rc<Cascade> alive so its pointer stays unique for the duration of the pass
+    by_cascade: HashMap<u64, Vec<CascadeStyleEntry>>,
     // the distinct styles of the pass by a hash of a few fields, so the many elements a page
     // styles alike hold one style between them
     shared: HashMap<u64, Vec<Rc<Style>>>,
@@ -3806,6 +3860,8 @@ impl Stylesheet {
             return self.compute_style(context);
         }
         let key = (context.node, context.pseudo);
+        let environment = layout_environment();
+        let zero_font = ZERO_FONT.with(std::cell::Cell::get);
         let inputs = StyleInputs {
             stylesheet: self,
             document: context.document,
@@ -3816,8 +3872,8 @@ impl Stylesheet {
                 context.parent_weight,
                 context.parent_text,
             ),
-            environment: layout_environment(),
-            zero_font: ZERO_FONT.with(std::cell::Cell::get),
+            environment,
+            zero_font,
         };
         let known = STYLE_MEMO.with(|memo| {
             memo.borrow()
@@ -3838,9 +3894,100 @@ impl Stylesheet {
             }
             return style;
         }
+        let own = context.pseudo.is_none().then_some(context.node);
+        let element = own.and_then(|node| context.document.element(node));
+        let name = match context.pseudo {
+            Some(pseudo) => pseudo.tag(),
+            None => element.map_or("", |element| element.name.as_str()),
+        };
+        let hidden = element
+            .and_then(|element| element.attr("hidden"))
+            .is_some_and(|hidden| !hidden.eq_ignore_ascii_case("until-found"));
+        let cascaded = self.cascaded_values(
+            context.document,
+            context.node,
+            context.pseudo,
+            context.state,
+        );
+        let custom_properties =
+            inherited_custom_properties(context.state, context.document, context.node);
+        let eligible = self.follows_versions()
+            && !context.document.has_shadow_roots()
+            && context.state.forced_colors.is_none()
+            && name != "svg"
+            && own.is_none_or(|node| {
+                let sized_media = matches!(name, "img" | "canvas" | "video")
+                    && context.state.image_sizes.contains_key(&node);
+                !sized_media
+                    && !context.state.script_animations.contains_key(&node)
+                    && !has_node_transition(context.state, node)
+            });
+        let cascade_key = eligible.then(|| {
+            let key = CascadeStyleKey {
+                stylesheet: self,
+                state: context.state,
+                cascade: Rc::as_ptr(&cascaded),
+                custom_properties: custom_properties.map_or(std::ptr::null(), std::ptr::from_ref),
+                default_display: default_display(name),
+                default_tag: default_tag_kind(name),
+                hidden,
+                color_scheme: context.state.color_scheme,
+                reduced_motion: context.state.reduced_motion,
+                parent: (
+                    context.parent_font_size,
+                    context.parent_color,
+                    context.parent_weight,
+                    context.parent_text,
+                ),
+                environment,
+                zero_font,
+            };
+            let hash = key.hash_key();
+            (hash, key)
+        });
+        if let Some((hash, ref ckey)) = cascade_key {
+            let hit = STYLE_MEMO.with(|memo| {
+                let mut memo = memo.borrow_mut();
+                let memo = memo.as_mut()?;
+                let shared = memo
+                    .by_cascade
+                    .get(&hash)?
+                    .iter()
+                    .find(|(seen, _, _)| seen == ckey)
+                    .map(|(_, _, style)| style.clone())?;
+                memo.entries
+                    .entry(key)
+                    .or_insert_with(|| Vec::with_capacity(1))
+                    .push((inputs, shared.clone(), None, false));
+                Some(*shared)
+            });
+            if let Some(style) = hit {
+                if cfg!(feature = "recheck") {
+                    let mut ignored = true;
+                    let fresh = self.compute_style_with(
+                        context,
+                        name,
+                        hidden,
+                        &cascaded,
+                        custom_properties,
+                        &mut ignored,
+                    );
+                    assert_eq!(style, fresh, "cascade-keyed style cache went stale");
+                }
+                return style;
+            }
+        }
         let outer = ANIMATION_WAKE.with(std::cell::Cell::take);
         let reported = moment_reports();
-        let style = self.compute_style(context);
+        let mut shareable = cascade_key.is_some();
+        let style = self.compute_style_with(
+            context,
+            name,
+            hidden,
+            &cascaded,
+            custom_properties,
+            &mut shareable,
+        );
         let moving = moment_reports() != reported;
         let wake = ANIMATION_WAKE.with(|current| current.replace(outer));
         if let Some(delay) = wake {
@@ -3853,13 +4000,60 @@ impl Stylesheet {
                 memo.entries
                     .entry(key)
                     .or_insert_with(|| Vec::with_capacity(1))
-                    .push((inputs, shared, wake, moving));
+                    .push((inputs, shared.clone(), wake, moving));
+                if shareable
+                    && !moving
+                    && wake.is_none()
+                    && let Some((hash, ckey)) = cascade_key
+                {
+                    memo.by_cascade
+                        .entry(hash)
+                        .or_insert_with(|| Vec::with_capacity(1))
+                        .push((ckey, cascaded, shared));
+                }
             }
         });
         style
     }
 
     fn compute_style(&self, context: StyleContext<'_>) -> Style {
+        let own = context.pseudo.is_none().then_some(context.node);
+        let element = own.and_then(|node| context.document.element(node));
+        let name = match context.pseudo {
+            Some(pseudo) => pseudo.tag(),
+            None => element.map_or("", |element| element.name.as_str()),
+        };
+        let hidden = element
+            .and_then(|element| element.attr("hidden"))
+            .is_some_and(|hidden| !hidden.eq_ignore_ascii_case("until-found"));
+        let cascaded = self.cascaded_values(
+            context.document,
+            context.node,
+            context.pseudo,
+            context.state,
+        );
+        let custom_properties =
+            inherited_custom_properties(context.state, context.document, context.node);
+        let mut shareable = false;
+        self.compute_style_with(
+            context,
+            name,
+            hidden,
+            &cascaded,
+            custom_properties,
+            &mut shareable,
+        )
+    }
+
+    fn compute_style_with(
+        &self,
+        context: StyleContext<'_>,
+        name: &str,
+        hidden: bool,
+        cascaded: &Cascade,
+        custom_properties: Option<&BTreeMap<String, String>>,
+        shareable: &mut bool,
+    ) -> Style {
         let _profile = crate::profile::scope("style: compute");
         let StyleContext {
             document,
@@ -3871,12 +4065,6 @@ impl Stylesheet {
             parent_text,
             state,
         } = context;
-        let name = match pseudo {
-            Some(pseudo) => pseudo.tag(),
-            None => document
-                .element(node)
-                .map_or("", |element| element.name.as_str()),
-        };
         let mut style = Style::default_for(
             name,
             parent_font_size,
@@ -3885,19 +4073,12 @@ impl Stylesheet {
             parent_text,
         );
         // the user agent hides elements with the hidden attribute, below any author display
-        if pseudo.is_none()
-            && document
-                .element(node)
-                .and_then(|element| element.attr("hidden"))
-                .is_some_and(|hidden| !hidden.eq_ignore_ascii_case("until-found"))
-        {
+        if hidden {
             style.display = Display::None;
         }
         crate::colors::use_system_colors(state.system_colors());
-        let cascaded = self.cascaded_values(document, node, pseudo, state);
         let empty_properties = BTreeMap::new();
-        let custom_properties =
-            inherited_custom_properties(state, document, node).unwrap_or(&empty_properties);
+        let custom_properties = custom_properties.unwrap_or(&empty_properties);
         // motion state belongs to the element itself, not to its generated boxes
         let own = pseudo.is_none().then_some(node);
         let mut animation = None;
@@ -3955,7 +4136,10 @@ impl Stylesheet {
                 };
                 if !reset_inherited_property(&mut style, &from, property) {
                     let from = match keyword {
-                        "inherit" => self.parent_style(context),
+                        "inherit" => {
+                            *shareable = false;
+                            self.parent_style(context)
+                        }
                         "revert" | "revert-layer" => Some(inherited),
                         _ => Some(initial()),
                     };
@@ -4007,6 +4191,7 @@ impl Stylesheet {
         }
         // animated values win over the normal cascade, as the animation origin requires
         if let Some(animation) = animation.filter(|_| !state.reduced_motion) {
+            *shareable = false;
             let started = own
                 .and_then(|node| state.animation_starts.get(&node).copied())
                 .unwrap_or(0);
@@ -7990,11 +8175,20 @@ pub(crate) fn parse_color(value: &str) -> Option<Color> {
     crate::colors::parse(value, CURRENT_COLOR.with(std::cell::Cell::get))
 }
 
+fn ascii_lower<'a>(value: &'a str) -> Cow<'a, str> {
+    let trimmed = value.trim();
+    if trimmed.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(trimmed.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(trimmed)
+    }
+}
+
 fn apply_declaration(style: &mut Style, property: &str, value: &str) {
     CURRENT_COLOR.with(|current| current.set(style.color));
     match property {
         "display" => {
-            style.display = match value.trim().to_ascii_lowercase().as_str() {
+            style.display = match ascii_lower(value).as_ref() {
                 "none" => Display::None,
                 "flex" => Display::Flex,
                 "grid" => Display::Grid,
@@ -8018,14 +8212,14 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             };
         }
         "float" => {
-            style.float = match value.trim().to_ascii_lowercase().as_str() {
+            style.float = match ascii_lower(value).as_ref() {
                 "left" | "inline-start" => Float::Left,
                 "right" | "inline-end" => Float::Right,
                 _ => Float::None,
             };
         }
         "clear" => {
-            style.clear = match value.trim().to_ascii_lowercase().as_str() {
+            style.clear = match ascii_lower(value).as_ref() {
                 "left" | "inline-start" => Clear::Left,
                 "right" | "inline-end" => Clear::Right,
                 "both" => Clear::Both,
@@ -8033,7 +8227,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             };
         }
         "position" => {
-            style.position = match value.trim().to_ascii_lowercase().as_str() {
+            style.position = match ascii_lower(value).as_ref() {
                 "relative" => Position::Relative,
                 "sticky" => Position::Sticky,
                 "absolute" => Position::Absolute,
@@ -8269,7 +8463,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         }
         "width" | "height" => {
             let axis = usize::from(property == "height");
-            style.content_size[axis] = match value.trim().to_ascii_lowercase().as_str() {
+            style.content_size[axis] = match ascii_lower(value).as_ref() {
                 "fit-content" => ContentSize::Fit,
                 "max-content" => ContentSize::Max,
                 "min-content" => ContentSize::Min,
@@ -8689,7 +8883,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             }
         }
         "text-align" => {
-            style.text_align = match value.trim().to_ascii_lowercase().as_str() {
+            style.text_align = match ascii_lower(value).as_ref() {
                 "center" | "-webkit-center" => TextAlign::Center,
                 "right" | "-webkit-right" => TextAlign::Right,
                 "left" | "-webkit-left" => TextAlign::Left,
@@ -8702,7 +8896,7 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             style.font_family = crate::font::intern_font_stack(value);
         }
         "text-transform" => {
-            style.text_transform = match value.trim().to_ascii_lowercase().as_str() {
+            style.text_transform = match ascii_lower(value).as_ref() {
                 "uppercase" => TextTransform::Uppercase,
                 "lowercase" => TextTransform::Lowercase,
                 "capitalize" => TextTransform::Capitalize,
@@ -8727,42 +8921,44 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
 }
 
 fn parse_edges(value: &str) -> Edges {
-    let mut values = split_words(value)
-        .into_iter()
-        .filter_map(parse_length)
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        return Edges::zero();
+    let mut values = [Length::Auto; 4];
+    let mut count = 0;
+    for word in split_words(value) {
+        if let Some(length) = parse_length(word) {
+            values[count] = length;
+            count += 1;
+            if count == 4 {
+                break;
+            }
+        }
     }
-    if values.len() > 4 {
-        values.truncate(4);
-    }
-    match values.as_slice() {
-        [all] => Edges::all(*all),
-        [vertical, horizontal] => Edges {
-            top: *vertical,
-            right: *horizontal,
-            bottom: *vertical,
-            left: *horizontal,
+    match count {
+        0 => Edges::zero(),
+        1 => Edges::all(values[0]),
+        2 => Edges {
+            top: values[0],
+            right: values[1],
+            bottom: values[0],
+            left: values[1],
         },
-        [top, horizontal, bottom] => Edges {
-            top: *top,
-            right: *horizontal,
-            bottom: *bottom,
-            left: *horizontal,
+        3 => Edges {
+            top: values[0],
+            right: values[1],
+            bottom: values[2],
+            left: values[1],
         },
-        [top, right, bottom, left] => Edges {
-            top: *top,
-            right: *right,
-            bottom: *bottom,
-            left: *left,
+        _ => Edges {
+            top: values[0],
+            right: values[1],
+            bottom: values[2],
+            left: values[3],
         },
-        _ => Edges::zero(),
     }
 }
 
 pub(crate) fn parse_length(value: &str) -> Option<Length> {
-    let value = value.trim().to_ascii_lowercase();
+    let value = ascii_lower(value);
+    let value = value.as_ref();
     if value == "auto" {
         return Some(Length::Auto);
     }
@@ -8793,7 +8989,7 @@ pub(crate) fn parse_length(value: &str) -> Option<Length> {
         let terms = parse_length_arguments(arguments, 2)?;
         return Some(Length::Largest(TermsList::new(terms)));
     }
-    parse_length_unit(&value).map(Length::Terms)
+    parse_length_unit(value).map(Length::Terms)
 }
 
 fn parse_length_arguments(arguments: &str, expected: usize) -> Option<Vec<LengthTerms>> {
