@@ -1075,6 +1075,7 @@ pub struct Browser {
     waker: Option<crate::bridge::Waker>,
     frame_interval: u64,
     visible: bool,
+    pointer_modifiers: KeyModifiers,
     viewport: ViewportMetrics,
     preferences: UserPreferences,
     fonts: Rc<FontSet>,
@@ -1387,6 +1388,7 @@ impl Browser {
             waker: None,
             frame_interval: FRAME_INTERVAL,
             visible: true,
+            pointer_modifiers: KeyModifiers::default(),
             viewport: ViewportMetrics::default(),
             preferences: UserPreferences::default(),
             fonts: Rc::new(FontSet::builtin()),
@@ -1883,6 +1885,7 @@ impl Browser {
         runtime.set_viewport_metrics(self.viewport);
         runtime.set_frame_interval(self.frame_interval);
         runtime.start_hidden(!self.visible);
+        runtime.set_pointer_modifiers(self.pointer_modifiers);
         let inspecting = crate::devtools_serving() || self.inspection.attached();
         if inspecting {
             runtime.capture_console();
@@ -2515,6 +2518,33 @@ impl Browser {
         Ok(clicked? | double?)
     }
 
+    // dispatches a cancelable wheel event at a point, returning (handled, default_prevented)
+    pub fn wheel_at(
+        &mut self,
+        viewport: Size,
+        x: f32,
+        y: f32,
+        delta_x: f32,
+        delta_y: f32,
+    ) -> Result<(bool, bool), NavigationError> {
+        let delta_x = if delta_x.is_finite() { delta_x } else { 0.0 };
+        let delta_y = if delta_y.is_finite() { delta_y } else { 0.0 };
+        let hit = self.layout(viewport)?.hit_test(x, y);
+        let (handled, prevented) = {
+            let page = self.page.as_mut().ok_or(NavigationError::NoPage)?;
+            page.runtime.set_pointer_position(x, y);
+            let target = hit.or_else(|| page.document.borrow().document_element());
+            let Some(node) = target else {
+                return Ok((false, false));
+            };
+            page.runtime
+                .dispatch_wheel_event(node, delta_x, delta_y)
+                .map_err(script_error)?
+        };
+        let navigated = self.process_pending_navigation()?.is_some();
+        Ok((handled || navigated, prevented))
+    }
+
     pub fn scroll_at(
         &mut self,
         viewport: Size,
@@ -2969,6 +2999,17 @@ impl Browser {
         if let Some(page) = self.page.as_mut() {
             page.runtime.set_pointer_button(button, pressed);
         }
+    }
+
+    pub fn set_pointer_modifiers(&mut self, modifiers: KeyModifiers) {
+        self.pointer_modifiers = modifiers;
+        if let Some(page) = self.page.as_mut() {
+            page.runtime.set_pointer_modifiers(modifiers);
+        }
+    }
+
+    pub fn pointer_modifiers(&self) -> KeyModifiers {
+        self.pointer_modifiers
     }
 
     pub fn cursor(&self) -> crate::css::Cursor {
@@ -4187,6 +4228,7 @@ impl Browser {
                 }
                 runtime.set_viewport_metrics(self.viewport);
                 runtime.set_frame_interval(self.frame_interval);
+                runtime.set_pointer_modifiers(self.pointer_modifiers);
                 runtime.set_layout_inputs(layout_inputs.clone());
                 runtime
             },

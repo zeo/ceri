@@ -1375,6 +1375,7 @@ impl AppWindow {
     ) -> Option<WindowId> {
         let background = background_mode();
         if background {
+            disable_background_throttling();
             // the off-display place a run opens at is no place to remember
             self.config.geometry_path = None;
         }
@@ -1873,6 +1874,12 @@ impl AppWindow {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
+                self.submit(InputEvent::ModifiersChanged(KeyModifiers {
+                    shift: self.modifiers.shift_key(),
+                    control: self.modifiers.control_key(),
+                    alt: self.modifiers.alt_key(),
+                    meta: self.modifiers.super_key(),
+                }));
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let key = match event.logical_key {
@@ -2398,10 +2405,12 @@ impl AppWindow {
     // tells the engine how often the display the window is on refreshes, and how big it is,
     // when either changes
     fn follow_refresh_rate(&mut self) {
-        let monitor = self
-            .window
-            .as_ref()
-            .and_then(|window| window.current_monitor());
+        let monitor = self.window.as_ref().and_then(|window| {
+            window
+                .current_monitor()
+                .or_else(|| window.primary_monitor())
+                .or_else(|| window.available_monitors().next())
+        });
         let rate = monitor
             .as_ref()
             .and_then(|monitor| monitor.refresh_rate_millihertz());
@@ -2709,6 +2718,39 @@ fn background_mode() -> bool {
     *BACKGROUND
         .get_or_init(|| std::env::var_os("CERI_BACKGROUND").is_some_and(|value| value == "1"))
 }
+
+// windows 11 ignores high-resolution timers and applies ecoqos throttling to processes whose
+// windows sit off every display; opt background runs out so animation frames keep monitor pacing
+#[cfg(target_os = "windows")]
+fn disable_background_throttling() {
+    use std::sync::Once;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
+    };
+    static APPLIED: Once = Once::new();
+    APPLIED.call_once(|| {
+        let state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+                | PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: 0,
+        };
+        // safety: state matches the win32 power throttling struct layout and size
+        unsafe {
+            let _ = SetProcessInformation(
+                GetCurrentProcess(),
+                ProcessPowerThrottling,
+                (&raw const state).cast(),
+                size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            );
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn disable_background_throttling() {}
 
 fn show_inactive(window: &Window) {
     #[cfg(target_os = "windows")]
@@ -3703,5 +3745,11 @@ mod geometry_tests {
         assert_eq!(super::scale_wheel_lines(f32::NAN, 3, 800.0), 0.0);
         assert_eq!(super::scale_wheel_chars(1.0, 3), 40.0);
         assert_eq!(super::scale_wheel_chars(1.0, 0), 0.0);
+    }
+
+    #[test]
+    fn background_throttling_opt_out_is_idempotent() {
+        super::disable_background_throttling();
+        super::disable_background_throttling();
     }
 }

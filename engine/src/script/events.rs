@@ -592,6 +592,10 @@ pub(super) struct PointerState {
     pending_capture: Option<NodeId>,
     // the capture the last release had, which its click goes to
     released_capture: Option<NodeId>,
+    // keyboard modifiers active for pointer, mouse, wheel, and drag events
+    modifiers: KeyModifiers,
+    // wheel delta carried while dispatching a trusted wheel event
+    wheel_delta: (f32, f32),
 }
 
 // the legacy keyCode of a key, which older code still compares against
@@ -750,6 +754,12 @@ impl ScriptRuntime {
                         set("pointerType", Value::String("mouse".into()));
                         set("isPrimary", Value::Bool(true));
                     }
+                    if interface == "WheelEvent" {
+                        set("deltaX", Value::Number(f64::from(pointer.wheel_delta.0)));
+                        set("deltaY", Value::Number(f64::from(pointer.wheel_delta.1)));
+                        set("deltaZ", Value::Number(0.0));
+                        set("deltaMode", Value::Number(0.0));
+                    }
                 }
                 "TransitionEvent" | "AnimationEvent" => {
                     if let Some(motion) = &self.motion_detail {
@@ -770,7 +780,14 @@ impl ScriptRuntime {
             ) {
                 set("isComposing", Value::Bool(self.composition.is_some()));
             }
-            let modifiers = fields.modifiers;
+            let modifiers = if matches!(
+                interface,
+                "PointerEvent" | "MouseEvent" | "WheelEvent" | "DragEvent"
+            ) {
+                self.pointer.modifiers
+            } else {
+                fields.modifiers
+            };
             for (name, on) in [
                 ("ctrlKey", modifiers.control),
                 ("shiftKey", modifiers.shift),
@@ -1730,6 +1747,28 @@ impl ScriptRuntime {
         } else {
             self.pointer.buttons &= !bit;
         }
+    }
+
+    pub(crate) fn set_pointer_modifiers(&mut self, modifiers: KeyModifiers) {
+        self.pointer.modifiers = modifiers;
+    }
+
+    pub(crate) fn dispatch_wheel_event(
+        &mut self,
+        node: NodeId,
+        delta_x: f32,
+        delta_y: f32,
+    ) -> Result<(bool, bool), ScriptError> {
+        self.pointer.wheel_delta = (delta_x, delta_y);
+        let dispatch = self.fire(
+            ListenerTarget::Node(node),
+            "wheel",
+            HostEventFields::default(),
+        );
+        self.pointer.wheel_delta = (0.0, 0.0);
+        let dispatch = dispatch?;
+        self.drain_microtasks()?;
+        Ok((dispatch.handled, dispatch.default_prevented))
     }
 
     // a pointer event followed by its compatibility mouse event

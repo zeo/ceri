@@ -10,7 +10,9 @@ use crate::script::{Incoming, PauseSource};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{
+    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
+};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -110,6 +112,7 @@ pub enum InputEvent {
     },
     CompositionCancel,
     Blur,
+    ModifiersChanged(KeyModifiers),
     ScaleChanged(f32),
     PreferencesChanged(UserPreferences),
     AdvanceTime(u64),
@@ -613,10 +616,7 @@ fn run_live_engine_worker(
         // lands all tick apart, so a page renders at most once per frame slot
         let slot = (deferred.is_some() || (host.is_dirty() && !announced))
             .then(|| last_frame.map_or(Duration::ZERO, |at| frame.saturating_sub(at.elapsed())));
-        let wake = host
-            .next_wake()
-            .map(|delay| Duration::from_millis(delay.max(1)));
-        let wait = wake.into_iter().chain(slot).min();
+        let wait = next_worker_wait(host.next_wake(), last_tick.elapsed(), slot);
         hold_fine_timer(&mut fine_timer, wait.is_some_and(|wait| wait < frame * 2));
         // what a frame leaves behind to make the next one cheaper is let go once no frame
         // has come for a while: frames driven by the pointer or the keyboard come apart
@@ -634,6 +634,11 @@ fn run_live_engine_worker(
         let command = match held.take().or_else(|| queued.borrow_mut().pop_front()) {
             Some(command) => Some(command),
             None => match wait {
+                Some(delay) if delay.is_zero() => match commands.try_recv() {
+                    Ok(command) => Some(command),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => break,
+                },
                 Some(delay) => match commands.recv_timeout(delay) {
                     Ok(command) => Some(command),
                     Err(RecvTimeoutError::Timeout) => None,
@@ -751,6 +756,17 @@ fn run_live_engine_worker(
         }
     }
     hold_fine_timer(&mut fine_timer, false);
+}
+
+// subtracts time already spent since the last clock advance so render, script, and cdp work
+// does not push animation frames past their deadline while keeping idle pages asleep
+fn next_worker_wait(
+    wake_ms: Option<u64>,
+    since_tick: Duration,
+    slot: Option<Duration>,
+) -> Option<Duration> {
+    let wake = wake_ms.map(|delay| Duration::from_millis(delay.max(1)).saturating_sub(since_tick));
+    wake.into_iter().chain(slot).min()
 }
 
 // windows rounds channel timeouts up to its default 15.6 ms tick, which holds animations near
@@ -1288,9 +1304,16 @@ impl EngineHost {
                 delta_y,
             } => {
                 self.smooth_scroll = None;
-                let handled = self
-                    .browser
-                    .scroll_at(self.viewport, x, y, delta_x, delta_y)?;
+                let (wheel_handled, prevented) =
+                    self.browser
+                        .wheel_at(self.viewport, x, y, delta_x, delta_y)?;
+                let scrolled = if prevented {
+                    false
+                } else {
+                    self.browser
+                        .scroll_at(self.viewport, x, y, delta_x, delta_y)?
+                };
+                let handled = wheel_handled || scrolled;
                 InputResult {
                     handled,
                     frame_requested: handled,
@@ -1307,46 +1330,56 @@ impl EngineHost {
                 let delta_y = if delta_y.is_finite() { delta_y } else { 0.0 };
                 if delta_x == 0.0 && delta_y == 0.0 {
                     InputResult::default()
-                } else if self.browser.user_preferences().reduced_motion {
-                    self.smooth_scroll = None;
-                    let handled = self
-                        .browser
-                        .scroll_at(self.viewport, x, y, delta_x, delta_y)?;
-                    InputResult {
-                        handled,
-                        frame_requested: handled,
-                        ..InputResult::default()
-                    }
                 } else {
-                    let was_idle = self.smooth_scroll.is_none();
-                    let next = match self.smooth_scroll {
-                        Some(mut state) => {
-                            state.x = x;
-                            state.y = y;
-                            merge_scroll_axis(&mut state.remaining_x, delta_x);
-                            merge_scroll_axis(&mut state.remaining_y, delta_y);
-                            state
-                        }
-                        None => SmoothScroll {
-                            x,
-                            y,
-                            remaining_x: delta_x,
-                            remaining_y: delta_y,
-                        },
-                    };
-                    self.smooth_scroll = Some(next);
-                    if was_idle {
-                        let step_ms = self.browser.frame_interval().max(1);
-                        let moved = self.step_smooth_scroll(step_ms)?;
+                    let (wheel_handled, prevented) =
+                        self.browser
+                            .wheel_at(self.viewport, x, y, delta_x, delta_y)?;
+                    if prevented {
+                        self.smooth_scroll = None;
                         InputResult {
-                            handled: moved,
-                            frame_requested: moved,
+                            handled: wheel_handled,
+                            frame_requested: wheel_handled,
+                            ..InputResult::default()
+                        }
+                    } else if self.browser.user_preferences().reduced_motion {
+                        self.smooth_scroll = None;
+                        let scrolled =
+                            self.browser
+                                .scroll_at(self.viewport, x, y, delta_x, delta_y)?;
+                        let handled = wheel_handled || scrolled;
+                        InputResult {
+                            handled,
+                            frame_requested: handled,
                             ..InputResult::default()
                         }
                     } else {
+                        let was_idle = self.smooth_scroll.is_none();
+                        let next = match self.smooth_scroll {
+                            Some(mut state) => {
+                                state.x = x;
+                                state.y = y;
+                                merge_scroll_axis(&mut state.remaining_x, delta_x);
+                                merge_scroll_axis(&mut state.remaining_y, delta_y);
+                                state
+                            }
+                            None => SmoothScroll {
+                                x,
+                                y,
+                                remaining_x: delta_x,
+                                remaining_y: delta_y,
+                            },
+                        };
+                        self.smooth_scroll = Some(next);
+                        let moved = if was_idle {
+                            let step_ms = self.browser.frame_interval().max(1);
+                            self.step_smooth_scroll(step_ms)?
+                        } else {
+                            true
+                        };
+                        let handled = wheel_handled || moved;
                         InputResult {
-                            handled: true,
-                            frame_requested: true,
+                            handled,
+                            frame_requested: handled,
                             ..InputResult::default()
                         }
                     }
@@ -1395,6 +1428,10 @@ impl EngineHost {
                 handled: self.browser.blur()?,
                 ..InputResult::default()
             },
+            InputEvent::ModifiersChanged(modifiers) => {
+                self.browser.set_pointer_modifiers(modifiers);
+                InputResult::default()
+            }
             InputEvent::AdvanceTime(milliseconds) => {
                 self.clock = self.clock.saturating_add(milliseconds);
                 let tasks_run = self.browser.advance_time(milliseconds)?;
@@ -4546,5 +4583,268 @@ mod tests {
             .expect("toggling reduced motion should flush remaining scroll");
         assert_eq!(host.next_wake(), None);
         assert!((scroll_offset_y(&host) - 240.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cdp_dispatch_mouse_event_plumbs_modifiers_and_preserves_live_state() {
+        let browser = Browser::new(bundle(
+            r#"<style>
+                #box { width: 100px; height: 100px; overflow: auto; margin: 0; }
+                #inner { width: 50px; height: 300px; margin: 0; }
+            </style>
+            <div id="box"><div id="inner"></div></div>
+            <p id="log"></p>
+            <script>
+                const box = document.getElementById("box");
+                const log = document.getElementById("log");
+                const fmt = (e) => `${e.type}:${e.altKey?1:0}${e.ctrlKey?1:0}${e.metaKey?1:0}${e.shiftKey?1:0}`;
+                for (const name of ["pointermove", "mousemove", "pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                    box.addEventListener(name, (e) => { log.textContent += fmt(e) + ";"; });
+                }
+                box.addEventListener("wheel", (e) => {
+                    log.textContent += `${fmt(e)}:${e.deltaX},${e.deltaY};`;
+                    if (e.ctrlKey) e.preventDefault();
+                });
+            </script>"#,
+        ));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 120.0,
+                height: 120.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("modifier test page should load");
+
+        let mut seen = 0usize;
+        let mut take_log = |host: &EngineHost| -> String {
+            let doc = host.browser().document().expect("document");
+            let doc = doc.borrow();
+            let node = doc.find_element_by_id("log").expect("log node");
+            let full = doc.element_text_content(node).unwrap_or_default();
+            let delta = full[seen..].to_string();
+            seen = full.len();
+            delta
+        };
+        let cdp_mouse = |host: &mut EngineHost, params: Json| {
+            let msg = json!({
+                "id": 1,
+                "method": "Input.dispatchMouseEvent",
+                "params": params,
+            })
+            .to_string();
+            let reply = host
+                .automation_call(&msg)
+                .expect("dispatchMouseEvent should be handled");
+            reply.answer.expect("dispatchMouseEvent should succeed");
+        };
+
+        // live window holds shift before any cdp call
+        let live_shift = KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        };
+        host.input(InputEvent::ModifiersChanged(live_shift))
+            .expect("live shift should apply");
+
+        // test alt(1), ctrl(2), meta(4), shift(8), and ctrl+shift(10) clicks
+        for (bits, expected) in [
+            (1u64, "1000"),
+            (2, "0100"),
+            (4, "0010"),
+            (8, "0001"),
+            (10, "0101"),
+        ] {
+            cdp_mouse(
+                &mut host,
+                json!({ "type": "mousePressed", "x": 20, "y": 20, "button": "left", "clickCount": 1, "modifiers": bits }),
+            );
+            cdp_mouse(
+                &mut host,
+                json!({ "type": "mouseReleased", "x": 20, "y": 20, "button": "left", "clickCount": 1, "modifiers": bits }),
+            );
+            let logged = take_log(&host);
+            assert_eq!(
+                logged,
+                format!(
+                    "pointerdown:{expected};mousedown:{expected};pointerup:{expected};mouseup:{expected};click:{expected};"
+                ),
+                "unexpected click log for modifiers={bits}"
+            );
+            // live modifier state must be restored after every cdp call
+            assert_eq!(host.browser().pointer_modifiers(), live_shift);
+        }
+
+        // modified mouse move
+        cdp_mouse(
+            &mut host,
+            json!({ "type": "mouseMoved", "x": 25, "y": 25, "modifiers": 3 }),
+        );
+        assert_eq!(take_log(&host), "pointermove:1100;mousemove:1100;");
+        assert_eq!(host.browser().pointer_modifiers(), live_shift);
+
+        // ctrl+wheel fires wheel event and preventdefault suppresses scrolling
+        cdp_mouse(
+            &mut host,
+            json!({ "type": "mouseWheel", "x": 20, "y": 20, "deltaX": 5, "deltaY": 60, "modifiers": 2 }),
+        );
+        assert_eq!(take_log(&host), "wheel:0100:5,60;");
+        assert_eq!(scroll_offset_y(&host), 0.0);
+        assert_eq!(host.browser().pointer_modifiers(), live_shift);
+
+        // shift+wheel fires wheel event and scrolls when not prevented
+        cdp_mouse(
+            &mut host,
+            json!({ "type": "mouseWheel", "x": 20, "y": 20, "deltaX": 0, "deltaY": 40, "modifiers": 8 }),
+        );
+        assert_eq!(take_log(&host), "wheel:0001:0,40;");
+        assert!((scroll_offset_y(&host) - 40.0).abs() < 1e-3);
+
+        // subsequent live window click still sees preserved live shift modifier
+        host.input(InputEvent::Click { x: 20.0, y: 20.0 })
+            .expect("live click should succeed");
+        assert_eq!(take_log(&host), "click:0001;");
+    }
+
+    #[test]
+    fn worker_wait_subtracts_elapsed_time_for_prompt_raf_and_sleeps_when_idle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // unit checks on next_worker_wait accounting
+        assert_eq!(next_worker_wait(None, Duration::from_millis(5), None), None);
+        assert_eq!(
+            next_worker_wait(Some(16), Duration::from_millis(6), None),
+            Some(Duration::from_millis(10))
+        );
+        assert_eq!(
+            next_worker_wait(Some(16), Duration::from_millis(20), None),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            next_worker_wait(
+                Some(16),
+                Duration::from_millis(2),
+                Some(Duration::from_millis(5))
+            ),
+            Some(Duration::from_millis(5))
+        );
+
+        // live worker runs raf promptly after an immediate dom update, then sleeps with zero wakes
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let notify = {
+            let wakes = wakes.clone();
+            Arc::new(move || {
+                wakes.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let mut worker = EngineWorker::spawn_live(
+            Size {
+                width: 200.0,
+                height: 120.0,
+            },
+            || {
+                Ok(Browser::new(bundle(
+                    r#"<button id="go" style="display:block;width:120px;height:40px">go</button><p id="status">init</p><script>
+                        const status = document.getElementById("status");
+                        document.getElementById("go").addEventListener("click", () => {
+                            status.textContent = "sync";
+                            requestAnimationFrame(() => {
+                                requestAnimationFrame(() => {
+                                    status.textContent = "raf2";
+                                });
+                            });
+                        });
+                    </script>"#,
+                )))
+            },
+            notify,
+        )
+        .expect("live worker should start");
+
+        worker
+            .navigate("https://app.ceri.invalid/")
+            .expect("navigate should queue");
+        loop {
+            if matches!(worker.wait(), Ok(EngineWorkerEvent::Navigated { .. })) {
+                break;
+            }
+        }
+        worker.render().expect("initial render");
+        loop {
+            if matches!(worker.wait(), Ok(EngineWorkerEvent::Frame { .. })) {
+                break;
+            }
+        }
+
+        // trigger sync dom mutation plus nested raf callbacks via click, render the sync frame,
+        // then send zero commands so the worker must wake itself on its raf timer
+        let click_start = Instant::now();
+        worker
+            .input(InputEvent::Click { x: 20.0, y: 20.0 })
+            .expect("click should queue");
+        loop {
+            if matches!(worker.wait(), Ok(EngineWorkerEvent::Input { .. })) {
+                break;
+            }
+        }
+        worker.render().expect("sync render");
+        loop {
+            if matches!(worker.wait(), Ok(EngineWorkerEvent::Frame { .. })) {
+                break;
+            }
+        }
+
+        let wait_start = Instant::now();
+        let mut saw_invalidated = false;
+        while wait_start.elapsed() < Duration::from_millis(250) {
+            if worker
+                .poll()
+                .iter()
+                .any(|event| matches!(event, EngineWorkerEvent::Invalidated))
+            {
+                saw_invalidated = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            saw_invalidated,
+            "worker must wake itself promptly for raf without incoming commands (elapsed={:?})",
+            click_start.elapsed()
+        );
+        // allow the second nested raf callback one more frame slot without sending commands
+        thread::sleep(Duration::from_millis(60));
+        worker.accessibility_tree().expect("tree request");
+        let mut reached_raf2 = false;
+        while let Ok(event) = worker.wait() {
+            if let EngineWorkerEvent::Accessibility { tree, .. } = event {
+                fn has_text(node: &AccessibilityNode, wanted: &str) -> bool {
+                    node.name == wanted || node.children.iter().any(|child| has_text(child, wanted))
+                }
+                reached_raf2 = tree.as_ref().is_some_and(|tree| has_text(tree, "raf2"));
+                break;
+            }
+        }
+        assert!(
+            reached_raf2,
+            "two nested raf callbacks should complete promptly on worker clock"
+        );
+
+        // once settled and rendered, the idle worker must not wake again
+        worker.render().expect("final render");
+        loop {
+            if matches!(worker.wait(), Ok(EngineWorkerEvent::Frame { .. })) {
+                break;
+            }
+        }
+        let settled_wakes = wakes.load(Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            settled_wakes,
+            "idle worker must not generate extra wakes once raf completes"
+        );
+        worker.shutdown();
     }
 }

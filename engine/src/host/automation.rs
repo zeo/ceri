@@ -72,7 +72,10 @@ impl EngineHost {
         let pressed = |button: Option<PointerButton>| {
             button.ok_or((-32602, "Invalid parameters: button".to_string()))
         };
-        match params["type"].as_str().unwrap_or_default() {
+        let modifiers = decode_modifiers(params);
+        let previous = self.browser.pointer_modifiers();
+        self.browser.set_pointer_modifiers(modifiers);
+        let outcome = match params["type"].as_str().unwrap_or_default() {
             "mouseMoved" => self.deliver(InputEvent::PointerMove { x, y }),
             "mousePressed" => {
                 let button = pressed(button)?;
@@ -104,17 +107,13 @@ impl EngineHost {
                 delta_y: params["deltaY"].as_f64().unwrap_or_default() as f32,
             }),
             _ => Err((-32602, "Invalid parameters: type".to_string())),
-        }
+        };
+        self.browser.set_pointer_modifiers(previous);
+        outcome
     }
 
     fn key(&mut self, params: &Json) -> Result<InputResult, Failure> {
-        let flags = params["modifiers"].as_u64().unwrap_or_default();
-        let modifiers = KeyModifiers {
-            alt: flags & 1 != 0,
-            control: flags & 2 != 0,
-            meta: flags & 4 != 0,
-            shift: flags & 8 != 0,
-        };
+        let modifiers = decode_modifiers(params);
         let text = params["text"].as_str().unwrap_or_default().to_string();
         let key = match params["key"].as_str() {
             Some(key) if !key.is_empty() => key.to_string(),
@@ -269,6 +268,16 @@ impl EngineHost {
             encode_png(out_width, out_height, 3, &out)
         };
         Ok(json!({ "data": base64(&encoded) }))
+    }
+}
+
+fn decode_modifiers(params: &Json) -> KeyModifiers {
+    let flags = params["modifiers"].as_u64().unwrap_or_default();
+    KeyModifiers {
+        alt: flags & 1 != 0,
+        control: flags & 2 != 0,
+        meta: flags & 4 != 0,
+        shift: flags & 8 != 0,
     }
 }
 
