@@ -54,12 +54,68 @@ pub(crate) struct AutoRepeat {
     pub(crate) tracks: Vec<TrackSize>,
 }
 
+// repeat(auto-fill, <line-names>+) inside a subgrid line-name list
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SubgridNameRepeat {
+    // zero-based line index where the repeated bracket groups begin
+    pub(crate) at: usize,
+    // each entry holds the line names inside one bracketed <line-names> group
+    pub(crate) groups: Vec<Vec<String>>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct TrackList {
     pub(crate) tracks: Vec<TrackSize>,
     pub(crate) repeat: Option<AutoRepeat>,
     // line names, each with the index of the line it names when auto repeats run once
     pub(crate) names: Vec<(usize, String)>,
+    pub(crate) subgrid: bool,
+    pub(crate) subgrid_repeat: Option<SubgridNameRepeat>,
+    pub(crate) subgrid_lines: usize,
+}
+
+impl TrackList {
+    // expands subgrid local line names for a subgrid spanning `span` parent tracks (`span + 1` lines)
+    pub(crate) fn subgrid_line_names(&self, span: usize) -> Vec<(usize, String)> {
+        let Some(repeat) = &self.subgrid_repeat else {
+            return self
+                .names
+                .iter()
+                .filter(|(line, _)| *line <= span)
+                .cloned()
+                .collect();
+        };
+        let group_len = repeat.groups.len().max(1);
+        let fixed = self.subgrid_lines.saturating_sub(group_len);
+        let count = ((span + 1).saturating_sub(fixed) / group_len).max(1);
+        let added = count * group_len;
+        let shift = added - group_len;
+        let after_at = repeat.at + group_len;
+        let mut out = Vec::with_capacity(self.names.len() + added);
+        for (line, name) in &self.names {
+            let mapped = if *line >= after_at {
+                *line + shift
+            } else {
+                *line
+            };
+            if mapped <= span {
+                out.push((mapped, name.clone()));
+            }
+        }
+        let mut cursor = repeat.at;
+        for _ in 0..count {
+            for group in &repeat.groups {
+                if cursor <= span {
+                    for name in group {
+                        out.push((cursor, name.clone()));
+                    }
+                }
+                cursor += 1;
+            }
+        }
+        out.sort_by_key(|(line, _)| *line);
+        out
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -105,6 +161,18 @@ impl Tracks {
             return Rc::new(TrackList::default());
         }
         INTERNED.with(|interned| interned.borrow().track_lists[self.0 as usize - 1].clone())
+    }
+
+    pub(crate) fn is_subgrid(self) -> bool {
+        if self.0 == 0 {
+            return false;
+        }
+        INTERNED.with(|interned| interned.borrow().track_lists[self.0 as usize - 1].subgrid)
+    }
+
+    pub(crate) fn parse_auto(value: &str) -> Option<Self> {
+        let parsed = Self::parse(value)?;
+        (!parsed.is_subgrid()).then_some(parsed)
     }
 
     pub(crate) fn parse(value: &str) -> Option<Self> {
@@ -371,7 +439,117 @@ fn tokens(value: &str) -> Vec<&str> {
     tokens
 }
 
+fn parse_bracket_groups(mut rest: &str) -> Option<Vec<Vec<String>>> {
+    let mut groups = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let after_open = rest.strip_prefix('[')?;
+        let close = after_open.find(']')?;
+        let inside = &after_open[..close];
+        if inside.contains('[') {
+            return None;
+        }
+        let names = inside
+            .split_ascii_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        groups.push(names);
+        rest = &after_open[close + 1..];
+    }
+    (!groups.is_empty()).then_some(groups)
+}
+
+// parses `subgrid [<line-name-list>]?` per css grid 2
+fn parse_subgrid_track_list(mut rest: &str) -> Option<TrackList> {
+    let mut list = TrackList {
+        subgrid: true,
+        ..TrackList::default()
+    };
+    let mut line = 0usize;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(after_open) = rest.strip_prefix('[') {
+            let close = after_open.find(']')?;
+            let inside = &after_open[..close];
+            if inside.contains('[') {
+                return None;
+            }
+            for name in inside.split_ascii_whitespace() {
+                list.names.push((line, name.to_string()));
+            }
+            line += 1;
+            rest = &after_open[close + 1..];
+            continue;
+        }
+        if rest.len() >= 7 && rest[..7].eq_ignore_ascii_case("repeat(") {
+            let after_open = &rest[7..];
+            let mut depth = 1usize;
+            let mut close = None;
+            for (index, ch) in after_open.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(index);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close = close?;
+            let arguments = &after_open[..close];
+            let (count_raw, body) = split_top_level_comma(arguments)?;
+            let groups = parse_bracket_groups(body)?;
+            let count_lower = count_raw.trim().to_ascii_lowercase();
+            if count_lower == "auto-fill" {
+                if list.subgrid_repeat.is_some() {
+                    return None;
+                }
+                let group_len = groups.len();
+                list.subgrid_repeat = Some(SubgridNameRepeat { at: line, groups });
+                line += group_len;
+            } else {
+                let count = count_lower
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&count| count > 0)?;
+                for _ in 0..count.min(10_000) {
+                    for group in &groups {
+                        for name in group {
+                            list.names.push((line, name.clone()));
+                        }
+                        line += 1;
+                    }
+                }
+            }
+            rest = &after_open[close + 1..];
+            continue;
+        }
+        return None;
+    }
+    list.subgrid_lines = line;
+    Some(list)
+}
+
 fn parse_track_list(value: &str) -> Option<TrackList> {
+    let trimmed = value.trim();
+    if trimmed.len() >= 7
+        && trimmed[..7].eq_ignore_ascii_case("subgrid")
+        && trimmed
+            .as_bytes()
+            .get(7)
+            .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'[')
+    {
+        return parse_subgrid_track_list(&trimmed[7..]);
+    }
     let mut list = TrackList::default();
     for token in tokens(value) {
         if let Some(names) = token
@@ -486,5 +664,80 @@ mod tests {
             Some(GridLine::Named(..))
         ));
         assert_eq!(Tracks::parse("minmax(1fr, 2fr)"), None);
+    }
+
+    #[test]
+    fn parses_subgrid_line_names_repeats_and_rejects_invalid_forms() {
+        let bare = Tracks::parse("subgrid").expect("bare subgrid");
+        assert!(bare.is_subgrid());
+        assert!(bare.list().subgrid_line_names(3).is_empty());
+
+        let named = Tracks::parse("SUBGRID [a] [b c] [] [d]").expect("named subgrid");
+        assert!(named.is_subgrid());
+        assert_eq!(
+            named.list().subgrid_line_names(3),
+            vec![
+                (0, "a".to_string()),
+                (1, "b".to_string()),
+                (1, "c".to_string()),
+                (3, "d".to_string()),
+            ]
+        );
+        // excess line names beyond span + 1 lines are ignored
+        assert_eq!(
+            named.list().subgrid_line_names(2),
+            vec![
+                (0, "a".to_string()),
+                (1, "b".to_string()),
+                (1, "c".to_string()),
+            ]
+        );
+
+        let adjacent = Tracks::parse("subgrid [x][y]").expect("adjacent brackets");
+        assert_eq!(
+            adjacent.list().subgrid_line_names(2),
+            vec![(0, "x".to_string()), (1, "y".to_string())]
+        );
+
+        let counted = Tracks::parse("subgrid [head] repeat(2, [s] [e]) [tail]")
+            .expect("counted subgrid repeat");
+        assert_eq!(
+            counted.list().subgrid_line_names(5),
+            vec![
+                (0, "head".to_string()),
+                (1, "s".to_string()),
+                (2, "e".to_string()),
+                (3, "s".to_string()),
+                (4, "e".to_string()),
+                (5, "tail".to_string()),
+            ]
+        );
+
+        let auto_fill = Tracks::parse("subgrid [start] repeat(auto-fill, [a] [b]) [end]")
+            .expect("auto-fill subgrid repeat");
+        assert_eq!(
+            auto_fill.list().subgrid_line_names(5),
+            vec![
+                (0, "start".to_string()),
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "a".to_string()),
+                (4, "b".to_string()),
+                (5, "end".to_string()),
+            ]
+        );
+
+        for invalid in [
+            "subgrid 100px",
+            "subgrid [a] 1fr",
+            "subgrid repeat(auto-fit, [a])",
+            "subgrid repeat(0, [a])",
+            "subgrid repeat(auto-fill, [a]) repeat(auto-fill, [b])",
+            "subgrid [unclosed",
+            "subgrid repeat(2, 10px)",
+        ] {
+            assert_eq!(Tracks::parse(invalid), None, "should reject {invalid}");
+        }
+        assert_eq!(Tracks::parse_auto("subgrid"), None);
     }
 }

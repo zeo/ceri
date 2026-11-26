@@ -120,6 +120,11 @@ impl Matrix {
 
     // maps a point on the z = 0 plane; None when it lands behind the viewer
     pub(crate) fn map_point(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        self.map_point_z(x, y).map(|(px, py, _)| (px, py))
+    }
+
+    // maps a point on z = 0 to projected (x, y, z); larger z is closer to the viewer
+    pub(crate) fn map_point_z(&self, x: f32, y: f32) -> Option<(f32, f32, f32)> {
         let w = self.at(3, 0) * x + self.at(3, 1) * y + self.at(3, 3);
         if w <= 1e-6 {
             return None;
@@ -127,6 +132,7 @@ impl Matrix {
         Some((
             (self.at(0, 0) * x + self.at(0, 1) * y + self.at(0, 3)) / w,
             (self.at(1, 0) * x + self.at(1, 1) * y + self.at(1, 3)) / w,
+            (self.at(2, 0) * x + self.at(2, 1) * y + self.at(2, 3)) / w,
         ))
     }
 
@@ -167,16 +173,40 @@ impl Matrix {
         column(0).max(column(1))
     }
 
-    // the back face shows when m33 of the inverse is negative, which separates a turn
-    // about the y axis from a mirror in the plane
+    // the back face shows when m33 of the 4x4 inverse is negative, which holds under
+    // perspective and off-origin transforms while separating a turn about y from a 2d mirror
     pub(crate) fn shows_back(&self) -> bool {
-        let m = |row, column| self.at(row, column);
-        let determinant = m(0, 0) * (m(1, 1) * m(2, 2) - m(1, 2) * m(2, 1))
-            - m(0, 1) * (m(1, 0) * m(2, 2) - m(1, 2) * m(2, 0))
-            + m(0, 2) * (m(1, 0) * m(2, 1) - m(1, 1) * m(2, 0));
-        let cofactor = m(0, 0) * m(1, 1) - m(0, 1) * m(1, 0);
-        determinant != 0.0 && cofactor / determinant < 0.0
+        let determinant = self.determinant();
+        let cofactor = det3(self.flattened());
+        determinant.abs() > 1e-12
+            && determinant.is_finite()
+            && cofactor.is_finite()
+            && cofactor / determinant < 0.0
     }
+
+    fn determinant(&self) -> f32 {
+        let m = |row, col| self.at(row, col);
+        let sub = |c0, c1, c2| {
+            det3([
+                m(1, c0),
+                m(1, c1),
+                m(1, c2),
+                m(2, c0),
+                m(2, c1),
+                m(2, c2),
+                m(3, c0),
+                m(3, c1),
+                m(3, c2),
+            ])
+        };
+        m(0, 0) * sub(1, 2, 3) - m(0, 1) * sub(0, 2, 3) + m(0, 2) * sub(0, 1, 3)
+            - m(0, 3) * sub(0, 1, 2)
+    }
+}
+
+fn det3(m: [f32; 9]) -> f32 {
+    m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6])
+        + m[2] * (m[3] * m[7] - m[4] * m[6])
 }
 
 fn invert3(m: [f32; 9]) -> Option<[f32; 9]> {
@@ -467,5 +497,32 @@ mod tests {
         assert!(!matrix_of("rotateY(20deg)").shows_back());
         assert!(!matrix_of("rotate(180deg)").shows_back());
         assert!((matrix_of("scale(3, 2)").max_scale() - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn map_point_z_orders_depth_and_shows_back_handles_off_origin_perspective() {
+        let near = matrix_of("perspective(500px) translateZ(60px)")
+            .map_point_z(0.0, 0.0)
+            .expect("near maps");
+        let far = matrix_of("perspective(500px) translateZ(-60px)")
+            .map_point_z(0.0, 0.0)
+            .expect("far maps");
+        assert!(near.2 > far.2, "near={near:?} far={far:?}");
+
+        let perspective = Matrix::perspective(500.0).about(500.0, 0.0);
+        let turned_back = perspective
+            .multiply(&Matrix::rotate((0.0, 1.0, 0.0), 100.0_f32.to_radians()).about(500.0, 0.0));
+        let turned_front = perspective
+            .multiply(&Matrix::rotate((0.0, 1.0, 0.0), 20.0_f32.to_radians()).about(500.0, 0.0));
+        assert!(turned_back.shows_back());
+        assert!(!turned_front.shows_back());
+        assert!(!matrix_of("scaleX(-1)").shows_back());
+
+        let flip = Matrix::rotate((0.0, 1.0, 0.0), std::f32::consts::PI).about(200.0, 200.0);
+        let back_face = Matrix::perspective(600.0)
+            .about(200.0, 200.0)
+            .multiply(&flip)
+            .multiply(&flip);
+        assert!(!back_face.shows_back());
     }
 }

@@ -2578,6 +2578,7 @@ pub(crate) struct Style {
     pub rotate_property: Option<crate::transform::TransformList>,
     pub scale_property: Option<crate::transform::TransformList>,
     pub transform_origin: (Length, Length),
+    pub transform_style_3d: bool,
     pub perspective: Option<f32>,
     pub perspective_origin: (Length, Length),
     pub backface_hidden: bool,
@@ -2745,8 +2746,8 @@ impl Style {
             align_self: None,
             align_content: AlignContent::Stretch,
             flex_wrap: FlexWrap::NoWrap,
-            gap: Length::px(0.0),
-            row_gap: Length::px(0.0),
+            gap: Length::Auto,
+            row_gap: Length::Auto,
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: Length::Auto,
@@ -2778,6 +2779,7 @@ impl Style {
             rotate_property: None,
             scale_property: None,
             transform_origin: (Length::percent(50.0), Length::percent(50.0)),
+            transform_style_3d: false,
             perspective: None,
             perspective_origin: (Length::percent(50.0), Length::percent(50.0)),
             backface_hidden: false,
@@ -2826,6 +2828,7 @@ pub struct Stylesheet {
     has_transitions: bool,
     has_animations: bool,
     has_container_queries: bool,
+    has_auto_content_visibility: bool,
     // a number no differently parsed sheet has
     identity: u64,
     // the compounds that carry :hover, or none where one sits inside another pseudo-class
@@ -4022,6 +4025,11 @@ impl Stylesheet {
                 .iter()
                 .any(|condition| matches!(condition, RuleCondition::Container(_)))
         });
+        let has_auto_content_visibility = rules.iter().any(|rule| {
+            rule.declarations
+                .iter()
+                .any(|declaration| declaration.property == "content-visibility")
+        });
         let styled_pseudo = styled_pseudo_elements(&rules);
         Ok(Self {
             identity: next_identity(),
@@ -4045,6 +4053,7 @@ impl Stylesheet {
             has_transitions,
             has_animations,
             has_container_queries,
+            has_auto_content_visibility,
             shadow_sheets: RefCell::default(),
             styled_pseudo_elements: styled_pseudo,
             font_faces,
@@ -4089,6 +4098,11 @@ impl Stylesheet {
                 .iter()
                 .any(|condition| matches!(condition, RuleCondition::Container(_)))
         });
+        let has_auto_content_visibility = rules.iter().any(|rule| {
+            rule.declarations
+                .iter()
+                .any(|declaration| declaration.property == "content-visibility")
+        });
         let styled_pseudo = styled_pseudo_elements(&rules);
         (
             Self {
@@ -4113,6 +4127,7 @@ impl Stylesheet {
                 has_transitions,
                 has_animations,
                 has_container_queries,
+                has_auto_content_visibility,
                 shadow_sheets: RefCell::default(),
                 styled_pseudo_elements: styled_pseudo,
                 font_faces,
@@ -4740,9 +4755,20 @@ impl Stylesheet {
         Some(quoted.to_string())
     }
 
+    pub(crate) fn has_auto_content_visibility(&self) -> bool {
+        self.has_auto_content_visibility
+    }
+
     pub(crate) fn style_for(&self, context: StyleContext<'_>) -> Style {
         if !STYLE_MEMO.with(|memo| memo.borrow().is_some()) {
             return self.compute_style(context);
+        }
+        *self.style_for_rc(context)
+    }
+
+    pub(crate) fn style_for_rc(&self, context: StyleContext<'_>) -> Rc<Style> {
+        if !STYLE_MEMO.with(|memo| memo.borrow().is_some()) {
+            return Rc::new(self.compute_style(context));
         }
         let key = (context.node, context.pseudo);
         let environment = layout_environment();
@@ -4764,7 +4790,7 @@ impl Stylesheet {
                         && seen.environment == environment
                         && seen.zero_font == zero_font
                 })
-                .map(|(_, style, wake, moving)| (**style, *wake, *moving))
+                .map(|(_, style, wake, moving)| (style.clone(), *wake, *moving))
         });
         if let Some((style, wake, moving)) = known {
             if let Some(delay) = wake {
@@ -4854,7 +4880,7 @@ impl Stylesheet {
                     .entry(key)
                     .or_insert_with(|| Vec::with_capacity(1))
                     .push((inputs.clone(), shared.clone(), None, false));
-                Some(*shared)
+                Some(shared)
             });
             if let Some(style) = hit {
                 if cfg!(feature = "recheck") {
@@ -4867,7 +4893,7 @@ impl Stylesheet {
                         custom_properties,
                         &mut ignored,
                     );
-                    assert_eq!(style, fresh, "cascade-keyed style cache went stale");
+                    assert_eq!(*style, fresh, "cascade-keyed style cache went stale");
                 }
                 return style;
             }
@@ -4888,7 +4914,7 @@ impl Stylesheet {
         if let Some(delay) = wake {
             note_animation_wake(delay);
         }
-        STYLE_MEMO.with(|memo| {
+        let shared = STYLE_MEMO.with(|memo| {
             if let Some(memo) = memo.borrow_mut().as_mut() {
                 let shared = memo.share(style);
                 // most elements are styled under one set of inputs a pass
@@ -4904,11 +4930,13 @@ impl Stylesheet {
                     memo.by_cascade
                         .entry(hash)
                         .or_insert_with(|| Vec::with_capacity(1))
-                        .push((ckey, cascaded, shared));
+                        .push((ckey, cascaded, shared.clone()));
                 }
+                return Some(shared);
             }
+            None
         });
-        style
+        shared.unwrap_or_else(|| Rc::new(style))
     }
 
     fn compute_style(&self, context: StyleContext<'_>) -> Style {
@@ -8962,6 +8990,11 @@ fn reset_property(style: &mut Style, from: &Style, property: &str) {
         "justify-content" => style.justify_content = from.justify_content,
         "align-items" => style.align_items = from.align_items,
         "transform" => style.transform = from.transform,
+        "transform-origin" => style.transform_origin = from.transform_origin,
+        "transform-style" => style.transform_style_3d = from.transform_style_3d,
+        "perspective" => style.perspective = from.perspective,
+        "perspective-origin" => style.perspective_origin = from.perspective_origin,
+        "backface-visibility" => style.backface_hidden = from.backface_hidden,
         "text-overflow" => style.text_overflow_ellipsis = from.text_overflow_ellipsis,
         "vertical-align" => style.vertical_align = from.vertical_align,
         _ => {}
@@ -9241,6 +9274,7 @@ const SUPPORTED_PROPERTIES: &[&str] = &[
     "touch-action",
     "transform",
     "transform-origin",
+    "transform-style",
     "transition",
     "transition-delay",
     "transition-duration",
@@ -9488,6 +9522,37 @@ pub(crate) fn supports_declaration(property: &str, value: &str) -> bool {
             CSS_WIDE_KEYWORDS.contains(&lower.as_str())
                 || lower.contains("var(")
                 || parse_contain_intrinsic_one(value).is_some()
+        }
+        "grid-template-columns" | "grid-template-rows" => {
+            let lower = value.trim().to_ascii_lowercase();
+            CSS_WIDE_KEYWORDS.contains(&lower.as_str())
+                || lower.contains("var(")
+                || Tracks::parse(value).is_some()
+        }
+        "grid-auto-columns" | "grid-auto-rows" => {
+            let lower = value.trim().to_ascii_lowercase();
+            CSS_WIDE_KEYWORDS.contains(&lower.as_str())
+                || lower.contains("var(")
+                || Tracks::parse_auto(value).is_some()
+        }
+        "transform-style" => {
+            let lower = value.trim().to_ascii_lowercase();
+            CSS_WIDE_KEYWORDS.contains(&lower.as_str())
+                || lower.contains("var(")
+                || matches!(lower.as_str(), "flat" | "preserve-3d")
+        }
+        "backface-visibility" => {
+            let lower = value.trim().to_ascii_lowercase();
+            CSS_WIDE_KEYWORDS.contains(&lower.as_str())
+                || lower.contains("var(")
+                || matches!(lower.as_str(), "visible" | "hidden")
+        }
+        "perspective" => {
+            let lower = value.trim().to_ascii_lowercase();
+            CSS_WIDE_KEYWORDS.contains(&lower.as_str())
+                || lower.contains("var(")
+                || lower == "none"
+                || parse_perspective_px(&lower).is_some()
         }
         _ => true,
     }
@@ -10234,14 +10299,17 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 style.transform_origin = origin;
             }
         }
+        "transform-style" => match value.trim().to_ascii_lowercase().as_str() {
+            "preserve-3d" => style.transform_style_3d = true,
+            "flat" => style.transform_style_3d = false,
+            _ => {}
+        },
         "perspective" => {
             let value = value.trim();
             if value.eq_ignore_ascii_case("none") {
                 style.perspective = None;
-            } else if let Some(Length::Terms(terms)) = parse_length(value)
-                && terms.px > 0.0
-            {
-                style.perspective = Some(terms.px);
+            } else if let Some(distance) = parse_perspective_px(value) {
+                style.perspective = Some(distance);
             }
         }
         "perspective-origin" => {
@@ -10249,9 +10317,11 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
                 style.perspective_origin = origin;
             }
         }
-        "backface-visibility" => {
-            style.backface_hidden = value.trim().eq_ignore_ascii_case("hidden");
-        }
+        "backface-visibility" => match value.trim().to_ascii_lowercase().as_str() {
+            "hidden" => style.backface_hidden = true,
+            "visible" => style.backface_hidden = false,
+            _ => {}
+        },
         "transition" => {
             style.transitions = parse_transitions(value);
         }
@@ -10382,14 +10452,18 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
             };
         }
         "gap" | "grid-gap" => {
-            let mut parts = split_words(value).into_iter().filter_map(parse_length);
+            let mut parts = split_words(value).into_iter().filter_map(parse_gap_length);
             if let Some(row) = parts.next() {
                 style.row_gap = row;
                 style.gap = parts.next().unwrap_or(row);
             }
         }
-        "row-gap" | "grid-row-gap" => style.row_gap = parse_length(value).unwrap_or(style.row_gap),
-        "column-gap" | "grid-column-gap" => style.gap = parse_length(value).unwrap_or(style.gap),
+        "row-gap" | "grid-row-gap" => {
+            style.row_gap = parse_gap_length(value).unwrap_or(style.row_gap)
+        }
+        "column-gap" | "grid-column-gap" => {
+            style.gap = parse_gap_length(value).unwrap_or(style.gap)
+        }
         "flex-shrink" => {
             style.flex_shrink = parse_number(value).unwrap_or(style.flex_shrink).max(0.0);
         }
@@ -10417,10 +10491,10 @@ fn apply_declaration(style: &mut Style, property: &str, value: &str) {
         }
         "grid-template" | "grid" => apply_grid_template(style, value),
         "grid-auto-columns" => {
-            style.grid_auto_columns = Tracks::parse(value).unwrap_or(style.grid_auto_columns);
+            style.grid_auto_columns = Tracks::parse_auto(value).unwrap_or(style.grid_auto_columns);
         }
         "grid-auto-rows" => {
-            style.grid_auto_rows = Tracks::parse(value).unwrap_or(style.grid_auto_rows);
+            style.grid_auto_rows = Tracks::parse_auto(value).unwrap_or(style.grid_auto_rows);
         }
         "grid-auto-flow" => {
             let value = value.to_ascii_lowercase();
@@ -11340,6 +11414,29 @@ fn parse_z_index(value: &str) -> Option<i32> {
     value.parse().ok()
 }
 
+fn parse_gap_length(value: &str) -> Option<Length> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("normal") {
+        return Some(Length::Auto);
+    }
+    let length = parse_length(value)?;
+    match length {
+        Length::Auto => None,
+        Length::Terms(terms)
+            if terms.em == 0.0
+                && terms.rem == 0.0
+                && terms.percent == 0.0
+                && terms.viewport_width == 0.0
+                && terms.viewport_height == 0.0
+                && terms.zero_width == 0.0
+                && terms.px < 0.0 =>
+        {
+            None
+        }
+        other => Some(other),
+    }
+}
+
 // grid-template and grid: rows and columns around a slash, optionally with quoted area rows
 fn apply_grid_template(style: &mut Style, value: &str) {
     let value = value.trim();
@@ -11360,7 +11457,7 @@ fn apply_grid_template(style: &mut Style, value: &str) {
             let sizes = lower.replace("auto-flow", "").replace("dense", "");
             (
                 dense,
-                Tracks::parse(if sizes.trim().is_empty() {
+                Tracks::parse_auto(if sizes.trim().is_empty() {
                     "none"
                 } else {
                     &sizes
@@ -11473,6 +11570,21 @@ fn parse_individual_transform(
         ("scale", [x, y, z]) => Some(TransformOp::Scale(number(x)?, number(y)?, number(z)?)),
         _ => None,
     }
+}
+
+fn parse_perspective_px(value: &str) -> Option<f32> {
+    let Length::Terms(terms) = parse_length(value)? else {
+        return None;
+    };
+    if terms.percent != 0.0
+        || terms.viewport_width != 0.0
+        || terms.viewport_height != 0.0
+        || terms.zero_width != 0.0
+    {
+        return None;
+    }
+    let px = terms.px + (terms.em + terms.rem) * 16.0;
+    (px.is_finite() && px >= 0.0).then(|| px.max(1.0))
 }
 
 // transform-origin and perspective-origin: keywords or lengths, with a centered default axis
@@ -13449,5 +13561,64 @@ mod tests {
                 "expected invalid selector: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn supports_subgrid_and_3d_transform_properties() {
+        assert!(supports_declaration("grid-template-columns", "subgrid"));
+        assert!(supports_declaration(
+            "grid-template-rows",
+            "subgrid [head] repeat(auto-fill, [item])"
+        ));
+        assert!(!supports_declaration(
+            "grid-template-columns",
+            "subgrid 100px"
+        ));
+        assert!(!supports_declaration("grid-auto-columns", "subgrid"));
+        assert!(!supports_declaration("grid-auto-rows", "subgrid"));
+
+        assert!(supports_declaration("transform-style", "preserve-3d"));
+        assert!(supports_declaration("transform-style", "flat"));
+        assert!(!supports_declaration("transform-style", "3d"));
+
+        assert!(supports_declaration("backface-visibility", "hidden"));
+        assert!(supports_declaration("backface-visibility", "visible"));
+        assert!(!supports_declaration("backface-visibility", "auto"));
+
+        assert!(supports_declaration("perspective", "600px"));
+        assert!(supports_declaration("perspective", "40rem"));
+        assert!(supports_declaration("perspective", "none"));
+        assert!(!supports_declaration("perspective", "-50px"));
+        assert!(!supports_declaration("perspective", "50%"));
+
+        let mut style = Style::default_for(
+            "div",
+            16.0,
+            Color::BLACK,
+            FontWeight::NORMAL,
+            InheritedText::default(),
+        );
+        assert_eq!(style.gap, Length::Auto);
+        assert_eq!(style.row_gap, Length::Auto);
+        apply_declaration(&mut style, "gap", "0px");
+        assert_eq!(style.gap, Length::px(0.0));
+        assert_eq!(style.row_gap, Length::px(0.0));
+        apply_declaration(&mut style, "column-gap", "normal");
+        assert_eq!(style.gap, Length::Auto);
+        assert_eq!(style.row_gap, Length::px(0.0));
+
+        apply_declaration(&mut style, "transform-style", "preserve-3d");
+        assert!(style.transform_style_3d);
+        apply_declaration(&mut style, "transform-style", "bogus");
+        assert!(style.transform_style_3d);
+        apply_declaration(&mut style, "transform-style", "flat");
+        assert!(!style.transform_style_3d);
+
+        apply_declaration(&mut style, "backface-visibility", "hidden");
+        assert!(style.backface_hidden);
+        apply_declaration(&mut style, "backface-visibility", "bogus");
+        assert!(style.backface_hidden);
+        apply_declaration(&mut style, "backface-visibility", "visible");
+        assert!(!style.backface_hidden);
     }
 }

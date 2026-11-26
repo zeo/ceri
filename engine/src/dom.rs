@@ -458,6 +458,15 @@ fn next_stamp() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+fn style_mentions_content_visibility(value: &str) -> bool {
+    const NEEDLE: &[u8] = b"content-visibility";
+    value.len() >= NEEDLE.len()
+        && value
+            .as_bytes()
+            .windows(NEEDLE.len())
+            .any(|window| window.eq_ignore_ascii_case(NEEDLE))
+}
+
 #[derive(Clone, Debug)]
 pub struct Document {
     slots: Vec<Slot>,
@@ -512,6 +521,8 @@ pub struct Document {
     // faces script added through document.fonts, and a count of the changes to them
     script_fonts: Vec<ScriptFont>,
     script_fonts_stamp: u64,
+    // true once any element in the document carries an inline content-visibility declaration
+    has_inline_content_visibility: bool,
 }
 
 // a face a FontFace object loaded and document.fonts holds
@@ -663,6 +674,7 @@ impl Document {
             disabled_sheets: HashSet::default(),
             script_fonts: Vec::new(),
             script_fonts_stamp: 0,
+            has_inline_content_visibility: false,
         };
         document.root = document.allocate(NodeKind::Document);
         document.orphans.clear();
@@ -792,6 +804,14 @@ impl Document {
     fn allocate_inner(&mut self, kind: NodeKind, orphan: bool) -> NodeId {
         if !matches!(kind, NodeKind::Text(_) | NodeKind::Comment(_)) {
             self.selector_version = next_stamp();
+        }
+        if !self.has_inline_content_visibility
+            && let NodeKind::Element(element) = &kind
+            && element
+                .attr("style")
+                .is_some_and(style_mentions_content_visibility)
+        {
+            self.has_inline_content_visibility = true;
         }
         let stamp = self.writing_stamp();
         let node = NodeData {
@@ -1007,6 +1027,10 @@ impl Document {
 
     pub(crate) fn inline_style_version(&self) -> u64 {
         self.inline_style_version
+    }
+
+    pub(crate) fn has_inline_content_visibility(&self) -> bool {
+        self.has_inline_content_visibility
     }
 
     fn note_selector_change(&mut self, id: NodeId, changed: Box<[String]>) {
@@ -1284,12 +1308,18 @@ impl Document {
                 && (unblocked
                     || old.as_deref().is_some_and(|value| value.contains("--"))
                     || new_value.is_some_and(|value| value.contains("--")));
+            let mentions_cv = attribute == "style"
+                && !self.has_inline_content_visibility
+                && new_value.is_some_and(style_mentions_content_visibility);
             self.version += 1;
             let changed = (attribute != "style")
                 .then(|| attribute_change(attribute, old.as_deref(), new_value));
             self.mark_written(id);
             if attribute == "style" {
                 self.inline_style_version = next_stamp();
+                if mentions_cv {
+                    self.has_inline_content_visibility = true;
+                }
             }
             if custom_style {
                 self.custom_style_version = next_stamp();
@@ -3341,10 +3371,17 @@ impl TreeBuilder {
     }
 
     fn merge_attributes(document: &mut Document, id: NodeId, attrs: Attributes) {
+        let mut mentions_cv = false;
         if let Some(NodeKind::Element(element)) = document.data_mut(id).map(|data| &mut data.kind) {
             for (name, value) in attrs {
+                if !mentions_cv && name == "style" && style_mentions_content_visibility(&value) {
+                    mentions_cv = true;
+                }
                 element.attrs.insert_missing(name, value);
             }
+        }
+        if mentions_cv {
+            document.has_inline_content_visibility = true;
         }
     }
 

@@ -135,6 +135,7 @@ pub struct LayoutBox {
     // the CSS transform about its origin, in coordinates relative to the border box corner
     pub(crate) transform: Option<Box<crate::transform::Matrix>>,
     pub(crate) backface_hidden: bool,
+    pub(crate) preserve_3d: bool,
     // relative to the border box corner
     pub(crate) clip_path: Option<Box<crate::clip_path::ClipRegion>>,
     pub(crate) radii: CornerRadii,
@@ -390,7 +391,7 @@ struct InlineLine {
 struct InlineDecoration {
     node: NodeId,
     tag: String,
-    style: Style,
+    style: Rc<Style>,
     font_size: f32,
     // how far its baseline sits above the line's
     raise: f32,
@@ -614,18 +615,30 @@ impl Drop for ViewportWindowGuard {
     }
 }
 
+static HAS_REMEMBERED_SIZES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn remembered_size(document: &Document, node: NodeId) -> Option<(f32, f32)> {
+    if !HAS_REMEMBERED_SIZES.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     REMEMBERED_SIZES.with(|sizes| sizes.borrow().get(&(document.identity(), node)).copied())
 }
 
 fn record_remembered_size(document: &Document, node: NodeId, style: &Style, size: (f32, f32)) {
+    if style.contain_intrinsic.is_none()
+        && !HAS_REMEMBERED_SIZES.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
     let key = (document.identity(), node);
     let axes = style.contain_intrinsic_axes();
     if axes[0].auto || axes[1].auto {
+        HAS_REMEMBERED_SIZES.store(true, std::sync::atomic::Ordering::Relaxed);
         REMEMBERED_SIZES.with(|sizes| {
             sizes.borrow_mut().insert(key, size);
         });
-    } else {
+    } else if HAS_REMEMBERED_SIZES.load(std::sync::atomic::Ordering::Relaxed) {
         REMEMBERED_SIZES.with(|sizes| {
             let mut map = sizes.borrow_mut();
             if !map.is_empty() {
@@ -1016,15 +1029,29 @@ impl<'a> Subject<'a> {
             })
         };
         items.extend(generated_box(PseudoElement::Before, &generated[0]));
-        push_flat_children(
-            self.document,
-            self.node,
-            stylesheet,
-            parent,
-            state,
-            &mut items,
-            0,
-        );
+        if !self.document.has_shadow_roots() {
+            for &child in self.document.children(self.node) {
+                match self.document.kind(child) {
+                    Some(NodeKind::Text(text)) => items.push(Child::Text(Some(child), text)),
+                    Some(NodeKind::Element(_))
+                        if !TOP_LAYER.with(|layer| layer.borrow().contains(&child)) =>
+                    {
+                        items.push(Child::Element(Subject::new(self.document, child)))
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            push_flat_children(
+                self.document,
+                self.node,
+                stylesheet,
+                parent,
+                state,
+                &mut items,
+                0,
+            );
+        }
         items.extend(generated_box(PseudoElement::After, &generated[1]));
         items
     }
@@ -1177,6 +1204,7 @@ struct InlineElementInput<'a> {
     style_state: &'a StyleState,
     viewport: Size,
     containing_block: ContainingBlock,
+    track_viewport: bool,
 }
 
 struct FlexLayoutInput<'a> {
@@ -1187,7 +1215,7 @@ struct FlexLayoutInput<'a> {
     parent_opacity: f32,
     parent_text: SharedText,
     node: Subject<'a>,
-    style: Style,
+    style: &'a Style,
     stylesheet: &'a Stylesheet,
     style_state: &'a StyleState,
     margin: ResolvedEdges,
@@ -1202,11 +1230,12 @@ struct FlexLayoutInput<'a> {
     containing_block: ContainingBlock,
     inherited_containing_block: ContainingBlock,
     mode: LayoutMode,
+    track_viewport: bool,
 }
 
 struct GridItem<'a> {
     source: FlexSource<'a>,
-    style: Style,
+    style: Rc<Style>,
     style_momentary: bool,
     margin: ResolvedEdges,
     padding: ResolvedEdges,
@@ -1224,7 +1253,7 @@ struct GridLayoutInput<'a> {
     parent_opacity: f32,
     parent_text: SharedText,
     node: Subject<'a>,
-    style: Style,
+    style: &'a Style,
     stylesheet: &'a Stylesheet,
     style_state: &'a StyleState,
     margin: ResolvedEdges,
@@ -1239,6 +1268,7 @@ struct GridLayoutInput<'a> {
     containing_block: ContainingBlock,
     inherited_containing_block: ContainingBlock,
     mode: LayoutMode,
+    track_viewport: bool,
 }
 
 #[derive(Clone)]
@@ -1258,7 +1288,7 @@ struct ElementLayoutInput<'node, 'style> {
     parent: ParentStyle,
     context: LayoutContext<'style>,
     // style already computed for node with the same parent, paired with whether it read motion
-    pre_style: Option<(Style, bool)>,
+    pre_style: Option<(Rc<Style>, bool)>,
 }
 
 pub fn layout(document: &Document, stylesheet: &Stylesheet, viewport: Size) -> LayoutDocument {
@@ -1298,6 +1328,7 @@ struct LayoutContext<'a> {
     mode: LayoutMode,
     stylesheet: &'a Stylesheet,
     style_state: &'a StyleState,
+    track_viewport: bool,
 }
 
 #[derive(Clone)]
@@ -1308,6 +1339,7 @@ struct PositionedLayoutContext<'a> {
     parent: ParentStyle,
     stylesheet: &'a Stylesheet,
     style_state: &'a StyleState,
+    track_viewport: bool,
 }
 
 thread_local! {
@@ -1367,6 +1399,7 @@ pub fn layout_with_state(
         top_layer: false,
         transform: None,
         backface_hidden: false,
+        preserve_3d: false,
         clip_path: None,
         radii: SQUARE_CORNERS,
         opacity: 1.0,
@@ -1505,14 +1538,19 @@ fn layout_document_children(
     style_state: &StyleState,
     root_scroll: (f32, f32),
 ) -> Vec<Rc<LayoutBox>> {
-    let _viewport_window = ViewportWindowGuard::enter(ViewportWindow {
-        clip: Rect {
-            x: 0.0,
-            y: 0.0,
-            width: viewport.width,
-            height: viewport.height,
-        },
-        scroll: root_scroll,
+    let track_viewport = stylesheet.has_auto_content_visibility()
+        || document.has_inline_content_visibility()
+        || document.has_shadow_roots();
+    let _viewport_window = track_viewport.then(|| {
+        ViewportWindowGuard::enter(ViewportWindow {
+            clip: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: viewport.width,
+                height: viewport.height,
+            },
+            scroll: root_scroll,
+        })
     });
     let viewport_block = viewport_block(viewport);
     let mut children = Vec::new();
@@ -1530,7 +1568,7 @@ fn layout_document_children(
     for node in document.element_children(document.root()) {
         let node = Subject::new(document, node);
         let before_style = crate::css::moment_reports();
-        let style = stylesheet.style_for(node.style_context(&root_parent, style_state));
+        let style = stylesheet.style_for_rc(node.style_context(&root_parent, style_state));
         let style_momentary = crate::css::moment_reports() != before_style;
         if style.position.is_out_of_flow() {
             positioned.push(node);
@@ -1577,6 +1615,7 @@ fn layout_document_children(
                     style_state,
                     viewport,
                     containing_block: viewport_block,
+                    track_viewport,
                 },
                 &style,
                 &mut line,
@@ -1600,6 +1639,7 @@ fn layout_document_children(
                 mode: LayoutMode::Flow,
                 stylesheet,
                 style_state,
+                track_viewport,
             },
             pre_style: Some((style, style_momentary)),
         }) {
@@ -1614,6 +1654,7 @@ fn layout_document_children(
         parent: root_parent.clone(),
         stylesheet,
         style_state,
+        track_viewport,
     };
     append_positioned_nodes(&mut children, positioned, positioned_context.clone());
     // the top layer paints over everything, each element over its backdrop, inheriting from
@@ -2482,7 +2523,7 @@ fn resolve_insets(edges: Edges, containing: ContainingBlock, font_size: f32) -> 
 
 fn position_layout_box(
     layout: &mut LayoutBox,
-    style: Style,
+    style: &Style,
     mode: LayoutMode,
     containing: ContainingBlock,
     font_size: f32,
@@ -2597,10 +2638,11 @@ fn append_positioned_nodes(
         parent,
         stylesheet,
         style_state,
+        track_viewport,
     } = context;
     for node in nodes {
         let before_style = crate::css::moment_reports();
-        let style = stylesheet.style_for(node.style_context(&parent, style_state));
+        let style = stylesheet.style_for_rc(node.style_context(&parent, style_state));
         let style_momentary = crate::css::moment_reports() != before_style;
         let mode = if style.position == Position::Fixed {
             LayoutMode::Fixed
@@ -2632,6 +2674,7 @@ fn append_positioned_nodes(
                 mode,
                 stylesheet,
                 style_state,
+                track_viewport,
             },
             pre_style: Some((style, style_momentary)),
         }) {
@@ -2874,6 +2917,35 @@ fn hit_test_context(
     {
         return None;
     }
+    if layout.preserve_3d {
+        let planes = collect_3d_planes(layout, ancestor_offset);
+        for plane in planes.iter().rev() {
+            if plane.backface_hidden && plane.matrix.shows_back() {
+                continue;
+            }
+            let Some((lx, ly)) = plane.matrix.unmap_point(x, y) else {
+                continue;
+            };
+            if plane.own_surface_only {
+                let rect = visual_rect_for(plane.layout, plane.ancestor_offset);
+                if inside_clip_path(plane.layout, rect, lx, ly)
+                    && contains_point(rect, lx, ly)
+                    && hit_target(plane.layout, rect, lx, ly)
+                {
+                    return Some(Hit {
+                        layout: plane.layout,
+                        offset: visual_offset_for(plane.layout, plane.ancestor_offset),
+                        point: (lx, ly),
+                    });
+                }
+            } else if let Some(hit) =
+                hit_test_context_in_local(plane.layout, lx, ly, None, plane.ancestor_offset)
+            {
+                return Some(hit);
+            }
+        }
+        return None;
+    }
     // inside a transform the ancestor clip has been applied, and the rest works in local space
     let (x, y) = local_point(layout, ancestor_offset, x, y)?;
     let clip = if layout.transform.is_some() {
@@ -2881,6 +2953,16 @@ fn hit_test_context(
     } else {
         clip
     };
+    hit_test_context_in_local(layout, x, y, clip, ancestor_offset)
+}
+
+fn hit_test_context_in_local(
+    layout: &LayoutBox,
+    x: f32,
+    y: f32,
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+) -> Option<Hit<'_>> {
     let visual_offset = visual_offset_for(layout, ancestor_offset);
     let rect = visual_rect_for(layout, ancestor_offset);
     if !inside_clip_path(layout, rect, x, y) {
@@ -2913,6 +2995,163 @@ fn hit_test_context(
         offset: visual_offset,
         point: (x, y),
     })
+}
+
+pub(crate) struct Plane3d<'a> {
+    pub(crate) layout: &'a LayoutBox,
+    pub(crate) ancestor_offset: (f32, f32),
+    pub(crate) matrix: crate::transform::Matrix,
+    pub(crate) z_key: i64,
+    pub(crate) order: usize,
+    pub(crate) own_surface_only: bool,
+    pub(crate) backface_hidden: bool,
+    pub(crate) opacity: f32,
+}
+
+fn box_world_matrix(layout: &LayoutBox, ancestor_offset: (f32, f32)) -> crate::transform::Matrix {
+    match layout.transform.as_deref() {
+        Some(transform) => {
+            let rect = visual_rect_for(layout, ancestor_offset);
+            transform.about(rect.x, rect.y)
+        }
+        None => crate::transform::Matrix::IDENTITY,
+    }
+}
+
+fn plane_z_key(matrix: &crate::transform::Matrix, rect: Rect) -> Option<i64> {
+    let cx = rect.x + rect.width * 0.5;
+    let cy = rect.y + rect.height * 0.5;
+    let z = if let Some((_, _, pz)) = matrix.map_point_z(cx, cy) {
+        pz
+    } else {
+        let corners = [
+            (rect.x, rect.y),
+            (rect.x + rect.width, rect.y),
+            (rect.x, rect.y + rect.height),
+            (rect.x + rect.width, rect.y + rect.height),
+        ];
+        let mut sum = 0.0_f32;
+        let mut count = 0_u32;
+        for (x, y) in corners {
+            if let Some((_, _, pz)) = matrix.map_point_z(x, y) {
+                sum += pz;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return None;
+        }
+        sum / count as f32
+    };
+    let scaled = (f64::from(z) * 1024.0).round();
+    Some(scaled.clamp(i64::MIN as f64 / 2.0, i64::MAX as f64 / 2.0) as i64)
+}
+
+fn has_own_surface(layout: &LayoutBox) -> bool {
+    layout.visible
+        && (layout.background.alpha > 0
+            || !layout.backgrounds.is_empty()
+            || !layout.border.is_none()
+            || !layout.shadows.is_empty()
+            || layout.outline.is_some()
+            || layout.control.is_some()
+            || layout.svg.is_some()
+            || !layout.text.is_empty()
+            || layout.children.iter().any(|child| child.inline))
+}
+
+fn collect_3d_node<'a>(
+    layout: &'a LayoutBox,
+    ancestor_offset: (f32, f32),
+    matrix: crate::transform::Matrix,
+    order: &mut usize,
+    planes: &mut Vec<Plane3d<'a>>,
+) {
+    let visual_offset = visual_offset_for(layout, ancestor_offset);
+    let ordered = paint_order(&layout.children);
+    for &index in &ordered {
+        let child = &layout.children[index];
+        if child.inline || child.z_index >= 0 {
+            continue;
+        }
+        collect_3d_child(child, visual_offset, matrix, order, planes);
+    }
+    if has_own_surface(layout) {
+        let rect = visual_rect_for(layout, ancestor_offset);
+        if let Some(z_key) = plane_z_key(&matrix, rect) {
+            let my_order = *order;
+            *order += 1;
+            planes.push(Plane3d {
+                layout,
+                ancestor_offset,
+                matrix,
+                z_key,
+                order: my_order,
+                own_surface_only: true,
+                backface_hidden: layout.backface_hidden,
+                opacity: layout.opacity,
+            });
+        }
+    }
+    for &index in &ordered {
+        let child = &layout.children[index];
+        if child.inline || child.z_index < 0 {
+            continue;
+        }
+        collect_3d_child(child, visual_offset, matrix, order, planes);
+    }
+}
+
+fn collect_3d_child<'a>(
+    child: &'a LayoutBox,
+    ancestor_offset: (f32, f32),
+    parent_matrix: crate::transform::Matrix,
+    order: &mut usize,
+    planes: &mut Vec<Plane3d<'a>>,
+) {
+    if child.opacity <= 0.0 {
+        return;
+    }
+    let local = box_world_matrix(child, ancestor_offset);
+    let combined = parent_matrix.multiply(&local);
+    if child.preserve_3d {
+        collect_3d_node(child, ancestor_offset, combined, order, planes);
+        return;
+    }
+    let rect = visual_rect_for(child, ancestor_offset);
+    let Some(z_key) = plane_z_key(&combined, rect) else {
+        return;
+    };
+    let my_order = *order;
+    *order += 1;
+    planes.push(Plane3d {
+        layout: child,
+        ancestor_offset,
+        matrix: combined,
+        z_key,
+        order: my_order,
+        own_surface_only: false,
+        backface_hidden: child.backface_hidden,
+        opacity: child.opacity,
+    });
+}
+
+pub(crate) fn collect_3d_planes(
+    layout: &LayoutBox,
+    ancestor_offset: (f32, f32),
+) -> Vec<Plane3d<'_>> {
+    let mut planes = Vec::new();
+    let mut order = 0;
+    let root_matrix = box_world_matrix(layout, ancestor_offset);
+    collect_3d_node(
+        layout,
+        ancestor_offset,
+        root_matrix,
+        &mut order,
+        &mut planes,
+    );
+    planes.sort_by_key(|plane| (plane.z_key, plane.order));
+    planes
 }
 
 // a clip-path hides its box and everything in it from the pointer outside the shape
@@ -3845,7 +4084,7 @@ fn layout_element(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
     layout_element_rc(input).map(Rc::unwrap_or_clone)
 }
 
-fn layout_element_rc(input: ElementLayoutInput<'_, '_>) -> Option<Rc<LayoutBox>> {
+fn layout_element_rc(mut input: ElementLayoutInput<'_, '_>) -> Option<Rc<LayoutBox>> {
     // floats are shared state the layout writes to, so a box that meets one is laid out each
     // time, and one that meets none keeps its answer only while it places none either
     let floats = input.floats.clone();
@@ -3939,9 +4178,9 @@ fn layout_element_rc(input: ElementLayoutInput<'_, '_>) -> Option<Rc<LayoutBox>>
         return layout;
     }
     let (reported, looked_up) = (crate::css::moment_reports(), crate::svg::reference_reads());
-    let (style, style_momentary) = input.pre_style.unwrap_or_else(|| {
+    let (style, style_momentary) = input.pre_style.take().unwrap_or_else(|| {
         (
-            input.context.stylesheet.style_for(
+            input.context.stylesheet.style_for_rc(
                 input
                     .node
                     .style_context(&input.parent, input.context.style_state),
@@ -3977,7 +4216,7 @@ fn layout_element_rc(input: ElementLayoutInput<'_, '_>) -> Option<Rc<LayoutBox>>
     if !reads_width {
         inputs.numbers[2] = ANY_DIM;
     }
-    let layout = layout_element_fresh_with_style(input, style).map(Rc::new);
+    let layout = layout_element_fresh_with_style(input, &style).map(Rc::new);
     let momentary = style_momentary || crate::css::moment_reports() != reported;
     let refers = crate::svg::reference_reads() != looked_up;
     // content-visibility: auto depends on the active viewport window, which can change within one pass
@@ -4009,45 +4248,48 @@ fn layout_element_rc(input: ElementLayoutInput<'_, '_>) -> Option<Rc<LayoutBox>>
     layout
 }
 
-fn layout_element_fresh(input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
-    let style = input.context.stylesheet.style_for(
-        input
-            .node
-            .style_context(&input.parent, input.context.style_state),
-    );
-    layout_element_fresh_with_style(input, style)
+fn layout_element_fresh(mut input: ElementLayoutInput<'_, '_>) -> Option<LayoutBox> {
+    let style = input
+        .pre_style
+        .take()
+        .map(|(style, _)| style)
+        .unwrap_or_else(|| {
+            input.context.stylesheet.style_for_rc(
+                input
+                    .node
+                    .style_context(&input.parent, input.context.style_state),
+            )
+        });
+    layout_element_fresh_with_style(input, &style)
 }
 
 fn layout_element_fresh_with_style(
     input: ElementLayoutInput<'_, '_>,
-    style: Style,
+    style: &Style,
 ) -> Option<LayoutBox> {
     let _profile = crate::profile::scope("layout: element");
     if style.display == Display::None {
         return None;
     }
-    let settle_clamped_scroll = |layout: LayoutBox, gutter: f32| -> Option<LayoutBox> {
-        if !layout.has_auto_visibility
-            || !matches!(layout.overflow, Overflow::Auto | Overflow::Hidden)
-        {
-            return Some(layout);
-        }
-        let requested = input
-            .node
-            .own()
-            .and_then(|id| input.context.style_state.scroll_offsets.get(&id).copied())
-            .unwrap_or((0.0, 0.0));
-        if (layout.scroll_offset.0 - requested.0).abs() > 0.5
-            || (layout.scroll_offset.1 - requested.1).abs() > 0.5
-        {
-            layout_element_with_gutter(input.clone(), style, gutter, Some(layout.scroll_offset))
-        } else {
-            Some(layout)
-        }
-    };
+    let may_clamp_scroll = input.context.track_viewport
+        && matches!(
+            effective_overflow(style).0,
+            Overflow::Auto | Overflow::Hidden
+        )
+        && input.node.own().is_some_and(|id| {
+            input
+                .context
+                .style_state
+                .scroll_offsets
+                .get(&id)
+                .is_some_and(|&(x, y)| x != 0.0 || y != 0.0)
+        });
     if style.overflow_axes()[1] != Overflow::Auto {
+        if !may_clamp_scroll {
+            return layout_element_with_gutter(input, style, 0.0, None);
+        }
         let layout = layout_element_with_gutter(input.clone(), style, 0.0, None)?;
-        return settle_clamped_scroll(layout, 0.0);
+        return settle_clamped_scroll(input, style, layout, 0.0);
     }
     // a vertical scrollbar sits between the border and the padding, so the content box gives
     // up its width and the content lays out again. a box lays out first with the scrollbar it
@@ -4058,7 +4300,11 @@ fn layout_element_fresh_with_style(
     if let Some(last) = last {
         let layout = layout_element_with_gutter(input.clone(), style, last, None)?;
         if wanted_gutter(&layout) == Some(last) {
-            return settle_clamped_scroll(layout, last);
+            return if may_clamp_scroll {
+                settle_clamped_scroll(input, style, layout, last)
+            } else {
+                Some(layout)
+            };
         }
     }
     let layout = layout_element_with_gutter(input.clone(), style, 0.0, None)?;
@@ -4084,7 +4330,35 @@ fn layout_element_fresh_with_style(
             }
         }
     });
-    settle_clamped_scroll(layout, gutter.unwrap_or(0.0))
+    if may_clamp_scroll {
+        settle_clamped_scroll(input, style, layout, gutter.unwrap_or(0.0))
+    } else {
+        Some(layout)
+    }
+}
+
+fn settle_clamped_scroll(
+    input: ElementLayoutInput<'_, '_>,
+    style: &Style,
+    layout: LayoutBox,
+    gutter: f32,
+) -> Option<LayoutBox> {
+    if !layout.has_auto_visibility || !matches!(layout.overflow, Overflow::Auto | Overflow::Hidden)
+    {
+        return Some(layout);
+    }
+    let requested = input
+        .node
+        .own()
+        .and_then(|id| input.context.style_state.scroll_offsets.get(&id).copied())
+        .unwrap_or((0.0, 0.0));
+    if (layout.scroll_offset.0 - requested.0).abs() > 0.5
+        || (layout.scroll_offset.1 - requested.1).abs() > 0.5
+    {
+        layout_element_with_gutter(input, style, gutter, Some(layout.scroll_offset))
+    } else {
+        Some(layout)
+    }
 }
 
 thread_local! {
@@ -4106,7 +4380,7 @@ fn wanted_gutter(layout: &LayoutBox) -> Option<f32> {
 
 fn layout_element_with_gutter(
     input: ElementLayoutInput<'_, '_>,
-    style: Style,
+    style: &Style,
     gutter: f32,
     scroll_override: Option<(f32, f32)>,
 ) -> Option<LayoutBox> {
@@ -4127,6 +4401,7 @@ fn layout_element_with_gutter(
                 mode,
                 stylesheet,
                 style_state,
+                track_viewport,
             },
         pre_style: _,
     } = input;
@@ -4148,10 +4423,10 @@ fn layout_element_with_gutter(
         .resolve(parent.font_size, parent.font_size)
         .unwrap_or(parent.font_size)
         .max(0.0);
-    let _zero_font = crate::css::use_zero_font(style.font_family, font_style(&style, font_size));
+    let _zero_font = crate::css::use_zero_font(style.font_family, font_style(style, font_size));
     let mut margin = resolve_margins(style.margin, containing_width, font_size);
     let padding = resolve_edges(style.padding, containing_width, font_size);
-    let border = used_border(&style);
+    let border = used_border(style);
     let horizontal_inner = padding.left + padding.right + border.left + border.right;
     let vertical_inner = padding.top + padding.bottom + border.top + border.bottom;
     let horizontal_extras = margin.left + margin.right + horizontal_inner;
@@ -4174,9 +4449,9 @@ fn layout_element_with_gutter(
     let inset = resolve_insets(style.inset, position_block, font_size);
     let control_size = control_content_size(
         node,
-        &style,
+        style,
         font_size,
-        used_line_height(&style, font_size),
+        used_line_height(style, font_size),
         style_state,
     );
     // an out-of-flow box with both block insets set stretches between them
@@ -4243,7 +4518,7 @@ fn layout_element_with_gutter(
                     (mode != LayoutMode::Flow || style.content_size[0] != ContentSize::None).then(
                         || {
                             resolve_contain_intrinsic(
-                                &style,
+                                style,
                                 0,
                                 node.document,
                                 node.own(),
@@ -4264,7 +4539,7 @@ fn layout_element_with_gutter(
                     explicit_height
                         .or_else(|| {
                             resolve_contain_intrinsic(
-                                &style,
+                                style,
                                 1,
                                 node.document,
                                 node.own(),
@@ -4297,7 +4572,7 @@ fn layout_element_with_gutter(
             };
             should_skip_contents(
                 node,
-                &style,
+                style,
                 style_state,
                 mode,
                 viewport,
@@ -4339,7 +4614,7 @@ fn layout_element_with_gutter(
             (mode != LayoutMode::Flow || style.content_size[0] != ContentSize::None).then(|| {
                 if skip_contents {
                     return resolve_contain_intrinsic(
-                        &style,
+                        style,
                         0,
                         node.document,
                         node.own(),
@@ -4412,7 +4687,7 @@ fn layout_element_with_gutter(
         .then(|| {
             leading_margin(
                 node,
-                &style,
+                style,
                 font_size,
                 content_width,
                 (stylesheet, style_state),
@@ -4438,7 +4713,7 @@ fn layout_element_with_gutter(
     };
     if skip_contents {
         let intrinsic_height =
-            resolve_contain_intrinsic(&style, 1, node.document, node.own(), font_size)
+            resolve_contain_intrinsic(style, 1, node.document, node.own(), font_size)
                 .unwrap_or(0.0);
         let content_height = explicit_height
             .unwrap_or_else(|| intrinsic_height.min(max_height).max(min_height))
@@ -4447,8 +4722,8 @@ fn layout_element_with_gutter(
             height: content_height + vertical_inner,
             ..rect
         };
-        let (overflow, overflow_axes) = effective_overflow(&style);
-        let filters = crate::filter::Filters::of(&style, font_size);
+        let (overflow, overflow_axes) = effective_overflow(style);
+        let filters = crate::filter::Filters::of(style, font_size);
         let has_backdrop_filter = !filters.backdrop.is_empty();
         let mut layout = LayoutBox {
             node: node.node,
@@ -4463,13 +4738,14 @@ fn layout_element_with_gutter(
             top_layer: false,
             transform: None,
             backface_hidden: style.backface_hidden,
+            preserve_3d: false,
             clip_path: None,
             radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
             opacity: style.opacity * parent.opacity,
             shadows: resolve_shadows(style.shadows, content_width, font_size),
             filters,
-            border: BoxBorder::of(&style),
-            outline: box_outline(&style),
+            border: BoxBorder::of(style),
+            outline: box_outline(style),
             text: Vec::new(),
             control: None,
             selection: None,
@@ -4501,7 +4777,7 @@ fn layout_element_with_gutter(
             scrollbar: scrollbar_for(
                 stylesheet,
                 (node.document, node.node),
-                &style,
+                style,
                 font_size,
                 style_state,
             ),
@@ -4517,7 +4793,7 @@ fn layout_element_with_gutter(
             position_layout_box(&mut layout, style, mode, position_block, font_size);
         }
         apply_relative_offset(&mut layout, style, containing_block, font_size);
-        apply_transform(&mut layout, &style, font_size);
+        apply_transform(&mut layout, style, font_size);
         finalize_scroll(&mut layout, padding, style_state);
         return Some(layout);
     }
@@ -4531,20 +4807,26 @@ fn layout_element_with_gutter(
     };
     let descendant_block = if style.position == Position::Static
         && style.content_visibility == ContentVisibility::Visible
+        && !style.transform_style_3d
+        && style.perspective.is_none()
     {
         containing_block
     } else {
         local_containing_block
     };
-    let _child_window = child_viewport_window(
-        node,
-        &style,
-        style_state,
-        (mode, viewport, rect),
-        (explicit_height, max_height, vertical_inner),
-        scroll_override,
-    )
-    .map(ViewportWindowGuard::enter);
+    let _child_window = if track_viewport {
+        child_viewport_window(
+            node,
+            style,
+            style_state,
+            (mode, viewport, rect),
+            (explicit_height, max_height, vertical_inner),
+            scroll_override,
+        )
+        .map(ViewportWindowGuard::enter)
+    } else {
+        None
+    };
     let content_x = rect.x + border.left + padding.left;
     let content_y = rect.y + border.top + padding.top;
     // size containment keeps a container's size from depending on its content, so its
@@ -4563,7 +4845,7 @@ fn layout_element_with_gutter(
     }
     let finish_rendered = |mut layout: LayoutBox| {
         if style.content_visibility != ContentVisibility::Visible {
-            let (overflow, overflow_axes) = effective_overflow(&style);
+            let (overflow, overflow_axes) = effective_overflow(style);
             layout.overflow = overflow;
             layout.overflow_axes = overflow_axes;
             layout.has_auto_visibility |= has_auto_visibility;
@@ -4572,7 +4854,7 @@ fn layout_element_with_gutter(
             record_remembered_size(
                 node.document,
                 own,
-                &style,
+                style,
                 (
                     (layout.rect.width - horizontal_inner - gutter).max(0.0),
                     (layout.rect.height - vertical_inner).max(0.0),
@@ -4603,6 +4885,7 @@ fn layout_element_with_gutter(
             containing_block: descendant_block,
             inherited_containing_block: containing_block,
             mode,
+            track_viewport,
         }));
     }
     if matches!(style.display, Display::Table | Display::InlineTable) {
@@ -4627,6 +4910,7 @@ fn layout_element_with_gutter(
             containing_block: descendant_block,
             inherited_containing_block: containing_block,
             mode,
+            track_viewport,
         }));
     }
     if matches!(style.display, Display::Grid | Display::InlineGrid) {
@@ -4651,12 +4935,13 @@ fn layout_element_with_gutter(
             containing_block: descendant_block,
             inherited_containing_block: containing_block,
             mode,
+            track_viewport,
         }));
     }
-    let line_height = used_line_height(&style, font_size);
+    let line_height = used_line_height(style, font_size);
     // a box that starts a formatting context keeps a float area of its own
     let float_area = match floats {
-        Some(area) if !establishes_formatting_context(&style) => area,
+        Some(area) if !establishes_formatting_context(style) => area,
         _ => Rc::new(FloatArea::default()),
     };
     let owns_floats = Rc::strong_count(&float_area) == 1;
@@ -4679,7 +4964,7 @@ fn layout_element_with_gutter(
     };
     line.fit_to_floats(content_x, content_width);
     let mut text = Vec::new();
-    let child_text = parent.text.child(&style);
+    let child_text = parent.text.child(style);
     // ::marker, ::placeholder and ::selection style parts of this box; they are cascaded only
     // when some rule names them
     let part_style = |pseudo: PseudoElement| {
@@ -4715,7 +5000,7 @@ fn layout_element_with_gutter(
         .resolve(font_size, font_size)
         .unwrap_or(0.0);
     let line_height = if name == "input" && control_value.is_some() {
-        editor_line_height(&style, font_size, line_height)
+        editor_line_height(style, font_size, line_height)
     } else {
         line_height
     };
@@ -4743,14 +5028,14 @@ fn layout_element_with_gutter(
                     value_line,
                     style.font_family,
                     font_size,
-                    font_style(&style, font_size),
+                    font_style(style, font_size),
                     letter_spacing,
                 ),
                 font_size,
                 letter_spacing,
                 font_stack: style.font_family,
                 color,
-                font: font_style(&style, font_size),
+                font: font_style(style, font_size),
                 node: None,
                 node_offset: 0,
                 source_len: 0,
@@ -4767,7 +5052,7 @@ fn layout_element_with_gutter(
     let inline_context = InlineContext {
         font_size,
         line_height,
-        color: text_color(&style),
+        color: text_color(style),
         weight: style.font_weight,
         text: *child_text,
         opacity: 1.0,
@@ -4804,11 +5089,11 @@ fn layout_element_with_gutter(
                 1
             }
         });
-    let mut marker_style = style;
+    let mut marker_style = std::borrow::Cow::Borrowed(style);
     if style.display == Display::ListItem
         && let Some(marker) = pseudo_style(PseudoElement::Marker)
     {
-        marker_style.color = marker.color;
+        marker_style.to_mut().color = marker.color;
     }
     if style.display == Display::ListItem && style.list_inside {
         match style.list_style_type.marker_text(list_ordinal) {
@@ -4898,7 +5183,7 @@ fn layout_element_with_gutter(
             Child::Element(child) => {
                 let before_style = crate::css::moment_reports();
                 let child_style =
-                    stylesheet.style_for(child.style_context(&child_parent, style_state));
+                    stylesheet.style_for_rc(child.style_context(&child_parent, style_state));
                 let child_momentary = crate::css::moment_reports() != before_style;
                 if child_style.display == Display::None {
                     continue;
@@ -4921,6 +5206,7 @@ fn layout_element_with_gutter(
                             style_state,
                             viewport,
                             containing_block: descendant_block,
+                            track_viewport,
                         },
                         &child_style,
                         &mut line,
@@ -4999,6 +5285,7 @@ fn layout_element_with_gutter(
                             mode: LayoutMode::Flow,
                             stylesheet,
                             style_state,
+                            track_viewport,
                         },
                         pre_style: Some((child_style, child_momentary)),
                     }) {
@@ -5023,6 +5310,7 @@ fn layout_element_with_gutter(
                             style_state,
                             viewport,
                             containing_block: descendant_block,
+                            track_viewport,
                         },
                         &mut text,
                         &mut line,
@@ -5042,7 +5330,7 @@ fn layout_element_with_gutter(
     if let Some(pending) = pending_margin.take() {
         // the last child's margin goes through a bottom edge that nothing holds in place
         if in_block_flow
-            && margins_pass_through(node, &style)
+            && margins_pass_through(node, style)
             && border.bottom == 0.0
             && padding.bottom == 0.0
             && explicit_height.is_none()
@@ -5126,12 +5414,12 @@ fn layout_element_with_gutter(
         Rc::new(crate::svg::build(
             node.document,
             node.node,
-            (&style, font_size),
+            (style, font_size),
             viewport,
             &style_of,
         ))
     });
-    let mut control = control_paint(node, &style, style_state, font_size);
+    let mut control = control_paint(node, style, style_state, font_size);
     if let Some(ControlPaint::Range {
         fraction,
         accent,
@@ -5166,7 +5454,7 @@ fn layout_element_with_gutter(
     let has_sticky =
         style.position == Position::Sticky || children.iter().any(|child| child.has_sticky);
     let has_stacking_descendant = box_has_stacking(&children);
-    let filters = crate::filter::Filters::of(&style, font_size);
+    let filters = crate::filter::Filters::of(style, font_size);
     let has_backdrop_filter =
         !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
     let child_has_auto_visibility =
@@ -5184,13 +5472,14 @@ fn layout_element_with_gutter(
         top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
+        preserve_3d: preserves_3d(style, style.opacity * parent.opacity),
         clip_path: None,
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: style.opacity * parent.opacity,
         shadows: resolve_shadows(style.shadows, content_width, font_size),
         filters,
-        border: BoxBorder::of(&style),
-        outline: box_outline(&style),
+        border: BoxBorder::of(style),
+        outline: box_outline(style),
         text,
         control,
         selection: selection_style
@@ -5230,7 +5519,7 @@ fn layout_element_with_gutter(
         scrollbar: scrollbar_for(
             stylesheet,
             (node.document, node.node),
-            &style,
+            style,
             font_size,
             style_state,
         ),
@@ -5264,7 +5553,7 @@ fn layout_element_with_gutter(
         position_layout_box(&mut layout, style, mode, position_block, font_size);
     }
     apply_relative_offset(&mut layout, style, containing_block, font_size);
-    apply_transform(&mut layout, &style, font_size);
+    apply_transform(&mut layout, style, font_size);
     let positioned_block = padding_block(&layout);
     append_positioned_to(
         &mut layout,
@@ -5272,6 +5561,8 @@ fn layout_element_with_gutter(
         PositionedLayoutContext {
             containing_block: if style.position == Position::Static
                 && style.content_visibility == ContentVisibility::Visible
+                && !style.transform_style_3d
+                && style.perspective.is_none()
             {
                 containing_block
             } else {
@@ -5282,21 +5573,38 @@ fn layout_element_with_gutter(
             parent: child_parent,
             stylesheet,
             style_state,
+            track_viewport,
         },
     );
+    apply_perspective(&mut layout, style, font_size);
     finalize_scroll(&mut layout, padding, style_state);
     finish_rendered(layout)
 }
 
-// a flex or grid item: an element child, or a run of text the container wraps in an anonymous box
+// a flex or grid item: an element child, generated pseudo-element, or a run of text
 enum FlexSource<'a> {
     Element(Subject<'a>),
+    Generated(&'a Document, NodeId, PseudoElement, String),
     Text(Vec<(Option<NodeId>, &'a str)>),
+}
+
+impl FlexSource<'_> {
+    fn subject(&self) -> Option<Subject<'_>> {
+        match self {
+            Self::Element(subject) => Some(*subject),
+            Self::Generated(document, node, pseudo, content) => Some(Subject {
+                document,
+                node: *node,
+                generated: Some((*pseudo, content.as_str())),
+            }),
+            Self::Text(_) => None,
+        }
+    }
 }
 
 struct FlexItem<'a> {
     source: FlexSource<'a>,
-    style: Style,
+    style: Rc<Style>,
     style_momentary: bool,
     font_size: f32,
     margin: ResolvedEdges,
@@ -5384,6 +5692,7 @@ fn anonymous_box(
         top_layer: false,
         transform: None,
         backface_hidden: false,
+        preserve_3d: false,
         clip_path: None,
         radii: SQUARE_CORNERS,
         opacity,
@@ -5950,9 +6259,10 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         containing_block,
         inherited_containing_block,
         mode,
+        track_viewport,
     } = input;
     let row = style.flex_direction.is_row();
-    let child_text = parent_text.child(&style);
+    let child_text = parent_text.child(style);
     let child_parent = ParentStyle {
         font_size,
         color: style.color,
@@ -5960,11 +6270,11 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         text: child_text.clone(),
         opacity: 1.0,
     };
-    let line_height = used_line_height(&style, font_size);
+    let line_height = used_line_height(style, font_size);
     let text_context = InlineContext {
         font_size,
         line_height,
-        color: text_color(&style),
+        color: text_color(style),
         weight: style.font_weight,
         text: *child_text,
         opacity: 1.0,
@@ -6009,7 +6319,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             Child::Element(child) => {
                 let before_style = crate::css::moment_reports();
                 let child_style =
-                    stylesheet.style_for(child.style_context(&child_parent, style_state));
+                    stylesheet.style_for_rc(child.style_context(&child_parent, style_state));
                 let child_momentary = crate::css::moment_reports() != before_style;
                 if child_style.display == Display::None {
                     continue;
@@ -6033,26 +6343,32 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         sources.push((FlexSource::Text(run), None));
     }
     // an anonymous item inherits text styles and none of the container's box
-    let mut anonymous_style = style;
-    anonymous_style.margin = Edges::zero();
-    anonymous_style.padding = Edges::zero();
-    anonymous_style.width = Length::Auto;
-    anonymous_style.height = Length::Auto;
-    anonymous_style.min_width = Length::Auto;
-    anonymous_style.max_width = Length::Auto;
-    anonymous_style.min_height = Length::Auto;
-    anonymous_style.max_height = Length::Auto;
-    anonymous_style.box_sizing = crate::css::BoxSizing::ContentBox;
-    anonymous_style.border = [BorderSide::INITIAL; 4];
-    anonymous_style.overflow = Overflow::Visible;
-    anonymous_style.flex_grow = 0.0;
-    anonymous_style.flex_shrink = 1.0;
-    anonymous_style.flex_basis = Length::Auto;
-    anonymous_style.order = 0;
-    anonymous_style.align_self = None;
+    let mut anonymous_style: Option<Rc<Style>> = None;
     let mut items = Vec::with_capacity(sources.len());
     for (source, child_style) in sources {
-        let (child_style, style_momentary) = child_style.unwrap_or((anonymous_style, false));
+        let (child_style, style_momentary) = child_style.unwrap_or_else(|| {
+            let anon = anonymous_style.get_or_insert_with(|| {
+                let mut anon = *style;
+                anon.margin = Edges::zero();
+                anon.padding = Edges::zero();
+                anon.width = Length::Auto;
+                anon.height = Length::Auto;
+                anon.min_width = Length::Auto;
+                anon.max_width = Length::Auto;
+                anon.min_height = Length::Auto;
+                anon.max_height = Length::Auto;
+                anon.box_sizing = crate::css::BoxSizing::ContentBox;
+                anon.border = [BorderSide::INITIAL; 4];
+                anon.overflow = Overflow::Visible;
+                anon.flex_grow = 0.0;
+                anon.flex_shrink = 1.0;
+                anon.flex_basis = Length::Auto;
+                anon.order = 0;
+                anon.align_self = None;
+                Rc::new(anon)
+            });
+            (anon.clone(), false)
+        });
         let child_font_size = child_style
             .font_size
             .resolve(font_size, font_size)
@@ -6113,8 +6429,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                     }
                     Some(Rc::new(layout))
                 }
-                FlexSource::Element(child) => layout_element_rc(ElementLayoutInput {
-                    node: *child,
+                _ => layout_element_rc(ElementLayoutInput {
+                    node: item.source.subject().expect("element source"),
                     containing_x: 0.0,
                     containing_y: 0.0,
                     containing_width: width.map_or(content_width, |width| {
@@ -6137,8 +6453,9 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                         mode: LayoutMode::Flow,
                         stylesheet,
                         style_state,
+                        track_viewport,
                     },
-                    pre_style: Some((item.style, item.style_momentary)),
+                    pre_style: Some((item.style.clone(), item.style_momentary)),
                 }),
             }
         };
@@ -6149,7 +6466,8 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                 let (min, max) = text_intrinsic_widths(pieces, text_context);
                 if minimum { min } else { max }
             }
-            FlexSource::Element(child) => {
+            _ => {
+                let child = item.source.subject().expect("element source");
                 let extras = item.padding.left
                     + item.padding.right
                     + item.border.left
@@ -6158,7 +6476,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
                     + item.margin.right;
                 (intrinsic_width(
                     MaxContentInput {
-                        node: *child,
+                        node: child,
                         stylesheet,
                         style_state,
                         parent: child_parent.clone(),
@@ -6543,7 +6861,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
     let has_sticky =
         style.position == Position::Sticky || children.iter().any(|child| child.has_sticky);
     let has_stacking_descendant = box_has_stacking(&children);
-    let filters = crate::filter::Filters::of(&style, font_size);
+    let filters = crate::filter::Filters::of(style, font_size);
     let has_backdrop_filter =
         !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
     let has_auto_visibility = style.content_visibility == ContentVisibility::Auto
@@ -6561,13 +6879,14 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
+        preserve_3d: preserves_3d(style, box_opacity),
         clip_path: None,
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadows: resolve_shadows(style.shadows, content_width, font_size),
         filters,
-        border: BoxBorder::of(&style),
-        outline: box_outline(&style),
+        border: BoxBorder::of(style),
+        outline: box_outline(style),
         text: Vec::new(),
         control_value: None,
         control_selection: None,
@@ -6599,7 +6918,7 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         scrollbar: scrollbar_for(
             stylesheet,
             (node.document, node.node),
-            &style,
+            style,
             font_size,
             style_state,
         ),
@@ -6634,13 +6953,17 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
         );
     }
     apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
-    apply_transform(&mut layout, &style, font_size);
+    apply_transform(&mut layout, style, font_size);
     let positioned_block = padding_block(&layout);
     append_positioned_to(
         &mut layout,
         positioned,
         PositionedLayoutContext {
-            containing_block: if style.position == Position::Static {
+            containing_block: if style.position == Position::Static
+                && style.content_visibility == ContentVisibility::Visible
+                && !style.transform_style_3d
+                && style.perspective.is_none()
+            {
                 inherited_containing_block
             } else {
                 positioned_block
@@ -6650,8 +6973,10 @@ fn layout_flex_element(input: FlexLayoutInput<'_>) -> LayoutBox {
             parent: child_parent,
             stylesheet,
             style_state,
+            track_viewport,
         },
     );
+    apply_perspective(&mut layout, style, font_size);
     finalize_scroll(&mut layout, padding, style_state);
     layout
 }
@@ -6679,8 +7004,9 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         containing_block,
         inherited_containing_block,
         mode,
+        track_viewport,
     } = input;
-    let child_text = parent_text.child(&style);
+    let child_text = parent_text.child(style);
     let child_parent = ParentStyle {
         font_size,
         color: style.color,
@@ -6688,11 +7014,11 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         text: child_text.clone(),
         opacity: 1.0,
     };
-    let line_height = used_line_height(&style, font_size);
+    let line_height = used_line_height(style, font_size);
     let text_context = InlineContext {
         font_size,
         line_height,
-        color: text_color(&style),
+        color: text_color(style),
         weight: style.font_weight,
         text: *child_text,
         opacity: 1.0,
@@ -6729,7 +7055,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             Child::Element(child) => {
                 let before_style = crate::css::moment_reports();
                 let child_style =
-                    stylesheet.style_for(child.style_context(&child_parent, style_state));
+                    stylesheet.style_for_rc(child.style_context(&child_parent, style_state));
                 let child_momentary = crate::css::moment_reports() != before_style;
                 if child_style.display == Display::None {
                     continue;
@@ -6753,33 +7079,41 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         sources.push((FlexSource::Text(run), None));
     }
     // an anonymous item inherits text styles and none of the container's box or placement
-    let mut anonymous_style = style;
-    anonymous_style.margin = Edges::zero();
-    anonymous_style.padding = Edges::zero();
-    anonymous_style.width = Length::Auto;
-    anonymous_style.height = Length::Auto;
-    anonymous_style.border = [BorderSide::INITIAL; 4];
-    anonymous_style.order = 0;
-    anonymous_style.align_self = None;
-    anonymous_style.justify_self = None;
-    anonymous_style.grid_column = GridPlacement::AUTO;
-    anonymous_style.grid_row = GridPlacement::AUTO;
+    let mut anonymous_style: Option<Rc<Style>> = None;
     let mut items = sources
         .into_iter()
         .map(|(source, child_style)| {
-            let (child_style, style_momentary) = child_style.unwrap_or((anonymous_style, false));
+            let (child_style, style_momentary) = child_style.unwrap_or_else(|| {
+                let anon = anonymous_style.get_or_insert_with(|| {
+                    let mut anon = *style;
+                    anon.margin = Edges::zero();
+                    anon.padding = Edges::zero();
+                    anon.width = Length::Auto;
+                    anon.height = Length::Auto;
+                    anon.border = [BorderSide::INITIAL; 4];
+                    anon.order = 0;
+                    anon.align_self = None;
+                    anon.justify_self = None;
+                    anon.grid_column = GridPlacement::AUTO;
+                    anon.grid_row = GridPlacement::AUTO;
+                    Rc::new(anon)
+                });
+                (anon.clone(), false)
+            });
             let child_font_size = child_style
                 .font_size
                 .resolve(font_size, font_size)
                 .unwrap_or(font_size)
                 .max(0.0);
+            let margin = resolve_margins(child_style.margin, content_width, child_font_size);
+            let padding = resolve_edges(child_style.padding, content_width, child_font_size);
             let border = used_border(&child_style);
             GridItem {
                 source,
                 style: child_style,
                 style_momentary,
-                margin: resolve_margins(child_style.margin, content_width, child_font_size),
-                padding: resolve_edges(child_style.padding, content_width, child_font_size),
+                margin,
+                padding,
                 border,
                 area: [(0, 1); 2],
                 width: None,
@@ -6832,6 +7166,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         [columns.tracks.len(), rows.tracks.len()],
         style.grid_auto_flow_column,
         style.grid_auto_flow_dense,
+        [false, false],
     );
     for (item, area) in items.iter_mut().zip(placed) {
         item.area = area;
@@ -6840,6 +7175,62 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let row_tracks = rows.all_tracks(counts[1], shift[1], &auto_rows);
     let column_collapsed = collapsed_tracks(&columns, counts[0], shift[0], &items, 0);
     let row_collapsed = collapsed_tracks(&rows, counts[1], shift[1], &items, 1);
+
+    let subgrid_env = SubgridEnv {
+        stylesheet,
+        style_state,
+        viewport,
+        containing_block: item_block,
+        track_viewport,
+    };
+    let has_subgrid = items
+        .iter()
+        .any(|item| is_subgrid_item(item, 0) || is_subgrid_item(item, 1));
+    let mut subgrids: Vec<Option<Box<PreparedSubgrid<'_>>>> = if has_subgrid {
+        items
+            .iter()
+            .map(|item| {
+                let sub_col = is_subgrid_item(item, 0);
+                let sub_row = is_subgrid_item(item, 1);
+                if !sub_col && !sub_row {
+                    return None;
+                }
+                let FlexSource::Element(child_node) = item.source else {
+                    return None;
+                };
+                let col_names = if sub_col {
+                    slice_line_names(&columns.names, shift[0], item.area[0])
+                } else {
+                    Vec::new()
+                };
+                let row_names = if sub_row {
+                    slice_line_names(&rows.names, shift[1], item.area[1])
+                } else {
+                    Vec::new()
+                };
+                Some(Box::new(prepare_subgrid_item(
+                    child_node,
+                    item,
+                    &child_parent,
+                    [sub_col, sub_row],
+                    [item.area[0].1, item.area[1].1],
+                    [column_gap, row_gap],
+                    (col_names, row_names),
+                    content_width,
+                    content_height,
+                    &subgrid_env,
+                )))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let has_col_subgrid = subgrids
+        .iter()
+        .any(|sub| sub.as_ref().is_some_and(|sub| sub.subgridded[0]));
+    let has_row_subgrid = subgrids
+        .iter()
+        .any(|sub| sub.as_ref().is_some_and(|sub| sub.subgridded[1]));
 
     let justify = |item: &GridItem<'_>| {
         auto_margin_alignment(item.style.margin.left, item.style.margin.right)
@@ -6858,9 +7249,9 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 let (min, max) = text_intrinsic_widths(pieces, text_context);
                 if minimum { min } else { max }
             }
-            FlexSource::Element(child) => intrinsic_width(
+            _ => intrinsic_width(
                 MaxContentInput {
-                    node: *child,
+                    node: item.source.subject().expect("element source"),
                     stylesheet,
                     style_state,
                     parent: child_parent.clone(),
@@ -6873,88 +7264,100 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         }
     };
 
-    let column_items = items
-        .iter()
-        .map(|item| (item.area[0].0, item.area[0].1))
-        .collect::<Vec<_>>();
-    let column_sizes = size_grid_tracks(
-        GridAxis {
-            tracks: &column_tracks,
-            collapsed: &column_collapsed,
-            available: Some(content_width),
-            gap: column_gap,
-            font_size,
-            stretch: style.justify_content == JustifyContent::FlexStart,
-        },
-        &column_items,
-        &mut |index, [need_floor, need_min, need_max]| {
-            let item = &items[index];
-            let get_min = |cache: &mut (Option<f32>, Option<f32>)| -> f32 {
-                if let Some(value) = cache.0 {
-                    return value;
-                }
-                match &item.source {
-                    FlexSource::Text(pieces) => {
-                        let (min, max) = text_intrinsic_widths(pieces, text_context);
-                        cache.0 = Some(min);
-                        cache.1 = Some(max);
-                        min
-                    }
-                    FlexSource::Element(_) => {
-                        let value = measure_grid_intrinsic(item, true);
-                        cache.0 = Some(value);
-                        value
-                    }
-                }
-            };
-            let get_max = |cache: &mut (Option<f32>, Option<f32>)| -> f32 {
-                if let Some(value) = cache.1 {
-                    return value;
-                }
-                match &item.source {
-                    FlexSource::Text(pieces) => {
-                        let (min, max) = text_intrinsic_widths(pieces, text_context);
-                        cache.0 = Some(min);
-                        cache.1 = Some(max);
-                        max
-                    }
-                    FlexSource::Element(_) => {
-                        let value = measure_grid_intrinsic(item, false);
-                        cache.1 = Some(value);
-                        value
-                    }
-                }
-            };
-            let cache = &mut cached_intrinsic[index];
-            // a scroll container, or an item with a min-width of its own, has that for its
-            // automatic minimum, where any other item has its narrowest content
-            let floor = if need_floor {
-                let scrolls = item.style.overflow_axes()[0] != Overflow::Visible;
-                let own = item.style.min_width.resolve(content_width, font_size);
-                match own {
-                    None if !scrolls => get_min(cache),
-                    own => {
-                        let inner = item.padding.left
-                            + item.padding.right
-                            + item.border.left
-                            + item.border.right;
-                        let own = own.unwrap_or(0.0);
-                        item.margin.left
-                            + item.margin.right
-                            + match item.style.box_sizing {
-                                crate::css::BoxSizing::BorderBox => own.max(inner),
-                                crate::css::BoxSizing::ContentBox => own + inner,
-                            }
-                    }
-                }
+    let column_sizes = if !has_col_subgrid {
+        let column_items = items
+            .iter()
+            .map(|item| (item.area[0].0, item.area[0].1))
+            .collect::<Vec<_>>();
+        size_grid_tracks(
+            GridAxis {
+                tracks: &column_tracks,
+                collapsed: &column_collapsed,
+                available: Some(content_width),
+                gap: column_gap,
+                font_size,
+                stretch: style.justify_content == JustifyContent::FlexStart,
+            },
+            &column_items,
+            &mut |index, need| {
+                grid_item_width_contribution(
+                    &items[index],
+                    text_context,
+                    &child_parent,
+                    content_width,
+                    font_size,
+                    (stylesheet, style_state),
+                    need,
+                    &mut cached_intrinsic[index],
+                )
+            },
+        )
+    } else {
+        let mut contributors = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if let Some(sub) = subgrids[index].as_deref()
+                && sub.subgridded[0]
+            {
+                let start_mbp = sub.margin.left + sub.border.left + sub.padding.left;
+                let end_mbp = sub.margin.right + sub.border.right + sub.padding.right;
+                let mut path = vec![index];
+                collect_subgrid_contributors(
+                    sub,
+                    0,
+                    item.area[0].0,
+                    (start_mbp, end_mbp),
+                    &mut path,
+                    &mut contributors,
+                );
             } else {
-                0.0
-            };
-            let minimum = if need_min { get_min(cache) } else { 0.0 };
-            let maximum = if need_max { get_max(cache) } else { 0.0 };
-            [floor, minimum, maximum]
-        },
-    );
+                contributors.push(TrackContributor::Direct(index, item.area[0]));
+            }
+        }
+        let spans = contributors
+            .iter()
+            .map(TrackContributor::span)
+            .collect::<Vec<_>>();
+        let mut sub_caches: Vec<(Option<f32>, Option<f32>)> =
+            vec![(None, None); contributors.len()];
+        size_grid_tracks(
+            GridAxis {
+                tracks: &column_tracks,
+                collapsed: &column_collapsed,
+                available: Some(content_width),
+                gap: column_gap,
+                font_size,
+                stretch: style.justify_content == JustifyContent::FlexStart,
+            },
+            &spans,
+            &mut |contrib_index, need| match &contributors[contrib_index] {
+                TrackContributor::Direct(index, _) => grid_item_width_contribution(
+                    &items[*index],
+                    text_context,
+                    &child_parent,
+                    content_width,
+                    font_size,
+                    (stylesheet, style_state),
+                    need,
+                    &mut cached_intrinsic[*index],
+                ),
+                TrackContributor::SubgridEdge(_, size) => [*size, *size, *size],
+                TrackContributor::SubgridLeaf { path, extra, .. } => {
+                    let (owner, leaf) = lookup_subgrid_leaf(&subgrids, path);
+                    let raw = grid_item_width_contribution(
+                        leaf,
+                        owner.text_context,
+                        &owner.child_parent,
+                        content_width,
+                        owner.font_size,
+                        (stylesheet, style_state),
+                        need,
+                        &mut sub_caches[contrib_index],
+                    );
+                    raw.map(|value| (value + *extra).max(0.0))
+                }
+            },
+        )
+    };
     let column_offsets = grid_track_offsets(
         &column_sizes,
         &column_collapsed,
@@ -7021,8 +7424,8 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 }
                 Some(Rc::new(layout))
             }
-            FlexSource::Element(child) => layout_element_rc(ElementLayoutInput {
-                node: *child,
+            _ => layout_element_rc(ElementLayoutInput {
+                node: item.source.subject().expect("element source"),
                 containing_x: origin.0,
                 containing_y: origin.1,
                 containing_width: cell_width,
@@ -7037,8 +7440,9 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                     mode: LayoutMode::Flow,
                     stylesheet,
                     style_state,
+                    track_viewport,
                 },
-                pre_style: Some((item.style, item.style_momentary)),
+                pre_style: Some((item.style.clone(), item.style_momentary)),
             }),
         }
     };
@@ -7046,11 +7450,61 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         let end = start + span - 1;
         offsets[end] + sizes[end] - offsets[start]
     };
+    let make_col_slice = |area: (usize, usize)| -> SubgridAxisSlice {
+        let (start, span) = area;
+        SubgridAxisSlice {
+            tracks: (start..start + span)
+                .map(|track| {
+                    (
+                        content_x + column_offsets[track],
+                        content_x + column_offsets[track] + column_sizes[track],
+                    )
+                })
+                .collect(),
+            collapsed: column_collapsed[start..start + span].to_vec(),
+            parent_gap: column_gap,
+        }
+    };
     for (index, item) in items.iter_mut().enumerate() {
         let cell_width = span_size(&column_offsets, &column_sizes, item.area[0]);
+        if has_subgrid && let Some(sub) = subgrids[index].as_deref_mut() {
+            let col_slice = sub.subgridded[0].then(|| make_col_slice(item.area[0]));
+            if sub.subgridded[1] {
+                let x_origin = content_x + column_offsets[item.area[0].0];
+                prepare_subgrid_for_rows(
+                    sub,
+                    col_slice.as_ref(),
+                    (x_origin, cell_width),
+                    box_opacity,
+                    &subgrid_env,
+                );
+            } else {
+                let y_origin = content_y
+                    + fixed_row_y
+                        .get(item.area[1].0)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(0.0);
+                let sub_box = finalize_subgrid(
+                    sub,
+                    col_slice.as_ref(),
+                    None,
+                    (
+                        content_x + column_offsets[item.area[0].0],
+                        y_origin,
+                        cell_width,
+                    ),
+                    None,
+                    box_opacity,
+                    &subgrid_env,
+                );
+                item.layout = Some(Rc::new(sub_box));
+            }
+            continue;
+        }
         // a stretched element fills its area as a block fills its container
         let width = match (&item.source, justify(item)) {
-            (FlexSource::Element(_), AlignItems::Stretch) => None,
+            (FlexSource::Element(_) | FlexSource::Generated(..), AlignItems::Stretch) => None,
             _ if item.style.width != Length::Auto => None,
             (FlexSource::Text(_), AlignItems::Stretch) => Some(cell_width),
             (_, _) => {
@@ -7088,10 +7542,41 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         item.layout = lay_out(item, origin, cell_width, None, None);
     }
 
-    let row_items = items
-        .iter()
-        .map(|item| (item.area[1].0, item.area[1].1))
-        .collect::<Vec<_>>();
+    let row_contributors = if has_row_subgrid {
+        let mut contributors = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if let Some(sub) = subgrids[index].as_deref()
+                && sub.subgridded[1]
+            {
+                let start_mbp = sub.margin.top + sub.border.top + sub.padding.top;
+                let end_mbp = sub.margin.bottom + sub.border.bottom + sub.padding.bottom;
+                let mut path = vec![index];
+                collect_subgrid_contributors(
+                    sub,
+                    1,
+                    item.area[1].0,
+                    (start_mbp, end_mbp),
+                    &mut path,
+                    &mut contributors,
+                );
+            } else {
+                contributors.push(TrackContributor::Direct(index, item.area[1]));
+            }
+        }
+        Some(contributors)
+    } else {
+        None
+    };
+    let row_items = match &row_contributors {
+        Some(contributors) => contributors
+            .iter()
+            .map(TrackContributor::span)
+            .collect::<Vec<_>>(),
+        None => items
+            .iter()
+            .map(|item| (item.area[1].0, item.area[1].1))
+            .collect::<Vec<_>>(),
+    };
     let size_rows = |available: Option<f32>| {
         size_grid_tracks(
             GridAxis {
@@ -7103,37 +7588,19 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 stretch: style.align_content == AlignContent::Stretch,
             },
             &row_items,
-            &mut |index, _| {
-                let item = &items[index];
-                let margins = item.margin.top + item.margin.bottom;
-                let height = item
-                    .layout
-                    .as_ref()
-                    .map_or(0.0, |layout| layout.rect.height)
-                    + margins;
-                // an item given a min-height and no height of its own, or one in percent
-                // that waits on the row, may be left as little as that min-height, and one
-                // that scrolls its content as little as its frame
-                let own = item.style.height;
-                let scrolls = item.style.overflow_axes()[1] != Overflow::Visible;
-                let minimum = if (item.style.min_height != Length::Auto || scrolls)
-                    && (own == Length::Auto || own.has_percent())
-                {
-                    let frame = item.padding.top
-                        + item.padding.bottom
-                        + item.border.top
-                        + item.border.bottom;
-                    let least =
-                        resolve_height(item.style.min_height, None, font_size).unwrap_or(0.0);
-                    let least = match item.style.box_sizing {
-                        crate::css::BoxSizing::BorderBox => least.max(frame),
-                        crate::css::BoxSizing::ContentBox => least + frame,
-                    };
-                    (least + margins).min(height)
-                } else {
-                    height
-                };
-                [minimum, height, height]
+            &mut |index, _| match &row_contributors {
+                None => grid_item_row_contribution(&items[index], font_size),
+                Some(contributors) => match &contributors[index] {
+                    TrackContributor::Direct(item_index, _) => {
+                        grid_item_row_contribution(&items[*item_index], font_size)
+                    }
+                    TrackContributor::SubgridEdge(_, size) => [*size, *size, *size],
+                    TrackContributor::SubgridLeaf { path, extra, .. } => {
+                        let (owner, leaf) = lookup_subgrid_leaf(&subgrids, path);
+                        grid_item_row_contribution(leaf, owner.font_size)
+                            .map(|value| (value + *extra).max(0.0))
+                    }
+                },
             },
         )
     };
@@ -7154,6 +7621,21 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         content_height,
         justify_for_content(style.align_content),
     );
+    let make_row_slice = |area: (usize, usize)| -> SubgridAxisSlice {
+        let (start, span) = area;
+        SubgridAxisSlice {
+            tracks: (start..start + span)
+                .map(|track| {
+                    (
+                        content_y + row_offsets[track],
+                        content_y + row_offsets[track] + row_sizes[track],
+                    )
+                })
+                .collect(),
+            collapsed: row_collapsed[start..start + span].to_vec(),
+            parent_gap: row_gap,
+        }
+    };
 
     // baseline-aligned items in a row share the lowest of their baselines
     let mut row_baselines = vec![0.0_f32; row_sizes.len()];
@@ -7166,14 +7648,64 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         }
     }
     let mut children = Vec::with_capacity(items.len());
-    for item in &mut items {
-        let Some(mut child) = item.layout.take() else {
-            continue;
-        };
+    for (index, item) in items.iter_mut().enumerate() {
         let cell_x = column_offsets[item.area[0].0];
         let cell_y = row_offsets[item.area[1].0];
         let cell_width = span_size(&column_offsets, &column_sizes, item.area[0]);
         let cell_height = span_size(&row_offsets, &row_sizes, item.area[1]);
+        if has_subgrid && let Some(sub) = subgrids[index].as_deref_mut() {
+            let col_slice = sub.subgridded[0].then(|| make_col_slice(item.area[0]));
+            let row_slice = sub.subgridded[1].then(|| make_row_slice(item.area[1]));
+            if sub.subgridded[1] {
+                let sub_box = finalize_subgrid(
+                    sub,
+                    col_slice.as_ref(),
+                    row_slice.as_ref(),
+                    (content_x + cell_x, content_y + cell_y, cell_width),
+                    None,
+                    box_opacity,
+                    &subgrid_env,
+                );
+                children.push(Rc::new(sub_box));
+                continue;
+            }
+            let Some(mut child) = item.layout.take() else {
+                continue;
+            };
+            let item_align = align(item);
+            if item_align == AlignItems::Stretch && item.style.height == Length::Auto {
+                let inner =
+                    item.padding.top + item.padding.bottom + item.border.top + item.border.bottom;
+                let target = (cell_height - item.margin.top - item.margin.bottom - inner).max(0.0);
+                if (child.rect.height - inner - target).abs() > 0.01 {
+                    child = Rc::new(finalize_subgrid(
+                        sub,
+                        col_slice.as_ref(),
+                        None,
+                        (content_x + cell_x, content_y + cell_y, cell_width),
+                        Some(target),
+                        box_opacity,
+                        &subgrid_env,
+                    ));
+                }
+            }
+            let free_y = cell_height - child.rect.height - item.margin.top - item.margin.bottom;
+            let desired_x = content_x + cell_x + item.margin.left;
+            let desired_y = if item_align == AlignItems::Baseline {
+                content_y + cell_y + row_baselines[item.area[1].0] - baseline_offset(&child)
+            } else {
+                content_y + cell_y + item.margin.top + align_offset(item_align, free_y, 0.0)
+            };
+            let offset = (desired_x - child.rect.x, desired_y - child.rect.y);
+            if offset != (0.0, 0.0) {
+                translate_layout_box(Rc::make_mut(&mut child), offset.0, offset.1);
+            }
+            children.push(child);
+            continue;
+        }
+        let Some(mut child) = item.layout.take() else {
+            continue;
+        };
         let item_align = align(item);
         let origin = (content_x + cell_x, content_y + cell_y);
         if item_align == AlignItems::Stretch && item.style.height == Length::Auto {
@@ -7218,7 +7750,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let has_sticky =
         style.position == Position::Sticky || children.iter().any(|child| child.has_sticky);
     let has_stacking_descendant = box_has_stacking(&children);
-    let filters = crate::filter::Filters::of(&style, font_size);
+    let filters = crate::filter::Filters::of(style, font_size);
     let has_backdrop_filter =
         !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
     let has_auto_visibility = style.content_visibility == ContentVisibility::Auto
@@ -7236,13 +7768,14 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
+        preserve_3d: preserves_3d(style, box_opacity),
         clip_path: None,
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadows: resolve_shadows(style.shadows, content_width, font_size),
         filters,
-        border: BoxBorder::of(&style),
-        outline: box_outline(&style),
+        border: BoxBorder::of(style),
+        outline: box_outline(style),
         text: Vec::new(),
         control_value: None,
         control_selection: None,
@@ -7274,7 +7807,7 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         scrollbar: scrollbar_for(
             stylesheet,
             (node.document, node.node),
-            &style,
+            style,
             font_size,
             style_state,
         ),
@@ -7300,13 +7833,17 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
         );
     }
     apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
-    apply_transform(&mut layout, &style, font_size);
+    apply_transform(&mut layout, style, font_size);
     let positioned_block = padding_block(&layout);
     append_positioned_to(
         &mut layout,
         positioned,
         PositionedLayoutContext {
-            containing_block: if style.position == Position::Static {
+            containing_block: if style.position == Position::Static
+                && style.content_visibility == ContentVisibility::Visible
+                && !style.transform_style_3d
+                && style.perspective.is_none()
+            {
                 inherited_containing_block
             } else {
                 positioned_block
@@ -7316,9 +7853,1488 @@ fn layout_grid_element(input: GridLayoutInput<'_>) -> LayoutBox {
             parent: child_parent,
             stylesheet,
             style_state,
+            track_viewport,
         },
     );
+    apply_perspective(&mut layout, style, font_size);
     finalize_scroll(&mut layout, padding, style_state);
+    layout
+}
+
+#[derive(Clone, Copy)]
+struct SubgridEnv<'a> {
+    stylesheet: &'a Stylesheet,
+    style_state: &'a StyleState,
+    viewport: Size,
+    containing_block: ContainingBlock,
+    track_viewport: bool,
+}
+
+#[derive(Clone)]
+struct SubgridAxisSlice {
+    // absolute (start, end) coordinates of each spanned track
+    tracks: Vec<(f32, f32)>,
+    collapsed: Vec<bool>,
+    parent_gap: f32,
+}
+
+enum TrackContributor {
+    Direct(usize, (usize, usize)),
+    SubgridLeaf {
+        path: Vec<usize>,
+        span: (usize, usize),
+        extra: f32,
+    },
+    SubgridEdge((usize, usize), f32),
+}
+
+impl TrackContributor {
+    fn span(&self) -> (usize, usize) {
+        match self {
+            Self::Direct(_, span) | Self::SubgridEdge(span, _) => *span,
+            Self::SubgridLeaf { span, .. } => *span,
+        }
+    }
+}
+
+struct PreparedSubgrid<'a> {
+    node: Subject<'a>,
+    style: Rc<Style>,
+    child_parent: ParentStyle,
+    font_size: f32,
+    text_context: InlineContext,
+    margin: ResolvedEdges,
+    padding: ResolvedEdges,
+    border: ResolvedEdges,
+    gaps: [f32; 2],
+    parent_gaps: [f32; 2],
+    subgridded: [bool; 2],
+    counts: [usize; 2],
+    explicit_cols: ExplicitTracks,
+    explicit_rows: ExplicitTracks,
+    auto_cols: Vec<TrackSize>,
+    auto_rows: Vec<TrackSize>,
+    shift: [usize; 2],
+    items: Vec<GridItem<'a>>,
+    nested: Vec<Option<Box<PreparedSubgrid<'a>>>>,
+    positioned: Vec<Subject<'a>>,
+    positioned_generated: Vec<(PseudoElement, String)>,
+    // resolved local column edges and collapsed flags for a row-only subgrid
+    own_col_edges: Vec<(f32, f32)>,
+    own_col_collapsed: Vec<bool>,
+}
+
+fn is_subgrid_item(item: &GridItem<'_>, axis: usize) -> bool {
+    matches!(item.source, FlexSource::Element(_))
+        && matches!(item.style.display, Display::Grid | Display::InlineGrid)
+        && item.style.content_visibility != ContentVisibility::Hidden
+        && if axis == 0 {
+            item.style.grid_template_columns.is_subgrid()
+        } else {
+            item.style.grid_template_rows.is_subgrid()
+        }
+}
+
+fn slice_line_names(
+    names: &[(usize, String)],
+    shift: usize,
+    (start, span): (usize, usize),
+) -> Vec<(usize, String)> {
+    names
+        .iter()
+        .filter_map(|(line, name)| {
+            let abs = line + shift;
+            (abs >= start && abs <= start + span).then(|| (abs - start, name.clone()))
+        })
+        .collect()
+}
+
+fn clamp_subgrid_placement(
+    placement: GridPlacement,
+    lines: &ExplicitTracks,
+) -> (Option<i32>, usize) {
+    let span_limit = lines.tracks.len().max(1);
+    let resolve_line = |side: GridLine, suffix: &str| match side {
+        GridLine::Line(number) if number > 0 => Some(number - 1),
+        GridLine::Line(number) => Some(span_limit as i32 + 1 + number),
+        GridLine::Named(name, nth) => Some(find_named_line(
+            lines,
+            &crate::grid::name(name),
+            suffix,
+            nth,
+        )),
+        _ => None,
+    };
+    let span_of = |side: GridLine| match side {
+        GridLine::Span(n) => (n as usize).clamp(1, span_limit),
+        _ => 1,
+    };
+    let limit_i = span_limit as i32;
+    match (
+        resolve_line(placement.start, "start"),
+        resolve_line(placement.end, "end"),
+    ) {
+        (Some(start), Some(end)) => {
+            let (lo, hi) = (start.min(end), start.max(end));
+            if lo >= limit_i {
+                (Some(limit_i - 1), 1)
+            } else if hi <= 0 {
+                (Some(0), 1)
+            } else {
+                let clamped_lo = lo.max(0);
+                let clamped_hi = hi.min(limit_i);
+                (Some(clamped_lo), (clamped_hi - clamped_lo).max(1) as usize)
+            }
+        }
+        (Some(start), None) => {
+            let clamped = start.clamp(0, limit_i - 1);
+            let max_span = (limit_i - clamped) as usize;
+            (Some(clamped), span_of(placement.end).min(max_span).max(1))
+        }
+        (None, Some(end)) => {
+            let clamped_end = end.clamp(1, limit_i);
+            let span = span_of(placement.start).min(clamped_end as usize).max(1);
+            (Some(clamped_end - span as i32), span)
+        }
+        (None, None) => match placement.start {
+            GridLine::Span(_) => (None, span_of(placement.start)),
+            _ => (None, span_of(placement.end)),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grid_item_width_contribution(
+    item: &GridItem<'_>,
+    text_context: InlineContext,
+    child_parent: &ParentStyle,
+    content_width: f32,
+    font_size: f32,
+    style_ctx: (&Stylesheet, &StyleState),
+    [need_floor, need_min, need_max]: [bool; 3],
+    cache: &mut (Option<f32>, Option<f32>),
+) -> [f32; 3] {
+    let (stylesheet, style_state) = style_ctx;
+    let measure = |minimum: bool| match &item.source {
+        FlexSource::Text(pieces) => {
+            let (min, max) = text_intrinsic_widths(pieces, text_context);
+            if minimum { min } else { max }
+        }
+        _ => intrinsic_width(
+            MaxContentInput {
+                node: item.source.subject().expect("element source"),
+                stylesheet,
+                style_state,
+                parent: child_parent.clone(),
+                containing_width: content_width,
+                own_width: true,
+                definite: false,
+            },
+            minimum,
+        ),
+    };
+    let get_min = |cache: &mut (Option<f32>, Option<f32>)| -> f32 {
+        if let Some(value) = cache.0 {
+            return value;
+        }
+        match &item.source {
+            FlexSource::Text(pieces) => {
+                let (min, max) = text_intrinsic_widths(pieces, text_context);
+                cache.0 = Some(min);
+                cache.1 = Some(max);
+                min
+            }
+            _ => {
+                let value = measure(true);
+                cache.0 = Some(value);
+                value
+            }
+        }
+    };
+    let get_max = |cache: &mut (Option<f32>, Option<f32>)| -> f32 {
+        if let Some(value) = cache.1 {
+            return value;
+        }
+        match &item.source {
+            FlexSource::Text(pieces) => {
+                let (min, max) = text_intrinsic_widths(pieces, text_context);
+                cache.0 = Some(min);
+                cache.1 = Some(max);
+                max
+            }
+            _ => {
+                let value = measure(false);
+                cache.1 = Some(value);
+                value
+            }
+        }
+    };
+    let floor = if need_floor {
+        let scrolls = item.style.overflow_axes()[0] != Overflow::Visible;
+        let own = item.style.min_width.resolve(content_width, font_size);
+        match own {
+            None if !scrolls => get_min(cache),
+            own => {
+                let inner =
+                    item.padding.left + item.padding.right + item.border.left + item.border.right;
+                let own = own.unwrap_or(0.0);
+                item.margin.left
+                    + item.margin.right
+                    + match item.style.box_sizing {
+                        crate::css::BoxSizing::BorderBox => own.max(inner),
+                        crate::css::BoxSizing::ContentBox => own + inner,
+                    }
+            }
+        }
+    } else {
+        0.0
+    };
+    let minimum = if need_min { get_min(cache) } else { 0.0 };
+    let maximum = if need_max { get_max(cache) } else { 0.0 };
+    [floor, minimum, maximum]
+}
+
+fn grid_item_row_contribution(item: &GridItem<'_>, font_size: f32) -> [f32; 3] {
+    let margins = item.margin.top + item.margin.bottom;
+    let height = item
+        .layout
+        .as_ref()
+        .map_or(0.0, |layout| layout.rect.height)
+        + margins;
+    let own = item.style.height;
+    let scrolls = item.style.overflow_axes()[1] != Overflow::Visible;
+    let minimum = if (item.style.min_height != Length::Auto || scrolls)
+        && (own == Length::Auto || own.has_percent())
+    {
+        let frame = item.padding.top + item.padding.bottom + item.border.top + item.border.bottom;
+        let least = resolve_height(item.style.min_height, None, font_size).unwrap_or(0.0);
+        let least = match item.style.box_sizing {
+            crate::css::BoxSizing::BorderBox => least.max(frame),
+            crate::css::BoxSizing::ContentBox => least + frame,
+        };
+        (least + margins).min(height)
+    } else {
+        height
+    };
+    [minimum, height, height]
+}
+
+fn lookup_subgrid_leaf<'a, 'b>(
+    roots: &'b [Option<Box<PreparedSubgrid<'a>>>],
+    path: &[usize],
+) -> (&'b PreparedSubgrid<'a>, &'b GridItem<'a>) {
+    let mut current = roots[path[0]]
+        .as_deref()
+        .expect("subgrid root should exist");
+    for &step in &path[1..path.len() - 1] {
+        current = current.nested[step]
+            .as_deref()
+            .expect("nested subgrid should exist");
+    }
+    let leaf = &current.items[*path.last().expect("leaf path non-empty")];
+    (current, leaf)
+}
+
+fn collect_subgrid_contributors(
+    sub: &PreparedSubgrid<'_>,
+    axis: usize,
+    parent_start: usize,
+    outer_edges: (f32, f32),
+    path: &mut Vec<usize>,
+    out: &mut Vec<TrackContributor>,
+) {
+    let span = sub.counts[axis].max(1);
+    let half_diff = (sub.gaps[axis] - sub.parent_gaps[axis]) * 0.5;
+    if span == 1 {
+        let edge_total = (outer_edges.0 + outer_edges.1).max(0.0);
+        if edge_total > 0.0 {
+            out.push(TrackContributor::SubgridEdge((parent_start, 1), edge_total));
+        }
+    } else {
+        if outer_edges.0 > 0.0 {
+            out.push(TrackContributor::SubgridEdge(
+                (parent_start, 1),
+                outer_edges.0,
+            ));
+        }
+        if outer_edges.1 > 0.0 {
+            out.push(TrackContributor::SubgridEdge(
+                (parent_start + span - 1, 1),
+                outer_edges.1,
+            ));
+        }
+    }
+    for (index, item) in sub.items.iter().enumerate() {
+        let (local_start, local_span) = item.area[axis];
+        let local_end = local_start + local_span;
+        let add_start = if local_start == 0 {
+            outer_edges.0
+        } else {
+            half_diff
+        };
+        let add_end = if local_end == span {
+            outer_edges.1
+        } else {
+            half_diff
+        };
+        path.push(index);
+        if let Some(child_sub) = sub.nested[index].as_deref()
+            && child_sub.subgridded[axis]
+        {
+            let (own_start, own_end) = if axis == 0 {
+                (
+                    child_sub.margin.left + child_sub.border.left + child_sub.padding.left,
+                    child_sub.margin.right + child_sub.border.right + child_sub.padding.right,
+                )
+            } else {
+                (
+                    child_sub.margin.top + child_sub.border.top + child_sub.padding.top,
+                    child_sub.margin.bottom + child_sub.border.bottom + child_sub.padding.bottom,
+                )
+            };
+            collect_subgrid_contributors(
+                child_sub,
+                axis,
+                parent_start + local_start,
+                (add_start + own_start, add_end + own_end),
+                path,
+                out,
+            );
+        } else {
+            out.push(TrackContributor::SubgridLeaf {
+                path: path.clone(),
+                span: (parent_start + local_start, local_span),
+                extra: add_start + add_end,
+            });
+        }
+        path.pop();
+    }
+}
+
+type LineNames = Vec<(usize, String)>;
+type StyledSource<'a> = (FlexSource<'a>, Option<(Rc<Style>, bool)>);
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_subgrid_item<'a>(
+    node: Subject<'a>,
+    item: &GridItem<'a>,
+    parent_style: &ParentStyle,
+    subgridded: [bool; 2],
+    parent_spans: [usize; 2],
+    parent_gaps: [f32; 2],
+    inherited_names: (LineNames, LineNames),
+    containing_width: f32,
+    containing_height: Option<f32>,
+    env: &SubgridEnv<'a>,
+) -> PreparedSubgrid<'a> {
+    let style = item.style.clone();
+    let font_size = style
+        .font_size
+        .resolve(parent_style.font_size, parent_style.font_size)
+        .unwrap_or(parent_style.font_size)
+        .max(0.0);
+    let child_text = parent_style.text.child(&style);
+    let child_parent = ParentStyle {
+        font_size,
+        color: style.color,
+        weight: style.font_weight,
+        text: child_text.clone(),
+        opacity: 1.0,
+    };
+    let line_height = used_line_height(&style, font_size);
+    let text_context = InlineContext {
+        font_size,
+        line_height,
+        color: text_color(&style),
+        weight: style.font_weight,
+        text: *child_text,
+        opacity: 1.0,
+        content_width: containing_width,
+        content_x: 0.0,
+        align: style.text_align,
+        raise: 0.0,
+    };
+    let col_gap = if subgridded[0] && style.gap == Length::Auto {
+        parent_gaps[0]
+    } else {
+        style
+            .gap
+            .resolve(containing_width, font_size)
+            .unwrap_or(0.0)
+            .max(0.0)
+    };
+    let row_gap = if subgridded[1] && style.row_gap == Length::Auto {
+        parent_gaps[1]
+    } else {
+        style
+            .row_gap
+            .resolve(containing_height.unwrap_or(0.0), font_size)
+            .unwrap_or(0.0)
+            .max(0.0)
+    };
+    let gaps = [col_gap, row_gap];
+
+    static EMPTY_GENERATED: [Option<String>; 2] = [None, None];
+    let [before_gen, after_gen] = node.generated_content(env.stylesheet, env.style_state);
+    let mut sources = Vec::new();
+    let mut positioned = Vec::new();
+    let mut positioned_generated = Vec::new();
+    let push_generated =
+        |pseudo: PseudoElement,
+         content: Option<String>,
+         sources: &mut Vec<StyledSource<'a>>,
+         positioned_generated: &mut Vec<(PseudoElement, String)>| {
+            let Some(content) = content else {
+                return;
+            };
+            let subject = Subject {
+                document: node.document,
+                node: node.node,
+                generated: Some((pseudo, content.as_str())),
+            };
+            let before_style = crate::css::moment_reports();
+            let child_style = env
+                .stylesheet
+                .style_for_rc(subject.style_context(&child_parent, env.style_state));
+            let child_momentary = crate::css::moment_reports() != before_style;
+            if child_style.display == Display::None {
+                return;
+            }
+            if child_style.position.is_out_of_flow() {
+                positioned_generated.push((pseudo, content));
+                return;
+            }
+            sources.push((
+                FlexSource::Generated(node.document, node.node, pseudo, content),
+                Some((child_style, child_momentary)),
+            ));
+        };
+    push_generated(
+        PseudoElement::Before,
+        before_gen,
+        &mut sources,
+        &mut positioned_generated,
+    );
+    let mut run: Vec<(Option<NodeId>, &str)> = Vec::new();
+    for child in node.children(
+        &EMPTY_GENERATED,
+        env.stylesheet,
+        &child_parent,
+        env.style_state,
+    ) {
+        match child {
+            Child::Text(text_node, value) => run.push((text_node, value)),
+            Child::Element(child) => {
+                let before_style = crate::css::moment_reports();
+                let child_style = env
+                    .stylesheet
+                    .style_for_rc(child.style_context(&child_parent, env.style_state));
+                let child_momentary = crate::css::moment_reports() != before_style;
+                if child_style.display == Display::None {
+                    continue;
+                }
+                if run.iter().any(|(_, value)| !value.trim().is_empty()) {
+                    sources.push((FlexSource::Text(std::mem::take(&mut run)), None));
+                }
+                run.clear();
+                if child_style.position.is_out_of_flow() {
+                    positioned.push(child);
+                    continue;
+                }
+                sources.push((
+                    FlexSource::Element(child),
+                    Some((child_style, child_momentary)),
+                ));
+            }
+        }
+    }
+    if run.iter().any(|(_, value)| !value.trim().is_empty()) {
+        sources.push((FlexSource::Text(run), None));
+    }
+    push_generated(
+        PseudoElement::After,
+        after_gen,
+        &mut sources,
+        &mut positioned_generated,
+    );
+    let mut anonymous_style: Option<Rc<Style>> = None;
+    let mut items = sources
+        .into_iter()
+        .map(|(source, child_style)| {
+            let (child_style, style_momentary) = child_style.unwrap_or_else(|| {
+                let anon = anonymous_style.get_or_insert_with(|| {
+                    let mut anon = *style;
+                    anon.margin = Edges::zero();
+                    anon.padding = Edges::zero();
+                    anon.width = Length::Auto;
+                    anon.height = Length::Auto;
+                    anon.border = [BorderSide::INITIAL; 4];
+                    anon.order = 0;
+                    anon.align_self = None;
+                    anon.justify_self = None;
+                    anon.grid_column = GridPlacement::AUTO;
+                    anon.grid_row = GridPlacement::AUTO;
+                    Rc::new(anon)
+                });
+                (anon.clone(), false)
+            });
+            let child_font_size = child_style
+                .font_size
+                .resolve(font_size, font_size)
+                .unwrap_or(font_size)
+                .max(0.0);
+            let margin = resolve_margins(child_style.margin, containing_width, child_font_size);
+            let padding = resolve_edges(child_style.padding, containing_width, child_font_size);
+            let border = used_border(&child_style);
+            GridItem {
+                source,
+                style: child_style,
+                style_momentary,
+                margin,
+                padding,
+                border,
+                area: [(0, 1); 2],
+                width: None,
+                layout: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    items.sort_by_key(|item| item.style.order);
+
+    let areas = style.grid_template_areas.map();
+    let auto_cols = implicit_track_sizes(style.grid_auto_columns);
+    let auto_rows = implicit_track_sizes(style.grid_auto_rows);
+    let mut explicit_cols = if subgridded[0] {
+        let span = parent_spans[0].max(1);
+        let mut names = inherited_names.0;
+        names.extend(style.grid_template_columns.list().subgrid_line_names(span));
+        names.sort_by_key(|(line, _)| *line);
+        ExplicitTracks {
+            tracks: vec![TrackSize::AUTO; span],
+            fit: vec![false; span],
+            names,
+        }
+    } else {
+        let mut cols = explicit_grid_tracks(
+            &style.grid_template_columns.list(),
+            Some(containing_width),
+            col_gap,
+            font_size,
+        );
+        cols.pad_to(areas.columns, &auto_cols);
+        cols
+    };
+    let mut explicit_rows = if subgridded[1] {
+        let span = parent_spans[1].max(1);
+        let mut names = inherited_names.1;
+        names.extend(style.grid_template_rows.list().subgrid_line_names(span));
+        names.sort_by_key(|(line, _)| *line);
+        ExplicitTracks {
+            tracks: vec![TrackSize::AUTO; span],
+            fit: vec![false; span],
+            names,
+        }
+    } else {
+        let mut rows = explicit_grid_tracks(
+            &style.grid_template_rows.list(),
+            containing_height,
+            row_gap,
+            font_size,
+        );
+        rows.pad_to(areas.rows, &auto_rows);
+        rows
+    };
+    for area in &areas.areas {
+        let r0 = if subgridded[1] {
+            area.rows.0.min(explicit_rows.tracks.len())
+        } else {
+            area.rows.0
+        };
+        let r1 = if subgridded[1] {
+            area.rows.1.min(explicit_rows.tracks.len())
+        } else {
+            area.rows.1
+        };
+        let c0 = if subgridded[0] {
+            area.columns.0.min(explicit_cols.tracks.len())
+        } else {
+            area.columns.0
+        };
+        let c1 = if subgridded[0] {
+            area.columns.1.min(explicit_cols.tracks.len())
+        } else {
+            area.columns.1
+        };
+        explicit_rows
+            .names
+            .push((r0, format!("{}-start", area.name)));
+        explicit_rows.names.push((r1, format!("{}-end", area.name)));
+        explicit_cols
+            .names
+            .push((c0, format!("{}-start", area.name)));
+        explicit_cols.names.push((c1, format!("{}-end", area.name)));
+    }
+    let placements = items
+        .iter()
+        .map(|child| {
+            [
+                if subgridded[0] {
+                    clamp_subgrid_placement(child.style.grid_column, &explicit_cols)
+                } else {
+                    resolve_grid_placement(child.style.grid_column, &explicit_cols)
+                },
+                if subgridded[1] {
+                    clamp_subgrid_placement(child.style.grid_row, &explicit_rows)
+                } else {
+                    resolve_grid_placement(child.style.grid_row, &explicit_rows)
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    let (placed, counts, shift) = place_grid_items(
+        &placements,
+        [explicit_cols.tracks.len(), explicit_rows.tracks.len()],
+        style.grid_auto_flow_column,
+        style.grid_auto_flow_dense,
+        subgridded,
+    );
+    for (child, area) in items.iter_mut().zip(placed) {
+        child.area = area;
+    }
+    let nested = items
+        .iter()
+        .map(|child| {
+            let child_sub_col = is_subgrid_item(child, 0);
+            let child_sub_row = is_subgrid_item(child, 1);
+            if !child_sub_col && !child_sub_row {
+                return None;
+            }
+            let FlexSource::Element(child_node) = child.source else {
+                return None;
+            };
+            let c_names = if child_sub_col {
+                slice_line_names(&explicit_cols.names, shift[0], child.area[0])
+            } else {
+                Vec::new()
+            };
+            let r_names = if child_sub_row {
+                slice_line_names(&explicit_rows.names, shift[1], child.area[1])
+            } else {
+                Vec::new()
+            };
+            Some(Box::new(prepare_subgrid_item(
+                child_node,
+                child,
+                &child_parent,
+                [child_sub_col, child_sub_row],
+                [child.area[0].1, child.area[1].1],
+                gaps,
+                (c_names, r_names),
+                containing_width,
+                containing_height,
+                env,
+            )))
+        })
+        .collect();
+    PreparedSubgrid {
+        node,
+        style,
+        child_parent,
+        font_size,
+        text_context,
+        margin: item.margin,
+        padding: item.padding,
+        border: item.border,
+        gaps,
+        parent_gaps,
+        subgridded,
+        counts,
+        explicit_cols,
+        explicit_rows,
+        auto_cols,
+        auto_rows,
+        shift,
+        items,
+        nested,
+        positioned,
+        positioned_generated,
+        own_col_edges: Vec::new(),
+        own_col_collapsed: Vec::new(),
+    }
+}
+
+fn subgrid_local_edges(
+    slice: &SubgridAxisSlice,
+    own_mbp: (f32, f32),
+    own_gap: f32,
+) -> Vec<(f32, f32)> {
+    let m = slice.tracks.len();
+    let half_diff = (own_gap - slice.parent_gap) * 0.5;
+    (0..m)
+        .map(|i| {
+            let start = if i == 0 {
+                slice.tracks[0].0 + own_mbp.0
+            } else {
+                slice.tracks[i].0 + half_diff
+            };
+            let end = if i + 1 == m {
+                slice.tracks[m - 1].1 - own_mbp.1
+            } else {
+                slice.tracks[i].1 - half_diff
+            };
+            (start, end.max(start))
+        })
+        .collect()
+}
+
+fn slice_edges(
+    edges: &[(f32, f32)],
+    collapsed: &[bool],
+    parent_gap: f32,
+    (start, span): (usize, usize),
+) -> SubgridAxisSlice {
+    SubgridAxisSlice {
+        tracks: edges[start..start + span].to_vec(),
+        collapsed: collapsed[start..start + span].to_vec(),
+        parent_gap,
+    }
+}
+
+fn resolve_subgrid_own_columns(
+    sub: &mut PreparedSubgrid<'_>,
+    content_x: f32,
+    content_width: f32,
+    env: &SubgridEnv<'_>,
+) {
+    let col_tracks = sub
+        .explicit_cols
+        .all_tracks(sub.counts[0], sub.shift[0], &sub.auto_cols);
+    let col_collapsed = collapsed_tracks(
+        &sub.explicit_cols,
+        sub.counts[0],
+        sub.shift[0],
+        &sub.items,
+        0,
+    );
+    let mut contributors = Vec::new();
+    for (index, item) in sub.items.iter().enumerate() {
+        if let Some(child_sub) = sub.nested[index].as_deref()
+            && child_sub.subgridded[0]
+        {
+            let start_mbp = child_sub.margin.left + child_sub.border.left + child_sub.padding.left;
+            let end_mbp = child_sub.margin.right + child_sub.border.right + child_sub.padding.right;
+            let mut path = vec![index];
+            collect_subgrid_contributors(
+                child_sub,
+                0,
+                item.area[0].0,
+                (start_mbp, end_mbp),
+                &mut path,
+                &mut contributors,
+            );
+        } else {
+            contributors.push(TrackContributor::Direct(index, item.area[0]));
+        }
+    }
+    let spans = contributors
+        .iter()
+        .map(TrackContributor::span)
+        .collect::<Vec<_>>();
+    let mut caches: Vec<(Option<f32>, Option<f32>)> = vec![(None, None); contributors.len()];
+    let sizes = size_grid_tracks(
+        GridAxis {
+            tracks: &col_tracks,
+            collapsed: &col_collapsed,
+            available: Some(content_width),
+            gap: sub.gaps[0],
+            font_size: sub.font_size,
+            stretch: sub.style.justify_content == JustifyContent::FlexStart,
+        },
+        &spans,
+        &mut |contrib_index, need| match &contributors[contrib_index] {
+            TrackContributor::Direct(index, _) => grid_item_width_contribution(
+                &sub.items[*index],
+                sub.text_context,
+                &sub.child_parent,
+                content_width,
+                sub.font_size,
+                (env.stylesheet, env.style_state),
+                need,
+                &mut caches[contrib_index],
+            ),
+            TrackContributor::SubgridEdge(_, size) => [*size, *size, *size],
+            TrackContributor::SubgridLeaf { path, extra, .. } => {
+                let (owner, leaf) = lookup_subgrid_leaf(&sub.nested, path);
+                let raw = grid_item_width_contribution(
+                    leaf,
+                    owner.text_context,
+                    &owner.child_parent,
+                    content_width,
+                    owner.font_size,
+                    (env.stylesheet, env.style_state),
+                    need,
+                    &mut caches[contrib_index],
+                );
+                raw.map(|value| (value + *extra).max(0.0))
+            }
+        },
+    );
+    let offsets = grid_track_offsets(
+        &sizes,
+        &col_collapsed,
+        sub.gaps[0],
+        content_width,
+        sub.style.justify_content,
+    );
+    sub.own_col_edges = offsets
+        .iter()
+        .zip(&sizes)
+        .map(|(&offset, &size)| (content_x + offset, content_x + offset + size))
+        .collect();
+    sub.own_col_collapsed = col_collapsed;
+}
+
+fn prepare_subgrid_for_rows(
+    sub: &mut PreparedSubgrid<'_>,
+    col_slice: Option<&SubgridAxisSlice>,
+    cell_x_width: (f32, f32),
+    parent_opacity: f32,
+    env: &SubgridEnv<'_>,
+) {
+    let box_opacity = sub.style.opacity * parent_opacity;
+    let col_edges = if let Some(slice) = col_slice {
+        let start_mbp = sub.margin.left + sub.border.left + sub.padding.left;
+        let end_mbp = sub.margin.right + sub.border.right + sub.padding.right;
+        subgrid_local_edges(slice, (start_mbp, end_mbp), sub.gaps[0])
+    } else {
+        let content_x = cell_x_width.0 + sub.margin.left + sub.border.left + sub.padding.left;
+        let content_width = (cell_x_width.1
+            - sub.margin.left
+            - sub.margin.right
+            - sub.border.left
+            - sub.border.right
+            - sub.padding.left
+            - sub.padding.right)
+            .max(0.0);
+        sub.text_context.content_width = content_width;
+        resolve_subgrid_own_columns(sub, content_x, content_width, env);
+        sub.own_col_edges.clone()
+    };
+    let col_collapsed = col_slice
+        .map(|slice| slice.collapsed.as_slice())
+        .unwrap_or(&sub.own_col_collapsed);
+    let col_gap = sub.gaps[0];
+    let item_block = env.containing_block;
+    for index in 0..sub.items.len() {
+        let area_col = sub.items[index].area[0];
+        let cell_start_x = col_edges[area_col.0].0;
+        let cell_end_x = col_edges[area_col.0 + area_col.1 - 1].1;
+        let cell_width = (cell_end_x - cell_start_x).max(0.0);
+        if let Some(child_sub) = sub.nested[index].as_deref_mut() {
+            let child_col_slice = child_sub.subgridded[0]
+                .then(|| slice_edges(&col_edges, col_collapsed, col_gap, area_col));
+            if child_sub.subgridded[1] {
+                prepare_subgrid_for_rows(
+                    child_sub,
+                    child_col_slice.as_ref(),
+                    (cell_start_x, cell_width),
+                    box_opacity,
+                    env,
+                );
+            } else {
+                let child_box = finalize_subgrid(
+                    child_sub,
+                    child_col_slice.as_ref(),
+                    None,
+                    (cell_start_x, 0.0, cell_width),
+                    None,
+                    box_opacity,
+                    env,
+                );
+                sub.items[index].layout = Some(Rc::new(child_box));
+            }
+            continue;
+        }
+        let item = &mut sub.items[index];
+        let justify = auto_margin_alignment(item.style.margin.left, item.style.margin.right)
+            .unwrap_or(item.style.justify_self.unwrap_or(sub.style.justify_items));
+        let width = match (&item.source, justify) {
+            (FlexSource::Element(_) | FlexSource::Generated(..), AlignItems::Stretch) => None,
+            _ if item.style.width != Length::Auto => None,
+            (FlexSource::Text(_), AlignItems::Stretch) => Some(cell_width),
+            _ => {
+                let mut cache = (None, None);
+                let [_, min_w, max_w] = grid_item_width_contribution(
+                    item,
+                    sub.text_context,
+                    &sub.child_parent,
+                    cell_width,
+                    sub.font_size,
+                    (env.stylesheet, env.style_state),
+                    [false, true, true],
+                    &mut cache,
+                );
+                let extras = if matches!(item.source, FlexSource::Text(_)) {
+                    0.0
+                } else {
+                    item.margin.left
+                        + item.margin.right
+                        + item.padding.left
+                        + item.padding.right
+                        + item.border.left
+                        + item.border.right
+                };
+                Some((max_w.min(cell_width).max(min_w) - extras).max(0.0))
+            }
+        };
+        item.width = width;
+        item.layout = match &item.source {
+            FlexSource::Text(pieces) => Some(Rc::new(layout_text_item(
+                pieces,
+                sub.node.node,
+                item.width.unwrap_or(cell_width),
+                sub.text_context,
+                box_opacity,
+            ))),
+            _ => layout_element_rc(ElementLayoutInput {
+                node: item.source.subject().expect("element source"),
+                containing_x: cell_start_x,
+                containing_y: 0.0,
+                containing_width: cell_width,
+                containing_height: None,
+                size_override: (item.width, None),
+                floats: None,
+                list_ordinal: 1,
+                parent: sub.child_parent.clone(),
+                context: LayoutContext {
+                    viewport: env.viewport,
+                    containing_block: item_block,
+                    mode: LayoutMode::Flow,
+                    stylesheet: env.stylesheet,
+                    style_state: env.style_state,
+                    track_viewport: env.track_viewport,
+                },
+                pre_style: Some((item.style.clone(), item.style_momentary)),
+            }),
+        };
+    }
+}
+
+fn finalize_subgrid(
+    sub: &mut PreparedSubgrid<'_>,
+    col_slice: Option<&SubgridAxisSlice>,
+    row_slice: Option<&SubgridAxisSlice>,
+    fallback_cell: (f32, f32, f32),
+    explicit_height_override: Option<f32>,
+    parent_opacity: f32,
+    env: &SubgridEnv<'_>,
+) -> LayoutBox {
+    let box_opacity = sub.style.opacity * parent_opacity;
+    let (border_x, border_width, col_edges, col_collapsed) = if let Some(slice) = col_slice {
+        let bx = slice.tracks[0].0 + sub.margin.left;
+        let bw = (slice.tracks[slice.tracks.len() - 1].1
+            - slice.tracks[0].0
+            - sub.margin.left
+            - sub.margin.right)
+            .max(0.0);
+        let start_mbp = sub.margin.left + sub.border.left + sub.padding.left;
+        let end_mbp = sub.margin.right + sub.border.right + sub.padding.right;
+        let edges = subgrid_local_edges(slice, (start_mbp, end_mbp), sub.gaps[0]);
+        (bx, bw, edges, slice.collapsed.clone())
+    } else {
+        let bx = fallback_cell.0 + sub.margin.left;
+        let bw = (fallback_cell.2 - sub.margin.left - sub.margin.right).max(0.0);
+        let cx = bx + sub.border.left + sub.padding.left;
+        let cw = (bw - sub.border.left - sub.border.right - sub.padding.left - sub.padding.right)
+            .max(0.0);
+        if sub.own_col_edges.is_empty() {
+            sub.text_context.content_width = cw;
+            resolve_subgrid_own_columns(sub, cx, cw, env);
+        }
+        (
+            bx,
+            bw,
+            sub.own_col_edges.clone(),
+            sub.own_col_collapsed.clone(),
+        )
+    };
+    let content_width =
+        (border_width - sub.border.left - sub.border.right - sub.padding.left - sub.padding.right)
+            .max(0.0);
+
+    let item_block = if sub.style.position == Position::Static {
+        env.containing_block
+    } else {
+        ContainingBlock {
+            x: border_x,
+            y: fallback_cell.1 + sub.margin.top,
+            width: border_width,
+            height: 0.0,
+        }
+    };
+    let (border_y, border_height, row_edges, row_collapsed) = if let Some(slice) = row_slice {
+        let by = slice.tracks[0].0 + sub.margin.top;
+        let bh = (slice.tracks[slice.tracks.len() - 1].1
+            - slice.tracks[0].0
+            - sub.margin.top
+            - sub.margin.bottom)
+            .max(0.0);
+        let start_mbp = sub.margin.top + sub.border.top + sub.padding.top;
+        let end_mbp = sub.margin.bottom + sub.border.bottom + sub.padding.bottom;
+        let edges = subgrid_local_edges(slice, (start_mbp, end_mbp), sub.gaps[1]);
+        (by, bh, edges, slice.collapsed.clone())
+    } else {
+        // column-only subgrid: lay out children along inherited columns, then size own rows
+        let by = fallback_cell.1 + sub.margin.top;
+        let cy = by + sub.border.top + sub.padding.top;
+        for index in 0..sub.items.len() {
+            let area_col = sub.items[index].area[0];
+            let cell_start_x = col_edges[area_col.0].0;
+            let cell_end_x = col_edges[area_col.0 + area_col.1 - 1].1;
+            let cell_width = (cell_end_x - cell_start_x).max(0.0);
+            if let Some(child_sub) = sub.nested[index].as_deref_mut() {
+                let child_col_slice = child_sub.subgridded[0]
+                    .then(|| slice_edges(&col_edges, &col_collapsed, sub.gaps[0], area_col));
+                if child_sub.subgridded[1] {
+                    prepare_subgrid_for_rows(
+                        child_sub,
+                        child_col_slice.as_ref(),
+                        (cell_start_x, cell_width),
+                        box_opacity,
+                        env,
+                    );
+                } else {
+                    let child_box = finalize_subgrid(
+                        child_sub,
+                        child_col_slice.as_ref(),
+                        None,
+                        (cell_start_x, cy, cell_width),
+                        None,
+                        box_opacity,
+                        env,
+                    );
+                    sub.items[index].layout = Some(Rc::new(child_box));
+                }
+                continue;
+            }
+            let item = &mut sub.items[index];
+            let justify = auto_margin_alignment(item.style.margin.left, item.style.margin.right)
+                .unwrap_or(item.style.justify_self.unwrap_or(sub.style.justify_items));
+            let width = match (&item.source, justify) {
+                (FlexSource::Element(_) | FlexSource::Generated(..), AlignItems::Stretch) => None,
+                _ if item.style.width != Length::Auto => None,
+                (FlexSource::Text(_), AlignItems::Stretch) => Some(cell_width),
+                _ => {
+                    let mut cache = (None, None);
+                    let [_, min_w, max_w] = grid_item_width_contribution(
+                        item,
+                        sub.text_context,
+                        &sub.child_parent,
+                        cell_width,
+                        sub.font_size,
+                        (env.stylesheet, env.style_state),
+                        [false, true, true],
+                        &mut cache,
+                    );
+                    let extras = if matches!(item.source, FlexSource::Text(_)) {
+                        0.0
+                    } else {
+                        item.margin.left
+                            + item.margin.right
+                            + item.padding.left
+                            + item.padding.right
+                            + item.border.left
+                            + item.border.right
+                    };
+                    Some((max_w.min(cell_width).max(min_w) - extras).max(0.0))
+                }
+            };
+            item.width = width;
+            item.layout = match &item.source {
+                FlexSource::Text(pieces) => Some(Rc::new(layout_text_item(
+                    pieces,
+                    sub.node.node,
+                    item.width.unwrap_or(cell_width),
+                    sub.text_context,
+                    box_opacity,
+                ))),
+                _ => layout_element_rc(ElementLayoutInput {
+                    node: item.source.subject().expect("element source"),
+                    containing_x: cell_start_x,
+                    containing_y: cy,
+                    containing_width: cell_width,
+                    containing_height: None,
+                    size_override: (item.width, None),
+                    floats: None,
+                    list_ordinal: 1,
+                    parent: sub.child_parent.clone(),
+                    context: LayoutContext {
+                        viewport: env.viewport,
+                        containing_block: item_block,
+                        mode: LayoutMode::Flow,
+                        stylesheet: env.stylesheet,
+                        style_state: env.style_state,
+                        track_viewport: env.track_viewport,
+                    },
+                    pre_style: Some((item.style.clone(), item.style_momentary)),
+                }),
+            };
+        }
+        let row_tracks = sub
+            .explicit_rows
+            .all_tracks(sub.counts[1], sub.shift[1], &sub.auto_rows);
+        let row_collapsed = collapsed_tracks(
+            &sub.explicit_rows,
+            sub.counts[1],
+            sub.shift[1],
+            &sub.items,
+            1,
+        );
+        let mut contributors = Vec::new();
+        for (index, item) in sub.items.iter().enumerate() {
+            if let Some(child_sub) = sub.nested[index].as_deref()
+                && child_sub.subgridded[1]
+            {
+                let start_mbp = child_sub.margin.top + child_sub.border.top + child_sub.padding.top;
+                let end_mbp =
+                    child_sub.margin.bottom + child_sub.border.bottom + child_sub.padding.bottom;
+                let mut path = vec![index];
+                collect_subgrid_contributors(
+                    child_sub,
+                    1,
+                    item.area[1].0,
+                    (start_mbp, end_mbp),
+                    &mut path,
+                    &mut contributors,
+                );
+            } else {
+                contributors.push(TrackContributor::Direct(index, item.area[1]));
+            }
+        }
+        let spans = contributors
+            .iter()
+            .map(TrackContributor::span)
+            .collect::<Vec<_>>();
+        let vertical_inner =
+            sub.padding.top + sub.padding.bottom + sub.border.top + sub.border.bottom;
+        let own_height = explicit_height_override.or_else(|| {
+            resolve_height(sub.style.height, None, sub.font_size).map(|height| {
+                match sub.style.box_sizing {
+                    crate::css::BoxSizing::BorderBox => (height - vertical_inner).max(0.0),
+                    crate::css::BoxSizing::ContentBox => height.max(0.0),
+                }
+            })
+        });
+        let row_sizes = size_grid_tracks(
+            GridAxis {
+                tracks: &row_tracks,
+                collapsed: &row_collapsed,
+                available: own_height,
+                gap: sub.gaps[1],
+                font_size: sub.font_size,
+                stretch: sub.style.align_content == AlignContent::Stretch,
+            },
+            &spans,
+            &mut |contrib_index, _| match &contributors[contrib_index] {
+                TrackContributor::Direct(index, _) => {
+                    grid_item_row_contribution(&sub.items[*index], sub.font_size)
+                }
+                TrackContributor::SubgridEdge(_, size) => [*size, *size, *size],
+                TrackContributor::SubgridLeaf { path, extra, .. } => {
+                    let (owner, leaf) = lookup_subgrid_leaf(&sub.nested, path);
+                    grid_item_row_contribution(leaf, owner.font_size)
+                        .map(|value| (value + *extra).max(0.0))
+                }
+            },
+        );
+        let rows_total = grid_tracks_total(&row_sizes, &row_collapsed, sub.gaps[1]);
+        let content_height = own_height.unwrap_or(rows_total);
+        let row_offsets = grid_track_offsets(
+            &row_sizes,
+            &row_collapsed,
+            sub.gaps[1],
+            content_height,
+            justify_for_content(sub.style.align_content),
+        );
+        let edges = row_offsets
+            .iter()
+            .zip(&row_sizes)
+            .map(|(&offset, &size)| (cy + offset, cy + offset + size))
+            .collect();
+        (by, content_height + vertical_inner, edges, row_collapsed)
+    };
+
+    let mut row_baselines = vec![0.0_f32; row_edges.len()];
+    for item in &sub.items {
+        let item_align = auto_margin_alignment(item.style.margin.top, item.style.margin.bottom)
+            .unwrap_or(item.style.align_self.unwrap_or(sub.style.align_items));
+        if let Some(child) = &item.layout
+            && item_align == AlignItems::Baseline
+        {
+            let row = &mut row_baselines[item.area[1].0];
+            *row = row.max(item.margin.top + baseline_offset(child));
+        }
+    }
+
+    let mut children = Vec::with_capacity(sub.items.len());
+    for index in 0..sub.items.len() {
+        let area_col = sub.items[index].area[0];
+        let area_row = sub.items[index].area[1];
+        let cell_x = col_edges[area_col.0].0;
+        let cell_width = (col_edges[area_col.0 + area_col.1 - 1].1 - cell_x).max(0.0);
+        let cell_y = row_edges[area_row.0].0;
+        let cell_height = (row_edges[area_row.0 + area_row.1 - 1].1 - cell_y).max(0.0);
+        if let Some(child_sub) = sub.nested[index].as_deref_mut() {
+            let child_col_slice = child_sub.subgridded[0]
+                .then(|| slice_edges(&col_edges, &col_collapsed, sub.gaps[0], area_col));
+            let child_row_slice = child_sub.subgridded[1]
+                .then(|| slice_edges(&row_edges, &row_collapsed, sub.gaps[1], area_row));
+            if child_sub.subgridded[1] {
+                let child_box = finalize_subgrid(
+                    child_sub,
+                    child_col_slice.as_ref(),
+                    child_row_slice.as_ref(),
+                    (cell_x, cell_y, cell_width),
+                    None,
+                    box_opacity,
+                    env,
+                );
+                children.push(Rc::new(child_box));
+                continue;
+            }
+            let Some(mut child) = sub.items[index].layout.take() else {
+                continue;
+            };
+            let item = &sub.items[index];
+            let item_align = auto_margin_alignment(item.style.margin.top, item.style.margin.bottom)
+                .unwrap_or(item.style.align_self.unwrap_or(sub.style.align_items));
+            if item_align == AlignItems::Stretch && item.style.height == Length::Auto {
+                let inner =
+                    item.padding.top + item.padding.bottom + item.border.top + item.border.bottom;
+                let target = (cell_height - item.margin.top - item.margin.bottom - inner).max(0.0);
+                if (child.rect.height - inner - target).abs() > 0.01 {
+                    child = Rc::new(finalize_subgrid(
+                        child_sub,
+                        child_col_slice.as_ref(),
+                        None,
+                        (cell_x, cell_y, cell_width),
+                        Some(target),
+                        box_opacity,
+                        env,
+                    ));
+                }
+            }
+            let free_y = cell_height - child.rect.height - item.margin.top - item.margin.bottom;
+            let desired_x = cell_x + item.margin.left;
+            let desired_y = if item_align == AlignItems::Baseline {
+                cell_y + row_baselines[area_row.0] - baseline_offset(&child)
+            } else {
+                cell_y + item.margin.top + align_offset(item_align, free_y, 0.0)
+            };
+            let offset = (desired_x - child.rect.x, desired_y - child.rect.y);
+            if offset != (0.0, 0.0) {
+                translate_layout_box(Rc::make_mut(&mut child), offset.0, offset.1);
+            }
+            children.push(child);
+            continue;
+        }
+        let item = &mut sub.items[index];
+        let Some(mut child) = item.layout.take() else {
+            continue;
+        };
+        let item_justify = auto_margin_alignment(item.style.margin.left, item.style.margin.right)
+            .unwrap_or(item.style.justify_self.unwrap_or(sub.style.justify_items));
+        let item_align = auto_margin_alignment(item.style.margin.top, item.style.margin.bottom)
+            .unwrap_or(item.style.align_self.unwrap_or(sub.style.align_items));
+        let re_lay_out = |item: &GridItem<'_>, height: Option<f32>| -> Option<Rc<LayoutBox>> {
+            match &item.source {
+                FlexSource::Text(pieces) => {
+                    let mut layout = layout_text_item(
+                        pieces,
+                        sub.node.node,
+                        item.width.unwrap_or(cell_width),
+                        sub.text_context,
+                        box_opacity,
+                    );
+                    if let Some(height) = height {
+                        layout.rect.height = height;
+                    }
+                    Some(Rc::new(layout))
+                }
+                _ => layout_element_rc(ElementLayoutInput {
+                    node: item.source.subject().expect("element source"),
+                    containing_x: cell_x,
+                    containing_y: cell_y,
+                    containing_width: cell_width,
+                    containing_height: Some(cell_height),
+                    size_override: (item.width, height),
+                    floats: None,
+                    list_ordinal: 1,
+                    parent: sub.child_parent.clone(),
+                    context: LayoutContext {
+                        viewport: env.viewport,
+                        containing_block: item_block,
+                        mode: LayoutMode::Flow,
+                        stylesheet: env.stylesheet,
+                        style_state: env.style_state,
+                        track_viewport: env.track_viewport,
+                    },
+                    pre_style: Some((item.style.clone(), item.style_momentary)),
+                }),
+            }
+        };
+        if item_align == AlignItems::Stretch && item.style.height == Length::Auto {
+            let inner =
+                item.padding.top + item.padding.bottom + item.border.top + item.border.bottom;
+            let target = (cell_height - item.margin.top - item.margin.bottom - inner).max(0.0);
+            if (child.rect.height - inner - target).abs() > 0.01 {
+                child = re_lay_out(item, Some(target)).unwrap_or(child);
+            }
+        } else if [
+            item.style.height,
+            item.style.min_height,
+            item.style.max_height,
+        ]
+        .iter()
+        .any(|length| length.has_percent())
+        {
+            child = re_lay_out(item, None).unwrap_or(child);
+        }
+        let free_x = cell_width - child.rect.width - item.margin.left - item.margin.right;
+        let free_y = cell_height - child.rect.height - item.margin.top - item.margin.bottom;
+        let desired_x = cell_x + item.margin.left + align_offset(item_justify, free_x, 0.0);
+        let desired_y = if item_align == AlignItems::Baseline {
+            cell_y + row_baselines[area_row.0] - baseline_offset(&child)
+        } else {
+            cell_y + item.margin.top + align_offset(item_align, free_y, 0.0)
+        };
+        let offset = (desired_x - child.rect.x, desired_y - child.rect.y);
+        if offset != (0.0, 0.0) {
+            translate_layout_box(Rc::make_mut(&mut child), offset.0, offset.1);
+        }
+        children.push(child);
+    }
+
+    let rect = Rect {
+        x: border_x,
+        y: border_y,
+        width: border_width,
+        height: border_height,
+    };
+    let has_child_shift = children.iter().any(|child| child.has_child_shift);
+    let has_sticky =
+        sub.style.position == Position::Sticky || children.iter().any(|child| child.has_sticky);
+    let has_stacking_descendant = box_has_stacking(&children);
+    let filters = crate::filter::Filters::of(&sub.style, sub.font_size);
+    let has_backdrop_filter =
+        !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
+    let has_auto_visibility = sub.style.content_visibility == ContentVisibility::Auto
+        || children.iter().any(|child| child.has_auto_visibility);
+    let (overflow, overflow_axes) = effective_overflow(&sub.style);
+    let mut layout = LayoutBox {
+        node: sub.node.node,
+        tag: sub.node.name().to_string(),
+        rect,
+        background: sub.style.background,
+        backgrounds: sub.style.layers(),
+        masks: sub.style.mask_layers(),
+        background_clip_text: sub.style.background_clip_text,
+        object_fit: sub.style.object_fit,
+        object_position: sub.style.object_position.map(Box::new),
+        top_layer: false,
+        transform: None,
+        backface_hidden: sub.style.backface_hidden,
+        preserve_3d: preserves_3d(&sub.style, box_opacity),
+        clip_path: None,
+        radii: resolve_corner_radii(
+            sub.style.border_radius,
+            rect.width,
+            rect.height,
+            sub.font_size,
+        ),
+        opacity: box_opacity,
+        shadows: resolve_shadows(sub.style.shadows, content_width, sub.font_size),
+        filters,
+        border: BoxBorder::of(&sub.style),
+        outline: box_outline(&sub.style),
+        text: Vec::new(),
+        control_value: None,
+        control_selection: None,
+        control_focused: false,
+        control_text_origin: None,
+        children,
+        position: sub.style.position,
+        visual_offset: (0.0, 0.0),
+        z_index: positioned_z_index(&sub.style),
+        creates_stacking_context: creates_stacking_context(&sub.style) || box_opacity < 1.0,
+        sticky_inset: (sub.style.position == Position::Sticky).then(|| Box::new(sub.style.inset)),
+        font_size: sub.font_size,
+        overflow,
+        overflow_axes,
+        visible: sub.style.visibility == Visibility::Visible,
+        pointer_events: sub.style.pointer_events,
+        selectable: sub.style.selectable,
+        cursor: sub.style.cursor,
+        floated: false,
+        inline: false,
+        control: None,
+        selection: None,
+        selection_color: None,
+        scroll_content: Size::default(),
+        scroll_offset: (0.0, 0.0),
+        svg: None,
+        stable_gutter: sub.style.scrollbar_gutter,
+        row_baseline: None,
+        scrollbar: scrollbar_for(
+            env.stylesheet,
+            (sub.node.document, sub.node.node),
+            &sub.style,
+            sub.font_size,
+            env.style_state,
+        ),
+        margin: sub.margin,
+        child_shift: (0.0, 0.0),
+        has_child_shift,
+        has_sticky,
+        has_stacking_descendant,
+        has_backdrop_filter,
+        has_auto_visibility,
+    };
+    apply_relative_offset(&mut layout, &sub.style, env.containing_block, sub.font_size);
+    apply_transform(&mut layout, &sub.style, sub.font_size);
+    let positioned_block = padding_block(&layout);
+    let mut positioned = std::mem::take(&mut sub.positioned);
+    let positioned_generated = std::mem::take(&mut sub.positioned_generated);
+    for (pseudo, content) in &positioned_generated {
+        positioned.push(Subject {
+            document: sub.node.document,
+            node: sub.node.node,
+            generated: Some((*pseudo, content.as_str())),
+        });
+    }
+    append_positioned_to(
+        &mut layout,
+        positioned,
+        PositionedLayoutContext {
+            containing_block: if sub.style.position == Position::Static
+                && sub.style.content_visibility == ContentVisibility::Visible
+                && !sub.style.transform_style_3d
+                && sub.style.perspective.is_none()
+            {
+                env.containing_block
+            } else {
+                positioned_block
+            },
+            viewport: viewport_block(env.viewport),
+            viewport_size: env.viewport,
+            parent: sub.child_parent.clone(),
+            stylesheet: env.stylesheet,
+            style_state: env.style_state,
+            track_viewport: env.track_viewport,
+        },
+    );
+    apply_perspective(&mut layout, &sub.style, sub.font_size);
+    finalize_scroll(&mut layout, sub.padding, env.style_state);
     layout
 }
 
@@ -7377,12 +9393,13 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         containing_block,
         inherited_containing_block,
         mode,
+        track_viewport,
     } = input;
     let child_parent = ParentStyle {
         font_size,
         color: style.color,
         weight: style.font_weight,
-        text: parent_text.child(&style),
+        text: parent_text.child(style),
         opacity: 1.0,
     };
     let box_opacity = style.opacity * parent_opacity;
@@ -8131,6 +10148,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 mode: LayoutMode::Flow,
                 stylesheet,
                 style_state,
+                track_viewport,
             },
             pre_style: None,
         })
@@ -8199,6 +10217,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
                 mode: LayoutMode::Flow,
                 stylesheet,
                 style_state,
+                track_viewport,
             },
             pre_style: None,
         })
@@ -8651,7 +10670,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
     let has_sticky =
         style.position == Position::Sticky || children.iter().any(|child| child.has_sticky);
     let has_stacking_descendant = box_has_stacking(&children);
-    let filters = crate::filter::Filters::of(&style, font_size);
+    let filters = crate::filter::Filters::of(style, font_size);
     let has_backdrop_filter =
         !filters.backdrop.is_empty() || children.iter().any(|child| child.has_backdrop_filter);
     let has_auto_visibility = style.content_visibility == ContentVisibility::Auto
@@ -8669,13 +10688,14 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         top_layer: false,
         transform: None,
         backface_hidden: style.backface_hidden,
+        preserve_3d: preserves_3d(style, box_opacity),
         clip_path: None,
         radii: resolve_corner_radii(style.border_radius, rect.width, rect.height, font_size),
         opacity: box_opacity,
         shadows: resolve_shadows(style.shadows, content_width, font_size),
         filters,
-        border: BoxBorder::of(&style),
-        outline: box_outline(&style),
+        border: BoxBorder::of(style),
+        outline: box_outline(style),
         text: Vec::new(),
         control_value: None,
         control_selection: None,
@@ -8707,7 +10727,7 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         scrollbar: scrollbar_for(
             stylesheet,
             (node.document, node.node),
-            &style,
+            style,
             font_size,
             style_state,
         ),
@@ -8733,13 +10753,17 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
         );
     }
     apply_relative_offset(&mut layout, style, inherited_containing_block, font_size);
-    apply_transform(&mut layout, &style, font_size);
+    apply_transform(&mut layout, style, font_size);
     let positioned_block = padding_block(&layout);
     append_positioned_to(
         &mut layout,
         positioned,
         PositionedLayoutContext {
-            containing_block: if style.position == Position::Static {
+            containing_block: if style.position == Position::Static
+                && style.content_visibility == ContentVisibility::Visible
+                && !style.transform_style_3d
+                && style.perspective.is_none()
+            {
                 inherited_containing_block
             } else {
                 positioned_block
@@ -8749,8 +10773,10 @@ fn layout_table_element(input: GridLayoutInput<'_>) -> LayoutBox {
             parent: child_parent,
             stylesheet,
             style_state,
+            track_viewport,
         },
     );
+    apply_perspective(&mut layout, style, font_size);
     finalize_scroll(&mut layout, padding, style_state);
     layout
 }
@@ -9656,27 +11682,41 @@ fn place_grid_items(
     explicit: [usize; 2],
     column_flow: bool,
     dense: bool,
+    clamped: [bool; 2],
 ) -> (Vec<GridArea>, [usize; 2], [usize; 2]) {
     let shift = [0, 1].map(|axis| {
-        placements
-            .iter()
-            .filter_map(|placement| placement[axis].0)
-            .min()
-            .unwrap_or(0)
-            .min(0)
-            .unsigned_abs() as usize
+        if clamped[axis] {
+            0
+        } else {
+            placements
+                .iter()
+                .filter_map(|placement| placement[axis].0)
+                .min()
+                .unwrap_or(0)
+                .min(0)
+                .unsigned_abs() as usize
+        }
     });
     let at = |placement: &[(Option<i32>, usize); 2], axis: usize| {
         placement[axis]
             .0
-            .map(|start| (start + shift[axis] as i32) as usize)
+            .map(|start| (start + shift[axis] as i32).max(0) as usize)
     };
     let (major, minor) = if column_flow { (0, 1) } else { (1, 0) };
     let mut minor_count = explicit[minor] + shift[minor];
-    for placement in placements {
-        let span = placement[minor].1;
-        minor_count = minor_count.max(at(placement, minor).map_or(span, |start| start + span));
+    if !clamped[minor] {
+        for placement in placements {
+            let span = placement[minor].1;
+            minor_count = minor_count.max(at(placement, minor).map_or(span, |start| start + span));
+        }
+    } else {
+        minor_count = minor_count.max(1);
     }
+    let major_limit = if clamped[major] {
+        Some(explicit[major].max(1))
+    } else {
+        None
+    };
     let mut areas = vec![[(0, 1); 2]; placements.len()];
     let mut occupied: Vec<Vec<bool>> = Vec::new();
     let mut place =
@@ -9701,6 +11741,7 @@ fn place_grid_items(
         let (Some(major_start), None) = (at(placement, major), at(placement, minor)) else {
             continue;
         };
+        let minor_span = placement[minor].1;
         let mut minor_start = if dense {
             0
         } else {
@@ -9709,12 +11750,20 @@ fn place_grid_items(
         while !grid_cells_free(
             &occupied,
             (major_start, placement[major].1),
-            (minor_start, placement[minor].1),
+            (minor_start, minor_span),
         ) {
             minor_start += 1;
+            if clamped[minor] && minor_start + minor_span > minor_count {
+                minor_start = minor_count.saturating_sub(minor_span);
+                break;
+            }
         }
-        minor_count = minor_count.max(minor_start + placement[minor].1);
-        line_cursors.insert(major_start, minor_start + placement[minor].1);
+        if clamped[minor] && minor_start + minor_span > minor_count {
+            minor_start = minor_count.saturating_sub(minor_span);
+        } else {
+            minor_count = minor_count.max(minor_start + minor_span);
+        }
+        line_cursors.insert(major_start, minor_start + minor_span);
         place(index, major_start, minor_start, &mut occupied);
     }
     let mut cursor = (0, 0);
@@ -9735,9 +11784,29 @@ fn place_grid_items(
                 while !grid_cells_free(&occupied, (cursor.0, major_span), (minor_start, minor_span))
                 {
                     cursor.0 += 1;
+                    if let Some(limit) = major_limit
+                        && cursor.0 + major_span > limit
+                    {
+                        cursor.0 = limit.saturating_sub(major_span);
+                        break;
+                    }
+                }
+                if let Some(limit) = major_limit
+                    && cursor.0 + major_span > limit
+                {
+                    cursor.0 = limit.saturating_sub(major_span);
                 }
             }
             None => loop {
+                if let Some(limit) = major_limit
+                    && cursor.0 + major_span > limit
+                {
+                    cursor = (
+                        limit.saturating_sub(major_span),
+                        minor_count.saturating_sub(minor_span),
+                    );
+                    break;
+                }
                 if cursor.1 + minor_span > minor_count {
                     cursor = (cursor.0 + 1, 0);
                 } else if grid_cells_free(&occupied, (cursor.0, major_span), (cursor.1, minor_span))
@@ -9751,10 +11820,14 @@ fn place_grid_items(
         place(index, cursor.0, cursor.1, &mut occupied);
         cursor.1 += minor_span;
     }
-    let major_count = areas
-        .iter()
-        .map(|area| area[major].0 + area[major].1)
-        .fold(explicit[major] + shift[major], usize::max);
+    let major_count = if let Some(limit) = major_limit {
+        limit
+    } else {
+        areas
+            .iter()
+            .map(|area| area[major].0 + area[major].1)
+            .fold(explicit[major] + shift[major], usize::max)
+    };
     let mut counts = [0; 2];
     counts[major] = major_count;
     counts[minor] = minor_count;
@@ -10173,7 +12246,7 @@ fn auto_margin_alignment(start: Length, end: Length) -> Option<AlignItems> {
     }
 }
 
-fn positioned_z_index(style: Style) -> i32 {
+fn positioned_z_index(style: &Style) -> i32 {
     if style.position.is_out_of_flow()
         || matches!(style.position, Position::Relative | Position::Sticky)
     {
@@ -10183,8 +12256,9 @@ fn positioned_z_index(style: Style) -> i32 {
     }
 }
 
-fn creates_stacking_context(style: Style) -> bool {
+fn creates_stacking_context(style: &Style) -> bool {
     style.has_transform()
+        || style.transform_style_3d
         || style.perspective.is_some()
         || style.clip_path.is_some()
         || style.masks.is_some_and(|masks| !masks.layers().is_empty())
@@ -10195,8 +12269,22 @@ fn creates_stacking_context(style: Style) -> bool {
         || (style.position != Position::Static && style.z_index.is_some())
 }
 
-// resolves the transform properties and clip-path against the border box, then lets the
-// box's perspective act on the transformed children laid out inside it
+// grouping properties force used transform-style back to flat
+fn preserves_3d(style: &Style, box_opacity: f32) -> bool {
+    style.transform_style_3d
+        && box_opacity >= 1.0
+        && style.filter.is_none()
+        && style.backdrop_filter.is_none()
+        && style.clip_path.is_none()
+        && style.masks.is_none_or(|masks| masks.layers().is_empty())
+        && style.content_visibility == ContentVisibility::Visible
+        && style
+            .overflow_axes()
+            .into_iter()
+            .all(|axis| axis == Overflow::Visible)
+}
+
+// resolves the transform properties and clip-path against the border box
 fn apply_transform(layout: &mut LayoutBox, style: &Style, font_size: f32) {
     use crate::transform::Matrix;
     let (width, height) = (layout.rect.width, layout.rect.height);
@@ -10230,37 +12318,46 @@ fn apply_transform(layout: &mut LayoutBox, style: &Style, font_size: f32) {
             layout.transform = Some(Box::new(matrix.about(origin_x, origin_y)));
         }
     }
-    if let Some(distance) = style.perspective {
-        let origin_x = style
-            .perspective_origin
-            .0
-            .resolve(width, font_size)
-            .unwrap_or(width / 2.0);
-        let origin_y = style
-            .perspective_origin
-            .1
-            .resolve(height, font_size)
-            .unwrap_or(height / 2.0);
-        let (corner_x, corner_y) = (layout.rect.x, layout.rect.y);
-        let shift = layout.child_shift;
-        for child in layout.children.iter_mut().map(Rc::make_mut) {
-            let Some(transform) = child.transform.as_deref().copied() else {
-                continue;
-            };
-            let relative_x = corner_x + origin_x - (child.rect.x + shift.0);
-            let relative_y = corner_y + origin_y - (child.rect.y + shift.1);
-            child.transform = Some(Box::new(
-                Matrix::perspective(distance)
-                    .about(relative_x, relative_y)
-                    .multiply(&transform),
-            ));
-        }
+}
+
+// lets a box's perspective act on both in-flow and positioned direct children
+fn apply_perspective(layout: &mut LayoutBox, style: &Style, font_size: f32) {
+    use crate::transform::Matrix;
+    let Some(distance) = style.perspective else {
+        return;
+    };
+    let (width, height) = (layout.rect.width, layout.rect.height);
+    let origin_x = style
+        .perspective_origin
+        .0
+        .resolve(width, font_size)
+        .unwrap_or(width / 2.0);
+    let origin_y = style
+        .perspective_origin
+        .1
+        .resolve(height, font_size)
+        .unwrap_or(height / 2.0);
+    let (corner_x, corner_y) = (layout.rect.x, layout.rect.y);
+    let shift = layout.child_shift;
+    for child in layout.children.iter_mut().map(Rc::make_mut) {
+        let transform = match child.transform.as_deref().copied() {
+            Some(transform) => transform,
+            None if child.preserve_3d => Matrix::IDENTITY,
+            None => continue,
+        };
+        let relative_x = corner_x + origin_x - (child.rect.x + shift.0 + child.visual_offset.0);
+        let relative_y = corner_y + origin_y - (child.rect.y + shift.1 + child.visual_offset.1);
+        child.transform = Some(Box::new(
+            Matrix::perspective(distance)
+                .about(relative_x, relative_y)
+                .multiply(&transform),
+        ));
     }
 }
 
 fn apply_relative_offset(
     layout: &mut LayoutBox,
-    style: Style,
+    style: &Style,
     containing: ContainingBlock,
     font_size: f32,
 ) {
@@ -10643,7 +12740,7 @@ fn append_inline_element(
     }
     let style = input
         .stylesheet
-        .style_for(input.node.style_context(&input.parent, input.style_state));
+        .style_for_rc(input.node.style_context(&input.parent, input.style_state));
     if style.display == Display::None {
         return;
     }
@@ -10667,6 +12764,7 @@ fn append_inline_element(
         style_state,
         viewport,
         containing_block,
+        track_viewport,
     } = input;
     let font_size = style
         .font_size
@@ -10701,6 +12799,7 @@ fn append_inline_element(
     let padding = resolve_edges(style.padding, context.content_width, font_size);
     let border = used_border(&style);
     let decoration = line.decorations.len();
+    let inline_opacity = style.opacity * parent.opacity;
     line.decorations.push(InlineDecoration {
         node: node.node,
         tag: node.name().to_string(),
@@ -10710,7 +12809,7 @@ fn append_inline_element(
         padding,
         border,
         margin,
-        opacity: style.opacity * parent.opacity,
+        opacity: inline_opacity,
     });
     line.push_edge(decoration, true, margin.left + border.left + padding.left);
     let generated = node.generated_content(stylesheet, style_state);
@@ -10732,6 +12831,7 @@ fn append_inline_element(
                     style_state,
                     viewport,
                     containing_block,
+                    track_viewport,
                 },
                 text,
                 line,
@@ -11183,6 +13283,7 @@ fn append_atomic(
         style_state,
         viewport,
         containing_block,
+        track_viewport,
     } = input;
     let font_size = style
         .font_size
@@ -11226,6 +13327,7 @@ fn append_atomic(
             mode: LayoutMode::Flow,
             stylesheet,
             style_state,
+            track_viewport,
         },
         pre_style: None,
     };
@@ -11813,6 +13915,7 @@ fn place_float(input: InlineElementInput<'_>, style: &Style, line: &mut InlineLi
         style_state,
         viewport,
         containing_block,
+        track_viewport,
     } = input;
     let Some(floats) = line.floats.clone() else {
         return;
@@ -11854,6 +13957,7 @@ fn place_float(input: InlineElementInput<'_>, style: &Style, line: &mut InlineLi
             mode: LayoutMode::Flow,
             stylesheet,
             style_state,
+            track_viewport,
         },
         pre_style: None,
     }) else {
@@ -12149,7 +14253,8 @@ fn patch_motion(
             && !layout.children.iter().any(|child| child.tag == "::text")
         {
             layout.opacity = next.opacity;
-            layout.creates_stacking_context = creates_stacking_context(*next) || next.opacity < 1.0;
+            layout.creates_stacking_context = creates_stacking_context(next) || next.opacity < 1.0;
+            layout.preserve_3d = preserves_3d(next, next.opacity);
             true
         } else {
             false
@@ -12432,6 +14537,7 @@ impl LayoutBox {
             top_layer,
             transform,
             backface_hidden,
+            preserve_3d,
             clip_path,
             radii,
             opacity,
@@ -12486,6 +14592,7 @@ impl LayoutBox {
             && *top_layer == other.top_layer
             && *transform == other.transform
             && *backface_hidden == other.backface_hidden
+            && *preserve_3d == other.preserve_3d
             && *clip_path == other.clip_path
             && *radii == other.radii
             && *opacity == other.opacity
@@ -16157,5 +18264,277 @@ mod tests {
             px(chip_box.rect.x + 30.0, chip_box.rect.y + 10.0),
             [0x22, 0x44, 0xcc, 255]
         );
+    }
+
+    #[test]
+    fn subgrid_columns_rows_gaps_margins_nesting_and_clamping() {
+        let viewport = Size {
+            width: 400.0,
+            height: 400.0,
+        };
+        // row subgrid aligns header/body/footer tracks across sibling cards
+        let row_doc = Document::parse_markup(
+            r#"<style>
+                * { margin: 0; box-sizing: border-box; }
+                #grid {
+                    display: grid;
+                    width: 220px;
+                    grid-template-columns: 100px 100px;
+                    column-gap: 20px;
+                    row-gap: 10px;
+                }
+                .card {
+                    display: grid;
+                    grid-template-rows: subgrid;
+                    grid-row: span 3;
+                    padding: 5px 0;
+                }
+                #h1 { height: 20px; }
+                #b1 { height: 60px; }
+                #f1 { height: 15px; }
+                #h2 { height: 40px; }
+                #b2 { height: 30px; }
+                #f2 { height: 25px; }
+            </style>
+            <div id="grid">
+                <div id="c1" class="card"><div id="h1"></div><div id="b1"></div><div id="f1"></div></div>
+                <div id="c2" class="card"><div id="h2"></div><div id="b2"></div><div id="f2"></div></div>
+            </div>"#,
+        )
+        .expect("row subgrid doc");
+        let row_sheet = Stylesheet::parse(&row_doc.style_text()).expect("row css");
+        let row_layout = layout(&row_doc, &row_sheet, viewport);
+        let box_of = |doc: &Document, res: &LayoutDocument, id: &str| {
+            let node = doc.find_element_by_id(id).expect(id);
+            find_box_by_node(&res.root, node).expect(id).rect
+        };
+        let c1 = box_of(&row_doc, &row_layout, "c1");
+        let c2 = box_of(&row_doc, &row_layout, "c2");
+        let h1 = box_of(&row_doc, &row_layout, "h1");
+        let h2 = box_of(&row_doc, &row_layout, "h2");
+        let b1 = box_of(&row_doc, &row_layout, "b1");
+        let b2 = box_of(&row_doc, &row_layout, "b2");
+        let f1 = box_of(&row_doc, &row_layout, "f1");
+        let f2 = box_of(&row_doc, &row_layout, "f2");
+        assert_eq!(c1.height, 155.0);
+        assert_eq!(c2.height, 155.0);
+        assert_eq!(h1.y, 5.0);
+        assert_eq!(h2.y, 5.0);
+        assert_eq!(b1.y, 55.0);
+        assert_eq!(b2.y, 55.0);
+        assert_eq!(f1.y, 125.0);
+        assert_eq!(f2.y, 125.0);
+
+        // column subgrid: auto track sizing, gap inheritance vs override, line names, nesting, clamping
+        let col_doc = Document::parse_markup(
+            r#"<style>
+                * { margin: 0; box-sizing: border-box; }
+                #outer {
+                    display: grid;
+                    width: 300px;
+                    grid-template-columns: [edge] max-content [mid] max-content [end];
+                    column-gap: 20px;
+                    justify-content: start;
+                }
+                #s1 {
+                    grid-column: 1 / 3;
+                    display: grid;
+                    grid-template-columns: subgrid [local-a] repeat(auto-fill, [local-b]);
+                    padding: 0 10px;
+                }
+                #a1 { width: 50px; height: 10px; }
+                #a2 { grid-column: local-b / span 1; width: 60px; height: 10px; }
+                #s2 {
+                    grid-column: 1 / 3;
+                    display: grid;
+                    grid-template-columns: subgrid;
+                    column-gap: 0px;
+                }
+                #b1, #b2 { height: 10px; }
+                #outer-sub {
+                    grid-column: 1 / 3;
+                    display: grid;
+                    grid-template-columns: subgrid;
+                    padding-left: 8px;
+                }
+                #inner-sub {
+                    grid-column: 1 / 3;
+                    display: grid;
+                    grid-template-columns: subgrid;
+                    padding-left: 4px;
+                }
+                #n1 { width: 40px; height: 10px; }
+                #n2 { grid-column: 10; width: 20px; height: 10px; }
+                #solo {
+                    display: grid;
+                    grid-template-columns: subgrid;
+                    width: 100px;
+                }
+                #solo-item { height: 14px; }
+            </style>
+            <div id="outer">
+                <div id="s1"><div id="a1"></div><div id="a2"></div></div>
+                <div id="s2"><div id="b1"></div><div id="b2"></div></div>
+                <div id="outer-sub"><div id="inner-sub"><div id="n1"></div><div id="n2"></div></div></div>
+            </div>
+            <div id="solo"><div id="solo-item"></div></div>"#,
+        )
+        .expect("col subgrid doc");
+        let col_sheet = Stylesheet::parse(&col_doc.style_text()).expect("col css");
+        let col_layout = layout(&col_doc, &col_sheet, viewport);
+        let a1 = box_of(&col_doc, &col_layout, "a1");
+        let a2 = box_of(&col_doc, &col_layout, "a2");
+        let b1 = box_of(&col_doc, &col_layout, "b1");
+        let b2 = box_of(&col_doc, &col_layout, "b2");
+        let n1 = box_of(&col_doc, &col_layout, "n1");
+        let n2 = box_of(&col_doc, &col_layout, "n2");
+        let solo = box_of(&col_doc, &col_layout, "solo");
+        let solo_item = box_of(&col_doc, &col_layout, "solo-item");
+        // col 0 = 10 pad + 50 = 60, gap = 20, col 1 starts at 80
+        assert!((a1.x - 10.0).abs() < 0.01, "a1={a1:?}");
+        assert!((a2.x - 80.0).abs() < 0.01, "a2={a2:?}");
+        // s2 overrides column-gap to 0px so b1 and b2 meet at 70px
+        assert!((b1.x - 0.0).abs() < 0.01, "b1={b1:?}");
+        assert!((b1.x + b1.width - b2.x).abs() < 0.01, "b1={b1:?} b2={b2:?}");
+        assert!((b2.x - 70.0).abs() < 0.01, "b2={b2:?}");
+        // nested subgrid accumulates 8 + 4 = 12px left padding and clamps grid-column: 10 to col 1
+        assert!((n1.x - 12.0).abs() < 0.01, "n1={n1:?}");
+        assert!((n2.x - 80.0).abs() < 0.01, "n2={n2:?}");
+        // non-grid-item subgrid falls back to none
+        assert_eq!(solo.width, 100.0);
+        assert_eq!(solo_item.height, 14.0);
+    }
+
+    #[test]
+    fn transforms_3d_preserve_3d_flip_card_depth_sorting_perspective_and_flattening() {
+        let viewport = Size {
+            width: 200.0,
+            height: 200.0,
+        };
+        let pixel_at = |res: &LayoutDocument, x: usize, y: usize| -> [u8; 4] {
+            let canvas = res.paint();
+            let idx = (y * canvas.width() as usize + x) * 4;
+            canvas.rgba_pixels()[idx..idx + 4].try_into().unwrap()
+        };
+
+        // flip card rotated 180deg hides front and shows back in paint and hit-testing
+        let flip_doc = Document::parse_markup(
+            r#"<style>
+                body { margin: 0; }
+                #scene { perspective: 600px; width: 100px; height: 100px; }
+                #card {
+                    position: relative;
+                    width: 100px;
+                    height: 100px;
+                    transform-style: preserve-3d;
+                    transform: rotateY(180deg);
+                }
+                #front, #back {
+                    position: absolute;
+                    inset: 0;
+                    backface-visibility: hidden;
+                }
+                #front { background-color: #ff0000; }
+                #back { background-color: #0000ff; transform: rotateY(180deg); }
+            </style>
+            <div id="scene"><div id="card"><div id="front"></div><div id="back"></div></div></div>"#,
+        )
+        .expect("flip doc");
+        let flip_sheet = Stylesheet::parse(&flip_doc.style_text()).expect("flip css");
+        let flip_res = layout(&flip_doc, &flip_sheet, viewport);
+        let back_id = flip_doc.find_element_by_id("back").expect("back");
+        assert_eq!(pixel_at(&flip_res, 50, 50), [0, 0, 255, 255]);
+        assert_eq!(flip_res.hit_test(50.0, 50.0), Some(back_id));
+
+        // 3d depth sorting: earlier DOM element at +60px paints over and hit-tests ahead of -60px
+        let depth_doc = Document::parse_markup(
+            r#"<style>
+                body { margin: 0; }
+                #stage {
+                    position: relative;
+                    width: 100px;
+                    height: 100px;
+                    perspective: 600px;
+                    transform-style: preserve-3d;
+                }
+                #near, #far { position: absolute; inset: 0; }
+                #near { background-color: #00aa44; transform: translateZ(60px); }
+                #far { background-color: #cc2200; transform: translateZ(-60px); }
+            </style>
+            <div id="stage"><div id="near"></div><div id="far"></div></div>"#,
+        )
+        .expect("depth doc");
+        let depth_sheet = Stylesheet::parse(&depth_doc.style_text()).expect("depth css");
+        let depth_res = layout(&depth_doc, &depth_sheet, viewport);
+        let near_id = depth_doc.find_element_by_id("near").expect("near");
+        assert_eq!(pixel_at(&depth_res, 50, 50), [0, 0xaa, 0x44, 255]);
+        assert_eq!(depth_res.hit_test(50.0, 50.0), Some(near_id));
+
+        // grouping property (overflow: hidden) forces used transform-style back to flat
+        let flat_doc = Document::parse_markup(
+            r#"<style>
+                body { margin: 0; }
+                #stage {
+                    position: relative;
+                    width: 100px;
+                    height: 100px;
+                    overflow: hidden;
+                    transform-style: preserve-3d;
+                }
+                #near, #far { position: absolute; inset: 0; }
+                #near { background-color: #00aa44; transform: translateZ(60px); }
+                #far { background-color: #cc2200; transform: translateZ(-60px); }
+            </style>
+            <div id="stage"><div id="near"></div><div id="far"></div></div>"#,
+        )
+        .expect("flat doc");
+        let flat_sheet = Stylesheet::parse(&flat_doc.style_text()).expect("flat css");
+        let flat_res = layout(&flat_doc, &flat_sheet, viewport);
+        let stage_id = flat_doc.find_element_by_id("stage").expect("stage");
+        let far_id = flat_doc.find_element_by_id("far").expect("far");
+        assert!(
+            !find_box_by_node(&flat_res.root, stage_id)
+                .unwrap()
+                .preserve_3d
+        );
+        assert_eq!(pixel_at(&flat_res, 50, 50), [0xcc, 0x22, 0, 255]);
+        assert_eq!(flat_res.hit_test(50.0, 50.0), Some(far_id));
+
+        // parent perspective and perspective-origin pass through an untransformed preserve-3d wrapper
+        let persp_doc = Document::parse_markup(
+            r#"<style>
+                body { margin: 0; }
+                #scene {
+                    width: 200px;
+                    height: 200px;
+                    perspective: 200px;
+                    perspective-origin: 0px 0px;
+                }
+                #wrap {
+                    position: relative;
+                    width: 200px;
+                    height: 200px;
+                    transform-style: preserve-3d;
+                }
+                #pop {
+                    position: absolute;
+                    left: 40px;
+                    top: 40px;
+                    width: 40px;
+                    height: 40px;
+                    background-color: #2244cc;
+                    transform: translateZ(100px);
+                }
+            </style>
+            <div id="scene"><div id="wrap"><div id="pop"></div></div></div>"#,
+        )
+        .expect("persp doc");
+        let persp_sheet = Stylesheet::parse(&persp_doc.style_text()).expect("persp css");
+        let persp_res = layout(&persp_doc, &persp_sheet, viewport);
+        let pop_id = persp_doc.find_element_by_id("pop").expect("pop");
+        // z=100 at perspective 200 about (0,0) scales [40..80] to [80..160]
+        assert_eq!(pixel_at(&persp_res, 120, 120), [0x22, 0x44, 0xcc, 255]);
+        assert_eq!(pixel_at(&persp_res, 50, 50), [255, 255, 255, 255]);
+        assert_eq!(persp_res.hit_test(120.0, 120.0), Some(pop_id));
     }
 }

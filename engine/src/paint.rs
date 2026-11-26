@@ -7,9 +7,9 @@ use crate::image::Image;
 use crate::layout::{
     BoxBorder, ControlPaint, CornerRadii, ImageLayer, LayoutBox, LayoutDocument, PaintDiff,
     ProseSpan, Rect, ResolvedEdges, SQUARE_CORNERS, Scrollbar, StackingContextEntry, TextRun,
-    ThumbPlacement, for_each_paint_order, overflow_clip_rect, part_box, scrollbar_metrics,
-    stacking_context_entries, thumb_placement, translate_rect, user_scroll_range,
-    visual_offset_for, visual_rect_for,
+    ThumbPlacement, collect_3d_planes, for_each_paint_order, overflow_clip_rect, part_box,
+    scrollbar_metrics, stacking_context_entries, thumb_placement, translate_rect,
+    user_scroll_range, visual_offset_for, visual_rect_for,
 };
 use crate::png::encode_png;
 use std::cell::RefCell;
@@ -3468,6 +3468,9 @@ fn measure_subtree_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -
 // where its corners land, as paint maps it about the border box corner, and one that turns
 // away from the viewer is out of reach
 fn placed_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent {
+    if layout_box.preserve_3d {
+        return placed_3d_extent(layout_box, ancestor_offset);
+    }
     let (bounds, finite) = subtree_extent(layout_box, ancestor_offset);
     let Some(transform) = layout_box.transform.as_deref() else {
         return (bounds, finite);
@@ -3505,6 +3508,106 @@ fn placed_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent 
             width: right - left,
             height: bottom - top,
         },
+        true,
+    )
+}
+
+fn own_surface_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent {
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    let box_rect = visual_rect_for(layout_box, ancestor_offset);
+    let mut bounds = box_rect;
+    if let Some(outline) = layout_box.outline.as_ref() {
+        let reach = outline.width + outline.offset.max(0.0) + 1.0;
+        bounds = union_rect(bounds, outset_rect(box_rect, reach));
+    }
+    if layout_box.control.is_some() {
+        bounds = union_rect(bounds, outset_rect(box_rect, 2.0));
+    }
+    if layout_box.control_value.is_some() {
+        bounds = union_rect(bounds, outset_rect(box_rect, layout_box.font_size * 0.5));
+    }
+    for shadow in layout_box.shadows.iter().filter(|shadow| !shadow.inset) {
+        let reach = shadow.blur + shadow.spread.max(0.0) + 1.0;
+        bounds = union_rect(
+            bounds,
+            Rect {
+                x: box_rect.x + shadow.offset_x - reach,
+                y: box_rect.y + shadow.offset_y - reach,
+                width: box_rect.width + reach * 2.0,
+                height: box_rect.height + reach * 2.0,
+            },
+        );
+    }
+    for run in &layout_box.text {
+        bounds = union_rect(bounds, text_run_ink(run, offset));
+    }
+    let mut finite = true;
+    for child in layout_box.children.iter().filter(|child| child.inline) {
+        let (child_bounds, child_finite) = placed_extent(child, offset);
+        finite &= child_finite;
+        bounds = union_rect(bounds, child_bounds);
+    }
+    (
+        outset_rect(bounds, crate::filter::reach(&layout_box.filters.own)),
+        finite,
+    )
+}
+
+fn placed_3d_extent(layout_box: &LayoutBox, ancestor_offset: (f32, f32)) -> Extent {
+    let planes = collect_3d_planes(layout_box, ancestor_offset);
+    let mut combined: Option<Rect> = None;
+    for plane in planes {
+        if plane.backface_hidden && plane.matrix.shows_back() {
+            continue;
+        }
+        let (bounds, finite) = if plane.own_surface_only {
+            own_surface_extent(plane.layout, plane.ancestor_offset)
+        } else {
+            subtree_extent(plane.layout, plane.ancestor_offset)
+        };
+        if !finite {
+            return (combined.unwrap_or(bounds), false);
+        }
+        let corners = [
+            (bounds.x, bounds.y),
+            (bounds.x + bounds.width, bounds.y),
+            (bounds.x, bounds.y + bounds.height),
+            (bounds.x + bounds.width, bounds.y + bounds.height),
+        ]
+        .map(|(x, y)| plane.matrix.map_point(x, y));
+        let Some(corners) = corners.into_iter().collect::<Option<Vec<_>>>() else {
+            return (combined.unwrap_or(bounds), false);
+        };
+        let (left, top, right, bottom) = corners.iter().fold(
+            (
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ),
+            |(left, top, right, bottom), &(x, y)| {
+                (left.min(x), top.min(y), right.max(x), bottom.max(y))
+            },
+        );
+        let projected = Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        };
+        combined = Some(match combined {
+            Some(current) => union_rect(current, projected),
+            None => projected,
+        });
+    }
+    let fallback = visual_rect_for(layout_box, ancestor_offset);
+    (
+        combined.unwrap_or(Rect {
+            x: fallback.x,
+            y: fallback.y,
+            width: 0.0,
+            height: 0.0,
+        }),
         true,
     )
 }
@@ -7230,6 +7333,7 @@ fn paint_context_multi(
     }
     if skip.is_none()
         && (layout_box.transform.is_some()
+            || layout_box.preserve_3d
             || !layout_box.filters.own.is_empty()
             || !layout_box.filters.backdrop.is_empty()
             || layout_box.clip_path.is_some()
@@ -7657,6 +7761,17 @@ fn paint_context(
     if opacity <= 0.0 || misses(layout_box, ancestor_offset, clip) {
         return;
     }
+    if layout_box.preserve_3d {
+        paint_3d_context(
+            canvas,
+            layout_box,
+            images,
+            prose_selections,
+            clip,
+            ancestor_offset,
+        );
+        return;
+    }
     if let Some(transform) = layout_box.transform.as_deref() {
         let rect = visual_rect_for(layout_box, ancestor_offset);
         // the stored transform is relative to the border box corner
@@ -7796,6 +7911,115 @@ fn paint_context(
         },
         skip,
     );
+}
+
+fn paint_3d_context(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    images: &[ImageLayer],
+    prose_selections: &[ProseSpan],
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+) {
+    let planes = collect_3d_planes(layout_box, ancestor_offset);
+    for plane in planes {
+        if plane.backface_hidden && plane.matrix.shows_back() {
+            continue;
+        }
+        if plane.matrix.is_identity()
+            && plane.layout.filters.own.is_empty()
+            && (plane.opacity >= 1.0 || fades_without_layer(plane.layout))
+        {
+            if plane.own_surface_only {
+                paint_3d_own_surface(
+                    canvas,
+                    plane.layout,
+                    images,
+                    prose_selections,
+                    clip,
+                    plane.ancestor_offset,
+                    plane.opacity,
+                );
+            } else {
+                paint_context_contents(
+                    canvas,
+                    plane.layout,
+                    ContextPaint {
+                        images,
+                        prose_selections,
+                        clip,
+                        ancestor_offset: plane.ancestor_offset,
+                        opacity: plane.opacity,
+                    },
+                    &mut None,
+                );
+            }
+            continue;
+        }
+        let bounds = if plane.own_surface_only {
+            own_surface_extent(plane.layout, plane.ancestor_offset).0
+        } else {
+            subtree_bounds(plane.layout, plane.ancestor_offset)
+        };
+        if bounds.width <= 0.0 || bounds.height <= 0.0 {
+            continue;
+        }
+        let mut layer_scale = canvas.scale * plane.matrix.max_scale().clamp(1.0, 4.0);
+        let area = bounds.width * bounds.height * layer_scale * layer_scale;
+        if area > MAX_TRANSFORM_LAYER_PIXELS {
+            layer_scale *= (MAX_TRANSFORM_LAYER_PIXELS / area).sqrt();
+        }
+        let mut layer = Canvas::transparent(bounds, layer_scale);
+        if plane.own_surface_only {
+            paint_3d_own_surface(
+                &mut layer,
+                plane.layout,
+                images,
+                prose_selections,
+                None,
+                plane.ancestor_offset,
+                1.0,
+            );
+        } else {
+            paint_context_contents(
+                &mut layer,
+                plane.layout,
+                ContextPaint {
+                    images,
+                    prose_selections,
+                    clip: None,
+                    ancestor_offset: plane.ancestor_offset,
+                    opacity: 1.0,
+                },
+                &mut None,
+            );
+        }
+        filter_layer(&mut layer, &plane.layout.filters.own);
+        canvas.composite_transformed(layer, &plane.matrix, clip, plane.opacity);
+    }
+}
+
+fn paint_3d_own_surface(
+    canvas: &mut Canvas,
+    layout_box: &LayoutBox,
+    images: &[ImageLayer],
+    prose_selections: &[ProseSpan],
+    clip: Option<Rect>,
+    ancestor_offset: (f32, f32),
+    opacity: f32,
+) {
+    let offset = visual_offset_for(layout_box, ancestor_offset);
+    let rect = visual_rect_for(layout_box, ancestor_offset);
+    let content_clip = paint_box_surface(canvas, layout_box, images, clip, offset, rect, opacity);
+    paint_inline_fragments(canvas, layout_box, images, content_clip, offset);
+    paint_box_text(
+        canvas,
+        layout_box,
+        content_clip,
+        offset,
+        &prose_selections_for_box(layout_box, prose_selections),
+    );
+    paint_outline(canvas, layout_box, rect, opacity, clip);
 }
 
 // a subtree whose ink lies outside the clip paints nothing a repaint keeps
@@ -11761,6 +11985,7 @@ mod tests {
                 top_layer: false,
                 transform: None,
                 backface_hidden: false,
+                preserve_3d: false,
                 clip_path: None,
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
@@ -12468,6 +12693,7 @@ mod tests {
                 top_layer: false,
                 transform: None,
                 backface_hidden: false,
+                preserve_3d: false,
                 clip_path: None,
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
@@ -12617,6 +12843,7 @@ mod tests {
                 top_layer: false,
                 transform: None,
                 backface_hidden: false,
+                preserve_3d: false,
                 clip_path: None,
                 radii: SQUARE_CORNERS,
                 opacity: 1.0,
