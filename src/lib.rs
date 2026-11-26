@@ -19,6 +19,7 @@ mod http;
 mod instance;
 mod notification;
 pub mod opener;
+pub mod sandbox;
 mod shortcut;
 mod taskbar;
 mod tray;

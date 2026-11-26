@@ -1823,20 +1823,27 @@ impl AppWindow {
                 });
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (delta_x, delta_y) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x * 40.0, -y * 40.0),
+                let (x, y) = self.cursor;
+                match delta {
+                    MouseScrollDelta::LineDelta(dx, dy) => {
+                        let (delta_x, delta_y) = wheel_line_delta(dx, dy, self.viewport.height);
+                        self.submit(InputEvent::SmoothScroll {
+                            x,
+                            y,
+                            delta_x,
+                            delta_y,
+                        });
+                    }
                     MouseScrollDelta::PixelDelta(position) => {
                         let scale = f64::from(self.scale);
-                        ((position.x / scale) as f32, -(position.y / scale) as f32)
+                        self.submit(InputEvent::Scroll {
+                            x,
+                            y,
+                            delta_x: (position.x / scale) as f32,
+                            delta_y: -(position.y / scale) as f32,
+                        });
                     }
-                };
-                let (x, y) = self.cursor;
-                self.submit(InputEvent::Scroll {
-                    x,
-                    y,
-                    delta_x,
-                    delta_y,
-                });
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let Some(button) = Self::pointer_button(button) else {
@@ -3136,6 +3143,68 @@ fn forced_palette() -> Option<crate::css::SystemColors> {
     None
 }
 
+// windows uses u32 max to indicate scrolling one screen per notch
+const WHEEL_PAGESCROLL: u32 = u32::MAX;
+const DEFAULT_WHEEL_LINES: u32 = 3;
+const DEFAULT_WHEEL_PIXELS: f32 = 40.0;
+
+fn scale_wheel_lines(lines: f32, scroll_lines: u32, viewport_height: f32) -> f32 {
+    if !lines.is_finite() || lines == 0.0 || scroll_lines == 0 {
+        return 0.0;
+    }
+    if scroll_lines == WHEEL_PAGESCROLL {
+        lines * (viewport_height * 0.875).max(DEFAULT_WHEEL_PIXELS)
+    } else {
+        lines * (DEFAULT_WHEEL_PIXELS * (scroll_lines as f32 / DEFAULT_WHEEL_LINES as f32))
+    }
+}
+
+fn scale_wheel_chars(chars: f32, scroll_chars: u32) -> f32 {
+    if !chars.is_finite() || chars == 0.0 || scroll_chars == 0 {
+        return 0.0;
+    }
+    chars * (DEFAULT_WHEEL_PIXELS * (scroll_chars as f32 / DEFAULT_WHEEL_LINES as f32))
+}
+
+#[cfg(target_os = "windows")]
+fn system_wheel_settings() -> (u32, u32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETWHEELSCROLLCHARS, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        SystemParametersInfoW,
+    };
+    let mut lines = DEFAULT_WHEEL_LINES;
+    let mut chars = DEFAULT_WHEEL_LINES;
+    // safety: each spi query writes a single u32 into the provided output slot
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some((&raw mut lines).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let _ = SystemParametersInfoW(
+            SPI_GETWHEELSCROLLCHARS,
+            0,
+            Some((&raw mut chars).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    (lines, chars)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn system_wheel_settings() -> (u32, u32) {
+    (DEFAULT_WHEEL_LINES, DEFAULT_WHEEL_LINES)
+}
+
+fn wheel_line_delta(dx: f32, dy: f32, viewport_height: f32) -> (f32, f32) {
+    let (scroll_lines, scroll_chars) = system_wheel_settings();
+    (
+        scale_wheel_chars(dx, scroll_chars),
+        -scale_wheel_lines(dy, scroll_lines, viewport_height),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3614,5 +3683,25 @@ mod geometry_tests {
             super::drop_payload(&paths),
             r#"{"paths":["C:\\shots\\a \"b\".png","/tmp/c.png"]}"#
         );
+    }
+
+    #[test]
+    fn wheel_line_scaling_matches_windows_scroll_settings() {
+        // default 3 lines preserves 40px per notch
+        assert_eq!(super::scale_wheel_lines(1.0, 3, 800.0), 40.0);
+        assert_eq!(super::scale_wheel_lines(-2.0, 3, 800.0), -80.0);
+        // 6 lines doubles the distance per notch
+        assert_eq!(super::scale_wheel_lines(1.0, 6, 800.0), 80.0);
+        // 0 lines disables wheel scrolling
+        assert_eq!(super::scale_wheel_lines(1.0, 0, 800.0), 0.0);
+        // page-scroll mode scrolls 87.5% of the viewport height
+        assert_eq!(
+            super::scale_wheel_lines(1.0, super::WHEEL_PAGESCROLL, 800.0),
+            700.0
+        );
+        // non-finite deltas are dropped safely
+        assert_eq!(super::scale_wheel_lines(f32::NAN, 3, 800.0), 0.0);
+        assert_eq!(super::scale_wheel_chars(1.0, 3), 40.0);
+        assert_eq!(super::scale_wheel_chars(1.0, 0), 0.0);
     }
 }

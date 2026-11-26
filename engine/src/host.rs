@@ -76,6 +76,13 @@ pub enum InputEvent {
         delta_x: f32,
         delta_y: f32,
     },
+    // discrete wheel scroll eased over frames unless reduced motion is set
+    SmoothScroll {
+        x: f32,
+        y: f32,
+        delta_x: f32,
+        delta_y: f32,
+    },
     KeyDown {
         key: String,
     },
@@ -167,6 +174,47 @@ pub struct EngineHost {
     drag_press: Option<(f32, f32, crate::dom::NodeId)>,
     // the frames go to a presenter that can show videos under the canvas
     planes: bool,
+    // in-flight discrete wheel scroll easing toward its target offset
+    smooth_scroll: Option<SmoothScroll>,
+}
+
+#[derive(Clone, Copy)]
+struct SmoothScroll {
+    x: f32,
+    y: f32,
+    remaining_x: f32,
+    remaining_y: f32,
+}
+
+// exponential decay time constant for smooth wheel scrolling; refresh-rate independent
+const SMOOTH_SCROLL_TAU_MS: f32 = 45.0;
+// snap sub-half-pixel remainder directly to target so scrolling stops with zero trailing wakes
+const SMOOTH_SCROLL_SNAP_PX: f32 = 0.5;
+
+fn merge_scroll_axis(remaining: &mut f32, delta: f32) {
+    if delta == 0.0 {
+        return;
+    }
+    if *remaining != 0.0 && remaining.signum() != delta.signum() {
+        *remaining = delta;
+    } else {
+        *remaining += delta;
+    }
+}
+
+fn take_scroll_step(remaining: &mut f32, alpha: f32) -> f32 {
+    if remaining.abs() <= SMOOTH_SCROLL_SNAP_PX {
+        std::mem::take(remaining)
+    } else {
+        let step = *remaining * alpha;
+        *remaining -= step;
+        // fold a sub-threshold remainder into this step instead of waking one extra frame
+        if remaining.abs() <= SMOOTH_SCROLL_SNAP_PX {
+            step + std::mem::take(remaining)
+        } else {
+            step
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -948,6 +996,7 @@ impl EngineHost {
             region_press: false,
             drag_press: None,
             planes: false,
+            smooth_scroll: None,
         }
     }
 
@@ -980,6 +1029,7 @@ impl EngineHost {
     }
 
     pub fn navigate(&mut self, url: &str) -> Result<NavigationStatus, NavigationError> {
+        self.smooth_scroll = None;
         let status = self.browser.navigate(url)?;
         self.browser.sample_transitions(self.viewport)?;
         self.dirty = true;
@@ -993,6 +1043,7 @@ impl EngineHost {
     }
 
     pub fn go(&mut self, delta: isize) -> Result<bool, NavigationError> {
+        self.smooth_scroll = None;
         let handled = self.browser.go(delta)?;
         self.dirty |= handled;
         Ok(handled)
@@ -1050,6 +1101,7 @@ impl EngineHost {
                 ..InputResult::default()
             },
             InputEvent::Resize(viewport) => {
+                self.smooth_scroll = None;
                 self.viewport = viewport;
                 self.browser.set_viewport(viewport, self.scale);
                 InputResult {
@@ -1067,6 +1119,9 @@ impl EngineHost {
             }
             InputEvent::Visible(visible) => {
                 self.visible = visible;
+                if !visible {
+                    self.smooth_scroll = None;
+                }
                 self.browser.set_visible(visible)?;
                 InputResult {
                     frame_requested: visible,
@@ -1074,6 +1129,7 @@ impl EngineHost {
                 }
             }
             InputEvent::ScaleChanged(scale) => {
+                self.smooth_scroll = None;
                 self.scale = normalize_scale(scale);
                 self.browser.set_viewport(self.viewport, self.scale);
                 InputResult {
@@ -1084,8 +1140,21 @@ impl EngineHost {
             InputEvent::PreferencesChanged(preferences) => {
                 let changed = self.browser.user_preferences() != preferences;
                 self.browser.set_user_preferences(preferences);
+                let flushed = if preferences.reduced_motion
+                    && let Some(state) = self.smooth_scroll.take()
+                {
+                    self.browser.scroll_at(
+                        self.viewport,
+                        state.x,
+                        state.y,
+                        state.remaining_x,
+                        state.remaining_y,
+                    )?
+                } else {
+                    false
+                };
                 InputResult {
-                    frame_requested: changed,
+                    frame_requested: changed || flushed,
                     ..InputResult::default()
                 }
             }
@@ -1122,6 +1191,7 @@ impl EngineHost {
                 if button == PointerButton::Primary
                     && self.browser.drag_region_at(self.viewport, x, y) =>
             {
+                self.smooth_scroll = None;
                 self.region_press = true;
                 let region = if self.count_press(x, y) >= 2 {
                     self.last_press = None;
@@ -1138,6 +1208,7 @@ impl EngineHost {
                 InputResult::default()
             }
             InputEvent::PointerDown { x, y, button } => {
+                self.smooth_scroll = None;
                 self.region_press = false;
                 self.browser.set_pointer_button(button_index(button), true);
                 let dispatched = self
@@ -1216,6 +1287,7 @@ impl EngineHost {
                 delta_x,
                 delta_y,
             } => {
+                self.smooth_scroll = None;
                 let handled = self
                     .browser
                     .scroll_at(self.viewport, x, y, delta_x, delta_y)?;
@@ -1223,6 +1295,61 @@ impl EngineHost {
                     handled,
                     frame_requested: handled,
                     ..InputResult::default()
+                }
+            }
+            InputEvent::SmoothScroll {
+                x,
+                y,
+                delta_x,
+                delta_y,
+            } => {
+                let delta_x = if delta_x.is_finite() { delta_x } else { 0.0 };
+                let delta_y = if delta_y.is_finite() { delta_y } else { 0.0 };
+                if delta_x == 0.0 && delta_y == 0.0 {
+                    InputResult::default()
+                } else if self.browser.user_preferences().reduced_motion {
+                    self.smooth_scroll = None;
+                    let handled = self
+                        .browser
+                        .scroll_at(self.viewport, x, y, delta_x, delta_y)?;
+                    InputResult {
+                        handled,
+                        frame_requested: handled,
+                        ..InputResult::default()
+                    }
+                } else {
+                    let was_idle = self.smooth_scroll.is_none();
+                    let next = match self.smooth_scroll {
+                        Some(mut state) => {
+                            state.x = x;
+                            state.y = y;
+                            merge_scroll_axis(&mut state.remaining_x, delta_x);
+                            merge_scroll_axis(&mut state.remaining_y, delta_y);
+                            state
+                        }
+                        None => SmoothScroll {
+                            x,
+                            y,
+                            remaining_x: delta_x,
+                            remaining_y: delta_y,
+                        },
+                    };
+                    self.smooth_scroll = Some(next);
+                    if was_idle {
+                        let step_ms = self.browser.frame_interval().max(1);
+                        let moved = self.step_smooth_scroll(step_ms)?;
+                        InputResult {
+                            handled: moved,
+                            frame_requested: moved,
+                            ..InputResult::default()
+                        }
+                    } else {
+                        InputResult {
+                            handled: true,
+                            frame_requested: true,
+                            ..InputResult::default()
+                        }
+                    }
                 }
             }
             InputEvent::KeyDown { key } => InputResult {
@@ -1271,9 +1398,10 @@ impl EngineHost {
             InputEvent::AdvanceTime(milliseconds) => {
                 self.clock = self.clock.saturating_add(milliseconds);
                 let tasks_run = self.browser.advance_time(milliseconds)?;
+                let scrolled = self.step_smooth_scroll(milliseconds)?;
                 InputResult {
                     tasks_run,
-                    frame_requested: self.browser.motion_due(),
+                    frame_requested: scrolled || self.browser.motion_due(),
                     ..InputResult::default()
                 }
             }
@@ -1318,7 +1446,36 @@ impl EngineHost {
     // milliseconds until the page has work of its own
     pub fn next_wake(&self) -> Option<u64> {
         self.browser.current_url()?;
-        self.browser.next_wake()
+        let browser = self.browser.next_wake();
+        let scroll =
+            (self.visible && self.smooth_scroll.is_some()).then(|| self.browser.frame_interval());
+        browser.into_iter().chain(scroll).min()
+    }
+
+    fn step_smooth_scroll(&mut self, milliseconds: u64) -> Result<bool, NavigationError> {
+        if milliseconds == 0 {
+            return Ok(false);
+        }
+        let Some(mut state) = self.smooth_scroll else {
+            return Ok(false);
+        };
+        let dt = (milliseconds as f32).min(1000.0);
+        let alpha = 1.0 - (-dt / SMOOTH_SCROLL_TAU_MS).exp();
+        let step_x = take_scroll_step(&mut state.remaining_x, alpha);
+        let step_y = take_scroll_step(&mut state.remaining_y, alpha);
+        if step_x == 0.0 && step_y == 0.0 {
+            self.smooth_scroll = None;
+            return Ok(false);
+        }
+        let moved = self
+            .browser
+            .scroll_at(self.viewport, state.x, state.y, step_x, step_y)?;
+        if !moved || (state.remaining_x == 0.0 && state.remaining_y == 0.0) {
+            self.smooth_scroll = None;
+        } else {
+            self.smooth_scroll = Some(state);
+        }
+        Ok(moved)
     }
 
     // an event for the page's ceri.listen callbacks; a page with no listeners ignores it
@@ -4127,5 +4284,267 @@ mod tests {
             "{restore_second:?}"
         );
         assert!(dispatch(&mut host, 9, "mouseReleased", 40.0, 16.0, 2).is_none());
+    }
+
+    fn scrollable_host(content_height: u32) -> EngineHost {
+        let html = format!(
+            r#"<style>#viewport {{ width: 100px; height: 100px; overflow: auto; margin: 0; }} #content {{ width: 50px; height: {content_height}px; margin: 0; }}</style><div id="viewport"><div id="content"></div></div>"#
+        );
+        let browser = Browser::new(bundle(&html));
+        let mut host = EngineHost::new(
+            browser,
+            Size {
+                width: 120.0,
+                height: 120.0,
+            },
+        );
+        host.navigate("https://app.ceri.invalid/")
+            .expect("scrollable page should load");
+        host.render()
+            .expect("initial frame should render")
+            .expect("initial frame should exist");
+        host
+    }
+
+    fn scroll_offset_y(host: &EngineHost) -> f32 {
+        let layout = host
+            .browser()
+            .layout(host.viewport())
+            .expect("layout should succeed");
+        -layout.body().children[0].children[0].rect.y
+    }
+
+    #[test]
+    fn smooth_scroll_eases_to_exact_target_and_stops_waking() {
+        let mut host = scrollable_host(1000);
+        assert_eq!(host.next_wake(), None);
+
+        let first = host
+            .input(InputEvent::SmoothScroll {
+                x: 20.0,
+                y: 20.0,
+                delta_x: 0.0,
+                delta_y: 120.0,
+            })
+            .expect("smooth scroll should succeed");
+        assert!(first.handled);
+        assert!(first.frame_requested);
+        let after_first = scroll_offset_y(&host);
+        assert!(
+            after_first > 0.0 && after_first < 120.0,
+            "first frame should ease partially, got {after_first}"
+        );
+        assert!(host.next_wake().is_some());
+
+        let mut prev = after_first;
+        let mut steps = 0usize;
+        while host.next_wake().is_some() {
+            let tick = host
+                .input(InputEvent::AdvanceTime(16))
+                .expect("advance time should succeed");
+            assert!(tick.frame_requested);
+            let now = scroll_offset_y(&host);
+            assert!(
+                now > prev,
+                "scroll should advance monotonically ({prev} -> {now})"
+            );
+            prev = now;
+            steps += 1;
+            assert!(steps < 60, "smooth scroll should settle promptly");
+        }
+        assert!(steps >= 3, "smooth scroll should span multiple frames");
+        assert!((scroll_offset_y(&host) - 120.0).abs() < 1e-3);
+        assert_eq!(host.next_wake(), None);
+
+        // once rendered after settling, idle ticks cause zero wakeups and zero dirty frames
+        host.render().expect("final frame should render");
+        assert!(!host.is_dirty());
+        let idle = host
+            .input(InputEvent::AdvanceTime(16))
+            .expect("idle tick should succeed");
+        assert!(!idle.frame_requested);
+        assert!(!host.is_dirty());
+        assert_eq!(host.next_wake(), None);
+    }
+
+    #[test]
+    fn smooth_scroll_accumulates_and_reverses_cleanly() {
+        let mut host = scrollable_host(1000);
+        host.input(InputEvent::SmoothScroll {
+            x: 20.0,
+            y: 20.0,
+            delta_x: 0.0,
+            delta_y: 80.0,
+        })
+        .expect("first notch should succeed");
+        host.input(InputEvent::SmoothScroll {
+            x: 20.0,
+            y: 20.0,
+            delta_x: 0.0,
+            delta_y: 80.0,
+        })
+        .expect("second notch should accumulate");
+
+        while host.next_wake().is_some() {
+            host.input(InputEvent::AdvanceTime(16))
+                .expect("tick should succeed");
+        }
+        assert!((scroll_offset_y(&host) - 160.0).abs() < 1e-3);
+
+        // start scrolling down, then reverse up mid-flight
+        host.input(InputEvent::SmoothScroll {
+            x: 20.0,
+            y: 20.0,
+            delta_x: 0.0,
+            delta_y: 200.0,
+        })
+        .expect("downward scroll should start");
+        let before_reverse = scroll_offset_y(&host);
+        assert!(before_reverse > 160.0);
+
+        host.input(InputEvent::SmoothScroll {
+            x: 20.0,
+            y: 20.0,
+            delta_x: 0.0,
+            delta_y: -60.0,
+        })
+        .expect("reverse scroll should override stale downward remainder");
+        while host.next_wake().is_some() {
+            host.input(InputEvent::AdvanceTime(16))
+                .expect("reverse tick should succeed");
+        }
+        let settled = scroll_offset_y(&host);
+        assert!(
+            (settled - (before_reverse - 60.0)).abs() < 1e-3,
+            "reversal should settle at {}, got {settled}",
+            before_reverse - 60.0
+        );
+    }
+
+    #[test]
+    fn smooth_scroll_stops_immediately_at_scroll_boundary() {
+        let mut host = scrollable_host(160);
+        // already at top edge: scrolling up does not start an animation
+        let at_top = host
+            .input(InputEvent::SmoothScroll {
+                x: 20.0,
+                y: 20.0,
+                delta_x: 0.0,
+                delta_y: -40.0,
+            })
+            .expect("top edge scroll should succeed");
+        assert!(!at_top.handled);
+        assert!(!at_top.frame_requested);
+        assert_eq!(host.next_wake(), None);
+
+        // max vertical scroll is 60px; scrolling 500px clamps cleanly and cancels without spinning
+        host.input(InputEvent::SmoothScroll {
+            x: 20.0,
+            y: 20.0,
+            delta_x: 0.0,
+            delta_y: 500.0,
+        })
+        .expect("overscroll should start");
+        let mut ticks = 0usize;
+        while host.next_wake().is_some() {
+            host.input(InputEvent::AdvanceTime(16))
+                .expect("overscroll tick should succeed");
+            ticks += 1;
+            assert!(ticks < 10, "overscroll must cancel as soon as edge clamps");
+        }
+        let clamped = scroll_offset_y(&host);
+        assert!(
+            (clamped - 60.0).abs() < 1e-3,
+            "expected clamp at 60.0, got {clamped}"
+        );
+        assert_eq!(host.next_wake(), None);
+    }
+
+    #[test]
+    fn smooth_scroll_cancels_on_pointer_down_and_immediate_scroll() {
+        let mut host = scrollable_host(1000);
+        host.input(InputEvent::SmoothScroll {
+            x: 20.0,
+            y: 20.0,
+            delta_x: 0.0,
+            delta_y: 200.0,
+        })
+        .expect("smooth scroll should start");
+        let mid = scroll_offset_y(&host);
+        assert!(host.next_wake().is_some());
+
+        host.input(InputEvent::PointerDown {
+            x: 20.0,
+            y: 20.0,
+            button: PointerButton::Primary,
+        })
+        .expect("pointer down should cancel smooth scroll");
+        assert_eq!(host.next_wake(), None);
+        host.input(InputEvent::AdvanceTime(16))
+            .expect("tick after cancel should succeed");
+        assert_eq!(scroll_offset_y(&host), mid);
+
+        // immediate scroll also cancels any in-flight smooth scroll
+        host.input(InputEvent::SmoothScroll {
+            x: 20.0,
+            y: 20.0,
+            delta_x: 0.0,
+            delta_y: 200.0,
+        })
+        .expect("second smooth scroll should start");
+        let before_immediate = scroll_offset_y(&host);
+        assert!(host.next_wake().is_some());
+        host.input(InputEvent::Scroll {
+            x: 20.0,
+            y: 20.0,
+            delta_x: 0.0,
+            delta_y: 10.0,
+        })
+        .expect("immediate scroll should apply and cancel animation");
+        assert_eq!(host.next_wake(), None);
+        assert!((scroll_offset_y(&host) - (before_immediate + 10.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn smooth_scroll_honors_reduced_motion_immediately_and_on_toggle() {
+        let mut host = scrollable_host(1000);
+        let mut prefs = UserPreferences {
+            reduced_motion: true,
+            ..UserPreferences::default()
+        };
+        host.input(InputEvent::PreferencesChanged(prefs))
+            .expect("preferences update should succeed");
+
+        let result = host
+            .input(InputEvent::SmoothScroll {
+                x: 20.0,
+                y: 20.0,
+                delta_x: 0.0,
+                delta_y: 120.0,
+            })
+            .expect("reduced motion scroll should succeed");
+        assert!(result.handled);
+        assert_eq!(host.next_wake(), None);
+        assert!((scroll_offset_y(&host) - 120.0).abs() < 1e-3);
+
+        // disable reduced motion, start easing, then re-enable reduced motion mid-flight
+        prefs.reduced_motion = false;
+        host.input(InputEvent::PreferencesChanged(prefs))
+            .expect("preferences reset should succeed");
+        host.input(InputEvent::SmoothScroll {
+            x: 20.0,
+            y: 20.0,
+            delta_x: 0.0,
+            delta_y: 120.0,
+        })
+        .expect("smooth scroll should start");
+        assert!(scroll_offset_y(&host) < 240.0);
+        assert!(host.next_wake().is_some());
+
+        prefs.reduced_motion = true;
+        host.input(InputEvent::PreferencesChanged(prefs))
+            .expect("toggling reduced motion should flush remaining scroll");
+        assert_eq!(host.next_wake(), None);
+        assert!((scroll_offset_y(&host) - 240.0).abs() < 1e-3);
     }
 }
