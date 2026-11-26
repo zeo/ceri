@@ -533,26 +533,44 @@ impl ScriptRuntime {
     ) -> Result<Value, ScriptError> {
         let value = self.get_property(&holder, &key)?;
         match &value {
-            Value::Array(array) => {
-                let length = array.borrow().len();
-                for index in 0..length {
-                    let element = self.internalize(value.clone(), index.to_string(), reviver)?;
-                    if let Some(slot) = array.borrow_mut().get_mut(index) {
-                        *slot = element;
-                    }
-                }
-            }
-            // an array behind a proxy is walked by index too, as IsArray sees through proxies
-            Value::Object(_) if self.is_array(&value)? => {
-                let length = self.get_property(&value, "length")?;
-                let length = self.coerce_number(length)?.max(0.0) as usize;
+            Value::Array(_) => {
+                let length = self.array_like_length(&value)?;
                 for index in 0..length {
                     let name = index.to_string();
                     let element = self.internalize(value.clone(), name.clone(), reviver)?;
                     if matches!(element, Value::Undefined) {
                         self.delete_property(&value, &name, false)?;
-                    } else {
-                        self.set_property(&value, &name, element, false)?;
+                    } else if self
+                        .create_data_property_or_throw(&value, name, element)
+                        .is_err()
+                    {
+                        self.pending_exception = None;
+                    }
+                }
+            }
+            // an array behind a proxy is walked by index too, as IsArray sees through proxies
+            Value::Object(_) if self.is_array(&value)? => {
+                let length = self.array_like_length(&value)?;
+                for index in 0..length {
+                    let name = index.to_string();
+                    let element = self.internalize(value.clone(), name.clone(), reviver)?;
+                    if matches!(element, Value::Undefined) {
+                        self.delete_property(&value, &name, false)?;
+                    } else if let Value::Object(obj) = &value
+                        && let Some(proxy) = super::reflect::proxy_of(obj)
+                    {
+                        let desc = self.object_from_entries(vec![
+                            ("value".to_string(), element),
+                            ("writable".to_string(), Value::Bool(true)),
+                            ("enumerable".to_string(), Value::Bool(true)),
+                            ("configurable".to_string(), Value::Bool(true)),
+                        ]);
+                        let _ = self.proxy_define(&proxy, &name, &desc)?;
+                    } else if self
+                        .create_data_property_or_throw(&value, name, element)
+                        .is_err()
+                    {
+                        self.pending_exception = None;
                     }
                 }
             }
@@ -567,10 +585,21 @@ impl ScriptRuntime {
                     let element = self.internalize(value.clone(), name.clone(), reviver)?;
                     if matches!(element, Value::Undefined) {
                         self.delete_property(&value, &name, false)?;
-                    } else if let Value::Object(object) = &value {
-                        object
-                            .borrow_mut()
-                            .define(name, object::Property::data(element));
+                    } else if let Value::Object(obj) = &value
+                        && let Some(proxy) = super::reflect::proxy_of(obj)
+                    {
+                        let desc = self.object_from_entries(vec![
+                            ("value".to_string(), element),
+                            ("writable".to_string(), Value::Bool(true)),
+                            ("enumerable".to_string(), Value::Bool(true)),
+                            ("configurable".to_string(), Value::Bool(true)),
+                        ]);
+                        let _ = self.proxy_define(&proxy, &name, &desc)?;
+                    } else if self
+                        .create_data_property_or_throw(&value, name, element)
+                        .is_err()
+                    {
+                        self.pending_exception = None;
                     }
                 }
             }
@@ -599,10 +628,12 @@ impl ScriptRuntime {
         };
         if is_callable(&replacer) {
             stringifier.replacer = Some(replacer);
-        } else if let Value::Array(list) = &replacer {
+        } else if self.is_array(&replacer)? {
             let mut allowed = Vec::new();
-            let items = list.borrow().clone();
-            for item in items {
+            let len = self.array_like_length(&replacer)?;
+            let limit = len.min(MAX_RUNTIME_ARRAY_LENGTH as u64);
+            for k in 0..limit {
+                let item = self.get_property(&replacer, &k.to_string())?;
                 let wrapped = matches!(&item, Value::Object(object) if matches!(object.borrow().class, ObjectClass::String(_) | ObjectClass::Number(_)));
                 let key = match &item {
                     Value::String(text) => Some(text.to_string()),
@@ -618,12 +649,17 @@ impl ScriptRuntime {
             }
             stringifier.allowed = Some(allowed);
         }
-        let space = match &space {
+        let space_kind = match &space {
             Value::Object(object) => match &object.borrow().class {
-                ObjectClass::Number(number) => Value::Number(*number),
-                ObjectClass::String(text) => Value::String(text.as_str().into()),
-                _ => space.clone(),
+                ObjectClass::Number(_) => 1u8,
+                ObjectClass::String(_) => 2,
+                _ => 0,
             },
+            _ => 0,
+        };
+        let space = match space_kind {
+            1 => Value::Number(self.coerce_number(space)?),
+            2 => Value::String(self.coerce_string(space)?.into()),
             _ => space,
         };
         stringifier.gap = match space {
@@ -662,14 +698,7 @@ impl ScriptRuntime {
         key: String,
         holder: &Value,
     ) -> Result<Option<String>, ScriptError> {
-        let mut value = match holder {
-            Value::Array(array) => key
-                .parse::<usize>()
-                .ok()
-                .and_then(|index| array.borrow().get(index).cloned())
-                .unwrap_or(Value::Undefined),
-            _ => self.get_property(holder, &key)?,
-        };
+        let mut value = self.get_property(holder, &key)?;
         if !is_primitive(&value) || matches!(value, Value::BigInt(_)) {
             let to_json = self.get_property(&value, "toJSON")?;
             if is_callable(&to_json) {
@@ -689,6 +718,7 @@ impl ScriptRuntime {
                 ObjectClass::Number(_) => Some(1),
                 ObjectClass::String(_) => Some(2),
                 ObjectClass::Boolean(_) => Some(3),
+                ObjectClass::BigInt(_) => Some(4),
                 _ => None,
             },
             _ => None,
@@ -696,9 +726,16 @@ impl ScriptRuntime {
         value = match unwrapped {
             Some(1) => Value::Number(self.coerce_number(value)?),
             Some(2) => Value::String(self.coerce_string(value)?.into()),
-            Some(_) => match &value {
+            Some(3) => match &value {
                 Value::Object(object) => match &object.borrow().class {
                     ObjectClass::Boolean(flag) => Value::Bool(*flag),
+                    _ => Value::Undefined,
+                },
+                _ => Value::Undefined,
+            },
+            Some(_) => match &value {
+                Value::Object(object) => match &object.borrow().class {
+                    ObjectClass::BigInt(bigint) => Value::BigInt(bigint.clone()),
                     _ => Value::Undefined,
                 },
                 _ => Value::Undefined,

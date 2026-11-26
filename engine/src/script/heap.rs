@@ -446,6 +446,7 @@ pub(super) struct Heap {
     gc_threshold: Cell<usize>,
     // recycled small scope slot vectors avoiding malloc/free on short-lived scopes
     slot_pool: UnsafeCell<Vec<Vec<Value>>>,
+    error_stacks: UnsafeCell<HashMap<NonZeroU64, JsStr>>,
     #[cfg(all(
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
@@ -480,6 +481,7 @@ impl Heap {
             allocs_since_gc: Cell::new(0),
             gc_threshold: Cell::new(MINIMUM_THRESHOLD),
             slot_pool: UnsafeCell::new(Vec::new()),
+            error_stacks: UnsafeCell::new(HashMap::default()),
             #[cfg(all(
                 target_arch = "x86_64",
                 any(target_os = "windows", target_os = "linux")
@@ -879,6 +881,23 @@ impl Drop for HeapGuard {
 }
 
 #[inline]
+pub(super) fn set_error_stack(handle: &ObjectHandle, stack: JsStr) {
+    let (heap_id, _, _) = unpack_handle(handle.0);
+    if let Some(ptr) = heap_for(heap_id) {
+        let heap = unsafe { &*ptr };
+        let stacks = unsafe { &mut *heap.error_stacks.get() };
+        stacks.insert(handle.0, stack);
+    }
+}
+
+pub(super) fn get_error_stack(handle: &ObjectHandle) -> Option<JsStr> {
+    let (heap_id, _, _) = unpack_handle(handle.0);
+    let ptr = heap_for(heap_id)?;
+    let heap = unsafe { &*ptr };
+    let stacks = unsafe { &*heap.error_stacks.get() };
+    stacks.get(&handle.0).cloned()
+}
+
 pub(super) fn enter(id: u16) -> HeapGuard {
     let prev_id = ACTIVE_ID.get();
     let prev_ptr = ACTIVE_PTR.get();
@@ -1908,6 +1927,11 @@ impl Tracer {
                     self.trace_value(&iter.borrow().target);
                 }
             }
+            ObjectClass::RegExpIterator(iter) => {
+                if self.visit_rc(iter) {
+                    self.trace_value(&iter.borrow().matcher);
+                }
+            }
             ObjectClass::Cursor(cursor) => {
                 if self.visit_rc(cursor) {
                     let col = cursor.borrow().collection.clone();
@@ -2039,6 +2063,13 @@ impl ScriptRuntime {
         drop(tracer);
 
         let cleared = heap.objects.sweep() + heap.arrays.sweep() + heap.scopes.sweep();
+        let stacks = unsafe { &mut *heap.error_stacks.get() };
+        if !stacks.is_empty() {
+            stacks.retain(|&raw, _| {
+                let (_, epoch, index) = unpack_handle(raw);
+                heap.objects.entry_if_alive(index, epoch).is_some()
+            });
+        }
         let survivors = heap.live_count();
         heap.allocs_since_gc.set(0);
         heap.gc_threshold.set(survivors.max(MINIMUM_THRESHOLD));

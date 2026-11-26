@@ -262,74 +262,6 @@ fn rfind_units(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
         .find(|&index| haystack[index..index + needle.len()] == *needle)
 }
 
-// expands $$, $&, $`, $' and $n in a replacement template for a string match
-fn expand_replacement(
-    template: &[u16],
-    matched: &[u16],
-    position: usize,
-    subject: &[u16],
-    captures: &[Option<Vec<u16>>],
-) -> Vec<u16> {
-    let mut output = Vec::with_capacity(template.len());
-    let mut index = 0;
-    let dollar = u16::from(b'$');
-    while index < template.len() {
-        let unit = template[index];
-        if unit != dollar || index + 1 >= template.len() {
-            output.push(unit);
-            index += 1;
-            continue;
-        }
-        let next = template[index + 1];
-        match next {
-            next if next == dollar => {
-                output.push(dollar);
-                index += 2;
-            }
-            next if next == u16::from(b'&') => {
-                output.extend_from_slice(matched);
-                index += 2;
-            }
-            next if next == u16::from(b'`') => {
-                output.extend_from_slice(&subject[..position]);
-                index += 2;
-            }
-            next if next == u16::from(b'\'') => {
-                let end = (position + matched.len()).min(subject.len());
-                output.extend_from_slice(&subject[end..]);
-                index += 2;
-            }
-            next if (u16::from(b'0')..=u16::from(b'9')).contains(&next) => {
-                let first = usize::from(next - u16::from(b'0'));
-                let second = template
-                    .get(index + 2)
-                    .filter(|unit| (u16::from(b'0')..=u16::from(b'9')).contains(unit))
-                    .map(|unit| usize::from(unit - u16::from(b'0')));
-                let two = second.map(|second| first * 10 + second);
-                if let Some(two) = two.filter(|two| *two >= 1 && *two <= captures.len()) {
-                    if let Some(capture) = &captures[two - 1] {
-                        output.extend_from_slice(capture);
-                    }
-                    index += 3;
-                } else if first >= 1 && first <= captures.len() {
-                    if let Some(capture) = &captures[first - 1] {
-                        output.extend_from_slice(capture);
-                    }
-                    index += 2;
-                } else {
-                    output.push(dollar);
-                    index += 1;
-                }
-            }
-            _ => {
-                output.push(dollar);
-                index += 1;
-            }
-        }
-    }
-    output
-}
-
 fn argument(arguments: &[Value], index: usize) -> Value {
     arguments.get(index).cloned().unwrap_or(Value::Undefined)
 }
@@ -373,24 +305,10 @@ impl ScriptRuntime {
         heap: &super::heap::Heap,
         pattern: &Value,
     ) -> Option<Rc<super::pattern::RegExpData>> {
-        let Value::Object(object) = pattern else {
-            return None;
-        };
-        let borrowed = unsafe { heap.object_ref(object)? };
-        let object::ObjectClass::RegExp(data) = &borrowed.class else {
-            return None;
-        };
-        if borrowed.contains_key("@@split") {
-            return None;
-        }
-        let proto = borrowed.own_prototype()?;
-        if !object::ObjectHandle::ptr_eq(proto, &self.intrinsics.regexp_prototype) {
-            return None;
-        }
-        let proto_borrowed = unsafe { heap.object_ref(proto)? };
-        proto_borrowed
-            .regexp_split_intact(heap)
-            .then(|| data.clone())
+        let data = self.plain_regexp_data(heap, pattern)?;
+        (self.regexp_proto_slot_intact(heap, 7, super::regexp::RegExpMethod::Split)
+            && self.regexp_species_and_exec_intact(heap))
+        .then_some(data)
     }
 
     pub(super) fn template_replacement(
@@ -419,38 +337,104 @@ impl ScriptRuntime {
             return Ok(units(&self.coerce_string(result)?));
         }
         let template = units(&self.coerce_string(replacement.clone())?);
-        let mut expanded = expand_replacement(&template, matched, position, subject, captures);
-        if let Value::Object(_) = groups {
-            expanded = self.expand_named_groups(&expanded, &groups)?;
-        }
-        Ok(expanded)
+        let named = if matches!(groups, Value::Undefined) {
+            None
+        } else {
+            Some(self.coerce_object(groups)?)
+        };
+        self.expand_substitution(
+            &template,
+            matched,
+            position,
+            subject,
+            captures,
+            named.as_ref(),
+        )
     }
 
-    // $<name> references to named groups in a replacement template
-    fn expand_named_groups(
+    // single-pass substitution for dollar escapes and named captures
+    pub(super) fn expand_substitution(
         &mut self,
         template: &[u16],
-        groups: &Value,
+        matched: &[u16],
+        position: usize,
+        subject: &[u16],
+        captures: &[Option<Vec<u16>>],
+        groups: Option<&Value>,
     ) -> Result<Vec<u16>, ScriptError> {
         let mut output = Vec::with_capacity(template.len());
         let mut index = 0;
+        let dollar = u16::from(b'$');
         while index < template.len() {
-            if template[index] == u16::from(b'$')
-                && template.get(index + 1) == Some(&u16::from(b'<'))
-                && let Some(close) = template[index + 2..]
-                    .iter()
-                    .position(|unit| *unit == u16::from(b'>'))
-            {
-                let name = from_units(&template[index + 2..index + 2 + close]);
-                let value = self.get_property(groups, &name)?;
-                if !matches!(value, Value::Undefined) {
-                    output.extend(units(&self.coerce_string(value)?));
-                }
-                index += close + 3;
+            let unit = template[index];
+            if unit != dollar || index + 1 >= template.len() {
+                output.push(unit);
+                index += 1;
                 continue;
             }
-            output.push(template[index]);
-            index += 1;
+            let next = template[index + 1];
+            match next {
+                n if n == dollar => {
+                    output.push(dollar);
+                    index += 2;
+                }
+                n if n == u16::from(b'&') => {
+                    output.extend_from_slice(matched);
+                    index += 2;
+                }
+                n if n == u16::from(b'`') => {
+                    output.extend_from_slice(&subject[..position]);
+                    index += 2;
+                }
+                n if n == u16::from(b'\'') => {
+                    let end = (position + matched.len()).min(subject.len());
+                    output.extend_from_slice(&subject[end..]);
+                    index += 2;
+                }
+                n if n == u16::from(b'<') => {
+                    if let Some(groups) = groups
+                        && let Some(close) = template[index + 2..]
+                            .iter()
+                            .position(|u| *u == u16::from(b'>'))
+                    {
+                        let name = from_units(&template[index + 2..index + 2 + close]);
+                        let value = self.get_property(groups, &name)?;
+                        if !matches!(value, Value::Undefined) {
+                            output.extend(units(&self.coerce_string(value)?));
+                        }
+                        index += close + 3;
+                    } else {
+                        output.push(dollar);
+                        index += 1;
+                    }
+                }
+                n if (u16::from(b'0')..=u16::from(b'9')).contains(&n) => {
+                    let first = usize::from(n - u16::from(b'0'));
+                    let second = template
+                        .get(index + 2)
+                        .filter(|u| (u16::from(b'0')..=u16::from(b'9')).contains(u))
+                        .map(|u| usize::from(u - u16::from(b'0')));
+                    let two = second.map(|second| first * 10 + second);
+                    if let Some(two) = two.filter(|two| *two >= 1 && *two <= captures.len()) {
+                        if let Some(capture) = &captures[two - 1] {
+                            output.extend_from_slice(capture);
+                        }
+                        index += 3;
+                    } else if first >= 1 && first <= captures.len() {
+                        if let Some(capture) = &captures[first - 1] {
+                            output.extend_from_slice(capture);
+                        }
+                        index += 2;
+                    } else {
+                        output.push(dollar);
+                        index += 1;
+                    }
+                }
+                _ => {
+                    output.push(dollar);
+                    index += 1;
+                }
+            }
         }
         Ok(output)
     }
@@ -462,15 +446,20 @@ impl ScriptRuntime {
         arguments: &[Value],
     ) -> Result<Value, ScriptError> {
         use StringMethod as M;
-        // regular-expression aware methods hand an object pattern its own protocol first
-        if let M::Match | M::MatchAll | M::Replace | M::ReplaceAll | M::Search | M::Split = method
-            && let Some(pattern) = arguments.first()
-            && !matches!(pattern, Value::Undefined | Value::Null | Value::String(_))
-            && !super::operations::is_primitive(pattern)
-        {
-            if matches!(method, M::Split) {
+        // regular-expression aware methods hand a pattern its own symbol protocol first
+        if let M::Match | M::MatchAll | M::Replace | M::ReplaceAll | M::Search | M::Split = method {
+            if matches!(this, Value::Undefined | Value::Null) {
+                return Err(self.type_error(format!(
+                    "String.prototype.{method:?} called on null or undefined"
+                )));
+            }
+            if let Some(pattern) = arguments.first()
+                && !super::operations::is_primitive(pattern)
+            {
                 let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
-                if let Some(data) = self.intrinsic_regexp_split(heap, pattern) {
+                if matches!(method, M::Split)
+                    && let Some(data) = self.intrinsic_regexp_split(heap, pattern)
+                {
                     let subject = self.this_js_str(this, method)?;
                     let limit = match arguments.get(1) {
                         None | Some(Value::Undefined) => u32::MAX as usize,
@@ -478,19 +467,27 @@ impl ScriptRuntime {
                     };
                     return self.regexp_split_str_fast(heap, &data, &subject, limit);
                 }
-            }
-            let pattern = pattern.clone();
-            let symbol = match method {
-                M::Match => "@@match",
-                M::MatchAll => "@@matchAll",
-                M::Replace | M::ReplaceAll => "@@replace",
-                M::Search => "@@search",
-                _ => "@@split",
-            };
-            let protocol = self.get_property(&pattern, symbol)?;
-            if is_callable(&protocol) {
-                if let M::ReplaceAll | M::MatchAll = method {
+                if let Some((slot_idx, rx_method)) = match method {
+                    M::Replace => Some((5, super::regexp::RegExpMethod::Replace)),
+                    M::Match => Some((3, super::regexp::RegExpMethod::Match)),
+                    M::Search => Some((6, super::regexp::RegExpMethod::Search)),
+                    _ => None,
+                } && self.plain_regexp_data(heap, pattern).is_some()
+                    && self.regexp_proto_slot_intact(heap, slot_idx, rx_method)
+                {
+                    let mut forwarded = Vec::with_capacity(arguments.len());
+                    forwarded.push(this.clone());
+                    forwarded.extend(arguments.iter().skip(1).cloned());
+                    return self.call_regexp(rx_method, pattern.clone(), forwarded, None);
+                }
+                let pattern = pattern.clone();
+                if let M::ReplaceAll | M::MatchAll = method
+                    && self.is_regexp(&pattern)?
+                {
                     let flags = self.get_property(&pattern, "flags")?;
+                    if matches!(flags, Value::Undefined | Value::Null) {
+                        return Err(self.type_error("RegExp flags cannot be null or undefined"));
+                    }
                     let flags = self.coerce_string(flags)?;
                     if !flags.contains('g') {
                         return Err(self.type_error(format!(
@@ -498,11 +495,25 @@ impl ScriptRuntime {
                         )));
                     }
                 }
-                let subject = self.this_js_str(this, method)?;
-                let mut forwarded = Vec::with_capacity(arguments.len());
-                forwarded.push(Value::String(subject));
-                forwarded.extend(arguments.iter().skip(1).cloned());
-                return self.call_function(protocol, pattern, forwarded);
+                let symbol = match method {
+                    M::Match => "@@match",
+                    M::MatchAll => "@@matchAll",
+                    M::Replace | M::ReplaceAll => "@@replace",
+                    M::Search => "@@search",
+                    _ => "@@split",
+                };
+                let protocol = self.get_property(&pattern, symbol)?;
+                if !matches!(protocol, Value::Undefined | Value::Null) {
+                    if !is_callable(&protocol) {
+                        return Err(self.type_error(format!(
+                            "Symbol protocol for {method:?} is not a function"
+                        )));
+                    }
+                    let mut forwarded = Vec::with_capacity(arguments.len());
+                    forwarded.push(this.clone());
+                    forwarded.extend(arguments.iter().skip(1).cloned());
+                    return self.call_function(protocol, pattern, forwarded);
+                }
             }
         }
         let text = self.this_js_str(this, method)?;
@@ -739,16 +750,19 @@ impl ScriptRuntime {
             M::Replace | M::ReplaceAll => {
                 let search_str = self.arg_js_str(arguments.first())?;
                 let replacement = argument(arguments, 1);
-                if text.is_ascii()
-                    && search_str.is_ascii()
-                    && !search_str.is_empty()
-                    && !is_callable(&replacement)
-                {
-                    let rep_str = match &replacement {
+                let functional = is_callable(&replacement);
+                let replacement = if functional {
+                    replacement
+                } else {
+                    let rep_str: JsStr = match &replacement {
                         Value::String(s) => s.clone(),
                         other => self.coerce_string(other.clone())?.into(),
                     };
-                    if !rep_str.contains('$') {
+                    if text.is_ascii()
+                        && search_str.is_ascii()
+                        && !search_str.is_empty()
+                        && !rep_str.contains('$')
+                    {
                         let hay: &str = &text;
                         let needle: &str = &search_str;
                         return Ok(if matches!(method, M::Replace) {
@@ -770,7 +784,8 @@ impl ScriptRuntime {
                             Value::String(hay.replace(needle, &rep_str).into())
                         });
                     }
-                }
+                    Value::String(rep_str)
+                };
                 let search = units(&search_str);
                 let subject = units(&text);
                 let mut positions = Vec::new();
@@ -871,16 +886,18 @@ impl ScriptRuntime {
                     None | Some(Value::Undefined) => u32::MAX as usize,
                     Some(limit) => self.coerce_uint32(limit.clone())? as usize,
                 };
+                let separator_arg = arguments.first();
+                let sep_str = match separator_arg {
+                    None | Some(Value::Undefined) => None,
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(other) => Some(self.coerce_string(other.clone())?.into()),
+                };
                 if limit == 0 {
                     return Ok(Self::new_array(Vec::new()));
                 }
-                let parts: Vec<Value> = match arguments.first() {
-                    None | Some(Value::Undefined) => vec![Value::String(text)],
-                    Some(separator) => {
-                        let sep_str = match separator {
-                            Value::String(s) => s.clone(),
-                            other => self.coerce_string(other.clone())?.into(),
-                        };
+                let parts: Vec<Value> = match sep_str {
+                    None => vec![Value::String(text)],
+                    Some(sep_str) => {
                         if text.is_ascii() && sep_str.is_ascii() {
                             if sep_str.is_empty() {
                                 text.as_bytes()
@@ -1187,14 +1204,19 @@ mod tests {
 
     #[test]
     fn replacement_templates_expand_like_the_spec() {
+        let document = crate::dom::Document::parse(r#"<p></p>"#).expect("document should parse");
+        let mut runtime = ScriptRuntime::new(Rc::new(RefCell::new(document)));
         let subject = units("abc");
-        let output = expand_replacement(
-            &units("[$$|$&|$`|$'|$1|$9]"),
-            &units("b"),
-            1,
-            &subject,
-            &[Some(units("x"))],
-        );
+        let output = runtime
+            .expand_substitution(
+                &units("[$$|$&|$`|$'|$1|$9]"),
+                &units("b"),
+                1,
+                &subject,
+                &[Some(units("x"))],
+                None,
+            )
+            .expect("template should expand");
         assert_eq!(from_units(&output), "[$|b|a|c|x|$9]");
     }
 

@@ -214,6 +214,8 @@ pub(super) enum ObjectClass {
     WeakRef(ObjectWeak),
     // an Array Iterator, which reads its target live on every step
     ArrayIterator(Rc<RefCell<ArrayIteration>>),
+    // a regexp string iterator from matchall
+    RegExpIterator(Rc<RefCell<super::regexp::RegExpIteratorState>>),
     // an object that holds event listeners, keyed by this id in the runtime's registry
     EventTarget(u32),
     // a Mutation, Resize or IntersectionObserver, keyed in the runtime's registry
@@ -1372,6 +1374,61 @@ impl JsObject {
             ObjectClass::Native(native)
                 if matches!(**native, super::realm::Native::Array(super::arrays::ArrayMethod::Pop))
         )
+    }
+
+    #[inline]
+    pub(super) fn has_no_indexed_keys(&self) -> bool {
+        !self.shape.has_integer_key
+    }
+
+    #[inline]
+    pub(super) fn shape_id(&self) -> u32 {
+        self.shape.id
+    }
+
+    #[inline]
+    pub(super) fn shape_keys(&self) -> &[Rc<str>] {
+        &self.shape.keys
+    }
+
+    #[inline]
+    pub(super) fn has_no_accessors(&self) -> bool {
+        self.shape.attrs.iter().all(|&a| (a & ATTR_ACCESSOR) == 0)
+    }
+
+    #[inline]
+    pub(super) fn is_slot_enumerable(&self, index: usize) -> bool {
+        (self.shape.attrs[index] & ATTR_ENUMERABLE) != 0
+    }
+
+    #[inline]
+    pub(super) fn is_plain_regexp_own(&self) -> bool {
+        self.shape.keys.len() == 1 && &*self.shape.keys[0] == "lastIndex"
+    }
+
+    #[inline]
+    pub(super) fn plain_writable_last_index(&self) -> Option<f64> {
+        if self.is_plain_regexp_own()
+            && (self.shape.attrs[0] & (ATTR_ACCESSOR | ATTR_WRITABLE)) == ATTR_WRITABLE
+            && let Some(Slot::Data(Value::Number(n))) = self.properties.first()
+        {
+            Some(*n)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(super) fn set_plain_last_index(&mut self, index: usize) -> bool {
+        if self.is_plain_regexp_own()
+            && (self.shape.attrs[0] & (ATTR_ACCESSOR | ATTR_WRITABLE)) == ATTR_WRITABLE
+            && let Some(Slot::Data(slot)) = self.properties.as_mut_slice().first_mut()
+        {
+            *slot = Value::Number(index as f64);
+            true
+        } else {
+            false
+        }
     }
 
     #[inline]

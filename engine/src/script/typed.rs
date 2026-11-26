@@ -552,7 +552,7 @@ impl ScriptRuntime {
     }
 
     // ToNumber, or ToBigInt for the 64-bit integer kinds
-    fn typed_element_value(
+    pub(super) fn typed_element_value(
         &mut self,
         kind: ElementKind,
         value: Value,
@@ -642,7 +642,15 @@ impl ScriptRuntime {
                                 }
                                 buffer_length
                             }
-                            Some(length) => offset + length * kind.size(),
+                            Some(length) => {
+                                let Some(byte_len) = length.checked_mul(kind.size()) else {
+                                    return Err(self.range_error("Invalid typed array length"));
+                                };
+                                let Some(end) = offset.checked_add(byte_len) else {
+                                    return Err(self.range_error("Invalid typed array length"));
+                                };
+                                end
+                            }
                         };
                         if offset > buffer_length || end > buffer_length {
                             return Err(self.range_error("Invalid typed array length"));
@@ -651,53 +659,147 @@ impl ScriptRuntime {
                     }
                     Value::TypedArray(_) => {
                         let source = self.valid_typed(&first)?;
+                        if source.borrow().kind.is_bigint() != kind.is_bigint() {
+                            return Err(self.type_error(
+                                "Cannot mix BigInt and other types in TypedArray constructor",
+                            ));
+                        }
                         let values = elements(&source.borrow());
                         self.typed_from_values(kind, values)
                     }
                     Value::Object(_) | Value::Array(_) => {
-                        let iterable = !matches!(
-                            self.get_property(&first, "@@iterator")?,
-                            Value::Undefined | Value::Null
-                        );
-                        let values = if iterable {
-                            self.iterate_to_vec(first)?
+                        let iter_method = self.get_property(&first, "@@iterator")?;
+                        let values = if !matches!(iter_method, Value::Undefined | Value::Null) {
+                            if !is_callable(&iter_method) {
+                                return Err(self.type_error("Symbol.iterator is not a function"));
+                            }
+                            let iterator = self.call_function(iter_method, first, Vec::new())?;
+                            if super::operations::is_primitive(&iterator) {
+                                return Err(self.type_error(
+                                    "Result of the Symbol.iterator method is not an object",
+                                ));
+                            }
+                            let next = self.get_property(&iterator, "next")?;
+                            let mut out = Vec::new();
+                            loop {
+                                let step =
+                                    self.call_function(next.clone(), iterator.clone(), Vec::new())?;
+                                if super::operations::is_primitive(&step) {
+                                    return Err(self.type_error("Iterator result is not an object"));
+                                }
+                                if self.get_property(&step, "done")?.truthy() {
+                                    break;
+                                }
+                                out.push(self.get_property(&step, "value")?);
+                            }
+                            out
                         } else {
-                            self.array_like_list(&first)?
+                            let len = self.array_like_length(&first)?;
+                            if len > MAX_TYPED_ARRAY_BYTES as u64 {
+                                return Err(self.range_error("Invalid typed array length"));
+                            }
+                            let mut out = Vec::with_capacity(len as usize);
+                            for k in 0..len {
+                                out.push(self.get_property(&first, &k.to_string())?);
+                            }
+                            out
                         };
                         self.typed_from_values(kind, values)
                     }
                     _ => {
                         let length = self.index_argument(first, "typed array length")?;
-                        let buffer = self.allocate(length * kind.size())?;
-                        Ok(new_typed(kind, buffer, 0, length * kind.size()))
+                        let Some(bytes) = length.checked_mul(kind.size()) else {
+                            return Err(self.range_error("Array buffer allocation failed"));
+                        };
+                        let buffer = self.allocate(bytes)?;
+                        Ok(new_typed(kind, buffer, 0, bytes))
                     }
                 }
             }
             M::AbstractConstructor => {
                 Err(self.type_error("Abstract class TypedArray not directly constructable"))
             }
-            M::From | M::Of => {
-                let kind = self.kind_of_constructor(&this)?;
-                let values = if matches!(method, M::Of) {
-                    arguments
-                } else {
-                    let mapper = argument(&arguments, 1);
-                    let values = self.iterate_to_vec(first)?;
-                    if is_callable(&mapper) {
-                        let mut mapped = Vec::with_capacity(values.len());
-                        for (index, value) in values.into_iter().enumerate() {
-                            mapped.push(self.call_function(
-                                mapper.clone(),
-                                argument(&arguments, 2),
-                                vec![value, Value::Number(index as f64)],
-                            )?);
-                        }
-                        mapped
-                    } else {
-                        values
+            M::Of => {
+                if !Self::is_constructor(&this) {
+                    return Err(self.type_error("TypedArray.of called on non-constructor"));
+                }
+                let len = arguments.len();
+                let made = self.typed_array_create(this, vec![Value::Number(len as f64)])?;
+                for (index, value) in arguments.into_iter().enumerate() {
+                    self.set_index(&made, Value::Number(index as f64), value, true)?;
+                }
+                Ok(made)
+            }
+            M::From => {
+                if !Self::is_constructor(&this) {
+                    return Err(self.type_error("TypedArray.from called on non-constructor"));
+                }
+                let mapper = argument(&arguments, 1);
+                let mapping = !matches!(mapper, Value::Undefined);
+                if mapping && !is_callable(&mapper) {
+                    return Err(self.type_error("TypedArray.from mapper is not a function"));
+                }
+                let this_arg = argument(&arguments, 2);
+                if matches!(first, Value::Undefined | Value::Null) {
+                    return Err(self
+                        .type_error("TypedArray.from requires an array-like or iterable object"));
+                }
+                let iter_method = self.get_property(&first, "@@iterator")?;
+                if !matches!(iter_method, Value::Undefined | Value::Null) {
+                    if !is_callable(&iter_method) {
+                        return Err(self.type_error("Symbol.iterator is not a function"));
                     }
-                };
-                self.typed_from_values(kind, values)
+                    let iterator = self.call_function(iter_method, first, Vec::new())?;
+                    if super::operations::is_primitive(&iterator) {
+                        return Err(self
+                            .type_error("Result of the Symbol.iterator method is not an object"));
+                    }
+                    let next = self.get_property(&iterator, "next")?;
+                    let mut values = Vec::new();
+                    loop {
+                        let step =
+                            self.call_function(next.clone(), iterator.clone(), Vec::new())?;
+                        if super::operations::is_primitive(&step) {
+                            return Err(self.type_error("Iterator result is not an object"));
+                        }
+                        if self.get_property(&step, "done")?.truthy() {
+                            break;
+                        }
+                        values.push(self.get_property(&step, "value")?);
+                    }
+                    let len = values.len();
+                    let target = self.typed_array_create(this, vec![Value::Number(len as f64)])?;
+                    for (k, value) in values.into_iter().enumerate() {
+                        let mapped = if mapping {
+                            self.call_function(
+                                mapper.clone(),
+                                this_arg.clone(),
+                                vec![value, Value::Number(k as f64)],
+                            )?
+                        } else {
+                            value
+                        };
+                        self.set_index(&target, Value::Number(k as f64), mapped, true)?;
+                    }
+                    return Ok(target);
+                }
+                let array_like = self.coerce_object(first)?;
+                let len = self.array_like_length(&array_like)?;
+                let target = self.typed_array_create(this, vec![Value::Number(len as f64)])?;
+                for k in 0..len {
+                    let value = self.get_property(&array_like, &k.to_string())?;
+                    let mapped = if mapping {
+                        self.call_function(
+                            mapper.clone(),
+                            this_arg.clone(),
+                            vec![value, Value::Number(k as f64)],
+                        )?
+                    } else {
+                        value
+                    };
+                    self.set_index(&target, Value::Number(k as f64), mapped, true)?;
+                }
+                Ok(target)
             }
             M::Buffer => Ok(Value::Bytes(
                 self.this_typed(&this)?.borrow().buffer.clone(),
@@ -721,18 +823,58 @@ impl ScriptRuntime {
                 _ => Value::Undefined,
             }),
             M::Set => {
-                let array = self.valid_typed(&this)?;
-                let offset = self.index_argument(argument(&arguments, 1), "offset")?;
-                let values = match &first {
-                    Value::TypedArray(_) => elements(&self.valid_typed(&first)?.borrow()),
-                    other => self.array_like_list(other)?,
+                let array = self.this_typed(&this)?;
+                let target_offset = match argument(&arguments, 1) {
+                    Value::Undefined => 0.0,
+                    v => {
+                        let n = self.coerce_number(v)?;
+                        if n.is_nan() { 0.0 } else { n.trunc() }
+                    }
                 };
-                let count = element_count(&array.borrow());
-                if offset + values.len() > count {
+                if target_offset < 0.0 {
                     return Err(self.range_error("offset is out of bounds"));
                 }
-                for (index, value) in values.into_iter().enumerate() {
-                    self.typed_set(&array, offset + index, value)?;
+                if typed_range(&array.borrow()).is_none() {
+                    return Err(self.type_error(
+                        "Cannot perform %TypedArray%.prototype.set on a detached or out of bounds typed array",
+                    ));
+                }
+                let target_len = element_count(&array.borrow());
+                if target_offset.is_infinite() {
+                    return Err(self.range_error("offset is out of bounds"));
+                }
+                let offset = target_offset as u64;
+                if let Value::TypedArray(_) = &first {
+                    let src = self.valid_typed(&first)?;
+                    let src_kind = src.borrow().kind;
+                    let dst_kind = array.borrow().kind;
+                    if src_kind.is_bigint() != dst_kind.is_bigint() {
+                        return Err(
+                            self.type_error("Cannot mix BigInt and other types in TypedArray.set")
+                        );
+                    }
+                    let values = elements(&src.borrow());
+                    if offset.saturating_add(values.len() as u64) > target_len as u64 {
+                        return Err(self.range_error("offset is out of bounds"));
+                    }
+                    for (index, value) in values.into_iter().enumerate() {
+                        self.typed_set(&array, offset as usize + index, value)?;
+                    }
+                    return Ok(Value::Undefined);
+                }
+                let src = self.coerce_object(first)?;
+                let src_len = self.array_like_length(&src)?;
+                if offset.saturating_add(src_len) > target_len as u64 {
+                    return Err(self.range_error("offset is out of bounds"));
+                }
+                let kind = array.borrow().kind;
+                for index in 0..src_len {
+                    let value = self.get_property(&src, &index.to_string())?;
+                    let converted = self.typed_element_value(kind, value)?;
+                    let borrowed = array.borrow();
+                    if typed_range(&borrowed).is_some() {
+                        write_element(&borrowed, offset as usize + index as usize, &converted);
+                    }
                 }
                 Ok(Value::Undefined)
             }
@@ -991,6 +1133,40 @@ impl ScriptRuntime {
                         }
                         Ok(result)
                     }
+                    ArrayMethod::With => {
+                        let len = element_count(&array.borrow());
+                        let relative_index = match first {
+                            Value::Undefined => 0.0,
+                            v => {
+                                let n = self.coerce_number(v)?;
+                                if n.is_nan() { 0.0 } else { n.trunc() }
+                            }
+                        };
+                        let actual = if relative_index < 0.0 {
+                            len as f64 + relative_index
+                        } else {
+                            relative_index
+                        };
+                        let value = self.typed_element_value(kind, argument(&arguments, 1))?;
+                        if actual < 0.0 || actual >= len as f64 {
+                            return Err(self.range_error("Invalid index"));
+                        }
+                        let current_len = element_count(&array.borrow());
+                        if typed_range(&array.borrow()).is_none() || actual >= current_len as f64 {
+                            return Err(self.range_error("Invalid index"));
+                        }
+                        let mut values = elements(&array.borrow());
+                        values.resize(
+                            len,
+                            if kind.is_bigint() {
+                                Value::BigInt(Rc::new(super::bigint::BigInt::from_i64(0)))
+                            } else {
+                                Value::Number(0.0)
+                            },
+                        );
+                        values[actual as usize] = value;
+                        self.typed_from_values(kind, values)
+                    }
                     _ => {
                         let copy = Self::new_array(elements(&array.borrow()));
                         // numbers sort numerically in typed arrays
@@ -1188,31 +1364,53 @@ impl ScriptRuntime {
                 Ok(made)
             }
             M::ViewConstructor => {
-                if new_target.is_none() {
+                let Some(nt) = new_target else {
                     return Err(self.type_error("Constructor DataView requires 'new'"));
-                }
+                };
                 let Value::Bytes(buffer) = &first else {
                     return Err(self.type_error(
                         "First argument to DataView constructor must be an ArrayBuffer",
                     ));
                 };
                 let offset = self.index_argument(argument(&arguments, 1), "DataView offset")?;
+                if buffer.borrow().detached {
+                    return Err(
+                        self.type_error("Cannot construct a DataView on a detached ArrayBuffer")
+                    );
+                }
+                let buffer_len = buffer.borrow().len();
+                if offset > buffer_len {
+                    return Err(self.range_error("Invalid DataView offset"));
+                }
                 let view_length = match argument(&arguments, 2) {
                     Value::Undefined => None,
-                    value => Some(self.index_argument(value, "DataView length")?),
+                    value => {
+                        let len = self.index_argument(value, "DataView length")?;
+                        if offset.checked_add(len).is_none_or(|end| end > buffer_len) {
+                            return Err(self.range_error("Invalid DataView length"));
+                        }
+                        Some(len)
+                    }
                 };
+                let default_proto = self.intrinsics.data_view_prototype.clone();
+                let prototype = self.prototype_from_constructor_or(&nt, &default_proto)?;
                 if buffer.borrow().detached {
                     return Err(
                         self.type_error("Cannot construct a DataView on a detached ArrayBuffer")
                     );
                 }
                 let length = buffer.borrow().len();
-                let tracking = view_length.is_none() && buffer.borrow().max.is_some();
-                let end = view_length.map_or(length, |view_length| offset + view_length);
-                if offset > length || end > length {
-                    return Err(self.range_error("Invalid DataView length"));
+                if offset > length {
+                    return Err(self.range_error("Invalid DataView offset"));
                 }
-                let prototype = self.intrinsics.data_view_prototype.clone();
+                let tracking = view_length.is_none() && buffer.borrow().max.is_some();
+                let end = match view_length {
+                    None => length,
+                    Some(vl) => match offset.checked_add(vl) {
+                        Some(end) if end <= length => end,
+                        _ => return Err(self.range_error("Invalid DataView length")),
+                    },
+                };
                 Ok(Value::Object(new_object(JsObject::with_prototype(
                     Some(prototype),
                     ObjectClass::DataView(Box::new(crate::script::object::DataViewRange {
@@ -1306,16 +1504,6 @@ impl ScriptRuntime {
 
     fn numeric_comparator(&self) -> Value {
         Value::builtin(Builtin::native(Native::NumericCompare))
-    }
-
-    fn kind_of_constructor(&mut self, constructor: &Value) -> Result<ElementKind, ScriptError> {
-        if let Value::Object(object) = constructor
-            && let ObjectClass::Native(native) = &object.borrow().class
-            && let Native::Typed(TypedMethod::Constructor(kind)) = **native
-        {
-            return Ok(kind);
-        }
-        Err(self.type_error("this is not a typed array constructor"))
     }
 }
 
@@ -1470,6 +1658,42 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(out).as_deref(),
             Some("true|ok|true|0|0|true|2,21,4,5|true|true|1")
+        );
+    }
+
+    #[test]
+    fn typed_array_internals_from_of_with_and_dataview_proto() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                "use strict";
+                const seen = [];
+                const a = Uint8Array.from({ length: 2, 0: 5, 1: 6 }, function(v) { return v + this.d; }, { d: 10 });
+                seen.push(a.join());
+                try { delete a[0]; } catch (e) { seen.push(e.name); }
+                seen.push(delete a["-0"], delete a[9]);
+                let coerced = false;
+                try {
+                    a.with(99, { valueOf() { coerced = true; return 1; } });
+                } catch (e) {
+                    seen.push(coerced, e.name);
+                }
+                try { new Uint8Array(new BigInt64Array(0)); } catch (e) { seen.push(e.name); }
+                class CustomView extends DataView {}
+                const dv = new CustomView(new ArrayBuffer(8), 2, 4);
+                seen.push(dv instanceof CustomView, dv.byteOffset, dv.byteLength);
+                document.getElementById("out").textContent = seen.join("|");
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some("15,16|TypeError|true|true|true|RangeError|TypeError|true|2|4")
         );
     }
 }

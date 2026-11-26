@@ -11,6 +11,8 @@ use std::cell::Cell;
 pub(super) enum Combinator {
     All,
     AllSettled,
+    AllKeyed,
+    AllSettledKeyed,
     Any,
     Race,
 }
@@ -22,6 +24,7 @@ pub(super) struct Capability {
 }
 
 pub(super) struct Aggregate {
+    keys: RefCell<Vec<String>>,
     values: RefCell<Vec<Value>>,
     remaining: Cell<usize>,
     resolve: Value,
@@ -141,6 +144,29 @@ impl ScriptRuntime {
 
     fn settle_aggregate(&mut self, state: &Aggregate) -> Result<(), ScriptError> {
         if state.remaining.get() != 0 {
+            return Ok(());
+        }
+        if matches!(
+            state.combinator,
+            Combinator::AllKeyed | Combinator::AllSettledKeyed
+        ) {
+            let keys = std::mem::take(&mut *state.keys.borrow_mut());
+            let values = std::mem::take(&mut *state.values.borrow_mut());
+            let object = object::new_object(object::JsObject::with_prototype(
+                None,
+                object::ObjectClass::Ordinary,
+            ));
+            {
+                let mut borrowed = object.borrow_mut();
+                for (key, value) in keys.into_iter().zip(values) {
+                    borrowed.define(key, object::Property::data(value));
+                }
+            }
+            self.call_function(
+                state.resolve.clone(),
+                Value::Undefined,
+                vec![Value::Object(object)],
+            )?;
             return Ok(());
         }
         let values = Self::new_array(std::mem::take(&mut *state.values.borrow_mut()));
@@ -273,6 +299,7 @@ impl ScriptRuntime {
         }
         let iterator = self.get_iterator(iterable)?;
         let state = Rc::new(Aggregate {
+            keys: RefCell::new(Vec::new()),
             values: RefCell::new(Vec::new()),
             remaining: Cell::new(1),
             resolve: resolve.clone(),
@@ -299,6 +326,71 @@ impl ScriptRuntime {
             state.remaining.set(state.remaining.get() - 1);
             self.settle_aggregate(&state)?;
         }
+        Ok(())
+    }
+
+    fn run_keyed_combinator(
+        &mut self,
+        combinator: Combinator,
+        constructor: &Value,
+        promises: Value,
+        resolve: &Value,
+        reject: &Value,
+    ) -> Result<(), ScriptError> {
+        let promise_resolve = self.get_property(constructor, "resolve")?;
+        if !is_callable(&promise_resolve) {
+            return Err(self.type_error("Promise resolve is not a function"));
+        }
+        if is_primitive(&promises) {
+            return Err(self.type_error("Promise keyed combinator requires an object"));
+        }
+        let all_keys = self.all_own_property_keys(&promises)?;
+        let state = Rc::new(Aggregate {
+            keys: RefCell::new(Vec::new()),
+            values: RefCell::new(Vec::new()),
+            remaining: Cell::new(1),
+            resolve: resolve.clone(),
+            reject: reject.clone(),
+            combinator,
+        });
+        for key in all_keys {
+            let Some(property) = self.own_property_of(&promises, &key)? else {
+                continue;
+            };
+            if !property.enumerable {
+                continue;
+            }
+            let item = self.get_property(&promises, &key)?;
+            let next =
+                self.call_function(promise_resolve.clone(), constructor.clone(), vec![item])?;
+            let index = {
+                state.keys.borrow_mut().push(key);
+                let mut values = state.values.borrow_mut();
+                values.push(Value::Undefined);
+                values.len() - 1
+            };
+            let called = Rc::new(Cell::new(false));
+            let element = |rejected| {
+                self.promise_closure(
+                    PromiseFunction::Element {
+                        state: state.clone(),
+                        index,
+                        rejected,
+                        called: called.clone(),
+                    },
+                    1,
+                )
+            };
+            let (fulfilled, rejected) = match combinator {
+                Combinator::AllKeyed => (element(false), reject.clone()),
+                Combinator::AllSettledKeyed => (element(false), element(true)),
+                _ => unreachable!("keyed combinator only"),
+            };
+            state.remaining.set(state.remaining.get() + 1);
+            self.invoke_then(next, vec![fulfilled, rejected])?;
+        }
+        state.remaining.set(state.remaining.get() - 1);
+        self.settle_aggregate(&state)?;
         Ok(())
     }
 
@@ -450,10 +542,16 @@ impl ScriptRuntime {
                         .type_error("Promise combinator called on a value that is not an object"));
                 }
                 let (promise, resolve, reject) = self.promise_capability(&this)?;
-                let iterable = argument(&arguments, 0);
-                if let Err(error) =
-                    self.run_combinator(combinator, &this, iterable, &resolve, &reject)
-                {
+                let input = argument(&arguments, 0);
+                let run = if matches!(
+                    combinator,
+                    Combinator::AllKeyed | Combinator::AllSettledKeyed
+                ) {
+                    self.run_keyed_combinator(combinator, &this, input, &resolve, &reject)
+                } else {
+                    self.run_combinator(combinator, &this, input, &resolve, &reject)
+                };
+                if let Err(error) = run {
                     let reason = self.take_thrown(error);
                     self.call_function(reject, Value::Undefined, vec![reason])?;
                 }
@@ -470,7 +568,7 @@ impl ScriptRuntime {
                 }
                 let value = argument(&arguments, 0);
                 let stored = match state.combinator {
-                    Combinator::AllSettled => {
+                    Combinator::AllSettled | Combinator::AllSettledKeyed => {
                         let (status, key) = if rejected {
                             ("rejected", "reason")
                         } else {
@@ -541,7 +639,7 @@ impl ScriptRuntime {
                 }
                 Ok(value)
             }
-            PromiseFunction::FromAsync => Ok(self.array_from_async(arguments)),
+            PromiseFunction::FromAsync => Ok(self.array_from_async(this, arguments)),
             PromiseFunction::FromAsyncStep(state, phase) => {
                 self.step_from_async(&state, phase, argument(&arguments, 0))
             }
@@ -606,6 +704,43 @@ mod tests {
         assert_eq!(
             document.borrow().element_text_content(out).as_deref(),
             Some("true|true|tracked|kept|true|function|true|true|TypeError|true|2")
+        );
+    }
+
+    #[test]
+    fn promise_keyed_combinators_resolve_null_proto_objects_and_settle_rejections() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [];
+                (async () => {
+                    const sym = Symbol("k");
+                    const input = { a: Promise.resolve(1), b: 2, [sym]: Promise.resolve(3) };
+                    Object.defineProperty(input, "hidden", { value: Promise.reject("skip"), enumerable: false });
+                    const all = await Promise.allKeyed(input);
+                    seen.push(Object.getPrototypeOf(all), all.a, all.b, all[sym], "hidden" in all);
+                    const empty = await Promise.allKeyed({});
+                    seen.push(Object.getPrototypeOf(empty), Object.keys(empty).length);
+                    try {
+                        await Promise.allKeyed({ ok: Promise.resolve(1), bad: Promise.reject("boom") });
+                    } catch (err) {
+                        seen.push(err);
+                    }
+                    const settled = await Promise.allSettledKeyed({ x: Promise.resolve(9), y: Promise.reject("no") });
+                    seen.push(Object.getPrototypeOf(settled), settled.x.status, settled.x.value, settled.y.status, settled.y.reason);
+                    document.getElementById("out").textContent = seen.join("|");
+                })();
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some("|1|2|3|false||0|boom||fulfilled|9|rejected|no")
         );
     }
 }

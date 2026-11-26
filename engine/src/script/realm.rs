@@ -70,6 +70,8 @@ pub(super) enum Native {
     ErrorToString,
     ErrorCaptureStackTrace,
     ErrorIsError,
+    ErrorStackGet,
+    ErrorStackSet,
     RegExpEscape,
     BooleanConstructor,
     BooleanToString,
@@ -354,6 +356,8 @@ pub(super) type BufferObjectMap =
 
 pub(super) struct Intrinsics {
     pub(super) object_prototype: ObjectHandle,
+    pub(super) object_proto_shape: u32,
+    pub(super) array_proto_shape: u32,
     pub(super) function_prototype: ObjectHandle,
     pub(super) async_function_prototype: ObjectHandle,
     pub(super) generator_function_prototype: ObjectHandle,
@@ -378,6 +382,10 @@ pub(super) struct Intrinsics {
     pub(super) promise_prototype: ObjectHandle,
     pub(super) promise_constructor: ObjectHandle,
     pub(super) regexp_prototype: ObjectHandle,
+    pub(super) regexp_constructor: ObjectHandle,
+    pub(super) regexp_proto_shape: u32,
+    pub(super) regexp_ctor_shape: u32,
+    pub(super) regexp_string_iterator_prototype: ObjectHandle,
     pub(super) array_values: Value,
     pub(super) iterator_prototype: ObjectHandle,
     pub(super) array_iterator_prototype: ObjectHandle,
@@ -790,6 +798,12 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         Value::String(String::new().into()),
     );
     build.method(&error_prototype, "toString", Native::ErrorToString, 0);
+    build.getter(
+        &error_prototype,
+        "stack",
+        Native::ErrorStackGet,
+        Some(Native::ErrorStackSet),
+    );
     let error = build.constructor(
         Native::ErrorConstructor("Error"),
         "Error",
@@ -979,6 +993,38 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
     for (key, method, length) in super::arrays::ARRAY_METHODS {
         build.method(&array_prototype, key, Native::Array(*method), *length);
     }
+    let unscopables = new_object(JsObject::with_prototype(None, ObjectClass::Ordinary));
+    for key in [
+        "at",
+        "copyWithin",
+        "entries",
+        "fill",
+        "find",
+        "findIndex",
+        "findLast",
+        "findLastIndex",
+        "flat",
+        "flatMap",
+        "includes",
+        "keys",
+        "toReversed",
+        "toSorted",
+        "toSpliced",
+        "values",
+    ] {
+        unscopables
+            .borrow_mut()
+            .define(key.to_string(), Property::data(Value::Bool(true)));
+    }
+    array_prototype.borrow_mut().define(
+        "@@unscopables".to_string(),
+        Property {
+            slot: Slot::Data(Value::Object(unscopables)),
+            enumerable: false,
+            writable: false,
+            configurable: true,
+        },
+    );
     let array = build.constructor(Native::ArrayConstructor, "Array", 1, &array_prototype);
     build.value(&array, "isArray", Value::builtin(Builtin::ArrayIsArray));
     build.method(&array, "from", Native::ArrayFrom, 1);
@@ -1022,6 +1068,11 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
             ..Property::hidden(Value::Object(generator_prototype.clone()))
         },
     );
+    build.value(
+        &generator_function_prototype,
+        "@@toStringTag",
+        Value::String("GeneratorFunction".into()),
+    );
 
     let async_generator_prototype = plain(&async_iterator_prototype);
     build.method(
@@ -1054,6 +1105,11 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
             writable: false,
             ..Property::hidden(Value::Object(async_generator_prototype.clone()))
         },
+    );
+    build.value(
+        &async_generator_function_prototype,
+        "@@toStringTag",
+        Value::String("AsyncGeneratorFunction".into()),
     );
     let async_function_prototype = plain(&function_prototype);
     build.value(
@@ -1092,6 +1148,16 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
             P::Combinator(super::promises::Combinator::AllSettled),
             1,
         ),
+        (
+            "allKeyed",
+            P::Combinator(super::promises::Combinator::AllKeyed),
+            1,
+        ),
+        (
+            "allSettledKeyed",
+            P::Combinator(super::promises::Combinator::AllSettledKeyed),
+            1,
+        ),
         ("any", P::Combinator(super::promises::Combinator::Any), 1),
         ("race", P::Combinator(super::promises::Combinator::Race), 1),
         ("withResolvers", P::WithResolvers, 0),
@@ -1106,6 +1172,18 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         None,
     );
     globals.push(("Promise", Value::Object(promise_constructor.clone())));
+    let regexp_string_iterator_prototype = plain(&iterator_prototype);
+    build.method(
+        &regexp_string_iterator_prototype,
+        "next",
+        Native::RegExp(super::regexp::RegExpMethod::MatchAllNext),
+        0,
+    );
+    build.value(
+        &regexp_string_iterator_prototype,
+        "@@toStringTag",
+        Value::String("RegExp String Iterator".to_string().into()),
+    );
     let regexp_prototype = plain(&object_prototype);
     for (key, method, length) in super::regexp::REGEXP_METHODS {
         build.method(&regexp_prototype, key, Native::RegExp(*method), *length);
@@ -1119,7 +1197,14 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         2,
         &regexp_prototype,
     );
+    build.getter(
+        &regexp,
+        "@@species",
+        Native::RegExp(super::regexp::RegExpMethod::Species),
+        None,
+    );
     build.method(&regexp, "escape", Native::RegExpEscape, 1);
+    let regexp_constructor = regexp.clone();
     globals.push(("RegExp", Value::Object(regexp)));
 
     let math = plain(&object_prototype);
@@ -1829,8 +1914,14 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         &object_prototype,
         &mut globals,
     );
+    let object_proto_shape = object_prototype.borrow().shape_id();
+    let array_proto_shape = array_prototype.borrow().shape_id();
+    let regexp_proto_shape = regexp_prototype.borrow().shape_id();
+    let regexp_ctor_shape = regexp_constructor.borrow().shape_id();
     let intrinsics = Intrinsics {
         object_prototype,
+        object_proto_shape,
+        array_proto_shape,
         function_prototype,
         async_function_prototype,
         generator_function_prototype,
@@ -1855,6 +1946,10 @@ pub(super) fn create_intrinsics() -> (Intrinsics, Vec<(&'static str, Value)>) {
         promise_prototype,
         promise_constructor,
         regexp_prototype,
+        regexp_constructor,
+        regexp_proto_shape,
+        regexp_ctor_shape,
+        regexp_string_iterator_prototype,
         array_values,
         iterator_prototype,
         array_iterator_prototype,
@@ -2083,6 +2178,7 @@ impl ScriptRuntime {
                 }
                 ObjectClass::Bound(bound) => Self::is_constructor(&bound.target),
                 ObjectClass::Native(native) => native.is_constructor(),
+                ObjectClass::Proxy(proxy) => proxy.constructor,
                 _ => false,
             },
             Value::Builtin(_) => false,
@@ -2191,17 +2287,16 @@ impl ScriptRuntime {
             return self.own_property_of(&Value::Object(object), key);
         }
         if let Value::TypedArray(array) = value {
-            if let Some(index) = array_index(key) {
-                return Ok(
-                    super::typed::read_element(&array.borrow(), index as usize).map(|element| {
-                        Property {
-                            slot: Slot::Data(element),
-                            enumerable: true,
-                            writable: true,
-                            configurable: true,
-                        }
-                    }),
-                );
+            if let Some(number) = super::typed::canonical_numeric_index(key) {
+                let borrowed = array.borrow();
+                return Ok(super::typed::valid_index(&borrowed, number)
+                    .and_then(|index| super::typed::read_element(&borrowed, index))
+                    .map(|element| Property {
+                        slot: Slot::Data(element),
+                        enumerable: true,
+                        writable: true,
+                        configurable: true,
+                    }));
             }
             if array.borrow().object.is_none() {
                 return Ok(None);
@@ -2225,6 +2320,7 @@ impl ScriptRuntime {
                 }
             }
             Value::String(text) => string_own_property(text, key),
+            Value::Builtin(builtin) => builtin_own_property(builtin, key),
             Value::Array(array) if array.borrow().own(key).is_some() => {
                 let mut property = array.borrow().own(key).cloned().expect("checked above");
                 let integrity = array.borrow().integrity();
@@ -2273,6 +2369,35 @@ impl ScriptRuntime {
             }
             _ => None,
         })
+    }
+
+    pub(super) fn all_own_property_keys(
+        &mut self,
+        value: &Value,
+    ) -> Result<Vec<String>, ScriptError> {
+        if let Some(object) = self.wrapper_object(value) {
+            return self.all_own_property_keys(&Value::Object(object));
+        }
+        if let Value::Object(object) = value
+            && let Some(proxy) = super::reflect::proxy_of(object)
+        {
+            return self.proxy_own_keys(&proxy);
+        }
+        let mut keys = self.own_keys(value, false);
+        keys.extend(self.own_keys(value, true));
+        if let Value::TypedArray(array) = value
+            && array.borrow().object.is_some()
+        {
+            let obj = Value::Object(super::typed_object(array));
+            let sym_start = keys
+                .iter()
+                .position(|k| is_symbol_key(k))
+                .unwrap_or(keys.len());
+            let extra_str = self.own_keys(&obj, false);
+            keys.splice(sym_start..sym_start, extra_str);
+            keys.extend(self.own_keys(&obj, true));
+        }
+        Ok(keys)
     }
 
     pub(super) fn own_property_keys(
@@ -2376,7 +2501,10 @@ impl ScriptRuntime {
         }
     }
 
-    fn descriptor_from(&mut self, value: &Value) -> Result<(Property, [bool; 6]), ScriptError> {
+    pub(super) fn descriptor_from(
+        &mut self,
+        value: &Value,
+    ) -> Result<(Property, [bool; 6]), ScriptError> {
         if is_primitive(value) {
             return Err(self.type_error("Property description must be an object"));
         }
@@ -2433,6 +2561,36 @@ impl ScriptRuntime {
         Ok(self.descriptor_from(descriptor)?.0)
     }
 
+    pub(super) fn create_data_property_or_throw(
+        &mut self,
+        target: &Value,
+        key: String,
+        value: Value,
+    ) -> Result<(), ScriptError> {
+        if let Value::Object(object) = target
+            && let Some(proxy) = super::reflect::proxy_of(object)
+        {
+            let descriptor = self.object_from_entries(vec![
+                ("value".to_string(), value),
+                ("writable".to_string(), Value::Bool(true)),
+                ("enumerable".to_string(), Value::Bool(true)),
+                ("configurable".to_string(), Value::Bool(true)),
+            ]);
+            if !self.proxy_define(&proxy, &key, &descriptor)? {
+                return Err(self.type_error(format!(
+                    "'defineProperty' on proxy: trap returned falsish for property '{key}'"
+                )));
+            }
+            return Ok(());
+        }
+        self.apply_property_descriptor(
+            target,
+            key,
+            Property::data(value),
+            [true, true, true, true, false, false],
+        )
+    }
+
     // ValidateAndApplyPropertyDescriptor for ordinary objects
     pub(super) fn define_property_value(
         &mut self,
@@ -2457,7 +2615,7 @@ impl ScriptRuntime {
         self.apply_property_descriptor(target, key, property, present)
     }
 
-    fn apply_property_descriptor(
+    pub(super) fn apply_property_descriptor(
         &mut self,
         target: &Value,
         key: String,
@@ -2729,9 +2887,12 @@ impl ScriptRuntime {
         }
         let first = argument(&arguments, 0);
         match native {
-            Native::ObjectConstructor => {
-                self.construct_native(Native::ObjectConstructor, arguments, Value::Undefined)
-            }
+            Native::ObjectConstructor => self.construct_native(
+                Native::ObjectConstructor,
+                arguments,
+                Value::Undefined,
+                None,
+            ),
             Native::ObjectCreate => {
                 let prototype = match &first {
                     Value::Object(prototype) => Some(prototype.clone()),
@@ -2829,8 +2990,7 @@ impl ScriptRuntime {
             Native::ObjectGetOwnPropertyDescriptors => {
                 let target = self.coerce_object(first)?;
                 let result = self.new_plain_object();
-                let mut keys = self.own_property_keys(&target, false)?;
-                keys.extend(self.own_property_keys(&target, true)?);
+                let keys = self.all_own_property_keys(&target)?;
                 for key in keys {
                     if let Some(property) = self.own_property_of(&target, &key)? {
                         let descriptor = self.descriptor_value(&property);
@@ -2850,28 +3010,147 @@ impl ScriptRuntime {
             }
             Native::ObjectValues | Native::ObjectEntries => {
                 let target = self.coerce_object(first)?;
-                let entries: Vec<(String, Value)> = self
-                    .own_enumerable_entries(&target)?
-                    .into_iter()
-                    .filter(|(key, _)| !is_symbol_key(key))
-                    .collect();
-                let values = entries
-                    .into_iter()
-                    .map(|(key, value)| match native {
-                        Native::ObjectValues => value,
-                        _ => Self::new_array(vec![Value::String(key.into()), value]),
-                    })
-                    .collect();
+                if let Value::Object(obj) = &target {
+                    let borrowed = obj.borrow();
+                    if matches!(borrowed.class, ObjectClass::Ordinary)
+                        && borrowed.has_no_indexed_keys()
+                        && borrowed.has_no_accessors()
+                    {
+                        let keys = borrowed.shape_keys();
+                        let slots = borrowed.slots();
+                        let mut values = Vec::with_capacity(keys.len());
+                        for (index, (key, slot)) in keys.iter().zip(slots).enumerate() {
+                            if !borrowed.is_slot_enumerable(index)
+                                || is_symbol_key(key)
+                                || super::object::is_private_key(key)
+                            {
+                                continue;
+                            }
+                            if let Slot::Data(val) = slot
+                                && !matches!(val, Value::Binding(_) | Value::ConstBinding(_))
+                            {
+                                values.push(match native {
+                                    Native::ObjectValues => val.clone(),
+                                    _ => Self::new_array(vec![
+                                        Value::String(JsStr::from(&**key)),
+                                        val.clone(),
+                                    ]),
+                                });
+                            }
+                        }
+                        return Ok(Self::new_array(values));
+                    }
+                }
+                let keys = self.all_own_property_keys(&target)?;
+                let mut values = Vec::new();
+                for key in keys {
+                    if is_symbol_key(&key) {
+                        continue;
+                    }
+                    if let Some(prop) = self.own_property_of(&target, &key)?
+                        && prop.enumerable
+                    {
+                        let value = self.get_property(&target, &key)?;
+                        values.push(match native {
+                            Native::ObjectValues => value,
+                            _ => Self::new_array(vec![Value::String(key.into()), value]),
+                        });
+                    }
+                }
                 Ok(Self::new_array(values))
             }
             Native::ObjectAssign => {
                 let target = self.coerce_object(first)?;
+                let heap = unsafe { &*super::heap::heap_ptr(self.heap_id) };
                 for source in arguments.into_iter().skip(1) {
                     if matches!(source, Value::Undefined | Value::Null) {
                         continue;
                     }
-                    for (key, value) in self.own_enumerable_entries(&source)? {
-                        self.set_property(&target, &key, value, true)?;
+                    let from = self.coerce_object(source)?;
+                    if let (Value::Object(target_h), Value::Object(from_h)) = (&target, &from)
+                        && !ObjectHandle::ptr_eq(target_h, from_h)
+                    {
+                        let fast_entries = {
+                            let target_ok =
+                                unsafe { heap.object_ref(target_h) }.is_some_and(|t| {
+                                    matches!(t.class, ObjectClass::Ordinary)
+                                        && t.has_no_accessors()
+                                        && match t.own_prototype() {
+                                            None => true,
+                                            Some(p) => {
+                                                ObjectHandle::ptr_eq(
+                                                    p,
+                                                    &self.intrinsics.object_prototype,
+                                                ) && unsafe { heap.object_ref(p) }.is_some_and(
+                                                    |o| {
+                                                        o.shape_id()
+                                                            == self.intrinsics.object_proto_shape
+                                                    },
+                                                )
+                                            }
+                                        }
+                                });
+                            if target_ok {
+                                let fb = from_h.borrow();
+                                if matches!(fb.class, ObjectClass::Ordinary)
+                                    && fb.has_no_indexed_keys()
+                                    && fb.has_no_accessors()
+                                {
+                                    let mut ok = true;
+                                    let mut list = Vec::with_capacity(fb.slots().len());
+                                    for (index, (key, slot)) in
+                                        fb.shape_keys().iter().zip(fb.slots()).enumerate()
+                                    {
+                                        if !fb.is_slot_enumerable(index)
+                                            || super::object::is_private_key(key)
+                                        {
+                                            continue;
+                                        }
+                                        if is_symbol_key(key) || &**key == "__proto__" {
+                                            ok = false;
+                                            break;
+                                        }
+                                        let Slot::Data(val) = slot else {
+                                            ok = false;
+                                            break;
+                                        };
+                                        if matches!(
+                                            val,
+                                            Value::Binding(_) | Value::ConstBinding(_)
+                                        ) {
+                                            ok = false;
+                                            break;
+                                        }
+                                        list.push((key.clone(), val.clone()));
+                                    }
+                                    ok.then_some(list)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(entries) = fast_entries {
+                            for (key, value) in entries {
+                                let res = target_h.borrow_mut().set_own_plain_data_or_add(
+                                    target_h, heap, &key, value,
+                                );
+                                if let Err(value) = res {
+                                    self.set_property(&target, &key, value, true)?;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    let keys = self.all_own_property_keys(&from)?;
+                    for key in keys {
+                        if let Some(prop) = self.own_property_of(&from, &key)?
+                            && prop.enumerable
+                        {
+                            let value = self.get_property(&from, &key)?;
+                            self.set_property(&target, &key, value, true)?;
+                        }
                     }
                 }
                 Ok(target)
@@ -2882,9 +3161,9 @@ impl ScriptRuntime {
                     if is_primitive(&entry) {
                         return Err(runtime.type_error("Iterator value is not an entry object"));
                     }
-                    let key = runtime.get_index(&entry, Value::Number(0.0))?;
-                    let key = runtime.coerce_key(key)?;
+                    let raw_key = runtime.get_index(&entry, Value::Number(0.0))?;
                     let value = runtime.get_index(&entry, Value::Number(1.0))?;
+                    let key = runtime.coerce_key(raw_key)?;
                     result.borrow_mut().define(key, Property::data(value));
                     Ok(())
                 })?;
@@ -2892,10 +3171,48 @@ impl ScriptRuntime {
             }
             Native::ObjectIs => Ok(Value::Bool(same_value(&first, &argument(&arguments, 1)))),
             Native::ObjectFreeze | Native::ObjectSeal | Native::ObjectPreventExtensions => {
+                if is_primitive(&first) {
+                    return Ok(first);
+                }
+                if let Value::Object(object) = &first
+                    && super::reflect::proxy_of(object).is_some()
+                {
+                    if !self.prevent_extensions_value(&first)? {
+                        return Err(self.type_error("Cannot prevent extensions on proxy"));
+                    }
+                    if !matches!(native, Native::ObjectPreventExtensions) {
+                        let frozen = matches!(native, Native::ObjectFreeze);
+                        let keys = self.all_own_property_keys(&first)?;
+                        for key in keys {
+                            if frozen {
+                                if let Some(desc) = self.own_property_of(&first, &key)? {
+                                    let entries = if matches!(desc.slot, Slot::Accessor(_)) {
+                                        vec![("configurable".to_string(), Value::Bool(false))]
+                                    } else {
+                                        vec![
+                                            ("configurable".to_string(), Value::Bool(false)),
+                                            ("writable".to_string(), Value::Bool(false)),
+                                        ]
+                                    };
+                                    let descriptor = self.object_from_entries(entries);
+                                    self.define_property_value(&first, key, &descriptor)?;
+                                }
+                            } else {
+                                let descriptor = self.object_from_entries(vec![(
+                                    "configurable".to_string(),
+                                    Value::Bool(false),
+                                )]);
+                                self.define_property_value(&first, key, &descriptor)?;
+                            }
+                        }
+                    }
+                    return Ok(first);
+                }
                 let target = match &first {
                     Value::TypedArray(array) => {
                         if !matches!(native, Native::ObjectPreventExtensions)
-                            && super::typed::element_count(&array.borrow()) > 0
+                            && (super::typed::element_count(&array.borrow()) > 0
+                                || array.borrow().buffer.borrow().max.is_some())
                         {
                             return Err(self.type_error(
                                 "Cannot freeze or seal an array buffer view with elements",
@@ -2913,6 +3230,16 @@ impl ScriptRuntime {
                         let mut array = array.borrow_mut();
                         let extra = array.extra_mut();
                         extra.integrity = extra.integrity.max(wanted);
+                        if wanted >= super::Integrity::Sealed {
+                            for (_, prop) in &mut extra.properties {
+                                prop.configurable = false;
+                                if wanted == super::Integrity::Frozen
+                                    && matches!(prop.slot, Slot::Data(_))
+                                {
+                                    prop.writable = false;
+                                }
+                            }
+                        }
                         None
                     }
                     _ => None,
@@ -2929,6 +3256,25 @@ impl ScriptRuntime {
             }
             Native::ObjectIsFrozen | Native::ObjectIsSealed => {
                 let frozen = matches!(native, Native::ObjectIsFrozen);
+                if let Value::Object(object) = &first
+                    && super::reflect::proxy_of(object).is_some()
+                {
+                    if self.is_extensible_value(&first)? {
+                        return Ok(Value::Bool(false));
+                    }
+                    let keys = self.all_own_property_keys(&first)?;
+                    for key in keys {
+                        if let Some(desc) = self.own_property_of(&first, &key)?
+                            && (desc.configurable
+                                || (frozen
+                                    && matches!(desc.slot, Slot::Data(_))
+                                    && desc.writable))
+                        {
+                            return Ok(Value::Bool(false));
+                        }
+                    }
+                    return Ok(Value::Bool(true));
+                }
                 Ok(Value::Bool(match &first {
                     Value::Object(object) => {
                         let object = object.borrow();
@@ -2957,16 +3303,12 @@ impl ScriptRuntime {
                     value => is_primitive(value),
                 }))
             }
-            Native::ObjectIsExtensible => Ok(Value::Bool(match &first {
-                Value::Array(array) => array.borrow().integrity() == super::Integrity::Open,
-                Value::Object(object) => object.borrow().extensible,
-                Value::TypedArray(array) => array
-                    .borrow()
-                    .object
-                    .as_ref()
-                    .is_none_or(|object| object.borrow().extensible),
-                value => !is_primitive(value),
-            })),
+            Native::ObjectIsExtensible => {
+                if is_primitive(&first) {
+                    return Ok(Value::Bool(false));
+                }
+                Ok(Value::Bool(self.is_extensible_value(&first)?))
+            }
             Native::ObjectHasOwn => {
                 let target = self.coerce_object(first)?;
                 let key = self.coerce_key(argument(&arguments, 1))?;
@@ -3015,6 +3357,11 @@ impl ScriptRuntime {
                 Ok(Self::prototype_value(self.prototype_of_value(&target)?))
             }
             Native::ObjectProtoSetter => {
+                if matches!(this, Value::Undefined | Value::Null) {
+                    return Err(
+                        self.type_error("Cannot convert undefined or null to object")
+                    );
+                }
                 let proto = match first {
                     Value::Object(prototype) => Some(Some(prototype)),
                     Value::Array(array) => Some(Some(self.array_prototype_wrapper(&array))),
@@ -3077,9 +3424,12 @@ impl ScriptRuntime {
                     };
                 }
             }
-            Native::FunctionConstructor => {
-                self.construct_native(Native::FunctionConstructor, arguments, Value::Undefined)
-            }
+            Native::FunctionConstructor => self.construct_native(
+                Native::FunctionConstructor,
+                arguments,
+                Value::Undefined,
+                None,
+            ),
             Native::FunctionPrototype => Ok(Value::Undefined),
             Native::FunctionCall => {
                 if !is_callable(&this) {
@@ -3236,6 +3586,65 @@ impl ScriptRuntime {
                 };
                 Ok(Value::String(regexp_escape(&text).into()))
             }
+            Native::ErrorStackGet => {
+                if is_primitive(&this) {
+                    return Err(
+                        self.type_error("Error.prototype.stack getter requires an object receiver")
+                    );
+                }
+                match &this {
+                    Value::Object(object)
+                        if matches!(object.borrow().class, ObjectClass::Error) =>
+                    {
+                        Ok(Value::String(
+                            super::heap::get_error_stack(object).unwrap_or_default(),
+                        ))
+                    }
+                    _ => Ok(Value::Undefined),
+                }
+            }
+            Native::ErrorStackSet => {
+                if is_primitive(&this) {
+                    return Err(
+                        self.type_error("Error.prototype.stack setter requires an object receiver")
+                    );
+                }
+                if !matches!(first, Value::String(_)) {
+                    return Err(self.type_error("Error.prototype.stack value must be a string"));
+                }
+                if let Value::Object(object) = &this
+                    && ObjectHandle::ptr_eq(object, &self.intrinsics.error_prototype)
+                {
+                    return Err(self.type_error("Cannot set stack directly on Error.prototype"));
+                }
+                match self.own_property_of(&this, "stack")? {
+                    None => {
+                        self.create_data_property_or_throw(&this, "stack".to_string(), first)?;
+                    }
+                    Some(existing) => match existing.slot {
+                        Slot::Accessor(acc) => match acc.set {
+                            Some(setter) => {
+                                self.call_function(setter, this, vec![first])?;
+                            }
+                            None => {
+                                return Err(self.type_error(
+                                    "Cannot set property stack which has only a getter",
+                                ));
+                            }
+                        },
+                        Slot::Data(_) => {
+                            if !existing.writable {
+                                return Err(self.type_error(
+                                    "Cannot assign to read only property 'stack'",
+                                ));
+                            }
+                            let desc = self.object_from_entries(vec![("value".to_string(), first)]);
+                            self.define_property_value(&this, "stack".to_string(), &desc)?;
+                        }
+                    },
+                }
+                Ok(Value::Undefined)
+            }
             Native::ErrorCaptureStackTrace => {
                 if let Value::Object(object) = &first {
                     let mut text = self.coerce_string(first.clone())?;
@@ -3331,46 +3740,338 @@ impl ScriptRuntime {
                 }
                 Ok(Value::String(String::from_utf16_lossy(&units).into()))
             }
-            Native::ArrayConstructor => {
-                self.construct_native(Native::ArrayConstructor, arguments, Value::Undefined)
-            }
+            Native::ArrayConstructor => self.construct_native(
+                Native::ArrayConstructor,
+                arguments,
+                Value::Undefined,
+                None,
+            ),
             Native::ArrayFrom => {
                 let mapper = argument(&arguments, 1);
-                if !matches!(mapper, Value::Undefined) && !is_callable(&mapper) {
+                let mapping = !matches!(mapper, Value::Undefined);
+                if mapping && !is_callable(&mapper) {
                     return Err(self.type_error("Array.from mapper is not a function"));
                 }
-                let iterable = match &first {
-                    Value::Undefined | Value::Null => {
+                let this_arg = argument(&arguments, 2);
+                if matches!(first, Value::Undefined | Value::Null) {
+                    return Err(
+                        self.type_error("Array.from requires an array-like or iterable object")
+                    );
+                }
+                let is_default_array = matches!(
+                    &this,
+                    Value::Object(object)
+                        if matches!(
+                            object.borrow().class,
+                            ObjectClass::Native(ref native) if matches!(**native, Native::ArrayConstructor)
+                        )
+                );
+                let custom_ctor = !is_default_array && Self::is_constructor(&this);
+                let iter_method = self.get_property(&first, "@@iterator")?;
+                if !matches!(iter_method, Value::Undefined | Value::Null) {
+                    if !is_callable(&iter_method) {
+                        return Err(self.type_error("Symbol.iterator is not a function"));
+                    }
+                    if !custom_ctor {
+                        let is_plain_array_iter = matches!(&first, Value::Array(arr) if arr.borrow().extra.is_none())
+                            && matches!(
+                                &iter_method,
+                                Value::Object(o)
+                                    if matches!(
+                                        o.borrow().class,
+                                        ObjectClass::Native(ref n) if matches!(**n, Native::ArrayValues)
+                                    )
+                            )
+                            && self
+                                .intrinsics
+                                .array_iterator_prototype
+                                .borrow()
+                                .property("next")
+                                .and_then(|p| p.value().cloned())
+                                .is_some_and(|v| {
+                                    matches!(
+                                        v,
+                                        Value::Object(o)
+                                            if matches!(
+                                                o.borrow().class,
+                                                ObjectClass::Native(ref n) if matches!(**n, Native::ArrayIteratorNext)
+                                            )
+                                    )
+                                });
+                        if is_plain_array_iter && let Value::Array(arr) = &first {
+                            if !mapping
+                                && !arr
+                                    .borrow()
+                                    .iter()
+                                    .any(|v| matches!(v, Value::Uninitialized))
+                            {
+                                return Ok(Self::new_array(arr.borrow().to_vec()));
+                            }
+                            if mapping {
+                                let fast_mapper = Self::simple_closure(&mapper);
+                                let mut out = Vec::with_capacity(arr.borrow().len());
+                                let mut k = 0usize;
+                                loop {
+                                    let next_val = {
+                                        let borrowed = arr.borrow();
+                                        if k >= borrowed.len() {
+                                            break;
+                                        }
+                                        borrowed[k].clone()
+                                    };
+                                    let val = if matches!(next_val, Value::Uninitialized) {
+                                        self.get_index(&first, Value::Number(k as f64))?
+                                    } else {
+                                        next_val
+                                    };
+                                    let mapped = match &fast_mapper {
+                                        Some(closure) => self.call_simple_closure(
+                                            closure,
+                                            &mapper,
+                                            this_arg.clone(),
+                                            &[val, Value::Number(k as f64)],
+                                        ),
+                                        None => self.call_function(
+                                            mapper.clone(),
+                                            this_arg.clone(),
+                                            vec![val, Value::Number(k as f64)],
+                                        ),
+                                    };
+                                    match mapped {
+                                        Ok(value) => out.push(value),
+                                        Err(error) => {
+                                            let reason = self.take_thrown(error);
+                                            let iter_proto = Value::Object(
+                                                self.intrinsics.array_iterator_prototype.clone(),
+                                            );
+                                            if self.has_property(&iter_proto, "return").unwrap_or(false)
+                                            {
+                                                let iteration = ArrayIteration {
+                                                    target: first.clone(),
+                                                    index: k + 1,
+                                                    kind: ArrayIterationKind::Values,
+                                                    done: false,
+                                                };
+                                                let iter_obj =
+                                                    Value::Object(new_object(JsObject::with_prototype(
+                                                        Some(
+                                                            self.intrinsics
+                                                                .array_iterator_prototype
+                                                                .clone(),
+                                                        ),
+                                                        ObjectClass::ArrayIterator(Rc::new(
+                                                            RefCell::new(iteration),
+                                                        )),
+                                                    )));
+                                                let _ = self.close_iterator_object(&iter_obj);
+                                            }
+                                            return Err(self.throw_value(reason));
+                                        }
+                                    }
+                                    k += 1;
+                                }
+                                return Ok(Self::new_array(out));
+                            }
+                        }
+                        let iterator = self.call_function(iter_method, first, Vec::new())?;
+                        if is_primitive(&iterator) {
+                            return Err(self.type_error(
+                                "Result of the Symbol.iterator method is not an object",
+                            ));
+                        }
+                        let next = self.get_property(&iterator, "next")?;
+                        let fast_mapper = mapping.then(|| Self::simple_closure(&mapper)).flatten();
+                        let mut out = Vec::new();
+                        let mut k = 0u64;
+                        loop {
+                            let step =
+                                self.call_function(next.clone(), iterator.clone(), Vec::new())?;
+                            if is_primitive(&step) {
+                                return Err(self.type_error("Iterator result is not an object"));
+                            }
+                            if self.get_property(&step, "done")?.truthy() {
+                                return Ok(Self::new_array(out));
+                            }
+                            let next_value = self.get_property(&step, "value")?;
+                            let mapped = if mapping {
+                                let res = match &fast_mapper {
+                                    Some(closure) => self.call_simple_closure(
+                                        closure,
+                                        &mapper,
+                                        this_arg.clone(),
+                                        &[next_value, Value::Number(k as f64)],
+                                    ),
+                                    None => self.call_function(
+                                        mapper.clone(),
+                                        this_arg.clone(),
+                                        vec![next_value, Value::Number(k as f64)],
+                                    ),
+                                };
+                                match res {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        let reason = self.take_thrown(error);
+                                        let _ = self.close_iterator_object(&iterator);
+                                        return Err(self.throw_value(reason));
+                                    }
+                                }
+                            } else {
+                                next_value
+                            };
+                            if out.len() >= MAX_RUNTIME_ARRAY_LENGTH {
+                                let _ = self.close_iterator_object(&iterator);
+                                return Err(self.range_error(
+                                    "array exceeds the deterministic length limit",
+                                ));
+                            }
+                            out.push(mapped);
+                            k += 1;
+                        }
+                    }
+                    let target = self.construct(this, Vec::new(), None)?;
+                    let iterator = self.call_function(iter_method, first, Vec::new())?;
+                    if is_primitive(&iterator) {
                         return Err(
-                            self.type_error("Array.from requires an array-like or iterable object")
+                            self.type_error("Result of the Symbol.iterator method is not an object")
                         );
                     }
-                    Value::Object(_) => !matches!(
-                        self.get_property(&first, "@@iterator")?,
-                        Value::Undefined | Value::Null
-                    ),
-                    _ => true,
-                };
-                let values = if iterable {
-                    self.iterate_to_vec(first)?
-                } else {
-                    self.array_like_values(&first)?
-                };
-                if matches!(mapper, Value::Undefined) {
-                    return Ok(Self::new_array(values));
+                    let next = self.get_property(&iterator, "next")?;
+                    let mut k = 0u64;
+                    loop {
+                        let step = self.call_function(next.clone(), iterator.clone(), Vec::new())?;
+                        if is_primitive(&step) {
+                            return Err(self.type_error("Iterator result is not an object"));
+                        }
+                        if self.get_property(&step, "done")?.truthy() {
+                            self.set_property(&target, "length", Value::Number(k as f64), true)?;
+                            return Ok(target);
+                        }
+                        let next_value = self.get_property(&step, "value")?;
+                        let mapped = if mapping {
+                            match self.call_function(
+                                mapper.clone(),
+                                this_arg.clone(),
+                                vec![next_value, Value::Number(k as f64)],
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    let reason = self.take_thrown(error);
+                                    let _ = self.close_iterator_object(&iterator);
+                                    return Err(self.throw_value(reason));
+                                }
+                            }
+                        } else {
+                            next_value
+                        };
+                        if let Err(error) =
+                            self.create_data_property_or_throw(&target, k.to_string(), mapped)
+                        {
+                            let reason = self.take_thrown(error);
+                            let _ = self.close_iterator_object(&iterator);
+                            return Err(self.throw_value(reason));
+                        }
+                        k += 1;
+                    }
                 }
-                let receiver = argument(&arguments, 2);
-                let mut mapped = Vec::with_capacity(values.len());
-                for (index, value) in values.into_iter().enumerate() {
-                    mapped.push(self.call_function(
-                        mapper.clone(),
-                        receiver.clone(),
-                        vec![value, Value::Number(index as f64)],
-                    )?);
+                let array_like = self.coerce_object(first)?;
+                let len = self.array_like_length(&array_like)?;
+                if !custom_ctor {
+                    if len > u32::MAX as u64 {
+                        return Err(self.range_error("Invalid array length"));
+                    }
+                    if len > MAX_RUNTIME_ARRAY_LENGTH as u64 {
+                        return Err(
+                            self.range_error("array exceeds the deterministic length limit")
+                        );
+                    }
+                    let empty_idx_shape = if let Value::Object(obj) = &array_like {
+                        let b = obj.borrow();
+                        let proto_ok = match b.own_prototype() {
+                            None => true,
+                            Some(p) => {
+                                ObjectHandle::ptr_eq(p, &self.intrinsics.object_prototype)
+                                    && p.borrow().shape_id() == self.intrinsics.object_proto_shape
+                            }
+                        };
+                        (matches!(b.class, ObjectClass::Ordinary)
+                            && b.has_no_indexed_keys()
+                            && proto_ok)
+                            .then(|| b.shape_id())
+                    } else {
+                        None
+                    };
+                    let fast_mapper = mapping.then(|| Self::simple_closure(&mapper)).flatten();
+                    let mut out = Vec::with_capacity(len as usize);
+                    for k in 0..len {
+                        let value = if let (Some(shape_id), Value::Object(obj)) =
+                            (empty_idx_shape, &array_like)
+                            && obj.borrow().shape_id() == shape_id
+                            && self.intrinsics.object_prototype.borrow().shape_id()
+                                == self.intrinsics.object_proto_shape
+                        {
+                            Value::Undefined
+                        } else {
+                            self.get_property(&array_like, &k.to_string())?
+                        };
+                        let mapped = if mapping {
+                            match &fast_mapper {
+                                Some(closure) => self.call_simple_closure(
+                                    closure,
+                                    &mapper,
+                                    this_arg.clone(),
+                                    &[value, Value::Number(k as f64)],
+                                )?,
+                                None => self.call_function(
+                                    mapper.clone(),
+                                    this_arg.clone(),
+                                    vec![value, Value::Number(k as f64)],
+                                )?,
+                            }
+                        } else {
+                            value
+                        };
+                        out.push(mapped);
+                    }
+                    return Ok(Self::new_array(out));
                 }
-                Ok(Self::new_array(mapped))
+                let target = self.construct(this, vec![Value::Number(len as f64)], None)?;
+                for k in 0..len {
+                    let value = self.get_property(&array_like, &k.to_string())?;
+                    let mapped = if mapping {
+                        self.call_function(
+                            mapper.clone(),
+                            this_arg.clone(),
+                            vec![value, Value::Number(k as f64)],
+                        )?
+                    } else {
+                        value
+                    };
+                    self.create_data_property_or_throw(&target, k.to_string(), mapped)?;
+                }
+                self.set_property(&target, "length", Value::Number(len as f64), true)?;
+                Ok(target)
             }
-            Native::ArrayOf => Ok(Self::new_array(arguments)),
+            Native::ArrayOf => {
+                let len = arguments.len();
+                let is_default_array = matches!(
+                    &this,
+                    Value::Object(object)
+                        if matches!(
+                            object.borrow().class,
+                            ObjectClass::Native(ref native) if matches!(**native, Native::ArrayConstructor)
+                        )
+                );
+                if !is_default_array && Self::is_constructor(&this) {
+                    let target = self.construct(this, vec![Value::Number(len as f64)], None)?;
+                    for (k, value) in arguments.into_iter().enumerate() {
+                        self.create_data_property_or_throw(&target, k.to_string(), value)?;
+                    }
+                    self.set_property(&target, "length", Value::Number(len as f64), true)?;
+                    Ok(target)
+                } else {
+                    Ok(Self::new_array(arguments))
+                }
+            }
             Native::ArrayValues | Native::ArrayKeys | Native::ArrayEntries => {
                 if matches!(this, Value::Undefined | Value::Null) {
                     return Err(
@@ -3863,13 +4564,17 @@ impl ScriptRuntime {
         native: Native,
         arguments: Vec<Value>,
         new_target: Value,
+        active: Option<&ObjectHandle>,
     ) -> Result<Value, ScriptError> {
         let first = argument(&arguments, 0);
-        let subclass = matches!(new_target, Value::Object(_));
+        let subclass = matches!(
+            &new_target,
+            Value::Object(target) if active.is_none_or(|callee| !ObjectHandle::ptr_eq(target, callee))
+        );
         let prototype_for =
             |runtime: &mut Self, fallback: ObjectHandle| -> Result<ObjectHandle, ScriptError> {
                 if subclass {
-                    runtime.prototype_from_constructor(&new_target)
+                    runtime.prototype_from_constructor_or(&new_target, &fallback)
                 } else {
                     Ok(fallback)
                 }
@@ -3913,7 +4618,12 @@ impl ScriptRuntime {
                 let primitive = self.call_native(&native, Value::Undefined, arguments)?;
                 let wrapped = self.coerce_object(primitive)?;
                 if subclass && let Value::Object(object) = &wrapped {
-                    let prototype = self.prototype_from_constructor(&new_target)?;
+                    let default = match native {
+                        Native::BooleanConstructor => self.intrinsics.boolean_prototype.clone(),
+                        Native::NumberConstructor => self.intrinsics.number_prototype.clone(),
+                        _ => self.intrinsics.string_prototype.clone(),
+                    };
+                    let prototype = self.prototype_from_constructor_or(&new_target, &default)?;
                     object.borrow_mut().set_prototype(Some(prototype));
                 }
                 Ok(wrapped)
@@ -3935,7 +4645,8 @@ impl ScriptRuntime {
                 };
                 let array = Self::new_array(values);
                 if subclass && let Value::Array(handle) = &array {
-                    let prototype = self.prototype_from_constructor(&new_target)?;
+                    let default = self.intrinsics.array_prototype.clone();
+                    let prototype = self.prototype_from_constructor_or(&new_target, &default)?;
                     handle.borrow_mut().extra_mut().prototype = Some(Some(prototype));
                 }
                 Ok(array)
@@ -3943,7 +4654,11 @@ impl ScriptRuntime {
             Native::RegExp(method) => {
                 self.call_regexp(method, Value::Undefined, arguments, Some(new_target))
             }
-            Native::Reflect(method) => self.call_reflect(method, arguments, Some(new_target)),
+            Native::Reflect(super::reflect::ReflectMethod::ProxyConstructor) => self.call_reflect(
+                super::reflect::ReflectMethod::ProxyConstructor,
+                arguments,
+                Some(new_target),
+            ),
             Native::Collection(method) => {
                 self.call_collection(method, Value::Undefined, arguments, Some(new_target))
             }
@@ -4279,25 +4994,18 @@ impl ScriptRuntime {
         prototype: Option<ObjectHandle>,
     ) -> Result<(), ScriptError> {
         if let Some(proxy) = super::reflect::proxy_of(object) {
-            let (target, trap) = self.proxy_trap(&proxy, "setPrototypeOf")?;
-            let value = Self::prototype_value(prototype.clone());
-            return match trap {
-                Some(trap) => {
-                    let handler = proxy.handler.borrow().clone().unwrap_or(Value::Undefined);
-                    if self
-                        .call_function(trap, handler, vec![target, value])?
-                        .truthy()
-                    {
-                        Ok(())
-                    } else {
-                        Err(self.type_error("'setPrototypeOf' on proxy: trap returned falsish"))
-                    }
-                }
-                None => match &target {
-                    Value::Object(target) => self.set_object_prototype(target, prototype),
-                    _ => Ok(()),
-                },
-            };
+            if self.proxy_set_prototype(&proxy, prototype)? {
+                return Ok(());
+            }
+            return Err(self.type_error("'setPrototypeOf' on proxy: trap returned falsish"));
+        }
+        if ObjectHandle::ptr_eq(object, &self.intrinsics.object_prototype) {
+            if prototype.is_none() {
+                return Ok(());
+            }
+            return Err(self.type_error(
+                "Immutable prototype object '#<Object>' cannot have their prototype set",
+            ));
         }
         let unchanged = match (&object.borrow().prototype_or(&self.intrinsics), &prototype) {
             (Some(current), Some(next)) => Self::prototypes_equal(current, next),
@@ -4334,31 +5042,35 @@ impl ScriptRuntime {
                 ObjectClass::Function(_) | ObjectClass::Bound(_) | ObjectClass::Native(_) => {
                     "Function"
                 }
+                ObjectClass::Proxy(proxy) if proxy.callable => "Function",
                 ObjectClass::Error => "Error",
                 ObjectClass::Boolean(_) => "Boolean",
                 ObjectClass::Number(_) => "Number",
                 ObjectClass::String(_) => "String",
+                ObjectClass::Date(_) => "Date",
+                ObjectClass::RegExp(_) => "RegExp",
                 ObjectClass::Arguments => "Arguments",
+                ObjectClass::ArrayProto(_) => "Array",
                 _ => "Object",
             },
             other if is_callable(other) => "Function",
-            other => {
-                let text = other.string_value();
-                if let Some(tag) = text
-                    .strip_prefix("[object ")
-                    .and_then(|rest| rest.strip_suffix(']'))
-                {
-                    return Ok(format!("[object {tag}]"));
-                }
-                "Object"
-            }
+            _ => "Object",
         };
         // primitives read the tag through their prototype, as ToObject would
         let tag = self.get_property(this, "@@toStringTag")?;
-        Ok(match tag {
-            Value::String(tag) => format!("[object {tag}]"),
-            _ => format!("[object {builtin}]"),
-        })
+        if let Value::String(tag) = tag {
+            return Ok(format!("[object {tag}]"));
+        }
+        if builtin == "Object"
+            && !matches!(this, Value::Object(_))
+            && let Some(tag) = this
+                .string_value()
+                .strip_prefix("[object ")
+                .and_then(|rest| rest.strip_suffix(']'))
+        {
+            return Ok(format!("[object {tag}]"));
+        }
+        Ok(format!("[object {builtin}]"))
     }
 }
 
@@ -4372,6 +5084,25 @@ fn same_optional(left: &Option<Value>, right: &Option<Value>) -> bool {
 
 fn to_uint32_from(value: f64) -> u32 {
     super::operations::to_uint32_number(value)
+}
+
+pub(super) fn builtin_own_property(builtin: &Builtin, key: &str) -> Option<Property> {
+    let (name, length) = match builtin {
+        Builtin::ArrayIsArray => ("isArray", 1.0),
+        Builtin::NumberIsFinite => ("isFinite", 1.0),
+        _ => return None,
+    };
+    let value = match key {
+        "name" => Value::String(name.into()),
+        "length" => Value::Number(length),
+        _ => return None,
+    };
+    Some(Property {
+        slot: Slot::Data(value),
+        enumerable: false,
+        writable: false,
+        configurable: true,
+    })
 }
 
 fn string_own_property(text: &str, key: &str) -> Option<Property> {

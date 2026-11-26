@@ -1,8 +1,10 @@
 // Proxy and Reflect: a proxy forwards each internal operation to a handler trap when the
 // handler defines one and to its target otherwise; Reflect exposes the same operations
 
-use super::object::{JsObject, ObjectClass, ObjectHandle, Property, is_symbol_key, new_object};
-use super::operations::{is_callable, is_primitive};
+use super::object::{
+    JsObject, ObjectClass, ObjectHandle, Property, Slot, is_symbol_key, new_object,
+};
+use super::operations::{is_callable, is_primitive, same_value};
 use super::*;
 
 pub(super) struct ProxyData {
@@ -71,6 +73,61 @@ pub(super) fn proxy_of(object: &ObjectHandle) -> Option<Rc<ProxyData>> {
     }
 }
 
+fn same_optional_val(left: &Option<Value>, right: &Option<Value>) -> bool {
+    match (left, right) {
+        (Some(a), Some(b)) => same_value(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn descriptor_compatible_with_target(
+    extensible: bool,
+    desc: &Property,
+    present: [bool; 6],
+    target: Option<&Property>,
+) -> bool {
+    let Some(current) = target else {
+        return extensible;
+    };
+    if current.configurable {
+        return true;
+    }
+    if present[1] && desc.configurable {
+        return false;
+    }
+    if present[0] && desc.enumerable != current.enumerable {
+        return false;
+    }
+    let desc_is_generic = !(present[2] || present[3] || present[4] || present[5]);
+    if desc_is_generic {
+        return true;
+    }
+    let desc_is_accessor = present[4] || present[5];
+    let current_is_accessor = matches!(current.slot, Slot::Accessor(_));
+    if desc_is_accessor != current_is_accessor {
+        return false;
+    }
+    match (&current.slot, &desc.slot) {
+        (Slot::Data(old), Slot::Data(new)) => {
+            if !current.writable {
+                if present[3] && desc.writable {
+                    return false;
+                }
+                if present[2] && !same_value(old, new) {
+                    return false;
+                }
+            }
+            true
+        }
+        (Slot::Accessor(old), Slot::Accessor(new)) => {
+            (!present[4] || same_optional_val(&old.get, &new.get))
+                && (!present[5] || same_optional_val(&old.set, &new.set))
+        }
+        _ => false,
+    }
+}
+
 impl ScriptRuntime {
     // IsArray, which sees through a proxy to its target
     pub(super) fn is_array(&mut self, value: &Value) -> Result<bool, ScriptError> {
@@ -88,6 +145,139 @@ impl ScriptRuntime {
             None => {
                 Err(self.type_error("Cannot perform 'IsArray' on a proxy that has been revoked"))
             }
+        }
+    }
+
+    pub(super) fn is_extensible_value(&mut self, value: &Value) -> Result<bool, ScriptError> {
+        match value {
+            Value::Object(object) => match proxy_of(object) {
+                Some(proxy) => {
+                    let (target, trap) = self.proxy_trap(&proxy, "isExtensible")?;
+                    match trap {
+                        Some(trap) => {
+                            let trap_result = self
+                                .call_function(
+                                    trap,
+                                    Self::proxy_handler(&proxy),
+                                    vec![target.clone()],
+                                )?
+                                .truthy();
+                            let target_result = self.is_extensible_value(&target)?;
+                            if trap_result != target_result {
+                                return Err(self.type_error(
+                                    "'isExtensible' on proxy: trap result does not reflect extensibility of proxy target",
+                                ));
+                            }
+                            Ok(trap_result)
+                        }
+                        None => self.is_extensible_value(&target),
+                    }
+                }
+                None => Ok(object.borrow().extensible),
+            },
+            Value::Array(array) => Ok(array.borrow().integrity() == super::Integrity::Open),
+            Value::TypedArray(array) => Ok(array
+                .borrow()
+                .object
+                .as_ref()
+                .is_none_or(|object| object.borrow().extensible)),
+            other => Ok(!is_primitive(other)),
+        }
+    }
+
+    pub(super) fn prevent_extensions_value(&mut self, value: &Value) -> Result<bool, ScriptError> {
+        match value {
+            Value::Object(object) => match proxy_of(object) {
+                Some(proxy) => {
+                    let (target, trap) = self.proxy_trap(&proxy, "preventExtensions")?;
+                    match trap {
+                        Some(trap) => {
+                            let trap_result = self
+                                .call_function(
+                                    trap,
+                                    Self::proxy_handler(&proxy),
+                                    vec![target.clone()],
+                                )?
+                                .truthy();
+                            if trap_result && self.is_extensible_value(&target)? {
+                                return Err(self.type_error(
+                                    "'preventExtensions' on proxy: trap returned truish but the proxy target is extensible",
+                                ));
+                            }
+                            Ok(trap_result)
+                        }
+                        None => self.prevent_extensions_value(&target),
+                    }
+                }
+                None => {
+                    object.borrow_mut().extensible = false;
+                    Ok(true)
+                }
+            },
+            Value::Array(array) => {
+                let mut array = array.borrow_mut();
+                let extra = array.extra_mut();
+                extra.integrity = extra.integrity.max(super::Integrity::Closed);
+                Ok(true)
+            }
+            Value::TypedArray(array) => {
+                super::typed_object(array).borrow_mut().extensible = false;
+                Ok(true)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    pub(super) fn proxy_set_prototype(
+        &mut self,
+        proxy: &ProxyData,
+        prototype: Option<ObjectHandle>,
+    ) -> Result<bool, ScriptError> {
+        let (target, trap) = self.proxy_trap(proxy, "setPrototypeOf")?;
+        let value = Self::prototype_value(prototype.clone());
+        match trap {
+            Some(trap) => {
+                let accepted = self
+                    .call_function(
+                        trap,
+                        Self::proxy_handler(proxy),
+                        vec![target.clone(), value],
+                    )?
+                    .truthy();
+                if !accepted {
+                    return Ok(false);
+                }
+                if !self.is_extensible_value(&target)? {
+                    let target_proto = self.prototype_of_value(&target)?;
+                    let same = match (&target_proto, &prototype) {
+                        (Some(a), Some(b)) => Self::prototypes_equal(a, b),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !same {
+                        return Err(self.type_error(
+                            "'setPrototypeOf' on proxy: trap returned truish for setting a new prototype on the non-extensible proxy target",
+                        ));
+                    }
+                }
+                Ok(true)
+            }
+            None => match &target {
+                Value::Array(array) => Ok(self.set_array_prototype(array, prototype)),
+                Value::Object(obj) => {
+                    if let Some(inner) = proxy_of(obj) {
+                        return self.proxy_set_prototype(&inner, prototype);
+                    }
+                    match self.set_object_prototype(obj, prototype) {
+                        Ok(()) => Ok(true),
+                        Err(_) => {
+                            self.pending_exception = None;
+                            Ok(false)
+                        }
+                    }
+                }
+                _ => Ok(true),
+            },
         }
     }
 
@@ -143,16 +333,120 @@ impl ScriptRuntime {
     ) -> Result<super::operations::GetOutcome, ScriptError> {
         let (target, trap) = self.proxy_trap(proxy, "get")?;
         match trap {
-            Some(trap) => Ok(super::operations::GetOutcome::Call {
-                callee: trap,
-                this: Self::proxy_handler(proxy),
-                arguments: vec![target, key_value(key), receiver.clone()],
-            }),
+            Some(trap) => {
+                let result = self.call_function(
+                    trap,
+                    Self::proxy_handler(proxy),
+                    vec![target.clone(), key_value(key), receiver.clone()],
+                )?;
+                if let Some(target_desc) = self.own_property_of(&target, key)?
+                    && !target_desc.configurable
+                {
+                    match &target_desc.slot {
+                        Slot::Data(target_val)
+                            if !target_desc.writable && !same_value(&result, target_val) =>
+                        {
+                            return Err(self.type_error(format!(
+                                "'get' on proxy: property '{key}' is a read-only and non-configurable data property on the proxy target"
+                            )));
+                        }
+                        Slot::Accessor(acc)
+                            if acc.get.is_none() && !matches!(result, Value::Undefined) =>
+                        {
+                            return Err(self.type_error(format!(
+                                "'get' on proxy: property '{key}' is a non-configurable accessor property without a getter"
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(super::operations::GetOutcome::Value(result))
+            }
             None => match &target {
                 Value::Object(object) => self.ordinary_get_tail(object.clone(), key, receiver),
                 other => self
                     .get_property(other, key)
                     .map(super::operations::GetOutcome::Value),
+            },
+        }
+    }
+
+    pub(super) fn proxy_set_bool(
+        &mut self,
+        proxy: &ProxyData,
+        key: &str,
+        value: Value,
+        receiver: &Value,
+    ) -> Result<bool, ScriptError> {
+        let (target, trap) = self.proxy_trap(proxy, "set")?;
+        match trap {
+            Some(trap) => {
+                let accepted = self
+                    .call_function(
+                        trap,
+                        Self::proxy_handler(proxy),
+                        vec![
+                            target.clone(),
+                            key_value(key),
+                            value.clone(),
+                            receiver.clone(),
+                        ],
+                    )?
+                    .truthy();
+                if !accepted {
+                    return Ok(false);
+                }
+                if let Some(target_desc) = self.own_property_of(&target, key)?
+                    && !target_desc.configurable
+                {
+                    match &target_desc.slot {
+                        Slot::Data(target_val)
+                            if !target_desc.writable && !same_value(&value, target_val) =>
+                        {
+                            return Err(self.type_error(format!(
+                                "'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"
+                            )));
+                        }
+                        Slot::Accessor(acc) if acc.set.is_none() => {
+                            return Err(self.type_error(format!(
+                                "'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable accessor property without a setter"
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(true)
+            }
+            None => match &target {
+                Value::Object(object) => {
+                    if let Some(inner) = proxy_of(object) {
+                        return self.proxy_set_bool(&inner, key, value, receiver);
+                    }
+                    match self.ordinary_set(object.clone(), key, value, receiver, true) {
+                        Ok(()) => Ok(true),
+                        Err(error) => {
+                            let thrown = self.take_thrown(error);
+                            let is_type_error = matches!(&thrown, Value::Object(obj) if obj.borrow().prototype_or(&self.intrinsics).is_some_and(|proto| ObjectHandle::ptr_eq(&proto, &self.intrinsics.type_error_prototype)));
+                            if is_type_error {
+                                Ok(false)
+                            } else {
+                                Err(self.throw_value(thrown))
+                            }
+                        }
+                    }
+                }
+                other => match self.set_property(other, key, value, true) {
+                    Ok(()) => Ok(true),
+                    Err(error) => {
+                        let thrown = self.take_thrown(error);
+                        let is_type_error = matches!(&thrown, Value::Object(obj) if obj.borrow().prototype_or(&self.intrinsics).is_some_and(|proto| ObjectHandle::ptr_eq(&proto, &self.intrinsics.type_error_prototype)));
+                        if is_type_error {
+                            Ok(false)
+                        } else {
+                            Err(self.throw_value(thrown))
+                        }
+                    }
+                },
             },
         }
     }
@@ -165,42 +459,36 @@ impl ScriptRuntime {
         receiver: &Value,
         strict: bool,
     ) -> Result<(), ScriptError> {
-        let (target, trap) = self.proxy_trap(proxy, "set")?;
-        match trap {
-            Some(trap) => {
-                let accepted = self
-                    .call_function(
-                        trap,
-                        Self::proxy_handler(proxy),
-                        vec![target, key_value(key), value, receiver.clone()],
-                    )?
-                    .truthy();
-                if !accepted && strict {
-                    return Err(self.type_error(format!(
-                        "'set' on proxy: trap returned falsish for property '{key}'"
-                    )));
-                }
-                Ok(())
-            }
-            None => match &target {
-                Value::Object(object) => {
-                    self.ordinary_set(object.clone(), key, value, receiver, strict)
-                }
-                other => self.set_property(other, key, value, strict),
-            },
+        let accepted = self.proxy_set_bool(proxy, key, value, receiver)?;
+        if !accepted && strict {
+            return Err(self.type_error(format!(
+                "'set' on proxy: trap returned falsish for property '{key}'"
+            )));
         }
+        Ok(())
     }
 
     pub(super) fn proxy_has(&mut self, proxy: &ProxyData, key: &str) -> Result<bool, ScriptError> {
         let (target, trap) = self.proxy_trap(proxy, "has")?;
         match trap {
-            Some(trap) => Ok(self
-                .call_function(
-                    trap,
-                    Self::proxy_handler(proxy),
-                    vec![target, key_value(key)],
-                )?
-                .truthy()),
+            Some(trap) => {
+                let result = self
+                    .call_function(
+                        trap,
+                        Self::proxy_handler(proxy),
+                        vec![target.clone(), key_value(key)],
+                    )?
+                    .truthy();
+                if !result
+                    && let Some(target_desc) = self.own_property_of(&target, key)?
+                    && (!target_desc.configurable || !self.is_extensible_value(&target)?)
+                {
+                    return Err(self.type_error(format!(
+                        "'has' on proxy: trap returned falsish for property '{key}' which exists in the proxy target as non-configurable or non-extensible"
+                    )));
+                }
+                Ok(result)
+            }
             None => self.has_property(&target, key),
         }
     }
@@ -218,15 +506,25 @@ impl ScriptRuntime {
                     .call_function(
                         trap,
                         Self::proxy_handler(proxy),
-                        vec![target, key_value(key)],
+                        vec![target.clone(), key_value(key)],
                     )?
                     .truthy();
-                if !deleted && strict {
+                if !deleted {
+                    if strict {
+                        return Err(self.type_error(format!(
+                            "'deleteProperty' on proxy: trap returned falsish for property '{key}'"
+                        )));
+                    }
+                    return Ok(false);
+                }
+                if let Some(target_desc) = self.own_property_of(&target, key)?
+                    && (!target_desc.configurable || !self.is_extensible_value(&target)?)
+                {
                     return Err(self.type_error(format!(
-                        "'deleteProperty' on proxy: trap returned falsish for property '{key}'"
+                        "'deleteProperty' on proxy: trap returned truish for property '{key}' which is non-configurable or non-extensible in the proxy target"
                     )));
                 }
-                Ok(deleted)
+                Ok(true)
             }
             None => self.delete_property(&target, key, strict),
         }
@@ -236,23 +534,68 @@ impl ScriptRuntime {
         let (target, trap) = self.proxy_trap(proxy, "ownKeys")?;
         match trap {
             Some(trap) => {
-                let list = self.call_function(trap, Self::proxy_handler(proxy), vec![target])?;
+                let list =
+                    self.call_function(trap, Self::proxy_handler(proxy), vec![target.clone()])?;
+                if is_primitive(&list) {
+                    return Err(self.type_error("proxy ownKeys trap returned a non-object"));
+                }
                 let values = self.array_like_list(&list)?;
                 let mut keys = Vec::with_capacity(values.len());
+                let mut seen = HashSet::default();
                 for value in values {
-                    match value {
-                        Value::String(text) => keys.push(text.to_string()),
-                        Value::Symbol(key) => keys.push(key.to_string()),
+                    let key = match value {
+                        Value::String(text) => text.to_string(),
+                        Value::Symbol(key) => key.to_string(),
                         _ => return Err(self.type_error("proxy ownKeys trap returned a non-key")),
+                    };
+                    if !seen.insert(key.clone()) {
+                        return Err(self.type_error(format!(
+                            "'ownKeys' on proxy: trap returned duplicate entries for '{key}'"
+                        )));
                     }
+                    keys.push(key);
+                }
+                let extensible = self.is_extensible_value(&target)?;
+                let target_keys = self.all_own_property_keys(&target)?;
+                let mut target_non_config = Vec::new();
+                let mut target_config = Vec::new();
+                for key in target_keys {
+                    if let Some(desc) = self.own_property_of(&target, &key)? {
+                        if !desc.configurable {
+                            target_non_config.push(key);
+                        } else {
+                            target_config.push(key);
+                        }
+                    }
+                }
+                if extensible && target_non_config.is_empty() {
+                    return Ok(keys);
+                }
+                for key in &target_non_config {
+                    if !seen.contains(key) {
+                        return Err(self.type_error(format!(
+                            "'ownKeys' on proxy: trap result did not include non-configurable property '{key}'"
+                        )));
+                    }
+                }
+                if extensible {
+                    return Ok(keys);
+                }
+                for key in &target_config {
+                    if !seen.contains(key) {
+                        return Err(self.type_error(format!(
+                            "'ownKeys' on proxy: trap result did not include property '{key}' of non-extensible target"
+                        )));
+                    }
+                }
+                if seen.len() != target_non_config.len() + target_config.len() {
+                    return Err(self.type_error(
+                        "'ownKeys' on proxy: trap returned extra keys but proxy target is non-extensible",
+                    ));
                 }
                 Ok(keys)
             }
-            None => {
-                let mut keys = self.own_property_keys(&target, false)?;
-                keys.extend(self.own_property_keys(&target, true)?);
-                Ok(keys)
-            }
+            None => self.all_own_property_keys(&target),
         }
     }
 
@@ -267,12 +610,65 @@ impl ScriptRuntime {
                 let descriptor = self.call_function(
                     trap,
                     Self::proxy_handler(proxy),
-                    vec![target, key_value(key)],
+                    vec![target.clone(), key_value(key)],
                 )?;
+                if !matches!(descriptor, Value::Undefined) && is_primitive(&descriptor) {
+                    return Err(self.type_error(
+                        "'getOwnPropertyDescriptor' on proxy: trap returned neither object nor undefined",
+                    ));
+                }
+                let target_desc = self.own_property_of(&target, key)?;
                 if matches!(descriptor, Value::Undefined) {
+                    if let Some(td) = target_desc
+                        && (!td.configurable || !self.is_extensible_value(&target)?)
+                    {
+                        return Err(self.type_error(format!(
+                            "'getOwnPropertyDescriptor' on proxy: trap returned undefined for property '{key}' which is non-configurable or non-extensible in the proxy target"
+                        )));
+                    }
                     return Ok(None);
                 }
-                Ok(Some(self.descriptor_property(&descriptor)?))
+                let extensible = self.is_extensible_value(&target)?;
+                let result_desc = self.descriptor_property(&descriptor)?;
+                let all_present = match &result_desc.slot {
+                    Slot::Data(_) => [true, true, true, true, false, false],
+                    Slot::Accessor(_) => [true, true, false, false, true, true],
+                };
+                if !descriptor_compatible_with_target(
+                    extensible,
+                    &result_desc,
+                    all_present,
+                    target_desc.as_ref(),
+                ) {
+                    return Err(self.type_error(format!(
+                        "'getOwnPropertyDescriptor' on proxy: trap reported incompatibility for property '{key}'"
+                    )));
+                }
+                if !result_desc.configurable {
+                    match &target_desc {
+                        None => {
+                            return Err(self.type_error(format!(
+                                "'getOwnPropertyDescriptor' on proxy: trap reported non-configurability for property '{key}' which is non-existent in the proxy target"
+                            )));
+                        }
+                        Some(td) if td.configurable => {
+                            return Err(self.type_error(format!(
+                                "'getOwnPropertyDescriptor' on proxy: trap reported non-configurability for property '{key}' which is configurable in the proxy target"
+                            )));
+                        }
+                        Some(td)
+                            if matches!(result_desc.slot, Slot::Data(_))
+                                && !result_desc.writable
+                                && td.writable =>
+                        {
+                            return Err(self.type_error(format!(
+                                "'getOwnPropertyDescriptor' on proxy: trap reported non-writability for property '{key}' which is writable in the proxy target"
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Some(result_desc))
             }
             None => self.own_property_of(&target, key),
         }
@@ -285,17 +681,102 @@ impl ScriptRuntime {
         descriptor: &Value,
     ) -> Result<bool, ScriptError> {
         let (target, trap) = self.proxy_trap(proxy, "defineProperty")?;
+        let (prop, present) = self.descriptor_from(descriptor)?;
         match trap {
-            Some(trap) => Ok(self
-                .call_function(
-                    trap,
-                    Self::proxy_handler(proxy),
-                    vec![target, key_value(key), descriptor.clone()],
-                )?
-                .truthy()),
-            None => {
-                self.define_property_value(&target, key.to_string(), descriptor)?;
+            Some(trap) => {
+                let mut entries = Vec::new();
+                if present[0] {
+                    entries.push(("enumerable".to_string(), Value::Bool(prop.enumerable)));
+                }
+                if present[1] {
+                    entries.push(("configurable".to_string(), Value::Bool(prop.configurable)));
+                }
+                match &prop.slot {
+                    Slot::Data(v) => {
+                        if present[2] {
+                            entries.push(("value".to_string(), v.clone()));
+                        }
+                        if present[3] {
+                            entries.push(("writable".to_string(), Value::Bool(prop.writable)));
+                        }
+                    }
+                    Slot::Accessor(acc) => {
+                        if present[4] {
+                            entries.push((
+                                "get".to_string(),
+                                acc.get.clone().unwrap_or(Value::Undefined),
+                            ));
+                        }
+                        if present[5] {
+                            entries.push((
+                                "set".to_string(),
+                                acc.set.clone().unwrap_or(Value::Undefined),
+                            ));
+                        }
+                    }
+                }
+                let desc_obj = self.object_from_entries(entries);
+                let accepted = self
+                    .call_function(
+                        trap,
+                        Self::proxy_handler(proxy),
+                        vec![target.clone(), key_value(key), desc_obj],
+                    )?
+                    .truthy();
+                if !accepted {
+                    return Ok(false);
+                }
+                let target_desc = self.own_property_of(&target, key)?;
+                let extensible = self.is_extensible_value(&target)?;
+                let setting_config_false = present[1] && !prop.configurable;
+                if target_desc.is_none() {
+                    if !extensible {
+                        return Err(self.type_error(format!(
+                            "'defineProperty' on proxy: trap returned truish for defining non-existent property '{key}' on non-extensible target"
+                        )));
+                    }
+                    if setting_config_false {
+                        return Err(self.type_error(format!(
+                            "'defineProperty' on proxy: trap returned truish for defining non-configurable property '{key}' which is non-existent in target"
+                        )));
+                    }
+                } else if let Some(td) = target_desc {
+                    if !descriptor_compatible_with_target(extensible, &prop, present, Some(&td)) {
+                        return Err(self.type_error(format!(
+                            "'defineProperty' on proxy: trap returned truish for defining incompatible property '{key}'"
+                        )));
+                    }
+                    if setting_config_false && td.configurable {
+                        return Err(self.type_error(format!(
+                            "'defineProperty' on proxy: trap returned truish for defining non-configurable property '{key}' which is configurable in target"
+                        )));
+                    }
+                    if !td.configurable
+                        && matches!(td.slot, Slot::Data(_))
+                        && td.writable
+                        && present[3]
+                        && !prop.writable
+                    {
+                        return Err(self.type_error(format!(
+                            "'defineProperty' on proxy: trap returned truish for defining non-writable property '{key}' which is writable in target"
+                        )));
+                    }
+                }
                 Ok(true)
+            }
+            None => {
+                if let Value::Object(object) = &target
+                    && let Some(inner) = proxy_of(object)
+                {
+                    return self.proxy_define(&inner, key, descriptor);
+                }
+                match self.apply_property_descriptor(&target, key.to_string(), prop, present) {
+                    Ok(()) => Ok(true),
+                    Err(_) => {
+                        self.pending_exception = None;
+                        Ok(false)
+                    }
+                }
             }
         }
     }
@@ -307,13 +788,34 @@ impl ScriptRuntime {
         let (target, trap) = self.proxy_trap(proxy, "getPrototypeOf")?;
         match trap {
             Some(trap) => {
-                match self.call_function(trap, Self::proxy_handler(proxy), vec![target])? {
-                    Value::Object(prototype) => Ok(Some(prototype)),
-                    Value::Array(array) => Ok(Some(self.array_prototype_wrapper(&array))),
-                    Value::Null => Ok(None),
-                    _ => Err(self
-                        .type_error("proxy getPrototypeOf trap returned neither object nor null")),
+                let trap_proto = match self.call_function(
+                    trap,
+                    Self::proxy_handler(proxy),
+                    vec![target.clone()],
+                )? {
+                    Value::Object(prototype) => Some(prototype),
+                    Value::Array(array) => Some(self.array_prototype_wrapper(&array)),
+                    Value::Null => None,
+                    _ => {
+                        return Err(self.type_error(
+                            "proxy getPrototypeOf trap returned neither object nor null",
+                        ));
+                    }
+                };
+                if !self.is_extensible_value(&target)? {
+                    let target_proto = self.prototype_of_value(&target)?;
+                    let same = match (&trap_proto, &target_proto) {
+                        (Some(a), Some(b)) => Self::prototypes_equal(a, b),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !same {
+                        return Err(self.type_error(
+                            "'getPrototypeOf' on proxy: proxy target is non-extensible but the trap did not return its actual prototype",
+                        ));
+                    }
                 }
+                Ok(trap_proto)
             }
             None => self.prototype_of_value(&target),
         }
@@ -362,14 +864,25 @@ impl ScriptRuntime {
                 ]))
             }
             M::Apply => {
-                let list = self.array_like_list(&argument(&arguments, 2))?;
+                if !is_callable(&first) {
+                    return Err(self.type_error("Reflect.apply target is not a function"));
+                }
+                let args_list = argument(&arguments, 2);
+                if is_primitive(&args_list) {
+                    return Err(self.type_error("CreateListFromArrayLike called on non-object"));
+                }
+                let list = self.array_like_list(&args_list)?;
                 self.call_function(first, argument(&arguments, 1), list)
             }
             M::Construct => {
                 if !Self::is_constructor(&first) {
                     return Err(self.type_error("Reflect.construct target is not a constructor"));
                 }
-                let list = self.array_like_list(&argument(&arguments, 1))?;
+                let args_list = argument(&arguments, 1);
+                if is_primitive(&args_list) {
+                    return Err(self.type_error("CreateListFromArrayLike called on non-object"));
+                }
+                let list = self.array_like_list(&args_list)?;
                 let new_target = match argument(&arguments, 2) {
                     Value::Undefined => first.clone(),
                     target if Self::is_constructor(&target) => target,
@@ -389,13 +902,16 @@ impl ScriptRuntime {
                         let proxy = proxy_of(object).expect("checked above");
                         Ok(Value::Bool(self.proxy_define(&proxy, &key, &descriptor)?))
                     }
-                    _ => match self.define_property_value(&first, key, &descriptor) {
-                        Ok(()) => Ok(Value::Bool(true)),
-                        Err(_) => {
-                            self.pending_exception = None;
-                            Ok(Value::Bool(false))
+                    _ => {
+                        let (property, present) = self.descriptor_from(&descriptor)?;
+                        match self.apply_property_descriptor(&first, key, property, present) {
+                            Ok(()) => Ok(Value::Bool(true)),
+                            Err(_) => {
+                                self.pending_exception = None;
+                                Ok(Value::Bool(false))
+                            }
                         }
-                    },
+                    }
                 }
             }
             M::DeleteProperty => {
@@ -422,6 +938,13 @@ impl ScriptRuntime {
                 } else {
                     first.clone()
                 };
+                if let Value::Object(object) = &first
+                    && let Some(proxy) = proxy_of(object)
+                {
+                    return Ok(Value::Bool(
+                        self.proxy_set_bool(&proxy, &key, value, &receiver)?,
+                    ));
+                }
                 let outcome = match &first {
                     Value::Object(object) => {
                         self.ordinary_set(object.clone(), &key, value, &receiver, true)
@@ -453,64 +976,10 @@ impl ScriptRuntime {
                 let key = self.coerce_key(argument(&arguments, 1))?;
                 Ok(Value::Bool(self.has_property(&first, &key)?))
             }
-            M::IsExtensible => Ok(Value::Bool(match &first {
-                Value::Object(object) => match super::reflect::proxy_of(object) {
-                    Some(proxy) => {
-                        let (target, trap) = self.proxy_trap(&proxy, "isExtensible")?;
-                        match trap {
-                            Some(trap) => self
-                                .call_function(trap, Self::proxy_handler(&proxy), vec![target])?
-                                .truthy(),
-                            None => match &target {
-                                Value::Object(object) => object.borrow().extensible,
-                                Value::Array(array) => {
-                                    array.borrow().integrity() == super::Integrity::Open
-                                }
-                                _ => false,
-                            },
-                        }
-                    }
-                    None => object.borrow().extensible,
-                },
-                _ => true,
-            })),
-            M::PreventExtensions => {
-                if let Value::Object(object) = &first {
-                    match super::reflect::proxy_of(object) {
-                        Some(proxy) => {
-                            let (target, trap) = self.proxy_trap(&proxy, "preventExtensions")?;
-                            match trap {
-                                Some(trap) => {
-                                    return Ok(Value::Bool(
-                                        self.call_function(
-                                            trap,
-                                            Self::proxy_handler(&proxy),
-                                            vec![target],
-                                        )?
-                                        .truthy(),
-                                    ));
-                                }
-                                None => {
-                                    if let Value::Array(array) = &target {
-                                        let mut array = array.borrow_mut();
-                                        let extra = array.extra_mut();
-                                        extra.integrity =
-                                            extra.integrity.max(super::Integrity::Closed);
-                                    }
-                                    if let Value::Object(target) = target {
-                                        target.borrow_mut().extensible = false;
-                                    }
-                                }
-                            }
-                        }
-                        None => object.borrow_mut().extensible = false,
-                    }
-                }
-                Ok(Value::Bool(true))
-            }
+            M::IsExtensible => Ok(Value::Bool(self.is_extensible_value(&first)?)),
+            M::PreventExtensions => Ok(Value::Bool(self.prevent_extensions_value(&first)?)),
             M::OwnKeys => {
-                let mut keys = self.own_property_keys(&first, false)?;
-                keys.extend(self.own_property_keys(&first, true)?);
+                let keys = self.all_own_property_keys(&first)?;
                 Ok(Self::new_array(
                     keys.iter().map(|key| key_value(key)).collect(),
                 ))
@@ -533,6 +1002,9 @@ impl ScriptRuntime {
                 let Value::Object(object) = target.as_ref().unwrap_or(&first) else {
                     return Ok(Value::Bool(false));
                 };
+                if let Some(proxy) = proxy_of(object) {
+                    return Ok(Value::Bool(self.proxy_set_prototype(&proxy, prototype)?));
+                }
                 match self.set_object_prototype(object, prototype) {
                     Ok(()) => Ok(Value::Bool(true)),
                     Err(_) => {
@@ -542,5 +1014,50 @@ impl ScriptRuntime {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_invariants_reflect_non_constructors_error_stack_and_json() {
+        let document =
+            crate::dom::Document::parse(r#"<p id="out"></p>"#).expect("document should parse");
+        let document = Rc::new(RefCell::new(document));
+        let mut runtime = ScriptRuntime::new(document.clone());
+        runtime
+            .execute(
+                r#"
+                const seen = [];
+                const target = {};
+                Object.defineProperty(target, "k", { value: 1, writable: false, configurable: false });
+                const badGet = new Proxy(target, { get() { return 2; } });
+                try { void badGet.k; } catch (e) { seen.push(e.name); }
+                const badHas = new Proxy(target, { has() { return false; } });
+                try { void ("k" in badHas); } catch (e) { seen.push(e.name); }
+                const badKeys = new Proxy(target, { ownKeys() { return []; } });
+                try { Object.keys(badKeys); } catch (e) { seen.push(e.name); }
+                const badExt = new Proxy(target, { isExtensible() { return false; } });
+                try { Object.isExtensible(badExt); } catch (e) { seen.push(e.name); }
+                try { new Reflect.get({}, "a"); } catch (e) { seen.push(e.name); }
+                const err = new Error("boom");
+                seen.push(Object.prototype.hasOwnProperty.call(err, "stack"), typeof err.stack, Error.prototype.stack === undefined);
+                err.stack = "custom";
+                seen.push(Object.prototype.hasOwnProperty.call(err, "stack"), err.stack);
+                seen.push(typeof new Object("hi"), Object.prototype.toString.call(new Object("hi")));
+                try { JSON.stringify(Object(1n)); } catch (e) { seen.push(e.name); }
+                document.getElementById("out").textContent = seen.join("|");
+                "#,
+            )
+            .expect("script should run");
+        let out = document.borrow().find_element_by_id("out").unwrap();
+        assert_eq!(
+            document.borrow().element_text_content(out).as_deref(),
+            Some(
+                "TypeError|TypeError|TypeError|TypeError|TypeError|false|string|true|true|custom|object|[object String]|TypeError"
+            )
+        );
     }
 }

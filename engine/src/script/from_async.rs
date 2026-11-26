@@ -9,16 +9,18 @@ use super::*;
 enum Source {
     // an async iterator and its next method
     Async(Value, Value),
-    // a sync iterator from get_iterator, whose values are awaited
-    Sync(Value),
-    ArrayLike(Value, usize),
+    // a sync iterator and its next method, whose values are awaited
+    Sync(Value, Value),
+    ArrayLike(Value, u64),
 }
 
 pub(super) struct FromAsync {
     result: PromiseHandle,
+    target: Value,
     source: Source,
     mapper: Value,
-    values: RefCell<Vec<Value>>,
+    this_arg: Value,
+    index: RefCell<u64>,
 }
 
 impl FromAsync {
@@ -27,17 +29,16 @@ impl FromAsync {
             return;
         }
         tracer.trace_promise(&self.result);
+        tracer.trace_value(&self.target);
         match &self.source {
-            Source::Async(iter, next) => {
+            Source::Async(iter, next) | Source::Sync(iter, next) => {
                 tracer.trace_value(iter);
                 tracer.trace_value(next);
             }
-            Source::Sync(iter) | Source::ArrayLike(iter, _) => tracer.trace_value(iter),
+            Source::ArrayLike(items, _) => tracer.trace_value(items),
         }
         tracer.trace_value(&self.mapper);
-        for value in self.values.borrow().iter() {
-            tracer.trace_value(value);
-        }
+        tracer.trace_value(&self.this_arg);
     }
 }
 
@@ -60,9 +61,9 @@ impl ScriptRuntime {
         ))))
     }
 
-    pub(super) fn array_from_async(&mut self, arguments: Vec<Value>) -> Value {
+    pub(super) fn array_from_async(&mut self, this: Value, arguments: Vec<Value>) -> Value {
         let result = Self::pending_promise();
-        if let Err(error) = self.start_from_async(&result, arguments) {
+        if let Err(error) = self.start_from_async(&result, this, arguments) {
             let reason = self.take_thrown(error);
             self.settle_promise(&result, PromiseOutcome::Rejected(reason));
         }
@@ -72,51 +73,82 @@ impl ScriptRuntime {
     fn start_from_async(
         &mut self,
         result: &PromiseHandle,
+        this: Value,
         arguments: Vec<Value>,
     ) -> Result<(), ScriptError> {
         let mut arguments = arguments.into_iter();
         let items = arguments.next().unwrap_or(Value::Undefined).resolve();
         let mapper = arguments.next().unwrap_or(Value::Undefined);
+        let this_arg = arguments.next().unwrap_or(Value::Undefined);
         if !matches!(mapper, Value::Undefined) && !is_callable(&mapper) {
             return Err(self.type_error("Array.fromAsync mapper is not a function"));
         }
         if matches!(items, Value::Undefined | Value::Null) {
             return Err(self.type_error("Array.fromAsync requires an iterable or array-like value"));
         }
-        let async_method = if is_primitive(&items) {
-            Value::Undefined
-        } else {
-            self.get_property(&items, "@@asyncIterator")?
-        };
-        let source = if !matches!(async_method, Value::Undefined | Value::Null) {
-            let iterator = self.call_function(async_method, items, Vec::new())?;
-            if is_primitive(&iterator) {
-                return Err(
-                    self.type_error("Result of the Symbol.asyncIterator method is not an object")
-                );
-            }
-            let next = self.get_property(&iterator, "next")?;
-            Source::Async(iterator, next)
-        } else if !matches!(
-            self.get_property(&items, "@@iterator")?,
-            Value::Undefined | Value::Null
-        ) {
-            Source::Sync(self.get_iterator(items)?)
-        } else {
-            let length = self.get_property(&items, "length")?;
-            let length = self.coerce_number(length)?;
-            let length = if length.is_nan() || length <= 0.0 {
-                0
+        let async_method = self.get_property(&items, "@@asyncIterator")?;
+        let source =
+            if !matches!(async_method, Value::Undefined | Value::Null) {
+                if !is_callable(&async_method) {
+                    return Err(self.type_error("Symbol.asyncIterator is not a function"));
+                }
+                let iterator = self.call_function(async_method, items, Vec::new())?;
+                if is_primitive(&iterator) {
+                    return Err(self
+                        .type_error("Result of the Symbol.asyncIterator method is not an object"));
+                }
+                let next = self.get_property(&iterator, "next")?;
+                Source::Async(iterator, next)
             } else {
-                length.min(MAX_RUNTIME_ARRAY_LENGTH as f64) as usize
+                let sync_method = self.get_property(&items, "@@iterator")?;
+                if !matches!(sync_method, Value::Undefined | Value::Null) {
+                    if !is_callable(&sync_method) {
+                        return Err(self.type_error("Symbol.iterator is not a function"));
+                    }
+                    let iterator = self.call_function(sync_method, items, Vec::new())?;
+                    if is_primitive(&iterator) {
+                        return Err(self
+                            .type_error("Result of the Symbol.iterator method is not an object"));
+                    }
+                    let next = self.get_property(&iterator, "next")?;
+                    Source::Sync(iterator, next)
+                } else {
+                    let array_like = self.coerce_object(items)?;
+                    let length = self.array_like_length(&array_like)?;
+                    Source::ArrayLike(array_like, length)
+                }
             };
-            Source::ArrayLike(items, length)
+        let target = match &source {
+            Source::Async(..) | Source::Sync(..) => {
+                if Self::is_constructor(&this) {
+                    self.construct(this, Vec::new(), None)?
+                } else {
+                    Self::new_array(Vec::new())
+                }
+            }
+            Source::ArrayLike(_, length) => {
+                if Self::is_constructor(&this) {
+                    self.construct(this, vec![Value::Number(*length as f64)], None)?
+                } else {
+                    if *length > u32::MAX as u64 {
+                        return Err(self.range_error("Invalid array length"));
+                    }
+                    if *length > MAX_RUNTIME_ARRAY_LENGTH as u64 {
+                        return Err(
+                            self.range_error("array exceeds the deterministic length limit")
+                        );
+                    }
+                    Self::new_array(vec![Value::Uninitialized; *length as usize])
+                }
+            }
         };
         let state = Rc::new(FromAsync {
             result: result.clone(),
+            target,
             source,
             mapper,
-            values: RefCell::new(Vec::new()),
+            this_arg,
+            index: RefCell::new(0),
         });
         self.advance_from_async(&state)
     }
@@ -128,12 +160,19 @@ impl ScriptRuntime {
                 let result = self.call_function(next.clone(), iterator.clone(), Vec::new())?;
                 (result, Phase::Result, false)
             }
-            Source::Sync(iterator) => match self.iterator_step(iterator)? {
-                Some(value) => (value, Phase::Value, true),
-                None => return self.finish_from_async(state),
-            },
+            Source::Sync(iterator, next) => {
+                let result = self.call_function(next.clone(), iterator.clone(), Vec::new())?;
+                if is_primitive(&result) {
+                    return Err(self.type_error("Iterator result is not an object"));
+                }
+                if self.get_property(&result, "done")?.truthy() {
+                    return self.finish_from_async(state);
+                }
+                let value = self.get_property(&result, "value")?;
+                (value, Phase::Value, true)
+            }
             Source::ArrayLike(items, length) => {
-                let index = state.values.borrow().len();
+                let index = *state.index.borrow();
                 if index >= *length {
                     return self.finish_from_async(state);
                 }
@@ -159,17 +198,18 @@ impl ScriptRuntime {
     }
 
     fn finish_from_async(&mut self, state: &Rc<FromAsync>) -> Result<(), ScriptError> {
-        let values = std::mem::take(&mut *state.values.borrow_mut());
+        let length = *state.index.borrow();
+        self.set_property(&state.target, "length", Value::Number(length as f64), true)?;
         self.settle_promise(
             &state.result,
-            PromiseOutcome::Fulfilled(Self::new_array(values)),
+            PromiseOutcome::Fulfilled(state.target.clone()),
         );
         Ok(())
     }
 
     fn close_from_async(&mut self, state: &Rc<FromAsync>) {
         let closed = match &state.source {
-            Source::Sync(iterator) => self.iterator_close(iterator),
+            Source::Sync(iterator, _) => self.close_iterator_object(iterator),
             Source::Async(iterator, _) => {
                 self.get_property(iterator, "return")
                     .and_then(|close| match close {
@@ -186,14 +226,30 @@ impl ScriptRuntime {
         }
     }
 
+    fn write_from_async(&mut self, state: &Rc<FromAsync>, value: Value) -> Result<(), ScriptError> {
+        let index = *state.index.borrow();
+        if let Err(error) =
+            self.create_data_property_or_throw(&state.target, index.to_string(), value)
+        {
+            let reason = self.take_thrown(error);
+            self.close_from_async(state);
+            return Err(self.throw_value(reason));
+        }
+        *state.index.borrow_mut() = index + 1;
+        self.advance_from_async(state)
+    }
+
     // a value is in hand: map it and wait, or keep it and move on
     fn take_from_async(&mut self, state: &Rc<FromAsync>, value: Value) -> Result<(), ScriptError> {
         if matches!(state.mapper, Value::Undefined) {
-            state.values.borrow_mut().push(value);
-            return self.advance_from_async(state);
+            return self.write_from_async(state, value);
         }
-        let index = Value::Number(state.values.borrow().len() as f64);
-        match self.call_function(state.mapper.clone(), Value::Undefined, vec![value, index]) {
+        let index = Value::Number(*state.index.borrow() as f64);
+        match self.call_function(
+            state.mapper.clone(),
+            state.this_arg.clone(),
+            vec![value, index],
+        ) {
             Ok(mapped) => self.await_from_async(state, mapped, Phase::Mapped, true),
             Err(error) => {
                 let reason = self.take_thrown(error);
@@ -232,10 +288,7 @@ impl ScriptRuntime {
                 }
             }
             Phase::Value => self.take_from_async(state, settled),
-            Phase::Mapped => {
-                state.values.borrow_mut().push(settled);
-                self.advance_from_async(state)
-            }
+            Phase::Mapped => self.write_from_async(state, settled),
         };
         if let Err(error) = outcome {
             let reason = self.take_thrown(error);

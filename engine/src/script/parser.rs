@@ -2163,6 +2163,8 @@ impl<'a> Parser<'a> {
             // a rewound arrow attempt can leave the rescanned literal in the buffer
             TokenKind::Regex { pattern, flags } => {
                 self.advance()?;
+                super::pattern::validate(&pattern, &flags)
+                    .map_err(|message| self.error_here(message))?;
                 Ok(Expr::Regex {
                     pattern: pattern.into(),
                     flags: flags.into(),
@@ -2178,6 +2180,8 @@ impl<'a> Parser<'a> {
                 let TokenKind::Regex { pattern, flags } = self.advance()?.kind else {
                     unreachable!("the rescan returns a regular expression");
                 };
+                super::pattern::validate(&pattern, &flags)
+                    .map_err(|message| self.error_here(message))?;
                 Ok(Expr::Regex {
                     pattern: pattern.into(),
                     flags: flags.into(),

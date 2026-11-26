@@ -2196,6 +2196,7 @@ unsafe fn helper_call_native(
                                 if let Value::Array(arr_h) = &*stack_ptr.add(return_base)
                                     && let Some(array) = heap.array_mut(arr_h)
                                     && array.extra.is_none()
+                                    && (&*ctx.rt).array_protos_clean(heap)
                                 {
                                     let value =
                                         array.values.pop().unwrap_or(Value::Undefined).filled();
@@ -2214,6 +2215,7 @@ unsafe fn helper_call_native(
                                 if let Value::Array(arr_h) = &*stack_ptr.add(return_base)
                                     && let Some(array) = heap.array_mut(arr_h)
                                     && array.extra.is_none()
+                                    && (&*ctx.rt).array_protos_clean(heap)
                                     && array.values.len().saturating_add(count_usize)
                                         <= MAX_RUNTIME_ARRAY_LENGTH
                                 {

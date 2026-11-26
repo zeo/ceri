@@ -971,6 +971,8 @@ impl ScriptRuntime {
             this
         } else if matches!(this, Value::Undefined | Value::Null) {
             Value::Window
+        } else if super::operations::is_primitive(&this) {
+            self.coerce_object(this)?
         } else {
             this
         };
@@ -1253,6 +1255,8 @@ impl ScriptRuntime {
                         this
                     } else if matches!(this, Value::Undefined | Value::Null) {
                         Value::Window
+                    } else if super::operations::is_primitive(&this) {
+                        self.coerce_object(this)?
                     } else {
                         this
                     };
@@ -1342,8 +1346,13 @@ impl ScriptRuntime {
                             return Err(self.type_error("Reflect.apply target is not a function"));
                         }
                         let receiver = arguments.get(1).cloned().unwrap_or(Value::Undefined);
-                        let list =
-                            self.array_like_list(arguments.get(2).unwrap_or(&Value::Undefined))?;
+                        let args_list = arguments.get(2).unwrap_or(&Value::Undefined);
+                        if super::operations::is_primitive(args_list) {
+                            return Err(
+                                self.type_error("CreateListFromArrayLike called on non-object")
+                            );
+                        }
+                        let list = self.array_like_list(args_list)?;
                         return self.prepare_call(target, receiver, list, None);
                     }
                     Native::Reflect(super::reflect::ReflectMethod::Get) => {
@@ -1469,6 +1478,7 @@ impl ScriptRuntime {
                         Rc::unwrap_or_clone(native),
                         arguments,
                         new_target,
+                        Some(object),
                     )?));
                 }
                 ObjectClass::Proxy(proxy) => {
@@ -1476,14 +1486,6 @@ impl ScriptRuntime {
                         return Err(self.type_error("value is not a constructor"));
                     }
                     let (target, trap) = self.proxy_trap(&proxy, "construct")?;
-                    let new_target = match &new_target {
-                        Value::Object(target_object)
-                            if ObjectHandle::ptr_eq(target_object, object) =>
-                        {
-                            target.clone()
-                        }
-                        _ => new_target,
-                    };
                     return match trap {
                         Some(trap) => {
                             let handler =
@@ -1512,10 +1514,19 @@ impl ScriptRuntime {
         &mut self,
         new_target: &Value,
     ) -> Result<ObjectHandle, ScriptError> {
+        let default = self.intrinsics.object_prototype.clone();
+        self.prototype_from_constructor_or(new_target, &default)
+    }
+
+    pub(super) fn prototype_from_constructor_or(
+        &mut self,
+        new_target: &Value,
+        default: &ObjectHandle,
+    ) -> Result<ObjectHandle, ScriptError> {
         match self.get_property(new_target, "prototype")? {
             Value::Object(prototype) => Ok(prototype),
             Value::Array(array) => Ok(self.array_prototype_wrapper(&array)),
-            _ => Ok(self.intrinsics.object_prototype.clone()),
+            _ => Ok(default.clone()),
         }
     }
 
@@ -2489,6 +2500,11 @@ impl ScriptRuntime {
             this
         } else if matches!(this, Value::Undefined | Value::Null) {
             Value::Window
+        } else if super::operations::is_primitive(&this) {
+            match self.coerce_object(this) {
+                Ok(object) => object,
+                Err(_) => return false,
+            }
         } else {
             this
         };
@@ -3085,6 +3101,7 @@ impl ScriptRuntime {
                     return Ok(FastNativeCall::NotHandled);
                 };
                 if array.extra.is_some()
+                    || !self.array_protos_clean(heap)
                     || array.values.len().saturating_add(count) > MAX_RUNTIME_ARRAY_LENGTH
                 {
                     return Ok(FastNativeCall::NotHandled);
@@ -3117,7 +3134,7 @@ impl ScriptRuntime {
                 let Some(array) = (unsafe { heap.array_mut(&array_handle) }) else {
                     return Ok(FastNativeCall::NotHandled);
                 };
-                if array.extra.is_some() {
+                if array.extra.is_some() || !self.array_protos_clean(heap) {
                     return Ok(FastNativeCall::NotHandled);
                 }
                 let value = array.values.pop().unwrap_or(Value::Undefined).filled();

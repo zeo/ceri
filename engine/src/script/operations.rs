@@ -284,10 +284,7 @@ impl ScriptRuntime {
         let object = new_object(object);
         let mut stack = super::object_display(&object);
         self.write_stack(&mut stack);
-        object.borrow_mut().define(
-            "stack".to_string(),
-            Property::hidden(Value::String(stack.into())),
-        );
+        super::heap::set_error_stack(&object, stack.into());
         Value::Object(object)
     }
 
@@ -1196,8 +1193,29 @@ impl ScriptRuntime {
                 }
                 None => self.ordinary_get(super::typed_object(array), key, value),
             },
+            Value::Builtin(builtin) => {
+                if let Some(prop) = super::realm::builtin_own_property(builtin, key)
+                    && let Some(val) = prop.slot.value()
+                {
+                    return Ok(val.clone());
+                }
+                self.host_get(value, key)
+            }
             _ => self.host_get(value, key),
         }
+    }
+
+    #[inline]
+    pub(super) fn array_protos_clean(&self, heap: &super::heap::Heap) -> bool {
+        let ap_ok = unsafe { heap.object_ref(&self.intrinsics.array_prototype) }.is_some_and(|o| {
+            o.shape_id() == self.intrinsics.array_proto_shape || o.has_no_indexed_keys()
+        });
+        if !ap_ok {
+            return false;
+        }
+        unsafe { heap.object_ref(&self.intrinsics.object_prototype) }.is_some_and(|o| {
+            o.shape_id() == self.intrinsics.object_proto_shape || o.has_no_indexed_keys()
+        })
     }
 
     fn host_get(&mut self, value: &Value, key: &str) -> Result<Value, ScriptError> {
@@ -1210,14 +1228,22 @@ impl ScriptRuntime {
             if let Some(found) = self.array_property_get(array, key, value)? {
                 return Ok(found);
             }
-            // an array answers only its length and indices itself, so a method name goes
-            // straight to the prototype chain instead of through a missing-property error
-            if key != "length" && key.parse::<usize>().is_err() {
-                return match self.prototype_of(value) {
-                    Some(prototype) => self.ordinary_get(prototype, key, value),
-                    None => Ok(Value::Undefined),
-                };
+            if key == "length" {
+                return Ok(Value::Number(array.borrow().len() as f64));
             }
+            if let Some(index) = array_index(key)
+                && let Some(found) = array
+                    .borrow()
+                    .get(index as usize)
+                    .filter(|v| !matches!(v, Value::Uninitialized))
+                    .cloned()
+            {
+                return Ok(found);
+            }
+            return match self.prototype_of(value) {
+                Some(prototype) => self.ordinary_get(prototype, key, value),
+                None => Ok(Value::Undefined),
+            };
         }
         match self.member(value.clone(), key) {
             Ok(found) => Ok(found),
@@ -1436,11 +1462,18 @@ impl ScriptRuntime {
                 }
                 Ok(())
             }
-            Value::TypedArray(array) => match array_index(key) {
-                Some(index) => self.typed_set(array, index as usize, value),
-                None if super::typed::canonical_numeric_index(key).is_some() => Ok(()),
-                None => self.ordinary_set(super::typed_object(array), key, value, target, strict),
-            },
+            Value::TypedArray(array) => {
+                if let Some(number) = super::typed::canonical_numeric_index(key) {
+                    let kind = array.borrow().kind;
+                    let converted = self.typed_element_value(kind, value)?;
+                    let borrowed = array.borrow();
+                    if let Some(index) = super::typed::valid_index(&borrowed, number) {
+                        super::typed::write_element(&borrowed, index, &converted);
+                    }
+                    return Ok(());
+                }
+                self.ordinary_set(super::typed_object(array), key, value, target, strict)
+            }
             Value::Array(array) if key == "length" => {
                 let wanted = self.parse_array_length(value)?;
                 if !self.apply_array_length(array, wanted, None)? && strict {
@@ -1929,8 +1962,17 @@ impl ScriptRuntime {
             return self.delete_property(&Value::Object(object), key, strict);
         }
         if let Value::TypedArray(array) = target {
-            if let Some(index) = array_index(key) {
-                return Ok(index as usize >= super::typed::element_count(&array.borrow()));
+            if let Some(number) = super::typed::canonical_numeric_index(key) {
+                if super::typed::valid_index(&array.borrow(), number).is_some() {
+                    if strict {
+                        return Err(self.type_error(format!(
+                            "Cannot delete property '{key}' of [object {}]",
+                            array.borrow().kind.name()
+                        )));
+                    }
+                    return Ok(false);
+                }
+                return Ok(true);
             }
             let object = Value::Object(super::typed_object(array));
             return self.delete_property(&object, key, strict);
@@ -1941,6 +1983,19 @@ impl ScriptRuntime {
                 self.proxy_delete(&proxy, key, strict)
             }
             Value::Object(object) => {
+                if let ObjectClass::String(text) = &object.borrow().class {
+                    let non_config = key == "length"
+                        || array_index(key)
+                            .is_some_and(|idx| (idx as usize) < super::strings::utf16_length(text));
+                    if non_config {
+                        if strict {
+                            return Err(self.type_error(format!(
+                                "Cannot delete property '{key}' of [object String]"
+                            )));
+                        }
+                        return Ok(false);
+                    }
+                }
                 let configurable = object
                     .borrow()
                     .property(key)
@@ -2902,6 +2957,18 @@ impl ScriptRuntime {
         step_state(self, state)
     }
 
+    pub(super) fn close_iterator_object(&mut self, iterator: &Value) -> Result<(), ScriptError> {
+        let method = self.get_property(iterator, "return")?;
+        if matches!(method, Value::Undefined | Value::Null) {
+            return Ok(());
+        }
+        let result = self.call_function(method, iterator.clone(), Vec::new())?;
+        if is_primitive(&result) {
+            return Err(self.type_error("iterator result is not an object"));
+        }
+        Ok(())
+    }
+
     pub(super) fn iterator_close(&mut self, iterator: &Value) -> Result<(), ScriptError> {
         let Value::VmIterator(state) = iterator else {
             return Ok(());
@@ -3093,9 +3160,21 @@ impl ScriptRuntime {
             return Ok(false);
         }
         let method = self.get_property(value, "@@iterator")?;
-        Ok(
-            matches!(&method, Value::Object(object) if matches!(object.borrow().class, ObjectClass::Native(ref native) if matches!(**native, Native::ArrayValues))),
-        )
+        if !matches!(&method, Value::Object(object) if matches!(object.borrow().class, ObjectClass::Native(ref native) if matches!(**native, Native::ArrayValues)))
+        {
+            return Ok(false);
+        }
+        let next = self
+            .intrinsics
+            .array_iterator_prototype
+            .borrow()
+            .property("next")
+            .and_then(|p| p.value().cloned());
+        Ok(matches!(
+            &next,
+            Some(Value::Object(object))
+                if matches!(object.borrow().class, ObjectClass::Native(ref native) if matches!(**native, Native::ArrayIteratorNext))
+        ))
     }
 
     pub(super) fn iterate_to_vec(&mut self, value: Value) -> Result<Vec<Value>, ScriptError> {
