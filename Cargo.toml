@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "ceri"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 publish = false
 license = "MIT OR Apache-2.0"
